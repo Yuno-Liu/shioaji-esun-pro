@@ -1,3 +1,5 @@
+import { esunTradeService, isEsunAccount } from './esun';
+import { connectEsunOrderStream } from './stream';
 import { canTrade } from './account-tradable';
 import { createAccountQuery } from './account-query';
 import { getApiBase, isTauri } from './runtime';
@@ -119,13 +121,49 @@ export function fetchInfo() {
     });
 }
 
+function connectEsunBridge(): Promise<unknown> {
+    // Vitest：不探測真實 /esun（測試以 setDriver/registerAccount 自行注入）
+    if (import.meta.env?.MODE === 'test') return Promise.resolve(null);
+    return esunTradeService.connectBridge().then(health => {
+        if (health?.ok) {
+            connectEsunOrderStream();
+        }
+        return health;
+    }).catch(() => null);
+}
+
 export function fetchAccounts() {
-    return apiGet<Account[]>('/api/v1/auth/accounts');
+    return connectEsunBridge().then(() => apiGet<Account[]>('/api/v1/auth/accounts')).then(
+        accounts => {
+            const esunAccounts = esunTradeService.getAccounts();
+            if (esunAccounts.length === 0) return accounts;
+            // 將玉山證券帳戶排在最前面，確保「永豐取行情、玉山負責任下單」並行時預設選中玉山帳戶
+            const merged = [...esunAccounts];
+            for (const a of accounts) {
+                if (!merged.some(ea => ea.broker_id === a.broker_id && ea.account_id === a.account_id)) {
+                    merged.push(a);
+                }
+            }
+            return merged;
+        },
+        error => {
+            const esunAccounts = esunTradeService.getAccounts();
+            if (esunAccounts.length > 0) return esunAccounts;
+            throw error;
+        },
+    );
 }
 
 // CA expiry for a person_id — production orders fail (400) without an active,
 // unexpired CA. Returns the expire time so the panel can show 有效/過期.
 export function fetchCaExpire(personId: string) {
+    const active = getAccountState().selectedStock ?? accountFor('S');
+    if (isEsunAccount(active)) {
+        return esunTradeService.fetchCaExpire(personId).then(expire_time => ({
+            person_id: personId,
+            expire_time,
+        }));
+    }
     return apiGet<{ person_id: string; expire_time: string }>(
         `/api/v1/auth/ca_expiretime?person_id=${encodeURIComponent(personId)}`,
     );
@@ -136,6 +174,10 @@ export async function subscribeTradeEvents(account: {
     account_id: string;
     account_type: string;
 }) {
+    if (isEsunAccount(account as Account)) {
+        connectEsunOrderStream();
+        return;
+    }
     const query = createAccountQuery();
     const current = query.account(account.account_type as AccountTypeName, account);
     return apiPost<unknown>('/api/v1/auth/subscribe_trade', {
@@ -847,11 +889,16 @@ export function placeStockOrder(
     account?: Account,
     opts?: { agentInitiated?: boolean; agentCallId?: string; agentAuto?: boolean; beforeDispatch?: () => void; onResponse?: (res: Response) => void },
 ) {
+    const selected = account ?? accountFor('S');
+    if (selected && isEsunAccount(selected)) {
+        return esunTradeService
+            .placeStockOrder(contract, order, selected, opts)
+            .then(trade => observeTradeResponse(trade, selected));
+    }
     // 零股不支援的組合（融資券／當沖／市價／IOC／超過 999 股）與整股信用規則
     // （融券買進、不可當沖的當沖先賣）一律在送出前擋下（#204）
     const problem = stockOrderProblem({ ...order, day_trade: (contract as { day_trade?: string }).day_trade });
     if (problem) return Promise.reject(Object.assign(new Error(problem), { mutationNotStarted: true as const }));
-    const selected = account ?? accountFor('S');
     return sendOrderMutation<Trade>('/api/v1/order/place_order', {
         contract: contractKey(contract),
         stock_order: { ...order, account: selected },
@@ -868,6 +915,9 @@ export function placeFuturesOrder(
     const problem = futuresOrderProblem(order);
     if (problem) return Promise.reject(Object.assign(new Error(problem), { mutationNotStarted: true as const }));
     const selected = account ?? accountFor('F');
+    if (selected && isEsunAccount(selected)) {
+        return Promise.reject(Object.assign(new Error('玉山證券不支援期貨交易'), { mutationNotStarted: true as const }));
+    }
     return sendOrderMutation<Trade>('/api/v1/order/place_order', {
         contract: orderableKey(contract),
         futures_order: { ...order, account: selected },
@@ -927,7 +977,7 @@ async function prepareOrderMutation(tradeId: string, trace: OrderTraceRecord | n
     if (account!.account_type !== (futures ? 'F' : 'S')) refuse('商品與委託帳戶不符，未送出改刪單');
     traceTrade(trace, trade, trade.account ?? trade.order.account ?? account);
     traceSet(trace, { reconcile: { ran: false } });
-    if (hasOrdersBaseline()) return { base, tradeId, trade, account: account!, tradingState };
+    if (hasOrdersBaseline() || isEsunAccount(account)) return { base, tradeId, trade, account: account!, tradingState };
     const seqno = trade.order.seqno?.trim();
     const ordno = trade.order.ordno?.trim();
     if (!seqno && !ordno) refuse('伺服器委託基準未建立且委託缺少序號，請先手動更新委託；未送出改刪單');
@@ -1057,6 +1107,14 @@ function observeCancel(
         const target = await prepareOrderMutation(tradeId, trace);
         traceEndpoint(trace, '/api/v1/order/cancel_order');
         const { account } = target;
+        if (isEsunAccount(account)) {
+            const cancelled = await esunTradeService.cancelOrder(
+                target.trade,
+                account,
+                { beforeDispatch: beforeSend },
+            );
+            return markConfirmedCancellation({ ...cancelled, account });
+        }
         const { cancelCacheTrusted, locallyCancelled } = target.tradingState;
         if (target.base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
         await sendOrderMutation<Trade>(
@@ -1103,6 +1161,13 @@ export function updateOrderPrice(tradeId: string, price: number) {
     return tracedMutation('update_price', tradeId, async trace => {
         const target = await prepareOrderMutation(tradeId, trace);
         traceEndpoint(trace, '/api/v1/order/update_price');
+        if (isEsunAccount(target.account)) {
+            return esunTradeService.updateOrderPrice(
+                target.trade,
+                price,
+                target.account,
+            );
+        }
         if (target.base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
         // 零股委託只能減量（#204）— 任何改價路徑都在送出前擋下
         if (isOddLot(target.trade.order.order_lot)) throw Object.assign(new Error(ODD_LOT_NO_PRICE_UPDATE), { mutationNotStarted: true });
@@ -1117,6 +1182,13 @@ export function updateOrderQty(tradeId: string, quantity: number) {
     return tracedMutation('update_qty', tradeId, async trace => {
         const target = await prepareOrderMutation(tradeId, trace);
         traceEndpoint(trace, '/api/v1/order/update_qty');
+        if (isEsunAccount(target.account)) {
+            return esunTradeService.updateOrderQty(
+                target.trade,
+                quantity,
+                target.account,
+            );
+        }
         if (target.base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
         noteMutationIntent(tradeId, { kind: 'qty', quantity });
         return sendOrderMutation<Trade>('/api/v1/order/update_qty', {
@@ -1136,12 +1208,54 @@ export interface AccountSelector {
 
 function accountQueryPost<T>(path: string, type: AccountTypeName, selector?: AccountSelector, extra: Record<string, unknown> = {}): Promise<T> {
     const query = createAccountQuery();
-    return query.read(type, selector, account => apiPost<T>(path, {
-        ...extra,
-        account_type: type,
-        broker_id: account.broker_id,
-        account_id: account.account_id,
-    }, { beforeDispatch: query.assertCurrent }));
+    return query.read(type, selector, account => {
+        if (isEsunAccount(account as Account)) {
+            const acc = account as Account;
+            if (path === '/api/v1/order/trades') {
+                const refresh = Boolean(extra.refresh);
+                return esunTradeService.fetchTrades(acc, refresh) as Promise<T>;
+            }
+            if (path === '/api/v1/order/trade_cache_health') {
+                return Promise.resolve({ state: 'Healthy', reasons: [] } as T);
+            }
+            if (path === '/api/v1/portfolio/position_unit') {
+                const unit = (extra.unit === 'Share' ? 'Share' : 'Common') as 'Common' | 'Share';
+                return esunTradeService.fetchPositions(acc, unit) as Promise<T>;
+            }
+            if (path === '/api/v1/portfolio/account_balance') {
+                return esunTradeService.fetchAccountBalance(acc) as Promise<T>;
+            }
+            if (path === '/api/v1/portfolio/settlements') {
+                return esunTradeService.fetchSettlements(acc) as Promise<T>;
+            }
+            if (path === '/api/v1/portfolio/profit_loss') {
+                const beginDate = String(extra.begin_date ?? '');
+                const endDate = String(extra.end_date ?? '');
+                return esunTradeService.fetchProfitLoss(acc, beginDate, endDate) as Promise<T>;
+            }
+            if (path === '/api/v1/portfolio/profitloss_sum') {
+                const beginDate = String(extra.begin_date ?? '');
+                const endDate = String(extra.end_date ?? '');
+                return esunTradeService.fetchProfitLossSummary(acc, beginDate, endDate) as Promise<T>;
+            }
+            if (path === '/api/v1/portfolio/trading_limits') {
+                return esunTradeService.fetchTradingLimits(acc) as Promise<T>;
+            }
+            if (path === '/api/v1/portfolio/stock_reserve_summary' || path === '/api/v1/order/stock_reserve_summary') {
+                return esunTradeService.fetchStockReserveSummary(acc) as Promise<T>;
+            }
+            if (path === '/api/v1/order/stock_reserve_detail' || path === '/api/v1/order/earmarking_detail') {
+                return Promise.resolve({ stocks: [], account: acc } as T);
+            }
+            return Promise.reject(new Error(`玉山證券帳戶暫不支援此查詢 (${path})`));
+        }
+        return apiPost<T>(path, {
+            ...extra,
+            account_type: type,
+            broker_id: account.broker_id,
+            account_id: account.account_id,
+        }, { beforeDispatch: query.assertCurrent });
+    });
 }
 
 export interface FetchTradesOptions {
@@ -1542,6 +1656,9 @@ export function placeComboOrder(
     account?: Account,
 ) {
     const acc = account ?? accountFor('F');
+    if (acc && isEsunAccount(acc)) {
+        return Promise.reject(Object.assign(new Error('玉山證券不支援期權組合單'), { mutationNotStarted: true as const }));
+    }
     return sendOrderMutation<ComboTrade>('/api/v1/order/place_comboorder', {
         combo_contract: {
             legs: combo.legs,

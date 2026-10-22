@@ -1,3 +1,4 @@
+import { isEsunBroker } from '../lib/esun';
 import { canTrade } from '../lib/account-tradable';
 // src/components/bottom-dock-account.tsx — 帳務/交割 tab。
 // 報表風卡片牆＋donut 改成交易工具：資金狀態緊湊數字列（含風險指標色條）、
@@ -639,7 +640,7 @@ export function AccountPane(props: AccountPaneProps) {
     return <>{visible.map(account => {
         const id = `${account.account_type}:${account.broker_id}:${account.account_id}`;
         return <section key={id}>
-            <h3>{account.account_type === 'F' ? '期貨' : '證券'} {account.broker_id}-{maskAccountId(account.account_id, privacy)}</h3>
+            <h3>{account.account_type === 'F' ? '期貨' : '證券'} {isEsunBroker(account.broker_id) ? '玉山' : account.broker_id}-{maskAccountId(account.account_id, privacy)}</h3>
             <AccountPaneContent {...props} scopeAccount={account}
                 positions={props.positions.filter(p => accountMatches(p.account, account))}
                 onRefreshControls={callbacks[id]} />

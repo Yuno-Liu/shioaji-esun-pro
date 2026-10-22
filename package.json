@@ -10,7 +10,12 @@
         "desktop:qa": "tauri build --debug --config src-tauri/tauri.dev.conf.json",
         "build": "tsc -b && vite build",
         "test": "vitest run",
-        "preview": "vite preview"
+        "preview": "vite preview",
+        "esun-bridge": "python server/esun_trade_server.py",
+        "docker:deploy": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-docker.ps1 -Action up",
+        "docker:down": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-docker.ps1 -Action down",
+        "docker:status": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-docker.ps1 -Action status",
+        "docker:logs": "docker compose logs -f"
     },
     "dependencies": {
         "@statsig/js-client": "^3.33.2",

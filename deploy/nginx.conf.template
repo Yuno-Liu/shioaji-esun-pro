@@ -1,0 +1,78 @@
+server {
+    listen ${PORT};
+    listen [::]:${PORT};
+    server_name localhost;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Enable gzip compression for fast asset transfers
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+
+    # Dedicated HTML pages
+    location = /approval.html {
+        try_files /approval.html =404;
+    }
+
+    # Static assets with long-term caching
+    location ~* \.(?:css|js|jpg|jpeg|gif|png|ico|cur|gz|svg|svgz|mp4|ogg|ogv|webm|htc|woff|woff2)$ {
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        try_files $uri =404;
+    }
+
+    # Redirect /esun without trailing slash to /esun/
+    location = /esun {
+        return 301 /esun/;
+    }
+
+    # Reverse-proxy /esun/ to E.Sun Bridge Sidecar with full SSE streaming support
+    location /esun/ {
+        proxy_pass ${ESUN_BRIDGE_UPSTREAM}/esun/;
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding off;
+        proxy_next_upstream off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Redirect /api without trailing slash to /api/
+    location = /api {
+        return 301 /api/;
+    }
+
+    # Reverse-proxy /api/ to SinoPac Shioaji API Upstream with full SSE streaming support
+    location /api/ {
+        proxy_pass ${SHIOAJI_API_UPSTREAM}/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding off;
+        proxy_next_upstream off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # SPA routing fallback
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

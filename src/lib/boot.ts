@@ -1,3 +1,4 @@
+import { isEsunAccount } from './esun';
 import { canTrade } from './account-tradable';
 import { createAccountQuery } from './account-query';
 // src/lib/boot.ts — startup orchestration:
@@ -596,6 +597,10 @@ export function subscribeTradeReports(): Promise<void> {
             const accounts = await loadAccountsShared();
             const query = createAccountQuery();
             for (const account of accounts.filter(a => canTrade(a))) {
+                if (isEsunAccount(account)) {
+                    await subscribeTradeEvents(account);
+                    continue;
+                }
                 let subscribed = false;
                 try {
                     const health = await query.read(account.account_type as 'S' | 'F', account,

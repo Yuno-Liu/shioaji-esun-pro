@@ -1,0 +1,44 @@
+# esun-config.ini.example — 玉山證券 (E.Sun Securities) API 設定檔範本
+#
+# 使用方式：
+# 1. 將此檔案複製為 `esun-config.ini`（或自訂路徑，並透過環境變數 ESUN_CONFIG_PATH 指定）。
+# 2. 依玉山證券 API 申請核發之資訊填寫下列欄位。
+# 3. 憑證密碼與登入密碼請透過環境變數傳入，切勿將明文密碼寫入本設定檔中：
+#      ESUN_ACCOUNT_PASSWORD=您的玉山證券登入密碼 (或 ESUN_PASSWORD)
+#      ESUN_CERT_PASSWORD=您的憑證密碼 (.p12)
+#
+# 官方限制提醒：
+# - 登入密碼輸錯 3 次將觸發帳號鎖定 (AGA0000)。本 Sidecar 內建單次熔斷保護，禁止自動重試。
+# - 每分鐘登入上限 10 次 (AGR0000)，每日上限 300 次 (AGR0004)。
+# - 每秒委託上限 20 筆 (AGR0002)，每日上限 2,000 筆 (AGR0001)。
+
+[Core]
+# API 主機位址 (Entry point)
+# 正式環境：https://esuntradingapi.esunsec.com.tw/api/v1
+# 模擬環境：https://esuntradingapi-simulation.esunsec.com.tw/api/v1
+Entry = https://esuntradingapi.esunsec.com.tw/api/v1
+
+# 運行環境 (Production / Simulation)
+# 注意：若設為 Simulation，Entry 網址必須包含 simulation 字眼
+Environment = Production
+
+[Cert]
+# 憑證路徑 (.p12 檔案)
+# 可以是絕對路徑，或相對於本設定檔所在目錄的相對路徑
+Path = certs/esun_cert.p12
+
+[Api]
+# 玉山證券核發之 API 金鑰 (Key) 與密鑰 (Secret)
+Key = YOUR_API_KEY_HERE
+Secret = YOUR_API_SECRET_HERE
+
+[User]
+# 證券帳號 (Account)
+# 支援 11 碼（前 4 碼為分公司代碼，後 7 碼為帳號，例如 88401234567）
+# 或 7 碼帳號（例如 1234567，預設分公司代碼為 8840）
+Account = 88401234567
+
+[Server]
+# 本地 Python Sidecar 監聽位址與埠號
+Host = 127.0.0.1
+Port = 8090

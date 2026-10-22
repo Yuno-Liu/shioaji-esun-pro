@@ -1,3 +1,4 @@
+import { isEsunBroker } from '../lib/esun';
 import { canTrade } from '../lib/account-tradable';
 // src/components/order-ticket.tsx — buy/sell ticket with two-step EXECUTE.
 // Stock vs futures aware; price autofills from the live quote.
@@ -826,7 +827,7 @@ export function OrderTicket({
                                                     style={{ width: 11 }}
                                                 />
                                             )}
-                                            {acctTag} {a.broker_id}-
+                                            {acctTag} {isEsunBroker(a.broker_id) ? '玉山' : a.broker_id}-
                                             {maskAccountId(a.account_id, priv)}
                                             （{maskName(a.username, priv)}）
                                         </button>
@@ -1245,7 +1246,7 @@ export function OrderTicket({
                                     className={styles.splitAcctLabel}
                                     title={maskName(a.username, priv)}
                                 >
-                                    {acctTag} {a.broker_id}-
+                                    {acctTag} {isEsunBroker(a.broker_id) ? '玉山' : a.broker_id}-
                                     {maskAccountId(a.account_id, priv)}
                                 </span>
                                 {splitMode === 'ratio' ? (

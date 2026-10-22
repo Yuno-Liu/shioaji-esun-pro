@@ -1,3 +1,4 @@
+import { isEsunAccount, validateEsunStockOrder } from './esun';
 import { canTrade } from './account-tradable';
 import { createAccountQuery } from './account-query';
 import { remainingWorkingOrderQuantity } from './working-order-quantity';
@@ -208,6 +209,9 @@ export async function placeQuickOrder(
     if (contract.security_type === 'IND') {
         throw mutationNotStartedError('指數商品僅提供行情，不可下單');
     }
+    if (isFuturesContract(contract) && isEsunAccount(capturedAccount)) {
+        throw mutationNotStartedError('玉山證券僅支援證券交易，不支援期貨/選擇權商品');
+    }
     const expectedAccountType = isFuturesContract(contract) ? 'F' : 'S';
     if (!capturedAccount || !canTrade(capturedAccount) || capturedAccount.account_type !== expectedAccountType
         || !getAccountState().accounts.some(a => canTrade(a) && a.account_type === expectedAccountType
@@ -233,16 +237,27 @@ export async function placeQuickOrder(
         if (problem) throw mutationNotStartedError(problem);
     } else {
         if (opts?.futuresPriceType === 'MKP') throw mutationNotStartedError('範圍市價（MKP）只適用期貨');
-        const problem = stockOrderProblem({
-            quantity,
-            price_type: price === null ? 'MKT' : 'LMT',
-            order_type: price === null ? 'IOC' : (opts?.orderType ?? 'ROD'),
-            order_lot: opts?.orderLot ?? 'Common',
-            order_cond: orderCond,
-            daytrade_short: daytradeShort,
-            action,
-            day_trade: (contract as Partial<ContractInfo>).day_trade,
-        });
+        const problem = isEsunAccount(capturedAccount)
+            ? validateEsunStockOrder(contract, {
+                action,
+                price: price ?? 0,
+                quantity,
+                price_type: price === null ? 'MKT' : 'LMT',
+                order_type: price === null ? 'IOC' : (opts?.orderType ?? 'ROD'),
+                order_lot: opts?.orderLot ?? 'Common',
+                order_cond: orderCond,
+                daytrade_short: daytradeShort,
+            })
+            : stockOrderProblem({
+                quantity,
+                price_type: price === null ? 'MKT' : 'LMT',
+                order_type: price === null ? 'IOC' : (opts?.orderType ?? 'ROD'),
+                order_lot: opts?.orderLot ?? 'Common',
+                order_cond: orderCond,
+                daytrade_short: daytradeShort,
+                action,
+                day_trade: (contract as Partial<ContractInfo>).day_trade,
+            });
         if (problem) throw mutationNotStartedError(problem);
     }
     const credit = isFuturesContract(contract) ? undefined : creditLabel(action, orderCond, daytradeShort);

@@ -8,6 +8,8 @@ dist/
 .env
 .env.local
 .env.*.local
+esun-config.ini
+.esun-bridge.pid
 
 # Logs
 *.log
@@ -21,3 +23,9 @@ dist/
 src-tauri/target/
 src-tauri/binaries/
 src-tauri/gen/schemas/
+
+# Python & Certs
+__pycache__/
+*.py[cod]
+*.p12
+certs/

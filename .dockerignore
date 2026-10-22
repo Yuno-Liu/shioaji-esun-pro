@@ -1,0 +1,36 @@
+# Dependencies and build caches
+node_modules
+dist
+.output
+.vite
+.cache
+
+# Tauri / Native build artifacts
+src-tauri/target
+src-tauri/gen
+src-tauri/binaries
+
+# Version control and tools
+.git
+.github
+.agents
+.wt
+
+# Local configs and certs (mounted dynamically at runtime)
+.env
+.env.local
+.env.*.local
+esun-config.ini
+certs/*.p12
+*.p12
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+
+# OS files
+.DS_Store
+Thumbs.db

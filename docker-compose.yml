@@ -1,0 +1,72 @@
+services:
+  shioaji-pro-web:
+    container_name: shioaji-pro-web
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:${PORT:-8080}"
+    environment:
+      - PORT=${PORT:-8080}
+      - SHIOAJI_API_UPSTREAM=${SHIOAJI_API_UPSTREAM:-http://127.0.0.1:21322}
+      - ESUN_BRIDGE_UPSTREAM=${ESUN_BRIDGE_UPSTREAM:-http://esun-bridge:8090}
+      - NGINX_ENVSUBST_FILTER=PORT|SHIOAJI_API_UPSTREAM|ESUN_BRIDGE_UPSTREAM
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - esun-bridge
+
+  shioaji-server:
+    container_name: shioaji-pro-sinopac
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: esun-bridge
+    restart: unless-stopped
+    network_mode: "service:shioaji-pro-web"
+    depends_on:
+      - shioaji-pro-web
+    environment:
+      - SJ_HTTP_ADDR=127.0.0.1:21322
+      - SJ_API_KEY=${SJ_API_KEY:-}
+      - SJ_SEC_KEY=${SJ_SEC_KEY:-}
+      - SJ_PRODUCTION=${SJ_PRODUCTION:-false}
+      - SJ_CA_PATH=${SJ_CA_PATH:-}
+      - SJ_CA_PASSWD=${SJ_CA_PASSWD:-}
+    volumes:
+      - ./certs:/app/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -z \"$$SJ_API_KEY\" || curl -sf http://127.0.0.1:21322/api/v1/info > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    command: >
+      sh -c 'if [ -z "$$SJ_API_KEY" ] || [ -z "$$SJ_SEC_KEY" ]; then
+        echo "[shioaji-server] 尚未設定 SJ_API_KEY / SJ_SEC_KEY，請於專案根目錄 .env 填寫永豐 API 金鑰後執行 docker compose up -d";
+         exec sleep infinity;
+      fi;
+      exec shioaji server start --no-open'
+
+  esun-bridge:
+    container_name: shioaji-pro-esun-bridge
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: esun-bridge
+    restart: unless-stopped
+    ports:
+      - "${BRIDGE_PORT:-8090}:8090"
+    environment:
+      - ESUN_SERVER_HOST=0.0.0.0
+      - ESUN_SERVER_PORT=8090
+      - ESUN_CONFIG_PATH=/app/esun-config.ini
+      - ESUN_ACCOUNT_PASSWORD=${ESUN_ACCOUNT_PASSWORD:-}
+      - ESUN_PASSWORD=${ESUN_PASSWORD:-}
+      - ESUN_CERT_PASSWORD=${ESUN_CERT_PASSWORD:-}
+    volumes:
+      - ./esun-config.ini:/app/esun-config.ini:ro
+      - ./certs:/app/certs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

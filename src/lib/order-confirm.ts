@@ -1,3 +1,4 @@
+import { isEsunBroker, ESUN_BROKER_NAME } from './esun';
 // src/lib/order-confirm.ts — 手動下單的可視化委託確認（promise 服務）
 //
 // RiskSettings.confirmManualOrders 開啟時，手動下單路徑先呼叫
@@ -112,7 +113,8 @@ export function accountConfirmLabel(account: Pick<Account, 'broker_id' | 'accoun
     const masked = getPrivacyMode()
         ? maskAccountId(id, true)
         : id.length > 4 ? `${'*'.repeat(id.length - 4)}${id.slice(-4)}` : id;
-    return `${account.broker_id}-${masked}`;
+    const broker = isEsunBroker(account.broker_id) ? ESUN_BROKER_NAME : account.broker_id;
+    return `${broker}-${masked}`;
 }
 
 /**
