@@ -48,6 +48,7 @@ const esunAccount: Account = {
 };
 
 let mockAccounts: Account[] = [sinopacAccount, esunAccount];
+let mockSelectedAccount: Account | null = sinopacAccount;
 let mockSelectedStock: Account | null = sinopacAccount;
 let mockSelectedFutures: Account | null = null;
 const listeners = new Set<() => void>();
@@ -55,10 +56,13 @@ const listeners = new Set<() => void>();
 vi.mock('../lib/account-store', () => ({
     useAccounts: () => ({
         accounts: mockAccounts,
+        selectedAccount: mockSelectedAccount,
         selectedStock: mockSelectedStock,
         selectedFutures: mockSelectedFutures,
     }),
+    getActiveAccount: (s?: any) => s?.selectedAccount ?? s?.selectedStock ?? s?.selectedFutures ?? mockSelectedAccount ?? mockSelectedStock ?? mockAccounts[0] ?? null,
     selectAccount: (acc: Account) => {
+        mockSelectedAccount = acc;
         if (acc.account_type === 'S') mockSelectedStock = acc;
         else mockSelectedFutures = acc;
         listeners.forEach((l) => l());
@@ -74,6 +78,7 @@ vi.mock('../lib/account-store', () => ({
     },
     getAccountState: () => ({
         accounts: mockAccounts,
+        selectedAccount: mockSelectedAccount,
         selectedStock: mockSelectedStock,
         selectedFutures: mockSelectedFutures,
     }),
@@ -148,7 +153,8 @@ describe('HudHeader Environment Detection & Switcher', () => {
     beforeEach(async () => {
         vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
         mockAccounts = [sinopacAccount, esunAccount];
-        mockSelectedStock = sinopacAccount;
+        mockSelectedAccount = sinopacAccount;
+        mockSelectedStock = sinopacAccount; mockSelectedAccount = sinopacAccount;
         mockSelectedFutures = null;
         esunTradeService.setConfigProfiles({
             SIMULATION: {
@@ -180,7 +186,7 @@ describe('HudHeader Environment Detection & Switcher', () => {
     });
 
     it('displays Sinopac broker tag and environment when Sinopac account is active', async () => {
-        mockSelectedStock = sinopacAccount;
+        mockSelectedStock = sinopacAccount; mockSelectedAccount = sinopacAccount;
 
         await act(async () => {
             view = create(createElement(HudHeader, baseProps));
@@ -195,7 +201,7 @@ describe('HudHeader Environment Detection & Switcher', () => {
     });
 
     it('automatically switches to reflect Esun environment when Esun account is selected', async () => {
-        mockSelectedStock = esunAccount;
+        mockSelectedStock = esunAccount; mockSelectedAccount = esunAccount;
         await esunTradeService.switchEnvironment('SIMULATION');
 
         await act(async () => {
@@ -209,7 +215,7 @@ describe('HudHeader Environment Detection & Switcher', () => {
     });
 
     it('opens switcher menu on badge click and switches Esun to PRODUCTION and back to SIMULATION', async () => {
-        mockSelectedStock = esunAccount;
+        mockSelectedStock = esunAccount; mockSelectedAccount = esunAccount;
         await esunTradeService.switchEnvironment('SIMULATION');
 
         await act(async () => {
@@ -263,7 +269,7 @@ describe('HudHeader Environment Detection & Switcher', () => {
     });
 
     it('allows switching active account between Sinopac and Esun directly from the menu', async () => {
-        mockSelectedStock = sinopacAccount;
+        mockSelectedStock = sinopacAccount; mockSelectedAccount = sinopacAccount;
 
         await act(async () => {
             view = create(createElement(HudHeader, baseProps));
@@ -299,7 +305,7 @@ describe('HudHeader Environment Detection & Switcher', () => {
     });
 
     it('disables PRODUCTION option and prevents switching when production config is missing', async () => {
-        mockSelectedStock = esunAccount;
+        mockSelectedStock = esunAccount; mockSelectedAccount = esunAccount;
 
         // Configure SIMULATION available, PRODUCTION missing
         esunTradeService.setConfigProfiles({
@@ -347,7 +353,7 @@ describe('HudHeader Environment Detection & Switcher', () => {
     });
 
     it('disables SIMULATION option and prevents switching when simulation config is missing', async () => {
-        mockSelectedStock = esunAccount;
+        mockSelectedStock = esunAccount; mockSelectedAccount = esunAccount;
 
         // Configure SIMULATION missing, PRODUCTION available
         esunTradeService.setConfigProfiles({

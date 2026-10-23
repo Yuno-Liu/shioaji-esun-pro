@@ -1,4 +1,4 @@
-import { isEsunBroker } from '../lib/esun';
+import { isEsunBroker, useEsunEnvironment } from '../lib/esun';
 import { canTrade } from '../lib/account-tradable';
 // src/components/bottom-dock-account.tsx — 帳務/交割 tab。
 // 報表風卡片牆＋donut 改成交易工具：資金狀態緊湊數字列（含風險指標色條）、
@@ -670,16 +670,20 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
     }, []);
     const sim = simulation === true;
 
+    const esunEnv = useEsunEnvironment();
+    const accountState = useAccounts();
+    const { accounts } = accountState;
+    const effectiveScopeAccount = scopeAccount ?? accountState.selectedAccount ?? null;
+
     // 全域帳戶範圍：scope 選 [期] 只顯示期貨區塊、[證] 只顯示證券區塊；
     // 市場篩選 chips 同樣生效
     const showStock =
-        market !== 'F' && (!scopeAccount || scopeAccount.account_type === 'S');
+        market !== 'F' && (!effectiveScopeAccount || effectiveScopeAccount.account_type === 'S');
     const showFut =
-        market !== 'S' && (!scopeAccount || scopeAccount.account_type === 'F');
+        market !== 'S' && (!effectiveScopeAccount || effectiveScopeAccount.account_type === 'F');
 
-    const { accounts } = useAccounts();
     const queryAccounts = accounts.filter(a => canTrade(a) && (a.account_type === 'S' || a.account_type === 'F')
-        && (!scopeAccount || (a.account_type === scopeAccount.account_type && a.broker_id === scopeAccount.broker_id && a.account_id === scopeAccount.account_id))
+        && (!effectiveScopeAccount || (a.account_type === effectiveScopeAccount.account_type && a.broker_id === effectiveScopeAccount.broker_id && a.account_id === effectiveScopeAccount.account_id))
         && (a.account_type === 'S' ? showStock : showFut));
     const stockAccounts = queryAccounts.filter(a => a.account_type === 'S');
     const selKey = queryAccounts.map(a => `${a.account_type}:${a.broker_id}:${a.account_id}`).sort().join('|');
@@ -729,7 +733,7 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
                 }),
             [showStock, selKey],
         ),
-        `settlements:${selKey}:${showStock}`,
+        `settlements:${selKey}:${showStock}:${esunEnv.environment}`,
         true, stockAccounts,
     );
 
@@ -763,7 +767,7 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
     }, [showStock, showFut, selKey]);
     const { data: pnl, refresh: refreshPnl, loading: loadingPnl, error: errorPnl } = useQuery<PnlData>(
         pnlFetcher,
-        `realized-pnl:${selKey}:${showStock}:${showFut}`,
+        `realized-pnl:${selKey}:${showStock}:${showFut}:${esunEnv.environment}`,
         true, queryAccounts,
     );
 
@@ -780,7 +784,7 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
             // eslint-disable-next-line react-hooks/exhaustive-deps
             [showStock, selKey],
         ),
-        `trading-limits:${selKey}:${showStock}`,
+        `trading-limits:${selKey}:${showStock}:${esunEnv.environment}`,
         true, stockAccounts,
     );
 

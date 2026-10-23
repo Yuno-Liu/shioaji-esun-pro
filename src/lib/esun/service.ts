@@ -4,6 +4,7 @@ import { useSyncExternalStore } from 'react';
 import type { ContractBase } from '../types/contract';
 import type { OrderResult, OrderStatusInfo, StockOrderReq, Trade } from '../types/order';
 import type { Account, AccountBalance, StockPosition } from '../types/portfolio';
+import { registerExternalAccounts } from '../account-store';
 import type {
     Settlement,
     StockProfitLoss,
@@ -349,6 +350,7 @@ export class EsunTradeService {
                         error: res.error || res.message || '切換失敗',
                     };
                 }
+                this.clearAccounts();
                 if (res?.activeConfigFile) {
                     this.activeConfigFile = res.activeConfigFile;
                 }
@@ -357,7 +359,8 @@ export class EsunTradeService {
                 }
                 if (res?.account?.account_id) {
                     const fullId = `${res.account.broker_id || ESUN_BROKER_CODE}${res.account.account_id}`;
-                    this.registerEsunAccount(fullId);
+                    const acc = this.registerEsunAccount(fullId);
+                    registerExternalAccounts([acc]);
                 }
                 bridgeUpdated = true;
             } else {
@@ -368,11 +371,13 @@ export class EsunTradeService {
                 });
                 if (res.ok) {
                     const data = await res.json().catch(() => null);
+                    this.clearAccounts();
                     if (data?.activeConfigFile) this.activeConfigFile = data.activeConfigFile;
                     if (data?.configProfiles) this.configProfiles = { ...this.configProfiles, ...data.configProfiles };
                     if (data?.account?.account_id) {
                         const fullId = `${data.account.broker_id || ESUN_BROKER_CODE}${data.account.account_id}`;
-                        this.registerEsunAccount(fullId);
+                        const acc = this.registerEsunAccount(fullId);
+                        registerExternalAccounts([acc]);
                     }
                     bridgeUpdated = true;
                 } else {
@@ -393,6 +398,7 @@ export class EsunTradeService {
                 try {
                     const accs = await this.driver.accounts(2000);
                     for (const a of accs) this.registerAccount(a);
+                    if (accs.length > 0) registerExternalAccounts(accs);
                 } catch {
                     // ignore
                 }

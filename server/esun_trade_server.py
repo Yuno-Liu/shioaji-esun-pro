@@ -606,6 +606,11 @@ class TTLCache:
             else:
                 self._cache.pop(key, None)
 
+    def clear(self) -> None:
+        with self.lock:
+            self._cache.clear()
+            self._dirty = True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Order Validation & Helper Rules
@@ -823,6 +828,12 @@ class OrderBookCache:
     def get_all(self) -> list[dict]:
         with self.lock:
             return list(self._orders.values())
+
+    def clear(self) -> None:
+        with self.lock:
+            self._orders.clear()
+            self._ord_no_map.clear()
+            self._pre_ord_no_map.clear()
 
     @staticmethod
     def is_reservation(order: dict | None) -> bool:
@@ -1332,6 +1343,14 @@ class EsunTradeBridge:
                 "loggedIn": self.logged_in,
                 "problems": current_problems,
             }
+
+        self.order_book_cache.clear()
+        self.positions_cache.clear()
+        self.balance_cache.clear()
+        self.settlements_cache.clear()
+        self.profit_loss_cache.clear()
+        self.trade_status_cache.clear()
+        self.market_status_cache.clear()
 
         target_path = profile_info.get("filePath")
         if target_path and os.path.exists(target_path):

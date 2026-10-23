@@ -952,8 +952,17 @@ class TestConfigProfilesDiscovery(unittest.TestCase):
             self.assertEqual(health["account"]["account_id"], "1111111")
             self.assertEqual(health["availableEnvironments"], ["SIMULATION", "PRODUCTION"])
 
+            # Populate caches in SIMULATION
+            bridge.order_book_cache.update_from_ack({"ord_no": "O_SIM", "stock_no": "2330"})
+            bridge.positions_cache.set("positions", [{"stock_no": "2330", "qty": 1000}])
+            bridge.balance_cache.set("balance", {"acc_balance": 500000})
+
             # Switch to PRODUCTION and verify account updates
             switch_res = bridge.switch_environment("PRODUCTION")
+            self.assertIsNone(bridge.order_book_cache.get("O_SIM"))
+            self.assertEqual(bridge.order_book_cache.get_all(), [])
+            self.assertIsNone(bridge.positions_cache.get("positions"))
+            self.assertIsNone(bridge.balance_cache.get("balance"))
             self.assertTrue(switch_res["ok"])
             self.assertEqual(switch_res["environment"], "PRODUCTION")
             self.assertEqual(switch_res["activeConfigFile"], "esun-config.production.ini")

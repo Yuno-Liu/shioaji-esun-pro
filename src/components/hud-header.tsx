@@ -29,7 +29,9 @@ import { externalServerLabel, useServerAttachment } from '../lib/server-adoption
 import { SettingsDialog } from './settings-dialog';
 import { flashPopoutParams, reseedPopoutFlashAccounts } from '../lib/flash-account';
 import { mainFlashSelection } from '../lib/order-account';
-import { ensureAccounts, registerExternalAccounts, selectAccount, useAccounts } from '../lib/account-store';
+import { ensureAccounts, getActiveAccount, registerExternalAccounts, selectAccount, useAccounts } from '../lib/account-store';
+import { invalidateAllQueries } from '../hooks/use-query';
+import { refreshTradingState, refreshTradingStateForModeChange } from '../lib/trading-state';
 import {
     ESUN_PRODUCTION_ENTRY,
     ESUN_SIMULATION_ENTRY,
@@ -252,7 +254,8 @@ export function HudHeader({
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [layoutLibOpen, setLayoutLibOpen] = useState(false);
 
-    const { accounts, selectedStock, selectedFutures } = useAccounts();
+    const accountState = useAccounts();
+    const { accounts, selectedStock, selectedFutures } = accountState;
     const esunEnv = useEsunEnvironment();
     const [envMenuOpen, setEnvMenuOpen] = useState(false);
 
@@ -270,7 +273,7 @@ export function HudHeader({
         return () => window.removeEventListener('keydown', onKey);
     }, [envMenuOpen]);
 
-    const activeAccount = selectedStock ?? selectedFutures ?? accounts[0] ?? null;
+    const activeAccount = getActiveAccount(accountState);
     const isEsunActive = isEsunAccount(activeAccount);
 
     const simProfile = esunEnv.configProfiles.SIMULATION;
@@ -383,9 +386,12 @@ export function HudHeader({
                                 <div className={styles.envAccountList}>
                                     {accounts.map((acc) => {
                                         const isEsun = isEsunAccount(acc);
-                                        const isSelected = (acc.account_type === 'S' && selectedStock?.account_id === acc.account_id && selectedStock?.broker_id === acc.broker_id)
-                                            || (acc.account_type === 'F' && selectedFutures?.account_id === acc.account_id && selectedFutures?.broker_id === acc.broker_id)
-                                            || (activeAccount?.account_id === acc.account_id && activeAccount?.broker_id === acc.broker_id);
+                                        const isSelected = Boolean(
+                                            activeAccount &&
+                                            activeAccount.broker_id === acc.broker_id &&
+                                            activeAccount.account_id === acc.account_id &&
+                                            activeAccount.account_type === acc.account_type
+                                        );
                                         return (
                                             <button
                                                 key={`${acc.broker_id}-${acc.account_id}`}
@@ -393,6 +399,8 @@ export function HudHeader({
                                                 className={isSelected ? styles.envAccountItemActive : styles.envAccountItem}
                                                 onClick={() => {
                                                     selectAccount(acc);
+                                                    invalidateAllQueries();
+                                                    void refreshTradingState('all');
                                                 }}
                                             >
                                                 <span className={isEsun ? styles.brokerBadgeEsun : styles.brokerBadgeSj}>
@@ -413,6 +421,8 @@ export function HudHeader({
                                                 const acc = esunTradeService.registerEsunAccount('88400664718');
                                                 registerExternalAccounts([acc]);
                                                 selectAccount(acc);
+                                                invalidateAllQueries();
+                                                void refreshTradingState('all');
                                             }}
                                         >
                                             ＋ 切換至玉山證券 (8840-0664718)
@@ -438,6 +448,8 @@ export function HudHeader({
                                             if (isEsunActive) {
                                                 const res = await esunEnv.switchEnvironment('SIMULATION');
                                                 if (res.ok) {
+                                                    invalidateAllQueries();
+                                                    void refreshTradingStateForModeChange();
                                                     showToast(`已切換玉山證券至模擬環境 (${res.activeConfigFile ?? simProfile?.fileName ?? 'esun-config.simulation.ini'})`);
                                                     setEnvMenuOpen(false);
                                                 } else {
@@ -448,6 +460,8 @@ export function HudHeader({
                                                 try {
                                                     localStorage.setItem('shioaji_simulation_override', 'true');
                                                 } catch {}
+                                                invalidateAllQueries();
+                                                void refreshTradingStateForModeChange();
                                                 showToast('已切換永豐金證券至模擬環境');
                                                 setEnvMenuOpen(false);
                                             }
@@ -495,6 +509,8 @@ export function HudHeader({
                                             if (isEsunActive) {
                                                 const res = await esunEnv.switchEnvironment('PRODUCTION');
                                                 if (res.ok) {
+                                                    invalidateAllQueries();
+                                                    void refreshTradingStateForModeChange();
                                                     showToast(`已切換玉山證券至正式環境 (${res.activeConfigFile ?? prodProfile?.fileName ?? 'esun-config.production.ini'})`);
                                                     setEnvMenuOpen(false);
                                                 } else {
@@ -505,6 +521,8 @@ export function HudHeader({
                                                 try {
                                                     localStorage.setItem('shioaji_simulation_override', 'false');
                                                 } catch {}
+                                                invalidateAllQueries();
+                                                void refreshTradingStateForModeChange();
                                                 showToast('已切換永豐金證券至正式環境');
                                                 setEnvMenuOpen(false);
                                             }

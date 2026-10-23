@@ -3,7 +3,9 @@ import { createAccountQuery } from './account-query';
 import { getServerModeVersion, knownServerInfo } from './server-info-store';
 import { onTradeMutation } from './trade-mutations';
 import { useEffect, useSyncExternalStore } from 'react';
-import { getAccountState, refreshAccounts, useAccounts } from './account-store';
+import { getAccountState, refreshAccounts, subscribeAccounts, useAccounts } from './account-store';
+import { invalidateAllQueries } from '../hooks/use-query';
+import { esunTradeService } from './esun';
 import { ensureContract, getCachedContract } from './contracts-cache';
 import { getApiBase } from './runtime';
 import { subscribeTradeReports } from './boot';
@@ -321,6 +323,14 @@ export function refreshTradingStateForModeChange(): Promise<void> {
     if (modeRefresh) return modeRefresh;
     modeRefresh = (async () => {
         if (inFlight) await inFlight;
+        snapshotEnds.clear();
+        const currentAccounts = tradableAccounts();
+        state = {
+            ...state,
+            positions: state.positions.filter(p => currentAccounts.some(a => p.account && accountKey(a) === accountKey(p.account))),
+            trades: state.trades.filter(t => currentAccounts.some(a => t.account && accountKey(a) === accountKey(t.account))),
+            funds: state.funds?.filter(f => currentAccounts.some(a => f.account && accountKey(a) === accountKey(f.account))),
+        };
         do {
             const version = getServerModeVersion();
             for (const key of queryScopes) nextRefreshAt[key] = 0;
@@ -1006,6 +1016,32 @@ function start() {
         });
         if (changed) { state = { ...state, positions }; schedulePublish(); }
     });
+    const accountSig = () => {
+        const s = getAccountState();
+        return `${s.accounts.map(a => `${a.broker_id}-${a.account_id}`).join(',')}|${s.selectedAccount ? `${s.selectedAccount.broker_id}-${s.selectedAccount.account_id}` : ''}|${s.selectedStock ? `${s.selectedStock.broker_id}-${s.selectedStock.account_id}` : ''}|${s.selectedFutures ? `${s.selectedFutures.broker_id}-${s.selectedFutures.account_id}` : ''}`;
+    };
+    let lastAccountSig = accountSig();
+    const stopAccounts = subscribeAccounts(() => {
+        const sig = accountSig();
+        if (sig !== lastAccountSig) {
+            lastAccountSig = sig;
+            invalidateAllQueries();
+            for (const key of queryScopes) nextRefreshAt[key] = 0;
+            void refreshTradingState('all');
+        }
+    });
+
+    const esunEnvSig = () => `${esunTradeService.getEnvironment()}|${esunTradeService.getActiveConfigFile() ?? ''}`;
+    let lastEsunEnvSig = esunEnvSig();
+    const stopEsun = esunTradeService.subscribe(() => {
+        const sig = esunEnvSig();
+        if (sig !== lastEsunEnvSig) {
+            lastEsunEnvSig = sig;
+            invalidateAllQueries();
+            void refreshTradingStateForModeChange();
+        }
+    });
+
     const statusChanged = () => {
         const live = getStreamStatus() === 'live';
         if (live && !hasConnected) { hasConnected = true; void refreshTradingState(); }
@@ -1026,7 +1062,7 @@ function start() {
     };
     const stopStatus = subscribeStatusStore(statusChanged);
     import.meta.hot?.dispose(() => {
-        stopMutations(); stopResponses(); stopOrders(); stopHints(); stopGaps(); gapTimers.forEach(clearTimeout); stopTicks(); lastTicks.clear(); stopStatus(); channel?.close();
+        stopMutations(); stopResponses(); stopOrders(); stopHints(); stopGaps(); gapTimers.forEach(clearTimeout); stopTicks(); lastTicks.clear(); stopStatus(); stopAccounts(); stopEsun(); channel?.close();
         positionQuotes.forEach(entry => entry.release?.());
         if (publishTimer) clearTimeout(publishTimer);
         clearInterval(stateHeartbeat);

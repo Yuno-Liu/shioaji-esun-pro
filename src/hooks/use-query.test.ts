@@ -1,7 +1,7 @@
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { useQuery } from './use-query';
+import { invalidateAllQueries, useQuery } from './use-query';
 import type { Account } from '../lib/types/portfolio';
 import { beginServerInfoRequest, forgetServerInfo, observeServerInfo } from '../lib/server-info-store';
 
@@ -99,5 +99,20 @@ describe('session shared query', () => {
         expect(fetcher).not.toHaveBeenCalled(); expect(value.data).toBeUndefined();
         await act(async () => { root.update(createElement(Probe, { fetcher, scope: 'same', receive, enabled: true })); });
         expect(value.data).toBe('enabled');
+    });
+
+    it('invalidateAllQueries forces immediate refetch on mounted useQuery without cooldown wait', async () => {
+        let count = 0;
+        const fetcher = vi.fn(async () => `call-${++count}`);
+        let value!: Snapshot;
+        await mount({ fetcher, scope: 'reactive-scope', receive: v => { value = v; } });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        expect(value.data).toBe('call-1');
+
+        await act(async () => {
+            invalidateAllQueries();
+        });
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        expect(value.data).toBe('call-2');
     });
 });

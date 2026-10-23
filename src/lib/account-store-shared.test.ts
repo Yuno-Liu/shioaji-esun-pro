@@ -156,3 +156,46 @@ describe('shared account read', () => {
         expect(fetchAccounts).toHaveBeenCalledTimes(2);
     });
 });
+
+describe('unified active account & broker account replacement', () => {
+    it('getActiveAccount falls back from selectedAccount to selectedStock, futures, or first', async () => {
+        const f1 = { ...account, account_type: 'F', account_id: 'f1' };
+        fetchAccounts.mockResolvedValue([account, f1]);
+        await mod.loadAccountsShared();
+        expect(mod.getActiveAccount()).toEqual(account);
+        mod.selectAccount(f1);
+        expect(mod.getAccountState().selectedAccount).toEqual(f1);
+        expect(mod.getActiveAccount()).toEqual(f1);
+    });
+
+    it('replaceExternalAccountsForBroker replaces accounts of matched broker and updates active account', async () => {
+        const esun1 = { account_type: 'S', broker_id: '8840', account_id: '0664718', signed: true, username: '玉山模擬', person_id: '' };
+        const esun2 = { account_type: 'S', broker_id: '8840', account_id: '9988776', signed: true, username: '玉山正式', person_id: '' };
+        fetchAccounts.mockResolvedValue([account, esun1]);
+        await mod.loadAccountsShared();
+        mod.selectAccount(esun1);
+        expect(mod.getActiveAccount()).toEqual(esun1);
+
+        mod.replaceExternalAccountsForBroker((b) => b === '8840', [esun2]);
+        const state = mod.getAccountState();
+        expect(state.accounts).toEqual([account, esun2]);
+        expect(state.selectedAccount).toEqual(esun2);
+        expect(state.selectedStock).toEqual(esun2);
+    });
+
+    it('registerExternalAccounts replaces stale account with same broker_id and account_type', async () => {
+        const esunSim = { account_type: 'S', broker_id: '8840', account_id: '0664718', signed: true, username: '玉山', person_id: '' };
+        const esunProd = { account_type: 'S', broker_id: '8840', account_id: '1234567', signed: true, username: '玉山', person_id: '' };
+        fetchAccounts.mockResolvedValue([account]);
+        await mod.loadAccountsShared();
+        mod.registerExternalAccounts([esunSim]);
+        mod.selectAccount(esunSim);
+        expect(mod.getActiveAccount()).toEqual(esunSim);
+
+        // Registering prod account should replace esunSim without duplicating
+        mod.registerExternalAccounts([esunProd]);
+        const state = mod.getAccountState();
+        expect(state.accounts.filter(a => a.broker_id === '8840')).toEqual([esunProd]);
+        expect(mod.getActiveAccount()).toEqual(esunProd);
+    });
+});

@@ -418,7 +418,9 @@ export function CandleChart({
     const orderAccountView: ChartOrderAccountView = useMemo(() => {
         const m = orderMarket ?? 'S';
         const eligible = accountState.accounts.filter(a => canTrade(a) && a.account_type === m);
-        const global = m === 'S' ? accountState.selectedStock : accountState.selectedFutures;
+        const global = (m === 'S'
+            ? (accountState.selectedStock ?? (accountState.selectedAccount?.account_type === 'S' ? accountState.selectedAccount : null))
+            : (accountState.selectedFutures ?? (accountState.selectedAccount?.account_type === 'F' ? accountState.selectedAccount : null))) ?? accountState.selectedAccount;
         const resolved = resolveFlashAccount(accountState.accounts, m, orderSettings.accountKey, global, true);
         const labels = flashAccountLabels(eligible, privacy);
         return { eligible, active: resolved.account, following: resolved.following, missing: resolved.missing, ...labels };

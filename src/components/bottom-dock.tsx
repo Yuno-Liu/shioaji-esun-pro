@@ -9,6 +9,7 @@ import { useEffect, useState } from 'react';
 import { RefreshButton } from './refresh-button';
 import {
     ensureAccounts,
+    getActiveAccount,
     selectAccount,
     useAccounts,
 } from '../lib/account-store';
@@ -92,7 +93,9 @@ export function BottomDock({
         void refreshTradingState(tab);
         if (tab === 'account') void accountRefresh?.refresh();
     };
-    const { accounts, selectedStock, selectedFutures } = useAccounts();
+    const accountState = useAccounts();
+    const { accounts, selectedStock, selectedFutures } = accountState;
+    const activeHeaderAccount = getActiveAccount(accountState);
     useEffect(ensureAccounts, []);
     const priv = usePrivacyMode();
     const privMoney = usePrivacyMoney();
@@ -126,13 +129,15 @@ export function BottomDock({
             !canTrade(a) && (a.account_type === 'S' || a.account_type === 'F'),
     );
     useEffect(() => {
-        if (
+        if (activeHeaderAccount) {
+            setScope(refKey(accountToRef(activeHeaderAccount)));
+        } else if (
             scope &&
             !tradable.some((a) => refKey(accountToRef(a)) === scope)
         ) {
             setScope('');
         }
-    }, [scope, tradable]);
+    }, [activeHeaderAccount, scope, tradable]);
     const scopeAccount =
         tradable.find((a) => refKey(accountToRef(a)) === scope) ?? null;
     const fallback = { stock: selectedStock, futures: selectedFutures };
@@ -222,7 +227,8 @@ export function BottomDock({
                 <span className={styles.tabSpacer} />
                 <select
                     className={styles.accountSelect}
-                    title='帳戶範圍（選個別帳戶會同步下單面板）'
+                    title="帳號由頂欄 (Header) 統一控管切換"
+                    disabled={true}
                     value={scope}
                     onChange={(e) => {
                         const v = e.target.value;
