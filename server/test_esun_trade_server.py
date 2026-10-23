@@ -922,6 +922,80 @@ class TestConfigProfilesDiscovery(unittest.TestCase):
         self.assertTrue(discovery["profiles"]["PRODUCTION"]["available"])
         self.assertEqual(discovery["profiles"]["PRODUCTION"]["fileName"], "esun-config.ini")
 
+    def test_discover_dual_profiles_with_placeholder_present(self):
+        # Create simulation and production files, plus an unconfigured placeholder esun-config.ini
+        sim_file = os.path.join(self.temp_dir.name, "esun-config.simulation.ini")
+        prod_file = os.path.join(self.temp_dir.name, "esun-config.production.ini")
+        placeholder = os.path.join(self.temp_dir.name, "esun-config.ini")
+
+        with open(sim_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n[Cert]\nPath=cert.p12\n[Api]\nKey=sim_key\nSecret=sim_sec\n[User]\nAccount=88401111111\n")
+        with open(prod_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_PRODUCTION_ENTRY}\n[Cert]\nPath=cert.p12\n[Api]\nKey=prod_key\nSecret=prod_sec\n[User]\nAccount=88402222222\n")
+        with open(placeholder, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n[Cert]\nPath=certs/cert.p12\n[Api]\nKey=YOUR_API_KEY_HERE\nSecret=YOUR_API_SECRET_HERE\n[User]\nAccount=88401234567\n")
+
+        os.environ["ESUN_CONFIG_DIR"] = self.temp_dir.name
+        try:
+            discovery = discover_esun_config_profiles()
+            self.assertEqual(discovery["availableEnvironments"], ["SIMULATION", "PRODUCTION"])
+            self.assertEqual(discovery["profiles"]["SIMULATION"]["fileName"], "esun-config.simulation.ini")
+            self.assertEqual(discovery["profiles"]["PRODUCTION"]["fileName"], "esun-config.production.ini")
+
+            mock_sdk = MockSDK()
+            bridge = EsunTradeBridge(config_path=None, sdk_factory=lambda cfg: mock_sdk, auto_login=True)
+            self.assertEqual(bridge.config_path, sim_file)
+            self.assertEqual(bridge.environment, "SIMULATION")
+
+            health = bridge.get_health()
+            self.assertEqual(health["activeConfigFile"], "esun-config.simulation.ini")
+            self.assertEqual(health["account"]["account_id"], "1111111")
+            self.assertEqual(health["availableEnvironments"], ["SIMULATION", "PRODUCTION"])
+
+            # Switch to PRODUCTION and verify account updates
+            switch_res = bridge.switch_environment("PRODUCTION")
+            self.assertTrue(switch_res["ok"])
+            self.assertEqual(switch_res["environment"], "PRODUCTION")
+            self.assertEqual(switch_res["activeConfigFile"], "esun-config.production.ini")
+            self.assertIsNotNone(switch_res["account"])
+            self.assertEqual(switch_res["account"]["account_id"], "2222222")
+        finally:
+            os.environ.pop("ESUN_CONFIG_DIR", None)
+
+    def test_single_sim_profile_with_leftover_ini_not_polluted(self):
+        # Only simulation file provided, but directory has leftover esun-config.ini
+        sim_file = os.path.join(self.temp_dir.name, "esun-config.simulation.ini")
+        leftover = os.path.join(self.temp_dir.name, "esun-config.ini")
+
+        with open(sim_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n[Cert]\nPath=cert.p12\n[Api]\nKey=sim_key\nSecret=sim_sec\n[User]\nAccount=88401111111\n")
+        with open(leftover, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_PRODUCTION_ENTRY}\n[Cert]\nPath=cert.p12\n[Api]\nKey=prod_key\nSecret=prod_sec\n[User]\nAccount=88409999999\n")
+
+        discovery = discover_esun_config_profiles(base_dir=self.temp_dir.name)
+        # PRODUCTION must be unavailable because user explicitly provided dedicated simulation config
+        self.assertEqual(discovery["availableEnvironments"], ["SIMULATION"])
+        self.assertTrue(discovery["profiles"]["SIMULATION"]["available"])
+        self.assertFalse(discovery["profiles"]["PRODUCTION"]["available"])
+
+    def test_esun_config_dir_support(self):
+        sim_file = os.path.join(self.temp_dir.name, "esun-config.simulation.ini")
+        with open(sim_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n[Cert]\nPath=cert.p12\n[Api]\nKey=k\nSecret=s\n[User]\nAccount=88401234567\n")
+
+        os.environ["ESUN_CONFIG_DIR"] = self.temp_dir.name
+        try:
+            discovery = discover_esun_config_profiles()
+            self.assertEqual(discovery["availableEnvironments"], ["SIMULATION"])
+            self.assertEqual(discovery["profiles"]["SIMULATION"]["filePath"], sim_file)
+
+            mock_sdk = MockSDK()
+            bridge = EsunTradeBridge(config_path=None, sdk_factory=lambda cfg: mock_sdk, auto_login=True)
+            self.assertEqual(bridge.base_dir, self.temp_dir.name)
+            self.assertEqual(bridge.config_path, sim_file)
+        finally:
+            os.environ.pop("ESUN_CONFIG_DIR", None)
+
 
 if __name__ == "__main__":
     unittest.main()

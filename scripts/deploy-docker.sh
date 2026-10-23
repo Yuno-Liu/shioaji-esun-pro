@@ -44,7 +44,32 @@ init_files() {
         success "已建立憑證放置目錄: ./certs/ (請將玉山憑證 .p12 放入此目錄)"
     fi
 
-    if [ ! -f "esun-config.ini" ]; then
+    # Check for dedicated config files
+    has_dedicated=0
+    for cand in esun-config.simulation.ini esun-config.sim.ini esun-config.test.ini esun-config.production.ini esun-config.prod.ini; do
+        if [ -f "$cand" ]; then
+            has_dedicated=1
+            break
+        fi
+    done
+
+    # If dedicated config exists and esun-config.ini is identical to esun-config.ini.example, remove placeholder
+    if [ "$has_dedicated" -eq 1 ] && [ -f "esun-config.ini" ] && [ -f "esun-config.ini.example" ]; then
+        if cmp -s esun-config.ini esun-config.ini.example; then
+            rm -f esun-config.ini
+            info "已偵測到專用環境設定檔，自動移除未編輯的預設範本 esun-config.ini"
+        fi
+    fi
+
+    has_any=0
+    for cand in esun-config.simulation.ini esun-config.sim.ini esun-config.test.ini esun-config.production.ini esun-config.prod.ini esun-config.ini; do
+        if [ -f "$cand" ]; then
+            has_any=1
+            break
+        fi
+    done
+
+    if [ "$has_any" -eq 0 ]; then
         if [ -f "esun-config.ini.example" ]; then
             cp esun-config.ini.example esun-config.ini
             success "已從 esun-config.ini.example 自動初始化 esun-config.ini (請編輯填寫您的帳號與 API 金鑰)"

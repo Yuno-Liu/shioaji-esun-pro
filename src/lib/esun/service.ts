@@ -105,10 +105,19 @@ export class EsunTradeService {
             this.bridgeProbe = (async () => {
                 try {
                     const health = await driver.health(3_000);
-                    const accounts = await driver.accounts(3_000);
+                    let accounts: Account[] = [];
+                    try {
+                        accounts = await driver.accounts(3_000);
+                    } catch {
+                        // ignore accounts query error if driver.health succeeded
+                    }
                     this.bridgeHealth = health;
                     this.setDriver(driver);
                     for (const a of accounts) this.registerAccount(a);
+                    if (health.account?.account_id) {
+                        const fullId = `${health.account.broker_id || ESUN_BROKER_CODE}${health.account.account_id}`;
+                        this.registerEsunAccount(fullId);
+                    }
                     if (health.configProfiles) {
                         this.setConfigProfiles(health.configProfiles, health.activeConfigFile);
                     }
@@ -127,6 +136,7 @@ export class EsunTradeService {
                     }
                     return health;
                 } catch {
+                    this.bridgeProbe = null;
                     return null;
                 }
             })();
@@ -210,13 +220,54 @@ export class EsunTradeService {
             if (this.driver.health) {
                 try {
                     const health = await this.driver.health(2000);
-                    if (health?.configProfiles) {
-                        this.setConfigProfiles(health.configProfiles, health.activeConfigFile);
+                    if (health) {
+                        if (health.configProfiles) {
+                            this.setConfigProfiles(health.configProfiles, health.activeConfigFile);
+                        }
+                        if (health.environment === 'SIMULATION' || health.environment === 'PRODUCTION') {
+                            this.environment = health.environment;
+                            this.entryUrl = health.entry || (health.environment === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY);
+                            if (health.activeConfigFile) this.activeConfigFile = health.activeConfigFile;
+                            this.updateSnapshot();
+                            this.emit();
+                        }
+                        if (health.account?.account_id) {
+                            const fullId = `${health.account.broker_id || ESUN_BROKER_CODE}${health.account.account_id}`;
+                            this.registerEsunAccount(fullId);
+                        }
                         return this.getConfigProfiles();
                     }
                 } catch {
                     // ignore health probe error
                 }
+            }
+
+            // Driver was unavailable or health failed, try direct fetch /esun/health first
+            try {
+                const healthRes = await fetch(`${bridgeBase()}/esun/health`, { method: 'GET' });
+                if (healthRes.ok) {
+                    const healthData = await healthRes.json();
+                    if (healthData?.ok) {
+                        void this.connectBridge();
+                        if (healthData.configProfiles) {
+                            this.setConfigProfiles(healthData.configProfiles, healthData.activeConfigFile);
+                        }
+                        if (healthData.environment === 'SIMULATION' || healthData.environment === 'PRODUCTION') {
+                            this.environment = healthData.environment;
+                            this.entryUrl = healthData.entry || (healthData.environment === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY);
+                            if (healthData.activeConfigFile) this.activeConfigFile = healthData.activeConfigFile;
+                            this.updateSnapshot();
+                            this.emit();
+                        }
+                        if (healthData.account?.account_id) {
+                            const fullId = `${healthData.account.broker_id || ESUN_BROKER_CODE}${healthData.account.account_id}`;
+                            this.registerEsunAccount(fullId);
+                        }
+                        return this.getConfigProfiles();
+                    }
+                }
+            } catch {
+                // ignore
             }
 
             const res = await fetch(`${bridgeBase()}/esun/config-profiles`, { method: 'GET' });
@@ -262,6 +313,7 @@ export class EsunTradeService {
         environment: EsunEnvironment;
         entry: string;
         bridgeUpdated: boolean;
+        account?: { broker_id: string; account_id: string } | null;
         activeConfigFile?: string | null;
         availableEnvironments?: EsunEnvironment[];
         configProfiles?: EsunConfigProfilesMap;
@@ -303,6 +355,10 @@ export class EsunTradeService {
                 if (res?.configProfiles) {
                     this.configProfiles = { ...this.configProfiles, ...res.configProfiles };
                 }
+                if (res?.account?.account_id) {
+                    const fullId = `${res.account.broker_id || ESUN_BROKER_CODE}${res.account.account_id}`;
+                    this.registerEsunAccount(fullId);
+                }
                 bridgeUpdated = true;
             } else {
                 const res = await fetch(`${bridgeBase()}/esun/auth/environment`, {
@@ -314,6 +370,10 @@ export class EsunTradeService {
                     const data = await res.json().catch(() => null);
                     if (data?.activeConfigFile) this.activeConfigFile = data.activeConfigFile;
                     if (data?.configProfiles) this.configProfiles = { ...this.configProfiles, ...data.configProfiles };
+                    if (data?.account?.account_id) {
+                        const fullId = `${data.account.broker_id || ESUN_BROKER_CODE}${data.account.account_id}`;
+                        this.registerEsunAccount(fullId);
+                    }
                     bridgeUpdated = true;
                 } else {
                     const errData = await res.json().catch(() => null);
@@ -327,6 +387,14 @@ export class EsunTradeService {
                         configProfiles: this.getConfigProfiles(),
                         error: errData?.error || `HTTP ${res.status}`,
                     };
+                }
+            }
+            if (this.driver.accounts) {
+                try {
+                    const accs = await this.driver.accounts(2000);
+                    for (const a of accs) this.registerAccount(a);
+                } catch {
+                    // ignore
                 }
             }
         } catch {
@@ -924,6 +992,7 @@ export function useEsunEnvironment(): {
         environment: EsunEnvironment;
         entry: string;
         bridgeUpdated: boolean;
+        account?: { broker_id: string; account_id: string } | null;
         activeConfigFile?: string | null;
         availableEnvironments?: EsunEnvironment[];
         configProfiles?: EsunConfigProfilesMap;

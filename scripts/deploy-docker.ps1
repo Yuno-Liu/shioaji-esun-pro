@@ -93,7 +93,52 @@ function Initialize-ConfigFiles {
         Write-Success "已建立憑證放置目錄: ./certs/ (請將玉山憑證 .p12 放入此目錄)"
     }
 
-    if (-not (Test-Path "esun-config.ini")) {
+    $dedicatedCandidates = @(
+        "esun-config.simulation.ini",
+        "esun-config.sim.ini",
+        "esun-config.test.ini",
+        "esun-config.production.ini",
+        "esun-config.prod.ini"
+    )
+    $hasDedicatedConfig = $false
+    foreach ($cand in $dedicatedCandidates) {
+        if (Test-Path $cand) {
+            $hasDedicatedConfig = $true
+            break
+        }
+    }
+
+    # If dedicated config exists, check if esun-config.ini is an unedited copy of esun-config.ini.example
+    if ($hasDedicatedConfig -and (Test-Path "esun-config.ini") -and (Test-Path "esun-config.ini.example")) {
+        try {
+            $hashExample = (Get-FileHash "esun-config.ini.example" -Algorithm SHA256).Hash
+            $hashCurrent = (Get-FileHash "esun-config.ini" -Algorithm SHA256).Hash
+            if ($hashExample -eq $hashCurrent) {
+                Remove-Item "esun-config.ini" -Force -ErrorAction SilentlyContinue
+                Write-Info "已偵測到專用環境設定檔，自動移除未編輯的預設範本 esun-config.ini"
+            }
+        } catch {
+            # ignore hash check error
+        }
+    }
+
+    $allEsunConfigs = @(
+        "esun-config.simulation.ini",
+        "esun-config.sim.ini",
+        "esun-config.test.ini",
+        "esun-config.production.ini",
+        "esun-config.prod.ini",
+        "esun-config.ini"
+    )
+    $hasAnyConfig = $false
+    foreach ($cand in $allEsunConfigs) {
+        if (Test-Path $cand) {
+            $hasAnyConfig = $true
+            break
+        }
+    }
+
+    if (-not $hasAnyConfig) {
         if (Test-Path "esun-config.ini.example") {
             Copy-Item "esun-config.ini.example" "esun-config.ini"
             Write-Success "已從 esun-config.ini.example 自動初始化 esun-config.ini (請編輯填寫您的帳號與 API 金鑰)"

@@ -70,6 +70,7 @@ export class MockEsunDriver implements IEsunTradeDriver {
         ok: boolean;
         environment: 'SIMULATION' | 'PRODUCTION';
         entry: string;
+        account?: { broker_id: string; account_id: string } | null;
     }> {
         this.environment = env;
         return {

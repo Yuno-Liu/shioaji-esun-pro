@@ -98,6 +98,7 @@ export interface IEsunTradeDriver {
         ok: boolean;
         environment: 'SIMULATION' | 'PRODUCTION';
         entry: string;
+        account?: { broker_id: string; account_id: string } | null;
         message?: string;
         activeConfigFile?: string | null;
         availableEnvironments?: EsunEnvironment[];
