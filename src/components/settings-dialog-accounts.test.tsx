@@ -54,32 +54,33 @@ afterEach(async () => {
 const text = () => JSON.stringify(view!.toJSON());
 const render = async () => { await act(async () => { view = create(createElement(AccountsSection)); }); };
 
-it('labels signed=false as 未簽署或未測試 with a consistent tooltip', async () => {
+it('labels signed=false as 未簽署或未測試 and locks buttons to header control', async () => {
     await render();
     expect(text()).toContain('未簽署或未測試（無法下單）');
     expect(text()).not.toMatch(/未簽署（無法下單）|未簽署 API 約定書/);
-    const unsigned = view!.root.findAll((n) => n.type === 'button' && n.props.disabled === true);
-    expect(unsigned).toHaveLength(1);
-    expect(unsigned[0]!.props.title).toBe('尚未完成 API 約定書簽署或模擬測試，無法下單');
+    expect(text()).toContain('帳號切換統一由頂欄 (Header) 控制');
+    const buttons = view!.root.findAll((n) => n.type === 'button' && n.props.disabled === true);
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]!.props.title).toBe('帳號由頂欄 (Header) 統一控管切換');
 });
-it('enables unsigned accounts and updates signing copy when simulation info arrives (#228)', async () => {
+it('updates signing copy when simulation info arrives (#228) while keeping account buttons locked', async () => {
     await render();
-    const unsignedButton = () => view!.root.findAllByType('button').find(n => n.props.title?.includes('模擬測試'))!;
-    expect(unsignedButton().props.disabled).toBe(true);
+    const accountButtons = () => view!.root.findAllByType('button').filter(b => b.props.title === '帳號由頂欄 (Header) 統一控管切換');
+    expect(accountButtons()).toHaveLength(2);
+    expect(accountButtons().every(b => b.props.disabled === true)).toBe(true);
     await act(async () => {
         observeServerInfo(beginServerInfoRequest(), { simulation: true } as import('../lib/shioaji').ServerInfo);
     });
     const label = '模擬可下單；正式交易需完成簽署與模擬測試';
-    expect(unsignedButton().props.disabled).toBe(false);
-    expect(unsignedButton().props.title).toBe(label);
     expect(text()).toContain(label);
     expect(text()).not.toContain('無法下單');
     expect(text()).not.toContain('無法選為下單帳戶');
     expect(fixture.accounts[1]!.signed).toBe(false);
+    expect(accountButtons().every(b => b.props.disabled === true)).toBe(true);
     await act(async () => {
         observeServerInfo(beginServerInfoRequest(), { simulation: false } as import('../lib/shioaji').ServerInfo);
     });
-    expect(unsignedButton().props.disabled).toBe(true);
+    expect(accountButtons().every(b => b.props.disabled === true)).toBe(true);
     expect(text()).toContain('未簽署或未測試（無法下單）');
 });
 

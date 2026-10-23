@@ -1,4 +1,5 @@
 import { canTrade } from '../lib/account-tradable';
+import { useEsunEnvironment } from '../lib/esun';
 import { RefreshButton } from './refresh-button';
 // src/components/pnl-panel.tsx — realized P&L analytics (30 days)
 
@@ -81,12 +82,14 @@ function EquityCurve({ rows }: { rows: PnlRow[] }) {
 }
 
 export function PnlPanel() {
-    const { accounts } = useAccounts();
+    const { accounts, selectedAccount } = useAccounts();
+    const esunEnv = useEsunEnvironment();
     const privMoney = usePrivacyMoney();
-    const tradable = accounts.filter(a => canTrade(a) && ['S', 'F'].includes(a.account_type));
+    const effectiveAccounts = selectedAccount ? accounts.filter(a => a.account_type === selectedAccount.account_type && a.broker_id === selectedAccount.broker_id && a.account_id === selectedAccount.account_id) : accounts;
+    const tradable = effectiveAccounts.filter(a => canTrade(a) && ['S', 'F'].includes(a.account_type));
     const key = tradable.map(a => `${a.account_type}:${a.broker_id}:${a.account_id}`).join(',');
     const { data, error, loading, refresh } = useQuery<PnlRow[]>(
-        useCallback(() => fetchPnl(tradable), [key]), `pnl-30d:${key}`, tradable.length > 0, tradable,
+        useCallback(() => fetchPnl(tradable), [key]), `pnl-30d:${key}:${esunEnv.environment}`, tradable.length > 0, tradable,
     );
     const controls = <div className={panel.refreshToolbar}>
         {error && <span role="status">查詢失敗，保留上次資料：{error}</span>}

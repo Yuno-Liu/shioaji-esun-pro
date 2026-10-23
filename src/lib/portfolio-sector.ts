@@ -16,7 +16,7 @@ import { companyData } from './company-data';
 import type { ChainTier, Theme } from './company-data/types';
 import { useTradingState } from './trading-state';
 import type { Trade } from './types/order';
-import type { AccountedPosition } from './types/portfolio';
+import type { Account, AccountedPosition } from './types/portfolio';
 
 export type Grouping = 'sector' | 'chain' | 'theme';
 export const GROUPINGS = ['sector', 'chain', 'theme'] as const;
@@ -168,14 +168,28 @@ export function holdingsPhase(updatedAt: number | null | undefined, error: strin
 }
 
 /** Stock holdings across every account in view (no extra request). */
-export function useHoldings(): HoldingsState {
+export function useHoldings(accountFilter?: Account | null): HoldingsState {
     const trading = useTradingState();
     const { positions, trades } = trading;
     const q = trading.queries.positions;
     return useMemo(() => {
-        const holdings = fromPositions(positions, trades);
+        const filteredPositions = accountFilter
+            ? positions.filter(p => !p.account || (
+                p.account.account_type === accountFilter.account_type &&
+                p.account.broker_id === accountFilter.broker_id &&
+                p.account.account_id === accountFilter.account_id
+            ))
+            : positions;
+        const filteredTrades = accountFilter
+            ? trades.filter(t => !t.account || (
+                t.account.account_type === accountFilter.account_type &&
+                t.account.broker_id === accountFilter.broker_id &&
+                t.account.account_id === accountFilter.account_id
+            ))
+            : trades;
+        const holdings = fromPositions(filteredPositions, filteredTrades);
         return { phase: holdingsPhase(q.updatedAt, q.error ?? null, holdings.length), holdings, error: q.error ?? null };
-    }, [positions, trades, q.updatedAt, q.error]);
+    }, [positions, trades, q.updatedAt, q.error, accountFilter]);
 }
 
 // ── company cards: industry, primary chain and tier, main theme ─────────────

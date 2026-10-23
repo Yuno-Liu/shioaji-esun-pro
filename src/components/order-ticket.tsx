@@ -1,10 +1,10 @@
-import { isEsunBroker } from '../lib/esun';
+import { isEsunBroker, useEsunEnvironment } from '../lib/esun';
 import { canTrade } from '../lib/account-tradable';
 // src/components/order-ticket.tsx — buy/sell ticket with two-step EXECUTE.
 // Stock vs futures aware; price autofills from the live quote.
 
 import { classifyOrderError, OUTCOME_UNKNOWN_GUIDANCE, reconcileAfterUnknownOutcome, reportOrderError } from '../lib/order-outcome';
-import { Check, ChevronDown } from 'lucide-react';
+// import { Check, ChevronDown } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { ORDER_CONTEXT_CHANGED_MESSAGE, useOrderContext } from '../hooks/use-order-context';
 import { TICKET_ACTION_EVENT } from '../hooks/use-hotkeys';
@@ -30,7 +30,6 @@ import { usePickedPrice } from '../lib/price-sync';
 import { maskAccountId, maskName, secretAccount, usePrivacyMode } from '../lib/privacy';
 import { useRevealText } from '../lib/privacy-text';
 import {
-    selectAccount,
     useAccounts,
 } from '../lib/account-store';
 import { accountConfirmLabel, requestOrderConfirm } from '../lib/order-confirm';
@@ -120,8 +119,7 @@ export function OrderTicket({
     const captureContext = useOrderContext(contract, `${orderLot}:${action}:${orderCond}:${daytradeShort}`);
 
     // ---- multi-account: chip + split-order (分倉) state ----
-    const [acctMenuOpen, setAcctMenuOpen] = useState(false);
-    const chipRef = useRef<HTMLDivElement>(null);
+
     const [simulation, setSimulation] = useState<boolean | null>(null);
     const [splitOpen, setSplitOpen] = useState(false);
     const [splitMode, setSplitMode] = useState<'ratio' | 'fixed'>('ratio');
@@ -161,7 +159,7 @@ export function OrderTicket({
         setTakePrice('');
         setSplitOpen(false);
         setSplitArmed(false);
-        setAcctMenuOpen(false);
+
     }, [contract.code, isFutures]);
 
     // 正式環境判斷：chip 上的 danger 視覺（下錯戶的最後防線）
@@ -179,17 +177,7 @@ export function OrderTicket({
         };
     }, []);
 
-    // click outside closes the account menu
-    useEffect(() => {
-        if (!acctMenuOpen) return;
-        const onDown = (e: MouseEvent) => {
-            if (!chipRef.current?.contains(e.target as Node)) {
-                setAcctMenuOpen(false);
-            }
-        };
-        document.addEventListener('mousedown', onDown);
-        return () => document.removeEventListener('mousedown', onDown);
-    }, [acctMenuOpen]);
+
 
     // any order-parameter change de-arms the split confirm step.
     // `price` is deliberately NOT a dep: the live-quote autofill mutates it
@@ -506,10 +494,10 @@ export function OrderTicket({
 
     const qtyUnit = orderQtyUnit(isFutures, orderLot);
     const odd = !isFutures && isOddLot(orderLot);
-    const { accounts, selectedStock, selectedFutures } = useAccounts();
+    const { accounts, selectedStock, selectedFutures, selectedAccount } = useAccounts();
     const priv = usePrivacyMode();
     const reveal = useRevealText();
-    const activeAccount = isFutures ? selectedFutures : selectedStock;
+    const activeAccount = (isFutures ? (selectedFutures ?? (selectedAccount?.account_type === 'F' ? selectedAccount : null)) : (selectedStock ?? (selectedAccount?.account_type === 'S' ? selectedAccount : null))) ?? selectedAccount ?? (isFutures ? selectedFutures : selectedStock);
     // any selection change in this window (this ticket's menu or another
     // panel's) disarms the ticket so a pending second click can't route
     // elsewhere
@@ -524,7 +512,8 @@ export function OrderTicket({
         (a) => canTrade(a) && a.account_type === (isFutures ? 'F' : 'S'),
     );
     const multi = routable.length >= 2;
-    const production = simulation === false;
+    const esunEnv = useEsunEnvironment();
+    const production = activeAccount && isEsunBroker(activeAccount.broker_id) ? !esunEnv.isSimulation : simulation === false;
 
     // ---- split allocation（比例＝largest remainder；固定＝直接數量）----
     const ratioSum = routable.reduce(
@@ -771,69 +760,23 @@ export function OrderTicket({
     return (
         <div className={styles.body}>
                 {activeAccount && (
-                    <div className={styles.chipRow} ref={chipRef}>
+                    <div className={styles.chipRow}>
                         <button
                             className={
                                 styles.acctChip[
                                     production
-                                        ? multi
-                                            ? 'dangerMulti'
-                                            : 'dangerSingle'
-                                        : multi
-                                          ? 'multi'
-                                          : 'single'
+                                        ? 'dangerSingle'
+                                        : 'single'
                                 ]
                             }
-                            onClick={
-                                multi
-                                    ? () => setAcctMenuOpen((v) => !v)
-                                    : undefined
-                            }
-                            title={`下單帳號 ${maskName(activeAccount.username, priv)}${
-                                production ? '（正式環境）' : ''
-                            }${multi ? ' — 點擊切換（與帳務查詢同步）' : ''}`}
+                            disabled={true}
+                            title="帳號由頂欄 (Header) 統一控管切換"
                         >
                             {acctTag} {activeAccount.broker_id}-
                             {maskAccountId(activeAccount.account_id, priv)}
-                            {multi && <ChevronDown size={11} />}
                         </button>
                         {production && (
                             <span className={styles.prodTag}>正式</span>
-                        )}
-                        {acctMenuOpen && (
-                            <div className={styles.acctMenu}>
-                                {routable.map((a) => {
-                                    const on =
-                                        acctKey(a) === acctKey(activeAccount);
-                                    return (
-                                        <button
-                                            key={acctKey(a)}
-                                            className={
-                                                styles.acctMenuItem[
-                                                    on ? 'on' : 'off'
-                                                ]
-                                            }
-                                            onClick={() => {
-                                                // 全域切換 — dock/帳務同步
-                                                selectAccount(a);
-                                                setAcctMenuOpen(false);
-                                                setArmed(false);
-                                            }}
-                                        >
-                                            {on ? (
-                                                <Check size={11} />
-                                            ) : (
-                                                <span
-                                                    style={{ width: 11 }}
-                                                />
-                                            )}
-                                            {acctTag} {isEsunBroker(a.broker_id) ? '玉山' : a.broker_id}-
-                                            {maskAccountId(a.account_id, priv)}
-                                            （{maskName(a.username, priv)}）
-                                        </button>
-                                    );
-                                })}
-                            </div>
                         )}
                     </div>
                 )}

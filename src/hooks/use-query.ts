@@ -4,12 +4,19 @@ import { createAccountQuery } from '../lib/account-query';
 import type { Account } from '../lib/types/portfolio';
 
 interface Result<T> { data?: T; error: string | null; loading: boolean; updatedAt: number | null }
-interface Entry { result: Result<unknown>; listeners: Set<() => void>; pending?: Promise<void>; attempted: boolean; nextAt: number }
+interface Entry {
+    result: Result<unknown>;
+    listeners: Set<() => void>;
+    pending?: Promise<void>;
+    attempted: boolean;
+    nextAt: number;
+    version: number;
+}
 const cache = new Map<string, Entry>();
 function entryFor(key: string) {
     let entry = cache.get(key);
     if (!entry) {
-        entry = { result: { error: null, loading: false, updatedAt: null }, listeners: new Set(), attempted: false, nextAt: 0 };
+        entry = { result: { error: null, loading: false, updatedAt: null }, listeners: new Set(), attempted: false, nextAt: 0, version: 0 };
         cache.set(key, entry);
     }
     return entry;
@@ -51,6 +58,18 @@ export function useQuery<T>(fetcher: () => Promise<T>, key: string, enabled = tr
         }).finally(() => { entry.pending = undefined; entry.nextAt = Date.now() + 1500; emit(); });
         return entry.pending;
     }, [entry, enabled, fetcher, accountScope]);
-    useEffect(() => { if (enabled && !entry.attempted) void refresh(); }, [entry, enabled, refresh]);
+    useEffect(() => { if (enabled && !entry.attempted) void refresh(); }, [entry, entry.version, enabled, refresh]);
     return { ...result, refresh };
+}
+
+/** 全域重置所有查詢快照，使已掛載的 useQuery 立即重新 fetch */
+export function invalidateAllQueries(): void {
+    for (const entry of cache.values()) {
+        entry.attempted = false;
+        entry.nextAt = 0;
+        entry.pending = undefined;
+        entry.version++;
+        entry.result = { ...entry.result };
+        entry.listeners.forEach((l) => l());
+    }
 }

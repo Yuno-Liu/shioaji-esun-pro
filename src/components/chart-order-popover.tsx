@@ -325,6 +325,8 @@ export function OrderSettingsPanel({
                     <span className={styles.label}>帳號</span>
                     <select
                         className={styles.select}
+                        disabled={true}
+                        title="帳號由頂欄 (Header) 統一控管切換"
                         aria-label={`${layout.title.replace('設定', '')}帳號`}
                         value={settings.accountKey ?? FOLLOW}
                         onChange={e => set({ accountKey: e.target.value === FOLLOW ? undefined : e.target.value })}
