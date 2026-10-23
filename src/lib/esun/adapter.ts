@@ -21,6 +21,8 @@ export interface EsunBridgeHealth {
     configured: boolean;
     problems: string[];
     environment: 'SIMULATION' | 'PRODUCTION' | null;
+    simulation?: boolean;
+    entry?: string | null;
     account: { broker_id: string; account_id: string } | null;
     loggedIn: boolean;
     loginError: string | null;
@@ -85,6 +87,14 @@ export interface IEsunTradeDriver {
 
     /** 查詢帳戶清單 */
     accounts?(timeoutMs?: number): Promise<Account[]>;
+
+    /** 切換環境（模擬 / 正式） */
+    switchEnvironment?(env: 'SIMULATION' | 'PRODUCTION'): Promise<{
+        ok: boolean;
+        environment: 'SIMULATION' | 'PRODUCTION';
+        entry: string;
+        message?: string;
+    }>;
 
     /** 登入 / 連線（可選） */
     login?(): Promise<void>;

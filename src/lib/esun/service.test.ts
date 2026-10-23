@@ -7,7 +7,13 @@ import type { Account } from '../types/portfolio';
 import { MockEsunDriver } from './mock-driver';
 import { HttpEsunDriver } from './http-driver';
 import { EsunTradeService } from './service';
-import { ESUN_BROKER_CODE } from './types';
+import {
+    ESUN_BROKER_CODE,
+    ESUN_PRODUCTION_ENTRY,
+    ESUN_SIMULATION_ENTRY,
+    formatEsunConfigCoreSection,
+    parseEsunConfigEnvironment,
+} from './types';
 
 const esunAccount: Account = {
     account_type: 'S',
@@ -491,6 +497,101 @@ describe('EsunTradeService', () => {
             await expect(service.fetchProfitLossSummary(otherAccount)).rejects.toThrow('非玉山證券帳戶');
             await expect(service.fetchTradingLimits(otherAccount)).rejects.toThrow('非玉山證券帳戶');
             await expect(service.fetchStockReserveSummary(otherAccount)).rejects.toThrow('非玉山證券帳戶');
+        });
+    });
+
+    describe('environment detection and switcher', () => {
+        it('parses esun-config.ini SIMULATION vs PRODUCTION rules correctly', () => {
+            const simIni = `
+[Core]
+Entry = https://esuntradingapi-simulation.esunsec.com.tw/api/v1
+Environment = SIMULATION
+`;
+            const parsedSim = parseEsunConfigEnvironment(simIni);
+            expect(parsedSim.environment).toBe('SIMULATION');
+            expect(parsedSim.hasEnvironmentKey).toBe(true);
+            expect(parsedSim.entry).toBe(ESUN_SIMULATION_ENTRY);
+
+            const prodIni = `
+[Core]
+Entry = https://esuntradingapi.esunsec.com.tw/api/v1
+`;
+            const parsedProd = parseEsunConfigEnvironment(prodIni);
+            expect(parsedProd.environment).toBe('PRODUCTION');
+            expect(parsedProd.hasEnvironmentKey).toBe(false);
+            expect(parsedProd.entry).toBe(ESUN_PRODUCTION_ENTRY);
+        });
+
+        it('formats [Core] section from SIMULATION to PRODUCTION by removing Environment key', () => {
+            const originalSim = `[Core]
+# API 主機位址
+Entry = https://esuntradingapi-simulation.esunsec.com.tw/api/v1
+Environment = SIMULATION
+
+[User]
+Account = 88401234567`;
+
+            const formattedProd = formatEsunConfigCoreSection(originalSim, 'PRODUCTION');
+            expect(formattedProd).toContain(`Entry = ${ESUN_PRODUCTION_ENTRY}`);
+            expect(formattedProd).not.toContain('Environment');
+            expect(formattedProd).toContain('[User]');
+            expect(formattedProd).toContain('Account = 88401234567');
+
+            const reParsed = parseEsunConfigEnvironment(formattedProd);
+            expect(reParsed.environment).toBe('PRODUCTION');
+            expect(reParsed.hasEnvironmentKey).toBe(false);
+        });
+
+        it('formats [Core] section from PRODUCTION to SIMULATION by adding Environment = SIMULATION', () => {
+            const originalProd = `[Core]
+Entry = https://esuntradingapi.esunsec.com.tw/api/v1
+
+[User]
+Account = 88401234567`;
+
+            const formattedSim = formatEsunConfigCoreSection(originalProd, 'SIMULATION');
+            expect(formattedSim).toContain(`Entry = ${ESUN_SIMULATION_ENTRY}`);
+            expect(formattedSim).toContain('Environment = SIMULATION');
+            expect(formattedSim).toContain('[User]');
+
+            const reParsed = parseEsunConfigEnvironment(formattedSim);
+            expect(reParsed.environment).toBe('SIMULATION');
+            expect(reParsed.hasEnvironmentKey).toBe(true);
+        });
+
+        it('reactive state updates and notifies subscribers upon switchEnvironment', async () => {
+            const listener = vi.fn();
+            const unsubscribe = service.subscribe(listener);
+
+            expect(service.getEnvironment()).toBe('SIMULATION');
+            expect(service.isSimulation()).toBe(true);
+
+            // Switch to PRODUCTION
+            const resProd = await service.switchEnvironment('PRODUCTION');
+            expect(resProd.ok).toBe(true);
+            expect(service.getEnvironment()).toBe('PRODUCTION');
+            expect(service.isSimulation()).toBe(false);
+            expect(service.getEntryUrl()).toBe(ESUN_PRODUCTION_ENTRY);
+            expect(listener).toHaveBeenCalled();
+
+            // Switch back to SIMULATION
+            listener.mockClear();
+            const resSim = await service.switchEnvironment('SIMULATION');
+            expect(resSim.ok).toBe(true);
+            expect(service.getEnvironment()).toBe('SIMULATION');
+            expect(service.isSimulation()).toBe(true);
+            expect(service.getEntryUrl()).toBe(ESUN_SIMULATION_ENTRY);
+            expect(listener).toHaveBeenCalled();
+
+            unsubscribe();
+        });
+
+        it('registerEsunAccount creates and registers account when missing', () => {
+            const acc = service.registerEsunAccount('88400664718');
+            expect(acc.broker_id).toBe('8840');
+            expect(acc.account_id).toBe('0664718');
+            expect(acc.signed).toBe(true);
+            expect(service.getAccounts()).toContainEqual(acc);
         });
     });
 });

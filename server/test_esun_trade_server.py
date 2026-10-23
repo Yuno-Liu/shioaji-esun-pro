@@ -45,9 +45,13 @@ from server.esun_trade_server import (
     apply_headless_keyring_patches,
     check_and_clamp_date_range,
     create_server,
+    detect_esun_environment,
     load_config,
     split_account,
+    update_esun_config_environment,
     validate_order_quantity,
+    ESUN_PRODUCTION_ENTRY,
+    ESUN_SIMULATION_ENTRY,
 )
 from esun_trade.constant import Action, APCode, BSFlag, PriceFlag, Trade
 
@@ -234,6 +238,50 @@ Account = 88401234567
         cfg, problems, env = load_config("non_existent_file.ini")
         self.assertIsNone(cfg)
         self.assertTrue(any("找不到玉山設定檔" in p for p in problems))
+
+    def test_detect_esun_environment(self):
+        cp_sim = configparser.ConfigParser()
+        cp_sim.read_string(f"[Core]\nEntry = {ESUN_SIMULATION_ENTRY}\nEnvironment = SIMULATION\n")
+        self.assertEqual(detect_esun_environment(cp_sim), "SIMULATION")
+
+        cp_prod = configparser.ConfigParser()
+        cp_prod.read_string(f"[Core]\nEntry = {ESUN_PRODUCTION_ENTRY}\n")
+        self.assertEqual(detect_esun_environment(cp_prod), "PRODUCTION")
+
+        cp_legacy_sim = configparser.ConfigParser()
+        cp_legacy_sim.read_string("[Core]\nEntry = https://custom-simulation.api.com\n")
+        self.assertEqual(detect_esun_environment(cp_legacy_sim), "SIMULATION")
+
+        cp_legacy_prod = configparser.ConfigParser()
+        cp_legacy_prod.read_string("[Core]\nEntry = https://custom.api.com\n")
+        self.assertEqual(detect_esun_environment(cp_legacy_prod), "PRODUCTION")
+
+    def test_update_esun_config_environment_roundtrip(self):
+        # 1. Switch to PRODUCTION
+        env, entry = update_esun_config_environment(self.config_file, "PRODUCTION")
+        self.assertEqual(env, "PRODUCTION")
+        self.assertEqual(entry, ESUN_PRODUCTION_ENTRY)
+
+        cp = configparser.ConfigParser()
+        cp.read(self.config_file, encoding="utf-8")
+        self.assertFalse(cp.has_option("Core", "Environment"))
+        self.assertEqual(cp.get("Core", "Entry"), ESUN_PRODUCTION_ENTRY)
+        self.assertEqual(detect_esun_environment(cp), "PRODUCTION")
+        # Ensure User and Api sections remain intact
+        self.assertEqual(cp.get("User", "Account"), "88401234567")
+        self.assertEqual(cp.get("Api", "Key"), "test_key")
+
+        # 2. Switch to SIMULATION
+        env2, entry2 = update_esun_config_environment(self.config_file, "SIMULATION")
+        self.assertEqual(env2, "SIMULATION")
+        self.assertEqual(entry2, ESUN_SIMULATION_ENTRY)
+
+        cp2 = configparser.ConfigParser()
+        cp2.read(self.config_file, encoding="utf-8")
+        self.assertTrue(cp2.has_option("Core", "Environment"))
+        self.assertEqual(cp2.get("Core", "Environment"), "SIMULATION")
+        self.assertEqual(cp2.get("Core", "Entry"), ESUN_SIMULATION_ENTRY)
+        self.assertEqual(detect_esun_environment(cp2), "SIMULATION")
 
 
 class TestLoginCircuitBreaker(unittest.TestCase):
@@ -713,6 +761,42 @@ class TestFullHttpIntegration(unittest.TestCase):
         self.assertEqual(mat_obj["data"]["StockDeal"]["deal_qty"], 1)
 
         resp.close()
+
+    def test_switch_environment_http(self):
+        # 1. Switch to PRODUCTION via POST /esun/auth/environment
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/esun/auth/environment",
+            data=json.dumps({"environment": "PRODUCTION"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            self.assertTrue(data.get("ok"))
+            self.assertEqual(data.get("environment"), "PRODUCTION")
+            self.assertFalse(data.get("simulation"))
+            self.assertEqual(data.get("entry"), ESUN_PRODUCTION_ENTRY)
+
+        # Health should reflect PRODUCTION
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/esun/health") as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(data.get("environment"), "PRODUCTION")
+            self.assertFalse(data.get("simulation"))
+            self.assertEqual(data.get("entry"), ESUN_PRODUCTION_ENTRY)
+
+        # 2. Switch back to SIMULATION via POST /esun/environment
+        req2 = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/esun/environment",
+            data=json.dumps({"simulation": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req2) as resp:
+            self.assertEqual(resp.status, 200)
+            data2 = json.loads(resp.read().decode("utf-8"))
+            self.assertTrue(data2.get("ok"))
+            self.assertEqual(data2.get("environment"), "SIMULATION")
+            self.assertTrue(data2.get("simulation"))
+            self.assertEqual(data2.get("entry"), ESUN_SIMULATION_ENTRY)
 
     def test_order_rate_limiter_burst_and_daily(self):
         # Test 18 req/sec sliding window limiter

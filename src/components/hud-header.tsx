@@ -2,7 +2,7 @@
 // 都收斂進統一設定 dialog（settings-dialog.tsx）；header 只留高頻操作：
 // 伺服器狀態、Kill Switch（一鍵鎖定/解鎖）、新增面板、閃電全開、設定。
 
-import { LayoutGrid, Lock, Settings, Undo2, Unlock, Zap } from 'lucide-react';
+import { Check, ChevronDown, LayoutGrid, Lock, Settings, Undo2, Unlock, Zap } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useStreamStatus } from '../hooks/use-stream';
 import { useHeaderItems } from '../lib/header-items';
@@ -29,6 +29,15 @@ import { externalServerLabel, useServerAttachment } from '../lib/server-adoption
 import { SettingsDialog } from './settings-dialog';
 import { flashPopoutParams, reseedPopoutFlashAccounts } from '../lib/flash-account';
 import { mainFlashSelection } from '../lib/order-account';
+import { ensureAccounts, registerExternalAccounts, selectAccount, useAccounts } from '../lib/account-store';
+import {
+    ESUN_PRODUCTION_ENTRY,
+    ESUN_SIMULATION_ENTRY,
+    esunTradeService,
+    isEsunAccount,
+    useEsunEnvironment,
+} from '../lib/esun';
+import { notify } from '../lib/trade';
 import * as styles from './hud-header.css';
 
 const STATUS_LABEL = {
@@ -243,6 +252,38 @@ export function HudHeader({
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [layoutLibOpen, setLayoutLibOpen] = useState(false);
 
+    const { accounts, selectedStock, selectedFutures } = useAccounts();
+    const esunEnv = useEsunEnvironment();
+    const [envMenuOpen, setEnvMenuOpen] = useState(false);
+
+    useEffect(() => {
+        ensureAccounts();
+        void esunTradeService.connectBridge();
+    }, []);
+
+    useEffect(() => {
+        if (!envMenuOpen) return;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setEnvMenuOpen(false);
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [envMenuOpen]);
+
+    const activeAccount = selectedStock ?? selectedFutures ?? accounts[0] ?? null;
+    const isEsunActive = isEsunAccount(activeAccount);
+
+    const activeIsSimulation = isEsunActive
+        ? esunEnv.isSimulation
+        : (simulation !== null ? simulation : true);
+
+    const activeBrokerName = isEsunActive ? '玉山證券' : '永豐金證券';
+    const activeBrokerShort = isEsunActive ? '玉山' : '永豐';
+
+    const showToast = (body: string) => {
+        notify({ kind: 'ok', title: '環境切換', body });
+    };
+
     useEffect(() => {
         let cleanup: (() => void) | undefined;
         listenTrayEvents(() => setServerMgrOpen(true)).then((un) => {
@@ -293,16 +334,159 @@ export function HudHeader({
                 </span>
             </div>
 
-            {simulation !== null &&
-                (simulation ? (
-                    <span className={styles.simBadge} title={external ? externalServerLabel(external) : undefined}>
-                        模擬環境{external && <span className={styles.externalTag}>· 外部伺服器</span>}
-                    </span>
-                ) : (
-                    <span className={styles.prodBadge} title={external ? externalServerLabel(external) : undefined}>
-                        正式環境{external && <span className={styles.externalTag}>· 外部伺服器</span>}
-                    </span>
-                ))}
+            <div className={styles.envMenuWrap}>
+                <button
+                    type="button"
+                    className={activeIsSimulation ? styles.simBadge : styles.prodBadge}
+                    data-testid="header-env-badge"
+                    aria-haspopup="menu"
+                    aria-expanded={envMenuOpen}
+                    onClick={() => setEnvMenuOpen((prev) => !prev)}
+                    title={`${activeBrokerName}：${activeIsSimulation ? '模擬環境' : '正式環境'}（點擊展開切換選單）`}
+                >
+                    <span className={styles.envBadgeBroker}>{activeBrokerShort}</span>
+                    <span>{activeIsSimulation ? '模擬環境' : '正式環境'}</span>
+                    {external && <span className={styles.externalTag}>· 外部伺服器</span>}
+                    <ChevronDown size={11} className={styles.envChevron} />
+                </button>
+
+                {envMenuOpen && (
+                    <>
+                        <div
+                            className={styles.popoverBackdrop}
+                            onClick={() => setEnvMenuOpen(false)}
+                        />
+                        <div
+                            className={styles.envPopover}
+                            data-testid="header-env-menu"
+                            role="menu"
+                        >
+                            {/* Section 1: 帳號切換 (判定依據) */}
+                            <div className={styles.envSection}>
+                                <div className={styles.envSectionHeader}>
+                                    <span className={styles.envSectionTitle}>帳號切換（判定依據）</span>
+                                    <span className={styles.envActiveTag}>目前：{activeBrokerName}</span>
+                                </div>
+                                <div className={styles.envAccountList}>
+                                    {accounts.map((acc) => {
+                                        const isEsun = isEsunAccount(acc);
+                                        const isSelected = (acc.account_type === 'S' && selectedStock?.account_id === acc.account_id && selectedStock?.broker_id === acc.broker_id)
+                                            || (acc.account_type === 'F' && selectedFutures?.account_id === acc.account_id && selectedFutures?.broker_id === acc.broker_id)
+                                            || (activeAccount?.account_id === acc.account_id && activeAccount?.broker_id === acc.broker_id);
+                                        return (
+                                            <button
+                                                key={`${acc.broker_id}-${acc.account_id}`}
+                                                type="button"
+                                                className={isSelected ? styles.envAccountItemActive : styles.envAccountItem}
+                                                onClick={() => {
+                                                    selectAccount(acc);
+                                                }}
+                                            >
+                                                <span className={isEsun ? styles.brokerBadgeEsun : styles.brokerBadgeSj}>
+                                                    {isEsun ? '玉山' : '永豐'}
+                                                </span>
+                                                <span className={styles.envAccountName}>
+                                                    {acc.broker_id}-{acc.account_id} ({acc.account_type === 'S' ? '證券' : '期貨'})
+                                                </span>
+                                                {isSelected && <Check size={12} className={styles.checkIcon} />}
+                                            </button>
+                                        );
+                                    })}
+                                    {!accounts.some(isEsunAccount) && (
+                                        <button
+                                            type="button"
+                                            className={styles.envAccountAddBtn}
+                                            onClick={() => {
+                                                const acc = esunTradeService.registerEsunAccount('88400664718');
+                                                registerExternalAccounts([acc]);
+                                                selectAccount(acc);
+                                            }}
+                                        >
+                                            ＋ 切換至玉山證券 (8840-0664718)
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Section 2: 環境切換 */}
+                            <div className={styles.envSection}>
+                                <div className={styles.envSectionHeader}>
+                                    <span className={styles.envSectionTitle}>環境切換 ({activeBrokerName})</span>
+                                </div>
+                                <div className={styles.envOptionGroup}>
+                                    <button
+                                        type="button"
+                                        data-testid="env-option-simulation"
+                                        className={activeIsSimulation ? styles.envOptionActive : styles.envOption}
+                                        onClick={async () => {
+                                            if (isEsunActive) {
+                                                await esunEnv.switchEnvironment('SIMULATION');
+                                                showToast('已切換玉山證券至模擬環境 (Environment = SIMULATION)');
+                                            } else {
+                                                setSimulation(true);
+                                                try {
+                                                    localStorage.setItem('shioaji_simulation_override', 'true');
+                                                } catch {}
+                                                showToast('已切換永豐金證券至模擬環境');
+                                            }
+                                            setEnvMenuOpen(false);
+                                        }}
+                                    >
+                                        <div className={styles.envOptionTop}>
+                                            <span className={styles.envOptionLabel}>模擬環境 (SIMULATION)</span>
+                                            {activeIsSimulation && <Check size={12} className={styles.checkIcon} />}
+                                        </div>
+                                        <div className={styles.envOptionSubtitle}>
+                                            {isEsunActive ? (
+                                                <>
+                                                    <div>Environment = SIMULATION</div>
+                                                    <div>Entry = {ESUN_SIMULATION_ENTRY}</div>
+                                                </>
+                                            ) : (
+                                                <div>Shioaji Simulation = True</div>
+                                            )}
+                                        </div>
+                                    </button>
+
+                                    <button
+                                        type="button"
+                                        data-testid="env-option-production"
+                                        className={!activeIsSimulation ? styles.envOptionActive : styles.envOption}
+                                        onClick={async () => {
+                                            if (isEsunActive) {
+                                                await esunEnv.switchEnvironment('PRODUCTION');
+                                                showToast('已切換玉山證券至正式環境 (Entry = https://esuntradingapi.esunsec.com.tw/api/v1)');
+                                            } else {
+                                                setSimulation(false);
+                                                try {
+                                                    localStorage.setItem('shioaji_simulation_override', 'false');
+                                                } catch {}
+                                                showToast('已切換永豐金證券至正式環境');
+                                            }
+                                            setEnvMenuOpen(false);
+                                        }}
+                                    >
+                                        <div className={styles.envOptionTop}>
+                                            <span className={styles.envOptionLabel}>正式環境 (PRODUCTION)</span>
+                                            {!activeIsSimulation && <Check size={12} className={styles.checkIcon} />}
+                                        </div>
+                                        <div className={styles.envOptionSubtitle}>
+                                            {isEsunActive ? (
+                                                <>
+                                                    <div>無 Environment 資訊 (僅 Entry)</div>
+                                                    <div>Entry = {ESUN_PRODUCTION_ENTRY}</div>
+                                                </>
+                                            ) : (
+                                                <div>Shioaji Simulation = False</div>
+                                            )}
+                                        </div>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </>
+                )}
+            </div>
             <ForeignServerChip />
 
             {headerItems.symbolSearch && (
