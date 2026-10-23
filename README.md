@@ -207,8 +207,26 @@ flowchart TD
 ```
 > 💡 若您同時有使用永豐證券帳號下單的需求，亦可將永豐憑證（如 `Sinopac.pfx`）一併放入 `./certs/` 目錄中。
 
-#### 步驟 2：設定玉山證券 `esun-config.ini`
-複製範本檔至專案根目錄 `./esun-config.ini`（或放入 `./certs/esun-config.ini`，系統皆會自動偵測）：
+#### 步驟 2：設定玉山證券設定檔（雙環境切換或單一設定檔）
+系統支援**測試與正式雙環境設定檔（推薦）**，亦完全向下相容單一 `esun-config.ini`：
+
+##### 模式 A：雙環境無縫切換（推薦）
+在專案根目錄同時提供測試與正式設定檔，終端介面頂欄即可隨時自由切換；若僅提供其中一個檔案，前端會自動禁用未提供之模式並提示「未提供設定檔 (不可選)」：
+- **測試／模擬環境**：複製 `esun-config.simulation.ini.example` 為 `esun-config.simulation.ini`（亦支援別名 `esun-config.sim.ini`）
+- **正式交易環境**：複製 `esun-config.production.ini.example` 為 `esun-config.production.ini`（亦支援別名 `esun-config.prod.ini`）
+
+```powershell
+# Windows PowerShell
+Copy-Item esun-config.simulation.ini.example esun-config.simulation.ini
+Copy-Item esun-config.production.ini.example esun-config.production.ini
+
+# Linux / macOS / Git Bash
+cp esun-config.simulation.ini.example esun-config.simulation.ini
+cp esun-config.production.ini.example esun-config.production.ini
+```
+
+##### 模式 B：單一通用設定檔向下相容
+複製範本檔至專案根目錄 `./esun-config.ini`：
 ```powershell
 # Windows PowerShell
 Copy-Item esun-config.ini.example esun-config.ini
@@ -216,13 +234,12 @@ Copy-Item esun-config.ini.example esun-config.ini
 # Linux / macOS / Git Bash
 cp esun-config.ini.example esun-config.ini
 ```
-編輯 `esun-config.ini` 並填入玉山證券 API 管理頁面核發之參數：
+編輯設定檔並填入玉山證券 API 管理頁面核發之參數：
 ```ini
 [Core]
-# 正式環境：https://esuntradingapi.esunsec.com.tw/api/v1
-# 模擬環境：https://esuntradingapi-simulation.esunsec.com.tw/api/v1
+# 正式環境規範：Entry = https://esuntradingapi.esunsec.com.tw/api/v1 (不設 Environment 欄位)
+# 測試環境規範：Entry = https://esuntradingapi-simulation.esunsec.com.tw/api/v1 且 Environment = SIMULATION
 Entry = https://esuntradingapi.esunsec.com.tw/api/v1
-Environment = Production
 
 [Cert]
 Path = ./certs/esun_cert.p12

@@ -50,8 +50,11 @@ from server.esun_trade_server import (
     split_account,
     update_esun_config_environment,
     validate_order_quantity,
+    discover_esun_config_profiles,
     ESUN_PRODUCTION_ENTRY,
     ESUN_SIMULATION_ENTRY,
+    ESUN_SIMULATION_CONFIG_CANDIDATES,
+    ESUN_PRODUCTION_CONFIG_CANDIDATES,
 )
 from esun_trade.constant import Action, APCode, BSFlag, PriceFlag, Trade
 
@@ -533,17 +536,25 @@ class TestFullHttpIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.TemporaryDirectory()
-        cls.config_file = os.path.join(cls.temp_dir.name, "test_config.ini")
-        with open(cls.config_file, "w") as f:
-            f.write("[Core]\nEntry=https://test\n[Cert]\nPath=c.p12\n[Api]\nKey=k\nSecret=s\n[User]\nAccount=88401234567\n")
         with open(os.path.join(cls.temp_dir.name, "c.p12"), "w") as f:
             f.write("cert")
+
+        # Create both simulation and production files in the directory
+        cls.sim_config_file = os.path.join(cls.temp_dir.name, "esun-config.simulation.ini")
+        with open(cls.sim_config_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n[Cert]\nPath=c.p12\n[Api]\nKey=sim_k\nSecret=sim_s\n[User]\nAccount=88401234567\n")
+
+        cls.prod_config_file = os.path.join(cls.temp_dir.name, "esun-config.production.ini")
+        with open(cls.prod_config_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_PRODUCTION_ENTRY}\n[Cert]\nPath=c.p12\n[Api]\nKey=prod_k\nSecret=prod_s\n[User]\nAccount=88401234567\n")
+
+        cls.config_file = cls.sim_config_file
         os.environ["ESUN_ACCOUNT_PASSWORD"] = "pw"
         os.environ["ESUN_CERT_PASSWORD"] = "cpw"
 
         cls.mock_sdk = MockSDK()
         cls.bridge = EsunTradeBridge(
-            config_path=cls.config_file,
+            config_path=cls.sim_config_file,
             sdk_factory=lambda cfg: cls.mock_sdk,
             auto_login=True,
         )
@@ -763,7 +774,15 @@ class TestFullHttpIntegration(unittest.TestCase):
         resp.close()
 
     def test_switch_environment_http(self):
-        # 1. Switch to PRODUCTION via POST /esun/auth/environment
+        # 1. Verify GET /esun/config-profiles returns both profiles
+        profiles_data, status = self._get("/esun/config-profiles")
+        self.assertEqual(status, 200)
+        self.assertTrue(profiles_data.get("ok"))
+        self.assertEqual(profiles_data.get("availableEnvironments"), ["SIMULATION", "PRODUCTION"])
+        self.assertTrue(profiles_data["configProfiles"]["SIMULATION"]["available"])
+        self.assertTrue(profiles_data["configProfiles"]["PRODUCTION"]["available"])
+
+        # 2. Switch to PRODUCTION via POST /esun/auth/environment
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/esun/auth/environment",
             data=json.dumps({"environment": "PRODUCTION"}).encode("utf-8"),
@@ -776,15 +795,18 @@ class TestFullHttpIntegration(unittest.TestCase):
             self.assertEqual(data.get("environment"), "PRODUCTION")
             self.assertFalse(data.get("simulation"))
             self.assertEqual(data.get("entry"), ESUN_PRODUCTION_ENTRY)
+            self.assertEqual(data.get("activeConfigFile"), "esun-config.production.ini")
 
-        # Health should reflect PRODUCTION
+        # Health should reflect PRODUCTION and activeConfigFile
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/esun/health") as resp:
             data = json.loads(resp.read().decode("utf-8"))
             self.assertEqual(data.get("environment"), "PRODUCTION")
             self.assertFalse(data.get("simulation"))
             self.assertEqual(data.get("entry"), ESUN_PRODUCTION_ENTRY)
+            self.assertEqual(data.get("activeConfigFile"), "esun-config.production.ini")
+            self.assertEqual(data.get("availableEnvironments"), ["SIMULATION", "PRODUCTION"])
 
-        # 2. Switch back to SIMULATION via POST /esun/environment
+        # 3. Switch back to SIMULATION via POST /esun/environment
         req2 = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/esun/environment",
             data=json.dumps({"simulation": True}).encode("utf-8"),
@@ -797,6 +819,7 @@ class TestFullHttpIntegration(unittest.TestCase):
             self.assertEqual(data2.get("environment"), "SIMULATION")
             self.assertTrue(data2.get("simulation"))
             self.assertEqual(data2.get("entry"), ESUN_SIMULATION_ENTRY)
+            self.assertEqual(data2.get("activeConfigFile"), "esun-config.simulation.ini")
 
     def test_order_rate_limiter_burst_and_daily(self):
         # Test 18 req/sec sliding window limiter
@@ -821,6 +844,83 @@ class TestFullHttpIntegration(unittest.TestCase):
         res, code = self.bridge.get_settlements()
         self.assertEqual(code, 429)
         self.assertEqual(res.get("code"), "AGR0006")
+
+
+
+class TestConfigProfilesDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        with open(os.path.join(self.temp_dir.name, "cert.p12"), "w") as f:
+            f.write("cert")
+        os.environ["ESUN_ACCOUNT_PASSWORD"] = "pw"
+        os.environ["ESUN_CERT_PASSWORD"] = "cpw"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        os.environ.pop("ESUN_ACCOUNT_PASSWORD", None)
+        os.environ.pop("ESUN_CERT_PASSWORD", None)
+        os.environ.pop("ESUN_SIMULATION_CONFIG_PATH", None)
+        os.environ.pop("ESUN_PRODUCTION_CONFIG_PATH", None)
+
+    def test_discover_dual_profiles(self):
+        sim_file = os.path.join(self.temp_dir.name, "esun-config.simulation.ini")
+        prod_file = os.path.join(self.temp_dir.name, "esun-config.production.ini")
+        with open(sim_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n")
+        with open(prod_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_PRODUCTION_ENTRY}\n")
+
+        discovery = discover_esun_config_profiles(base_dir=self.temp_dir.name)
+        self.assertEqual(discovery["availableEnvironments"], ["SIMULATION", "PRODUCTION"])
+        self.assertTrue(discovery["profiles"]["SIMULATION"]["available"])
+        self.assertEqual(discovery["profiles"]["SIMULATION"]["fileName"], "esun-config.simulation.ini")
+        self.assertTrue(discovery["profiles"]["PRODUCTION"]["available"])
+        self.assertEqual(discovery["profiles"]["PRODUCTION"]["fileName"], "esun-config.production.ini")
+
+    def test_discover_aliases(self):
+        sim_alias = os.path.join(self.temp_dir.name, "esun-config.sim.ini")
+        prod_alias = os.path.join(self.temp_dir.name, "esun-config.prod.ini")
+        with open(sim_alias, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n")
+        with open(prod_alias, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_PRODUCTION_ENTRY}\n")
+
+        discovery = discover_esun_config_profiles(base_dir=self.temp_dir.name)
+        self.assertEqual(discovery["availableEnvironments"], ["SIMULATION", "PRODUCTION"])
+        self.assertEqual(discovery["profiles"]["SIMULATION"]["fileName"], "esun-config.sim.ini")
+        self.assertEqual(discovery["profiles"]["PRODUCTION"]["fileName"], "esun-config.prod.ini")
+
+    def test_single_sim_profile_refuses_production_switch(self):
+        sim_file = os.path.join(self.temp_dir.name, "esun-config.simulation.ini")
+        with open(sim_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n[Cert]\nPath=cert.p12\n[Api]\nKey=k\nSecret=s\n[User]\nAccount=88401234567\n")
+
+        mock_sdk = MockSDK()
+        bridge = EsunTradeBridge(config_path=sim_file, sdk_factory=lambda cfg: mock_sdk, auto_login=True)
+        health = bridge.get_health()
+        self.assertEqual(health["availableEnvironments"], ["SIMULATION"])
+        self.assertTrue(health["configProfiles"]["SIMULATION"]["available"])
+        self.assertFalse(health["configProfiles"]["PRODUCTION"]["available"])
+
+        # Attempt to switch to unavailable PRODUCTION
+        res = bridge.switch_environment("PRODUCTION")
+        self.assertFalse(res["ok"])
+        self.assertIn("未提供 esun-config.production.ini 設定檔", res["error"])
+        # Environment should remain unchanged
+        self.assertEqual(bridge.environment, "SIMULATION")
+        self.assertEqual(res["environment"], "SIMULATION")
+
+    def test_single_fallback_esun_config_detection(self):
+        # Single esun-config.ini with PRODUCTION settings
+        single_file = os.path.join(self.temp_dir.name, "esun-config.ini")
+        with open(single_file, "w") as f:
+            f.write(f"[Core]\nEntry={ESUN_PRODUCTION_ENTRY}\n[Cert]\nPath=cert.p12\n[Api]\nKey=k\nSecret=s\n[User]\nAccount=88401234567\n")
+
+        discovery = discover_esun_config_profiles(base_dir=self.temp_dir.name)
+        self.assertEqual(discovery["availableEnvironments"], ["PRODUCTION"])
+        self.assertFalse(discovery["profiles"]["SIMULATION"]["available"])
+        self.assertTrue(discovery["profiles"]["PRODUCTION"]["available"])
+        self.assertEqual(discovery["profiles"]["PRODUCTION"]["fileName"], "esun-config.ini")
 
 
 if __name__ == "__main__":

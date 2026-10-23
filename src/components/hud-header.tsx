@@ -273,6 +273,11 @@ export function HudHeader({
     const activeAccount = selectedStock ?? selectedFutures ?? accounts[0] ?? null;
     const isEsunActive = isEsunAccount(activeAccount);
 
+    const simProfile = esunEnv.configProfiles.SIMULATION;
+    const prodProfile = esunEnv.configProfiles.PRODUCTION;
+    const isSimDisabled = isEsunActive && !simProfile?.available;
+    const isProdDisabled = isEsunActive && !prodProfile?.available;
+
     const activeIsSimulation = isEsunActive
         ? esunEnv.isSimulation
         : (simulation !== null ? simulation : true);
@@ -341,7 +346,15 @@ export function HudHeader({
                     data-testid="header-env-badge"
                     aria-haspopup="menu"
                     aria-expanded={envMenuOpen}
-                    onClick={() => setEnvMenuOpen((prev) => !prev)}
+                    onClick={() => {
+                        setEnvMenuOpen((prev) => {
+                            const next = !prev;
+                            if (next && isEsunActive) {
+                                void esunEnv.refreshConfigProfiles();
+                            }
+                            return next;
+                        });
+                    }}
                     title={`${activeBrokerName}：${activeIsSimulation ? '模擬環境' : '正式環境'}（點擊展開切換選單）`}
                 >
                     <span className={styles.envBadgeBroker}>{activeBrokerShort}</span>
@@ -411,37 +424,60 @@ export function HudHeader({
                             {/* Section 2: 環境切換 */}
                             <div className={styles.envSection}>
                                 <div className={styles.envSectionHeader}>
-                                    <span className={styles.envSectionTitle}>環境切換 ({activeBrokerName})</span>
+                                    <span className={styles.envSectionTitle}>交易環境切換 ({activeBrokerName})</span>
                                 </div>
                                 <div className={styles.envOptionGroup}>
                                     <button
                                         type="button"
                                         data-testid="env-option-simulation"
-                                        className={activeIsSimulation ? styles.envOptionActive : styles.envOption}
+                                        disabled={isSimDisabled}
+                                        aria-disabled={isSimDisabled}
+                                        className={isSimDisabled ? styles.envOptionDisabled : (activeIsSimulation ? styles.envOptionActive : styles.envOption)}
                                         onClick={async () => {
+                                            if (isSimDisabled) return;
                                             if (isEsunActive) {
-                                                await esunEnv.switchEnvironment('SIMULATION');
-                                                showToast('已切換玉山證券至模擬環境 (Environment = SIMULATION)');
+                                                const res = await esunEnv.switchEnvironment('SIMULATION');
+                                                if (res.ok) {
+                                                    showToast(`已切換玉山證券至模擬環境 (${res.activeConfigFile ?? simProfile?.fileName ?? 'esun-config.simulation.ini'})`);
+                                                    setEnvMenuOpen(false);
+                                                } else {
+                                                    notify({ kind: 'err', title: '環境切換失敗', body: res.error || '無法切換至模擬環境' });
+                                                }
                                             } else {
                                                 setSimulation(true);
                                                 try {
                                                     localStorage.setItem('shioaji_simulation_override', 'true');
                                                 } catch {}
                                                 showToast('已切換永豐金證券至模擬環境');
+                                                setEnvMenuOpen(false);
                                             }
-                                            setEnvMenuOpen(false);
                                         }}
                                     >
                                         <div className={styles.envOptionTop}>
                                             <span className={styles.envOptionLabel}>模擬環境 (SIMULATION)</span>
+                                            {isEsunActive && (
+                                                simProfile?.available ? (
+                                                    <span className={styles.configFileBadge}>{simProfile.fileName ?? 'esun-config.simulation.ini'}</span>
+                                                ) : (
+                                                    <span className={styles.missingConfigBadge}>未提供設定檔 (不可選)</span>
+                                                )
+                                            )}
                                             {activeIsSimulation && <Check size={12} className={styles.checkIcon} />}
                                         </div>
                                         <div className={styles.envOptionSubtitle}>
                                             {isEsunActive ? (
-                                                <>
-                                                    <div>Environment = SIMULATION</div>
-                                                    <div>Entry = {ESUN_SIMULATION_ENTRY}</div>
-                                                </>
+                                                simProfile?.available ? (
+                                                    <>
+                                                        <div>設定檔: {simProfile.fileName ?? 'esun-config.simulation.ini'}</div>
+                                                        <div>Environment = SIMULATION</div>
+                                                        <div>Entry = {ESUN_SIMULATION_ENTRY}</div>
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <div>未偵測到模擬環境設定檔，請於專案根目錄提供：</div>
+                                                        <div>esun-config.simulation.ini（或 esun-config.sim.ini）</div>
+                                                    </>
+                                                )
                                             ) : (
                                                 <div>Shioaji Simulation = True</div>
                                             )}
@@ -451,37 +487,65 @@ export function HudHeader({
                                     <button
                                         type="button"
                                         data-testid="env-option-production"
-                                        className={!activeIsSimulation ? styles.envOptionActive : styles.envOption}
+                                        disabled={isProdDisabled}
+                                        aria-disabled={isProdDisabled}
+                                        className={isProdDisabled ? styles.envOptionDisabled : (!activeIsSimulation ? styles.envOptionActive : styles.envOption)}
                                         onClick={async () => {
+                                            if (isProdDisabled) return;
                                             if (isEsunActive) {
-                                                await esunEnv.switchEnvironment('PRODUCTION');
-                                                showToast('已切換玉山證券至正式環境 (Entry = https://esuntradingapi.esunsec.com.tw/api/v1)');
+                                                const res = await esunEnv.switchEnvironment('PRODUCTION');
+                                                if (res.ok) {
+                                                    showToast(`已切換玉山證券至正式環境 (${res.activeConfigFile ?? prodProfile?.fileName ?? 'esun-config.production.ini'})`);
+                                                    setEnvMenuOpen(false);
+                                                } else {
+                                                    notify({ kind: 'err', title: '環境切換失敗', body: res.error || '無法切換至正式環境' });
+                                                }
                                             } else {
                                                 setSimulation(false);
                                                 try {
                                                     localStorage.setItem('shioaji_simulation_override', 'false');
                                                 } catch {}
                                                 showToast('已切換永豐金證券至正式環境');
+                                                setEnvMenuOpen(false);
                                             }
-                                            setEnvMenuOpen(false);
                                         }}
                                     >
                                         <div className={styles.envOptionTop}>
                                             <span className={styles.envOptionLabel}>正式環境 (PRODUCTION)</span>
+                                            {isEsunActive && (
+                                                prodProfile?.available ? (
+                                                    <span className={styles.configFileBadge}>{prodProfile.fileName ?? 'esun-config.production.ini'}</span>
+                                                ) : (
+                                                    <span className={styles.missingConfigBadge}>未提供設定檔 (不可選)</span>
+                                                )
+                                            )}
                                             {!activeIsSimulation && <Check size={12} className={styles.checkIcon} />}
                                         </div>
                                         <div className={styles.envOptionSubtitle}>
                                             {isEsunActive ? (
-                                                <>
-                                                    <div>無 Environment 資訊 (僅 Entry)</div>
-                                                    <div>Entry = {ESUN_PRODUCTION_ENTRY}</div>
-                                                </>
+                                                prodProfile?.available ? (
+                                                    <>
+                                                        <div>設定檔: {prodProfile.fileName ?? 'esun-config.production.ini'}</div>
+                                                        <div>無 Environment 資訊 (僅 Entry)</div>
+                                                        <div>Entry = {ESUN_PRODUCTION_ENTRY}</div>
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <div>未偵測到正式環境設定檔，請於專案根目錄提供：</div>
+                                                        <div>esun-config.production.ini（或 esun-config.prod.ini）</div>
+                                                    </>
+                                                )
                                             ) : (
                                                 <div>Shioaji Simulation = False</div>
                                             )}
                                         </div>
                                     </button>
                                 </div>
+                                {isEsunActive && (
+                                    <div className={styles.menuFooterHint}>
+                                        💡 命名規範：測試 esun-config.simulation.ini ／ 正式 esun-config.production.ini
+                                    </div>
+                                )}
                             </div>
                         </div>
                     </>

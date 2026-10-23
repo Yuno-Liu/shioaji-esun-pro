@@ -1,8 +1,16 @@
 # esun-config.ini.example — 玉山證券 (E.Sun Securities) API 設定檔範本
 #
-# 使用方式：
-# 1. 將此檔案複製為 `esun-config.ini`（或自訂路徑，並透過環境變數 ESUN_CONFIG_PATH 指定）。
-# 2. 依玉山證券 API 申請核發之資訊填寫下列欄位。
+# 使用方式與設定檔命名建議：
+# 1. 雙環境/多模式設定（推薦）：
+#    若欲在交易終端中隨時無縫切換測試與正式環境，請分別提供兩個設定檔：
+#    - 測試/模擬環境：`esun-config.simulation.ini`（別名：`esun-config.sim.ini`）
+#      範本請參考：`esun-config.simulation.ini.example`
+#    - 正式交易環境：`esun-config.production.ini`（別名：`esun-config.prod.ini`）
+#      範本請參考：`esun-config.production.ini.example`
+#    若僅提供其中一個檔案，前端切換選單會將未提供的環境標記為「未提供設定檔 (不可選)」，防止誤下。
+# 2. 單一通用設定檔向下相容：
+#    亦可直接將此檔案複製為 `esun-config.ini`（或透過 ESUN_CONFIG_PATH 指定），
+#    系統將自動解析 [Core] 判定為測試或正式環境。
 # 3. 憑證密碼與登入密碼請透過環境變數傳入，切勿將明文密碼寫入本設定檔中：
 #      ESUN_ACCOUNT_PASSWORD=您的玉山證券登入密碼 (或 ESUN_PASSWORD)
 #      ESUN_CERT_PASSWORD=您的憑證密碼 (.p12)

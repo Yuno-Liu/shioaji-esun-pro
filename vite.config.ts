@@ -24,6 +24,112 @@ const pkg = JSON.parse(
     fs.readFileSync(path.resolve(__dirname, 'package.json'), 'utf8'),
 ) as { version?: string };
 
+function esunConfigDiscoveryPlugin() {
+    const SIM_CANDIDATES = ['esun-config.simulation.ini', 'esun-config.sim.ini', 'esun-config.test.ini'];
+    const PROD_CANDIDATES = ['esun-config.production.ini', 'esun-config.prod.ini'];
+    const SIM_ENTRY = 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1';
+    const PROD_ENTRY = 'https://esuntradingapi.esunsec.com.tw/api/v1';
+
+    function scanDir(dir: string) {
+        let simPath: string | null = null;
+        let prodPath: string | null = null;
+
+        for (const f of SIM_CANDIDATES) {
+            const p = path.resolve(dir, f);
+            if (fs.existsSync(p)) {
+                simPath = p;
+                break;
+            }
+        }
+        for (const f of PROD_CANDIDATES) {
+            const p = path.resolve(dir, f);
+            if (fs.existsSync(p)) {
+                prodPath = p;
+                break;
+            }
+        }
+
+        const fallback = path.resolve(dir, 'esun-config.ini');
+        if (fs.existsSync(fallback)) {
+            try {
+                const content = fs.readFileSync(fallback, 'utf8');
+                const isSim = /environment\s*[:=]\s*simulation/i.test(content) || /entry\s*[:=].*simulation/i.test(content);
+                if (isSim && !simPath) simPath = fallback;
+                else if (!isSim && !prodPath) prodPath = fallback;
+            } catch {
+                // ignore
+            }
+        }
+
+        return { simPath, prodPath };
+    }
+
+    function getDiscovery() {
+        const cwd = process.cwd();
+        let { simPath, prodPath } = scanDir(cwd);
+
+        if (!simPath && !prodPath) {
+            const parentMain = path.resolve(cwd, '../..', 'shioaji-pro-app');
+            if (fs.existsSync(parentMain)) {
+                const parentResult = scanDir(parentMain);
+                simPath = parentResult.simPath;
+                prodPath = parentResult.prodPath;
+            }
+        }
+
+        const simFile = simPath ? path.basename(simPath) : null;
+        const prodFile = prodPath ? path.basename(prodPath) : null;
+        const availableEnvironments: string[] = [];
+        if (simPath) availableEnvironments.push('SIMULATION');
+        if (prodPath) availableEnvironments.push('PRODUCTION');
+
+        const activeEnvironment = simPath ? 'SIMULATION' : (prodPath ? 'PRODUCTION' : 'SIMULATION');
+        const activeConfigFile = simPath ? simFile : prodFile;
+
+        return {
+            ok: true,
+            availableEnvironments,
+            configProfiles: {
+                SIMULATION: {
+                    available: Boolean(simPath),
+                    fileName: simFile,
+                    filePath: simPath,
+                    expectedFileName: 'esun-config.simulation.ini',
+                    aliases: SIM_CANDIDATES,
+                    entry: SIM_ENTRY,
+                },
+                PRODUCTION: {
+                    available: Boolean(prodPath),
+                    fileName: prodFile,
+                    filePath: prodPath,
+                    expectedFileName: 'esun-config.production.ini',
+                    aliases: PROD_CANDIDATES,
+                    entry: PROD_ENTRY,
+                },
+            },
+            activeEnvironment,
+            activeConfigFile,
+        };
+    }
+
+    return {
+        name: 'esun-config-discovery',
+        configureServer(server: any) {
+            server.middlewares.use((req: any, res: any, next: any) => {
+                const pathname = req.url ? req.url.split('?')[0] : '';
+                if (req.method === 'GET' && pathname === '/esun/config-profiles') {
+                    const data = getDiscovery();
+                    res.statusCode = 200;
+                    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                    res.end(JSON.stringify(data));
+                    return;
+                }
+                next();
+            });
+        },
+    };
+}
+
 export default defineConfig(({ mode, command }) => {
     const env = loadEnv(mode, process.cwd(), '');
     const devPort = command === 'serve' ? env.VITE_DEV_SERVER_PORT : undefined;
@@ -114,7 +220,7 @@ export default defineConfig(({ mode, command }) => {
                     .trim(),
             ),
         },
-        plugins: [vanillaExtractPlugin(), react()],
+        plugins: [vanillaExtractPlugin(), react(), esunConfigDiscoveryPlugin()],
         test: {
             // The desktop overlay is mirrored here for Tauri dev/CI, but its
             // Rust-adjacent Node tests use node:test rather than Vitest.
