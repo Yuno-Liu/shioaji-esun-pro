@@ -8,7 +8,9 @@ import {
     resolveContract,
 } from './shioaji';
 import {
+    fuzzySubsequenceGap,
     loadStockCatalog,
+    normalizeSearchText,
     searchStocks,
     SECTOR_INDICES,
 } from './stock-index';
@@ -81,9 +83,14 @@ function derivativeSort(a: ContractInfo, b: ContractInfo) {
     );
 }
 
-function normalizeSearchText(value: string) {
-    return value.trim().replace(/臺/g, '台').toUpperCase();
-}
+const ROOT_ALIASES: Record<string, string[]> = {
+    TXF: ['台指', '大台', '台指期'],
+    MXF: ['小台', '小台指'],
+    TMF: ['微台', '微台指'],
+    EXF: ['電子', '電子期'],
+    FXF: ['金融', '金融期'],
+    TXO: ['台指選', '台指選擇權'],
+};
 
 function findRoot(
     roots: { root: string; name: string }[],
@@ -92,17 +99,54 @@ function findRoot(
 ) {
     const normalizedLookup = normalizeSearchText(lookup);
     const normalizedRaw = normalizeSearchText(raw);
+    if (!normalizedLookup) return undefined;
+    const isPureDigits = /^\d+$/.test(normalizedLookup);
     return roots
-        .filter((root) => {
+        .map((root) => {
             const code = normalizeSearchText(root.root);
             const name = normalizeSearchText(root.name);
-            return code === normalizedLookup || name.includes(normalizedLookup);
+            const aliases = (ROOT_ALIASES[code] ?? []).map(normalizeSearchText);
+            const aliasExact = aliases.some(
+                (a) => a === normalizedLookup || a === normalizedRaw,
+            );
+            const codeExact = code === normalizedLookup;
+            const nameExact =
+                name === normalizedRaw || name === normalizedLookup;
+            const nameSubstr = name.includes(normalizedLookup);
+            const gap =
+                !nameSubstr && !isPureDigits
+                    ? fuzzySubsequenceGap(name, normalizedLookup)
+                    : null;
+            const matched =
+                aliasExact ||
+                codeExact ||
+                nameSubstr ||
+                (gap !== null && gap <= 4);
+            if (!matched) return null;
+            const rank =
+                nameExact || aliasExact
+                    ? 0
+                    : codeExact
+                      ? 1
+                      : name.startsWith(normalizedLookup)
+                        ? 2
+                        : nameSubstr
+                          ? 3
+                          : 4 + (gap ?? 0);
+            return { root, rank };
         })
-        .sort((a, b) => {
-            const exactA = normalizeSearchText(a.name) === normalizedRaw ? 0 : 1;
-            const exactB = normalizeSearchText(b.name) === normalizedRaw ? 0 : 1;
-            return exactA - exactB || a.name.length - b.name.length;
-        })[0];
+        .filter(
+            (
+                item,
+            ): item is {
+                root: { root: string; name: string };
+                rank: number;
+            } => item !== null,
+        )
+        .sort(
+            (a, b) =>
+                a.rank - b.rank || a.root.name.length - b.root.name.length,
+        )[0]?.root;
 }
 
 export async function searchProducts(
@@ -123,18 +167,19 @@ export async function searchProducts(
         .replace(/期$/, '')
         .trim();
     const lookup = query || raw;
+    const normalizedLookup = normalizeSearchText(lookup);
 
     const [catalog, roots] = await Promise.all([
         loadStockCatalog(),
         loadRoots(),
     ]);
     const stockMatches = searchStocks(catalog, lookup, limit);
-    const exactStock =
-        stockMatches.find(
-            (stock) =>
-                stock.code.toUpperCase() === lookup.toUpperCase() ||
-                stock.name === lookup,
-        ) ?? stockMatches[0];
+    const strictExactStock = stockMatches.find(
+        (stock) =>
+            stock.code.toUpperCase() === normalizedLookup ||
+            normalizeSearchText(stock.name) === normalizedLookup,
+    );
+    const exactStock = strictExactStock ?? stockMatches[0];
     const results: ProductSuggestion[] = stockMatches.map((stock) => ({
         code: stock.code,
         name: stock.name,
@@ -205,7 +250,7 @@ export async function searchProducts(
     }
 
     const matchingFutureRoot = findRoot(roots.futures, lookup, raw);
-    if (matchingFutureRoot && (wantsFutures || !exactStock)) {
+    if (matchingFutureRoot && (wantsFutures || !strictExactStock)) {
         const futures = await fetchFutures({
             root: matchingFutureRoot.root,
         }).catch((): ContractInfo[] => []);
@@ -252,12 +297,17 @@ export async function searchProducts(
             name: `${index.label}類指數`,
             category: index.category,
         })),
-    ].filter(
-        (index) =>
-            index.code.startsWith(
-                normalizeContractCode(normalized, 'IND'),
-            ) || index.name.includes(lookup),
-    );
+    ].filter((index) => {
+        const normName = normalizeSearchText(index.name);
+        if (index.code.startsWith(normalizeContractCode(normalized, 'IND'))) {
+            return true;
+        }
+        if (normName.includes(normalizedLookup)) return true;
+        const gap = !/^\d+$/.test(normalizedLookup)
+            ? fuzzySubsequenceGap(normName, normalizedLookup)
+            : null;
+        return gap !== null && gap <= 4;
+    });
     results.push(
         ...indexMatches.map((index) => ({
             code: index.code,

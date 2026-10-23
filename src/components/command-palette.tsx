@@ -99,12 +99,17 @@ export function CommandPalette({
             addPanelAt(activeIndex - suggestions.length);
             return;
         }
-        const item = picked ?? suggestions[activeIndex];
-        const code = item?.code ?? value.trim().toUpperCase();
-        if (!code || busy) return;
+        const raw = value.trim();
+        if (!raw || busy) return;
         setBusy(true);
         setError(false);
         try {
+            let item = picked ?? suggestions[activeIndex];
+            if (!item && panelMatches.length === 0) {
+                const fresh = await searchProducts(raw, 4).catch(() => []);
+                item = fresh[0];
+            }
+            const code = item?.code ?? raw.toUpperCase();
             if (item?.contract) primeContract(item.contract);
             await onJump(code);
             onClose();
@@ -128,6 +133,9 @@ export function CommandPalette({
                         setError(false);
                     }}
                     onKeyDown={(e) => {
+                        if (e.nativeEvent?.isComposing || e.keyCode === 229) {
+                            return;
+                        }
                         if (e.key === 'ArrowDown' && rowCount > 0) {
                             e.preventDefault();
                             setActiveIndex((index) => (index + 1) % rowCount);

@@ -8,6 +8,7 @@ import { useSyncExternalStore } from 'react';
 const KEY = 'sj-pro-header-items';
 
 export type HeaderItemKey =
+    | 'symbolSearch'
     | 'marketIndex'
     | 'marketBasis'
     | 'bankBalance'
@@ -17,6 +18,7 @@ export type HeaderItemKey =
     | 'clock';
 
 export const HEADER_ITEMS: { key: HeaderItemKey; label: string }[] = [
+    { key: 'symbolSearch', label: '快速商品搜尋' },
     { key: 'marketIndex', label: '加權指數' },
     { key: 'marketBasis', label: '期現基差' },
     { key: 'bankBalance', label: '銀行水位' },
@@ -29,6 +31,7 @@ export const HEADER_ITEMS: { key: HeaderItemKey; label: string }[] = [
 export type HeaderItemsState = Record<HeaderItemKey, boolean>;
 
 const DEFAULTS: HeaderItemsState = {
+    symbolSearch: true,
     marketIndex: true,
     marketBasis: true,
     bankBalance: true,
