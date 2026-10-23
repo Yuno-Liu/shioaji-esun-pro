@@ -103,6 +103,7 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         ok: boolean;
         environment: 'SIMULATION' | 'PRODUCTION';
         entry: string;
+        account?: { broker_id: string; account_id: string } | null;
         message?: string;
         activeConfigFile?: string | null;
         availableEnvironments?: any[];
@@ -113,6 +114,7 @@ export class HttpEsunDriver implements IEsunTradeDriver {
             ok: boolean;
             environment: 'SIMULATION' | 'PRODUCTION';
             entry: string;
+            account?: { broker_id: string; account_id: string } | null;
             message?: string;
             activeConfigFile?: string | null;
             availableEnvironments?: any[];
@@ -283,6 +285,7 @@ export class UnavailableEsunDriver implements IEsunTradeDriver {
         ok: boolean;
         environment: 'SIMULATION' | 'PRODUCTION';
         entry: string;
+        account?: { broker_id: string; account_id: string } | null;
     }> {
         return {
             ok: true,

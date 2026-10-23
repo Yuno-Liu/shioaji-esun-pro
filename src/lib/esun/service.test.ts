@@ -662,5 +662,68 @@ Account = 88401234567`;
             expect(service.getEnvironment()).toBe('PRODUCTION');
             expect(service.isSimulation()).toBe(false);
         });
+
+        it('connectBridge allows retry when initial probe fails', async () => {
+            let attempt = 0;
+            const failingDriver: any = {
+                health: vi.fn(async () => {
+                    attempt++;
+                    if (attempt === 1) throw new Error('bridge not ready');
+                    return {
+                        ok: true,
+                        configured: true,
+                        environment: 'SIMULATION',
+                        entry: ESUN_SIMULATION_ENTRY,
+                        account: { broker_id: '8840', account_id: '1234567' },
+                        problems: [],
+                        loggedIn: true,
+                        loginLocked: false,
+                        loginError: null,
+                    };
+                }),
+                accounts: vi.fn(async () => []),
+            };
+
+            const firstResult = await service.connectBridge(failingDriver);
+            expect(firstResult).toBeNull();
+
+            // Subsequent call should retry since bridgeProbe was reset to null
+            const secondResult = await service.connectBridge(failingDriver);
+            expect(secondResult).not.toBeNull();
+            expect(secondResult?.configured).toBe(true);
+            expect(failingDriver.health).toHaveBeenCalledTimes(2);
+
+            // Account from health.account should have been registered
+            const accs = service.getAccounts();
+            expect(accs.some((a) => a.account_id === '1234567')).toBe(true);
+        });
+
+        it('switchEnvironment updates registered account if bridge response includes account', async () => {
+            const driver: any = {
+                health: vi.fn(async () => ({
+                    ok: true,
+                    configured: true,
+                    environment: 'SIMULATION',
+                    entry: ESUN_SIMULATION_ENTRY,
+                    problems: [],
+                    loggedIn: true,
+                    loginLocked: false,
+                    loginError: null,
+                })),
+                accounts: vi.fn(async () => []),
+                switchEnvironment: vi.fn(async (target: string) => ({
+                    ok: true,
+                    environment: target,
+                    entry: ESUN_PRODUCTION_ENTRY,
+                    activeConfigFile: 'esun-config.production.ini',
+                    account: { broker_id: '8840', account_id: '7654321' },
+                })),
+            };
+
+            service.setDriver(driver);
+            const res = await service.switchEnvironment('PRODUCTION');
+            expect(res.ok).toBe(true);
+            expect(service.getAccounts().some((a) => a.account_id === '7654321')).toBe(true);
+        });
     });
 });

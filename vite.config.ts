@@ -1,6 +1,7 @@
 // vite.config.ts
 
 import fs from 'node:fs';
+import net from 'node:net';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { buildVersionLabel } from './src/lib/build-version';
@@ -30,6 +31,15 @@ function esunConfigDiscoveryPlugin() {
     const SIM_ENTRY = 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1';
     const PROD_ENTRY = 'https://esuntradingapi.esunsec.com.tw/api/v1';
 
+    function isPlaceholder(filepath: string): boolean {
+        try {
+            const content = fs.readFileSync(filepath, 'utf8');
+            return /YOUR_API_KEY/i.test(content) && /1234567/i.test(content);
+        } catch {
+            return false;
+        }
+    }
+
     function scanDir(dir: string) {
         let simPath: string | null = null;
         let prodPath: string | null = null;
@@ -49,15 +59,18 @@ function esunConfigDiscoveryPlugin() {
             }
         }
 
-        const fallback = path.resolve(dir, 'esun-config.ini');
-        if (fs.existsSync(fallback)) {
-            try {
-                const content = fs.readFileSync(fallback, 'utf8');
-                const isSim = /environment\s*[:=]\s*simulation/i.test(content) || /entry\s*[:=].*simulation/i.test(content);
-                if (isSim && !simPath) simPath = fallback;
-                else if (!isSim && !prodPath) prodPath = fallback;
-            } catch {
-                // ignore
+        // Only fall back to single generic config when NEITHER dedicated simPath NOR prodPath was found!
+        if (!simPath && !prodPath) {
+            const fallback = path.resolve(dir, 'esun-config.ini');
+            if (fs.existsSync(fallback) && !isPlaceholder(fallback)) {
+                try {
+                    const content = fs.readFileSync(fallback, 'utf8');
+                    const isSim = /environment\s*[:=]\s*simulation/i.test(content) || /entry\s*[:=].*simulation/i.test(content);
+                    if (isSim) simPath = fallback;
+                    else prodPath = fallback;
+                } catch {
+                    // ignore
+                }
             }
         }
 
@@ -112,18 +125,95 @@ function esunConfigDiscoveryPlugin() {
         };
     }
 
+    function checkBridgeRunning(port = 8090): Promise<boolean> {
+        return new Promise((resolve) => {
+            const socket = net.createConnection({ host: '127.0.0.1', port }, () => {
+                socket.destroy();
+                resolve(true);
+            });
+            socket.setTimeout(150);
+            socket.on('timeout', () => {
+                socket.destroy();
+                resolve(false);
+            });
+            socket.on('error', () => {
+                resolve(false);
+            });
+        });
+    }
+
     return {
         name: 'esun-config-discovery',
         configureServer(server: any) {
-            server.middlewares.use((req: any, res: any, next: any) => {
+            server.middlewares.use(async (req: any, res: any, next: any) => {
                 const pathname = req.url ? req.url.split('?')[0] : '';
+                const bridgePort = Number(process.env.BRIDGE_PORT || 8090);
+
                 if (req.method === 'GET' && pathname === '/esun/config-profiles') {
+                    const running = await checkBridgeRunning(bridgePort);
+                    if (running) {
+                        return next();
+                    }
                     const data = getDiscovery();
                     res.statusCode = 200;
                     res.setHeader('Content-Type', 'application/json; charset=utf-8');
                     res.end(JSON.stringify(data));
                     return;
                 }
+
+                if (req.method === 'POST' && (pathname === '/esun/auth/environment' || pathname === '/esun/environment')) {
+                    const running = await checkBridgeRunning(bridgePort);
+                    if (running) {
+                        return next();
+                    }
+
+                    let bodyStr = '';
+                    req.on('data', (chunk: any) => {
+                        bodyStr += chunk;
+                    });
+                    req.on('end', () => {
+                        try {
+                            const body = bodyStr ? JSON.parse(bodyStr) : {};
+                            let target = body.environment;
+                            if (target === undefined && 'simulation' in body) {
+                                target = body.simulation ? 'SIMULATION' : 'PRODUCTION';
+                            }
+                            target = String(target || '').toUpperCase();
+                            const discovery = getDiscovery();
+                            const profile = (discovery.configProfiles as any)[target];
+                            if (!profile || !profile.available) {
+                                const expected = profile?.expectedFileName || `esun-config.${target.toLowerCase()}.ini`;
+                                res.statusCode = 400;
+                                res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                                res.end(JSON.stringify({
+                                    ok: false,
+                                    error: `未提供 ${expected} 設定檔，無法切換至 ${target}`,
+                                    environment: discovery.activeEnvironment,
+                                    availableEnvironments: discovery.availableEnvironments,
+                                }));
+                                return;
+                            }
+
+                            res.statusCode = 200;
+                            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                            res.end(JSON.stringify({
+                                ok: true,
+                                environment: target,
+                                simulation: target === 'SIMULATION',
+                                entry: profile.entry,
+                                activeConfigFile: profile.fileName,
+                                availableEnvironments: discovery.availableEnvironments,
+                                configProfiles: discovery.configProfiles,
+                            }));
+                        } catch {
+                            res.statusCode = 400;
+                            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+                            res.end(JSON.stringify({ ok: false, error: 'JSON 格式錯誤' }));
+                        }
+                    });
+                    return;
+                }
+
                 next();
             });
         },

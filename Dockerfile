@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Copy wheel packages, bridge server, config template, and install helper
 COPY esun_trade*.whl ./
 COPY server/esun_trade_server.py ./server/esun_trade_server.py
-COPY esun-config.ini.example ./esun-config.ini.example
+COPY esun-config*.ini.example ./
 COPY deploy/install_sdk.py ./deploy/install_sdk.py
 
 # Install E.Sun Python SDK:
@@ -58,7 +58,7 @@ RUN python deploy/install_sdk.py \
 
 ENV ESUN_SERVER_HOST=0.0.0.0
 ENV ESUN_SERVER_PORT=8090
-ENV ESUN_CONFIG_PATH=/app/esun-config.ini
+ENV ESUN_CONFIG_DIR=/app
 
 EXPOSE 8090
 
