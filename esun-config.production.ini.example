@@ -1,0 +1,31 @@
+# esun-config.production.ini.example — 玉山證券 (E.Sun Securities) 正式環境設定檔範本
+#
+# 使用方式：
+# 1. 將此檔案複製為 `esun-config.production.ini`（或支援的別名 `esun-config.prod.ini`）。
+# 2. 填寫玉山證券正式環境核發之 API 金鑰與帳號。
+# 3. 正式環境規範：
+#      Entry = https://esuntradingapi.esunsec.com.tw/api/v1
+#      不可含有 Environment 欄位
+# 4. 密碼請透過環境變數傳入：
+#      ESUN_ACCOUNT_PASSWORD=您的玉山證券登入密碼 (或 ESUN_PASSWORD)
+#      ESUN_CERT_PASSWORD=您的憑證密碼 (.p12)
+
+[Core]
+Entry = https://esuntradingapi.esunsec.com.tw/api/v1
+
+[Cert]
+# 憑證路徑 (.p12 檔案)
+Path = certs/esun_cert.p12
+
+[Api]
+# 玉山證券正式環境 API 金鑰 (Key) 與密鑰 (Secret)
+Key = YOUR_PRODUCTION_API_KEY_HERE
+Secret = YOUR_PRODUCTION_API_SECRET_HERE
+
+[User]
+# 證券帳號 (支援 11 碼或 7 碼)
+Account = 88401234567
+
+[Server]
+Host = 127.0.0.1
+Port = 8090

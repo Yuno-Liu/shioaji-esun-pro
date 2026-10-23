@@ -21,6 +21,11 @@ src-tauri/binaries
 .env.local
 .env.*.local
 esun-config.ini
+esun-config.simulation.ini
+esun-config.sim.ini
+esun-config.test.ini
+esun-config.production.ini
+esun-config.prod.ini
 certs/*.p12
 *.p12
 

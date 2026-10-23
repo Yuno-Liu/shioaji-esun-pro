@@ -115,6 +115,120 @@ apply_headless_keyring_patches()
 ESUN_SIMULATION_ENTRY = "https://esuntradingapi-simulation.esunsec.com.tw/api/v1"
 ESUN_PRODUCTION_ENTRY = "https://esuntradingapi.esunsec.com.tw/api/v1"
 
+ESUN_SIMULATION_CONFIG_CANDIDATES = (
+    "esun-config.simulation.ini",
+    "esun-config.sim.ini",
+    "esun-config.test.ini",
+)
+ESUN_PRODUCTION_CONFIG_CANDIDATES = (
+    "esun-config.production.ini",
+    "esun-config.prod.ini",
+)
+
+
+def discover_esun_config_profiles(
+    base_dir: str | None = None,
+    default_config_path: str | None = None,
+) -> dict[str, any]:
+    """
+    Scans directory for simulation and production config profiles.
+    Supports dual config files (esun-config.simulation.ini + esun-config.production.ini),
+    aliases (.sim.ini, .test.ini, .prod.ini), environment variables
+    (ESUN_SIMULATION_CONFIG_PATH, ESUN_PRODUCTION_CONFIG_PATH),
+    and single esun-config.ini fallback detection.
+    """
+    if base_dir:
+        root_dir = base_dir if os.path.isdir(base_dir) else os.path.dirname(os.path.abspath(base_dir))
+    else:
+        root_dir = os.getcwd()
+    root_dir = os.path.abspath(root_dir)
+
+    sim_path: str | None = None
+    prod_path: str | None = None
+
+    # 1. Check SIMULATION environment variable & candidates
+    env_sim = os.environ.get("ESUN_SIMULATION_CONFIG_PATH")
+    if env_sim and os.path.isfile(env_sim):
+        sim_path = os.path.abspath(env_sim)
+    else:
+        for candidate in ESUN_SIMULATION_CONFIG_CANDIDATES:
+            candidate_path = os.path.join(root_dir, candidate)
+            if os.path.isfile(candidate_path):
+                sim_path = os.path.abspath(candidate_path)
+                break
+
+    # 2. Check PRODUCTION environment variable & candidates
+    env_prod = os.environ.get("ESUN_PRODUCTION_CONFIG_PATH")
+    if env_prod and os.path.isfile(env_prod):
+        prod_path = os.path.abspath(env_prod)
+    else:
+        for candidate in ESUN_PRODUCTION_CONFIG_CANDIDATES:
+            candidate_path = os.path.join(root_dir, candidate)
+            if os.path.isfile(candidate_path):
+                prod_path = os.path.abspath(candidate_path)
+                break
+
+    # 3. Fallback check for single config file (esun-config.ini or explicit default_config_path)
+    fallback_candidates: list[str] = []
+    if default_config_path:
+        p = default_config_path if os.path.isabs(default_config_path) else os.path.join(root_dir, default_config_path)
+        fallback_candidates.append(p)
+    if os.environ.get("ESUN_CONFIG_PATH"):
+        fallback_candidates.append(os.environ.get("ESUN_CONFIG_PATH"))
+    fallback_candidates.append(os.path.join(root_dir, "esun-config.ini"))
+    fallback_candidates.append(os.path.join(root_dir, "config.ini"))
+
+    found_fallback: str | None = None
+    for fc in fallback_candidates:
+        if fc and os.path.isfile(fc):
+            found_fallback = os.path.abspath(fc)
+            break
+
+    if found_fallback:
+        # If not already claimed as sim_path or prod_path
+        if found_fallback != sim_path and found_fallback != prod_path:
+            try:
+                cp = configparser.ConfigParser()
+                cp.read(found_fallback, encoding="utf-8")
+                detected = detect_esun_environment(cp)
+                if detected == "SIMULATION" and sim_path is None:
+                    sim_path = found_fallback
+                elif detected == "PRODUCTION" and prod_path is None:
+                    prod_path = found_fallback
+            except Exception as e:
+                logger.warning(f"Failed to parse fallback config file {found_fallback}: {e}")
+
+    sim_file = os.path.basename(sim_path) if sim_path else None
+    prod_file = os.path.basename(prod_path) if prod_path else None
+
+    available_envs: list[str] = []
+    if sim_path is not None:
+        available_envs.append("SIMULATION")
+    if prod_path is not None:
+        available_envs.append("PRODUCTION")
+
+    return {
+        "availableEnvironments": available_envs,
+        "profiles": {
+            "SIMULATION": {
+                "available": sim_path is not None,
+                "fileName": sim_file,
+                "filePath": sim_path,
+                "expectedFileName": "esun-config.simulation.ini",
+                "aliases": list(ESUN_SIMULATION_CONFIG_CANDIDATES),
+                "entry": ESUN_SIMULATION_ENTRY,
+            },
+            "PRODUCTION": {
+                "available": prod_path is not None,
+                "fileName": prod_file,
+                "filePath": prod_path,
+                "expectedFileName": "esun-config.production.ini",
+                "aliases": list(ESUN_PRODUCTION_CONFIG_CANDIDATES),
+                "entry": ESUN_PRODUCTION_ENTRY,
+            },
+        },
+    }
+
 
 def detect_esun_environment(config: configparser.ConfigParser | None) -> str:
     """
@@ -149,19 +263,27 @@ def split_account(aid: str | None) -> dict[str, str]:
 
 def load_config(config_path_override: str | None = None) -> tuple[configparser.ConfigParser | None, list[str], str]:
     """
-    Loads config.ini / esun-config.ini from path or environment.
+    Loads config.ini / esun-config.ini or profile-specific config from path or environment.
     Returns (config_parser, problems, environment).
     """
-    config_path = (
-        config_path_override
-        or os.environ.get("ESUN_CONFIG_PATH")
-        or "esun-config.ini"
-    )
-    problems: list[str] = []
+    if config_path_override:
+        config_path = config_path_override
+    elif os.environ.get("ESUN_CONFIG_PATH"):
+        config_path = os.environ.get("ESUN_CONFIG_PATH")
+    elif os.path.exists("esun-config.ini"):
+        config_path = "esun-config.ini"
+    else:
+        discovery = discover_esun_config_profiles()
+        if discovery["profiles"]["SIMULATION"]["available"]:
+            config_path = discovery["profiles"]["SIMULATION"]["filePath"]
+        elif discovery["profiles"]["PRODUCTION"]["available"]:
+            config_path = discovery["profiles"]["PRODUCTION"]["filePath"]
+        elif os.path.exists("config.ini"):
+            config_path = "config.ini"
+        else:
+            config_path = "esun-config.ini"
 
-    # If default file not found, try fallback config.ini
-    if not os.path.exists(config_path) and config_path == "esun-config.ini" and os.path.exists("config.ini"):
-        config_path = "config.ini"
+    problems: list[str] = []
 
     if not os.path.exists(config_path) or not os.path.isfile(config_path):
         return None, [f"找不到玉山設定檔：{config_path}"], "UNKNOWN"
@@ -762,7 +884,28 @@ class EsunTradeBridge:
         sdk_factory: any = None,
         auto_login: bool = True,
     ):
-        self.config_path = config_path or os.environ.get("ESUN_CONFIG_PATH", "esun-config.ini")
+        if config_path is not None:
+            self.config_path = config_path
+        elif os.environ.get("ESUN_CONFIG_PATH"):
+            self.config_path = os.environ.get("ESUN_CONFIG_PATH")
+        elif os.path.exists("esun-config.ini"):
+            self.config_path = "esun-config.ini"
+        else:
+            discovery = discover_esun_config_profiles()
+            if discovery["profiles"]["SIMULATION"]["available"]:
+                self.config_path = discovery["profiles"]["SIMULATION"]["filePath"]
+            elif discovery["profiles"]["PRODUCTION"]["available"]:
+                self.config_path = discovery["profiles"]["PRODUCTION"]["filePath"]
+            elif os.path.exists("config.ini"):
+                self.config_path = "config.ini"
+            else:
+                self.config_path = "esun-config.ini"
+
+        self.base_dir = (
+            os.path.dirname(os.path.abspath(self.config_path))
+            if self.config_path and os.path.exists(self.config_path)
+            else os.getcwd()
+        )
         self.sdk_factory = sdk_factory or (lambda cfg: SDK(cfg))
         self.sdk: any = None
 
@@ -1059,6 +1202,8 @@ class EsunTradeBridge:
             except Exception:
                 pass
 
+        discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
+
         return {
             "ok": True,
             "configured": len(problems) == 0,
@@ -1073,6 +1218,18 @@ class EsunTradeBridge:
             "certInfo": cert_info,
             "machineTime": machine_time,
             "marketStatus": market_status,
+            "availableEnvironments": discovery["availableEnvironments"],
+            "configProfiles": {
+                k: {
+                    "available": v["available"],
+                    "fileName": v["fileName"],
+                    "expectedFileName": v["expectedFileName"],
+                    "aliases": v["aliases"],
+                    "entry": v["entry"],
+                }
+                for k, v in discovery["profiles"].items()
+            },
+            "activeConfigFile": os.path.basename(self.config_path) if self.config_path and os.path.exists(self.config_path) else None,
             "rateLimits": {
                 "ordersToday": self.order_mutation_daily.get_count(),
                 "ordersDailyMax": 2000,
@@ -1083,11 +1240,46 @@ class EsunTradeBridge:
 
     def switch_environment(self, target_env: str) -> dict[str, any]:
         """
-        Switches between SIMULATION and PRODUCTION, updating esun-config.ini [Core] section.
+        Switches between SIMULATION and PRODUCTION.
+        Validates target environment profile availability.
+        Switches activeConfigFile to corresponding profile file if available.
         """
         target_env_normalized = str(target_env or "").strip().upper()
         if target_env_normalized not in ("SIMULATION", "PRODUCTION"):
             raise ValueError(f"不支援的環境設定：{target_env}，僅支援 SIMULATION 或 PRODUCTION")
+
+        discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
+        profile_info = discovery["profiles"].get(target_env_normalized, {})
+
+        if not profile_info.get("available", False):
+            expected = profile_info.get("expectedFileName", f"esun-config.{target_env_normalized.lower()}.ini")
+            cfg, current_problems, _ = load_config(self.config_path)
+            return {
+                "ok": False,
+                "error": f"未提供 {expected} 設定檔，無法切換至 {target_env_normalized}",
+                "environment": self.environment,
+                "simulation": self.environment == "SIMULATION",
+                "entry": self.entry,
+                "activeConfigFile": os.path.basename(self.config_path) if self.config_path and os.path.exists(self.config_path) else None,
+                "availableEnvironments": discovery["availableEnvironments"],
+                "configProfiles": {
+                    k: {
+                        "available": v["available"],
+                        "fileName": v["fileName"],
+                        "expectedFileName": v["expectedFileName"],
+                        "aliases": v["aliases"],
+                        "entry": v["entry"],
+                    }
+                    for k, v in discovery["profiles"].items()
+                },
+                "loggedIn": self.logged_in,
+                "problems": current_problems,
+            }
+
+        target_path = profile_info.get("filePath")
+        if target_path and os.path.exists(target_path):
+            self.config_path = target_path
+            self.base_dir = os.path.dirname(os.path.abspath(self.config_path))
 
         env, entry = update_esun_config_environment(self.config_path, target_env_normalized)
         cfg, problems, loaded_env = load_config(self.config_path)
@@ -1117,12 +1309,26 @@ class EsunTradeBridge:
             self.login_locked = True
             self.login_error = "；".join(problems)
 
+        new_discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
+
         return {
             "ok": True,
             "environment": self.environment,
             "simulation": self.environment == "SIMULATION",
             "entry": self.entry,
-            "logged_in": self.logged_in,
+            "activeConfigFile": os.path.basename(self.config_path) if self.config_path and os.path.exists(self.config_path) else None,
+            "availableEnvironments": new_discovery["availableEnvironments"],
+            "configProfiles": {
+                k: {
+                    "available": v["available"],
+                    "fileName": v["fileName"],
+                    "expectedFileName": v["expectedFileName"],
+                    "aliases": v["aliases"],
+                    "entry": v["entry"],
+                }
+                for k, v in new_discovery["profiles"].items()
+            },
+            "loggedIn": self.logged_in,
             "problems": problems,
         }
 
@@ -1603,6 +1809,24 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
         elif path == "/esun/market_status":
             data, code = self.bridge.get_market_status()
             self._send_json(code, data)
+        elif path == "/esun/config-profiles":
+            discovery = discover_esun_config_profiles(self.bridge.base_dir, self.bridge.config_path)
+            self._send_json(200, {
+                "ok": True,
+                "availableEnvironments": discovery["availableEnvironments"],
+                "configProfiles": {
+                    k: {
+                        "available": v["available"],
+                        "fileName": v["fileName"],
+                        "expectedFileName": v["expectedFileName"],
+                        "aliases": v["aliases"],
+                        "entry": v["entry"],
+                    }
+                    for k, v in discovery["profiles"].items()
+                },
+                "activeConfigFile": os.path.basename(self.bridge.config_path) if self.bridge.config_path and os.path.exists(self.bridge.config_path) else None,
+                "activeEnvironment": self.bridge.environment,
+            })
         elif path == "/esun/stream/orders":
             self._handle_sse()
         else:
@@ -1633,7 +1857,8 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     res = self.bridge.switch_environment(str(target))
-                    self._send_json(200, res)
+                    status_code = 200 if res.get("ok") else 400
+                    self._send_json(status_code, res)
                 except ValueError as ve:
                     self._send_json(400, {"error": str(ve)})
             elif path == "/esun/orders/place":

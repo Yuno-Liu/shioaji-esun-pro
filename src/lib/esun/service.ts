@@ -30,6 +30,9 @@ import {
     ESUN_SIMULATION_ENTRY,
     type EsunClientConfig,
     type EsunEnvironment,
+    type EsunConfigProfileInfo,
+    type EsunConfigProfilesMap,
+    createDefaultEsunConfigProfiles,
 } from './types';
 import { HttpEsunDriver, UnavailableEsunDriver } from './http-driver';
 
@@ -66,7 +69,17 @@ export class EsunTradeService {
     private bridgeHealth: EsunBridgeHealth | null = null;
     private environment: EsunEnvironment = 'SIMULATION';
     private entryUrl: string = ESUN_SIMULATION_ENTRY;
+    private configProfiles: EsunConfigProfilesMap = createDefaultEsunConfigProfiles(true, true);
+    private activeConfigFile: string | null = null;
     private listeners = new Set<() => void>();
+    private snapshot!: {
+        environment: EsunEnvironment;
+        isSimulation: boolean;
+        entry: string;
+        activeConfigFile: string | null;
+        configProfiles: EsunConfigProfilesMap;
+        availableEnvironments: EsunEnvironment[];
+    };
 
     constructor(initialDriver?: IEsunTradeDriver) {
         this.driver = initialDriver ?? defaultDriver();
@@ -80,6 +93,7 @@ export class EsunTradeService {
             // ignore
         }
         this.initFromEnv();
+        this.updateSnapshot();
     }
 
     /**
@@ -95,9 +109,14 @@ export class EsunTradeService {
                     this.bridgeHealth = health;
                     this.setDriver(driver);
                     for (const a of accounts) this.registerAccount(a);
+                    if (health.configProfiles) {
+                        this.setConfigProfiles(health.configProfiles, health.activeConfigFile);
+                    }
                     if (health.environment === 'SIMULATION' || health.environment === 'PRODUCTION') {
                         this.environment = health.environment;
                         this.entryUrl = health.entry || (health.environment === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY);
+                        if (health.activeConfigFile) this.activeConfigFile = health.activeConfigFile;
+                        this.updateSnapshot();
                         this.emit();
                     }
                     if (!health.configured || health.loginError) {
@@ -113,6 +132,106 @@ export class EsunTradeService {
             })();
         }
         return this.bridgeProbe;
+    }
+
+    private computeSnapshot() {
+        return {
+            environment: this.environment,
+            isSimulation: this.environment === 'SIMULATION',
+            entry: this.entryUrl,
+            activeConfigFile: this.activeConfigFile,
+            configProfiles: {
+                SIMULATION: { ...this.configProfiles.SIMULATION },
+                PRODUCTION: { ...this.configProfiles.PRODUCTION },
+            },
+            availableEnvironments: this.getAvailableEnvironments(),
+        };
+    }
+
+    private updateSnapshot(): void {
+        this.snapshot = this.computeSnapshot();
+    }
+
+    getSnapshot() {
+        return this.snapshot;
+    }
+
+    getConfigProfiles(): EsunConfigProfilesMap {
+        return {
+            SIMULATION: { ...this.configProfiles.SIMULATION },
+            PRODUCTION: { ...this.configProfiles.PRODUCTION },
+        };
+    }
+
+    getAvailableEnvironments(): EsunEnvironment[] {
+        const envs: EsunEnvironment[] = [];
+        if (this.configProfiles.SIMULATION?.available) envs.push('SIMULATION');
+        if (this.configProfiles.PRODUCTION?.available) envs.push('PRODUCTION');
+        return envs;
+    }
+
+    getActiveConfigFile(): string | null {
+        return this.activeConfigFile;
+    }
+
+    isEnvironmentAvailable(env: EsunEnvironment): boolean {
+        return Boolean(this.configProfiles[env]?.available);
+    }
+
+    setConfigProfiles(profiles: Partial<EsunConfigProfilesMap>, activeConfigFile?: string | null): void {
+        if (profiles.SIMULATION) {
+            this.configProfiles.SIMULATION = { ...this.configProfiles.SIMULATION, ...profiles.SIMULATION };
+        }
+        if (profiles.PRODUCTION) {
+            this.configProfiles.PRODUCTION = { ...this.configProfiles.PRODUCTION, ...profiles.PRODUCTION };
+        }
+        if (activeConfigFile !== undefined) {
+            this.activeConfigFile = activeConfigFile;
+        }
+
+        // If currently selected environment is unavailable, auto-switch to available one
+        if (!this.configProfiles[this.environment]?.available) {
+            const other: EsunEnvironment = this.environment === 'SIMULATION' ? 'PRODUCTION' : 'SIMULATION';
+            if (this.configProfiles[other]?.available) {
+                this.environment = other;
+                this.entryUrl = other === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY;
+                if (!this.activeConfigFile) {
+                    this.activeConfigFile = this.configProfiles[other]?.fileName;
+                }
+            }
+        }
+
+        this.updateSnapshot();
+        this.emit();
+    }
+
+    async refreshConfigProfiles(): Promise<EsunConfigProfilesMap> {
+        try {
+            if (this.driver.health) {
+                try {
+                    const health = await this.driver.health(2000);
+                    if (health?.configProfiles) {
+                        this.setConfigProfiles(health.configProfiles, health.activeConfigFile);
+                        return this.getConfigProfiles();
+                    }
+                } catch {
+                    // ignore health probe error
+                }
+            }
+
+            const res = await fetch(`${bridgeBase()}/esun/config-profiles`, { method: 'GET' });
+            if (res.ok) {
+                const data = await res.json();
+                if (data?.configProfiles) {
+                    this.setConfigProfiles(data.configProfiles, data.activeConfigFile);
+                    return this.getConfigProfiles();
+                }
+            }
+        } catch {
+            // ignore network errors
+        }
+
+        return this.getConfigProfiles();
     }
 
     getEnvironment(): EsunEnvironment {
@@ -143,11 +262,47 @@ export class EsunTradeService {
         environment: EsunEnvironment;
         entry: string;
         bridgeUpdated: boolean;
+        activeConfigFile?: string | null;
+        availableEnvironments?: EsunEnvironment[];
+        configProfiles?: EsunConfigProfilesMap;
+        error?: string;
     }> {
+        if (!this.isEnvironmentAvailable(targetEnv)) {
+            const expected = this.configProfiles[targetEnv]?.expectedFileName || `esun-config.${targetEnv.toLowerCase()}.ini`;
+            return {
+                ok: false,
+                environment: this.environment,
+                entry: this.entryUrl,
+                bridgeUpdated: false,
+                activeConfigFile: this.activeConfigFile,
+                availableEnvironments: this.getAvailableEnvironments(),
+                configProfiles: this.getConfigProfiles(),
+                error: `未提供 ${expected} 設定檔，無法切換至 ${targetEnv}`,
+            };
+        }
+
         let bridgeUpdated = false;
         try {
             if (this.driver.switchEnvironment) {
-                await this.driver.switchEnvironment(targetEnv);
+                const res = await this.driver.switchEnvironment(targetEnv);
+                if (res && res.ok === false) {
+                    return {
+                        ok: false,
+                        environment: this.environment,
+                        entry: this.entryUrl,
+                        bridgeUpdated: false,
+                        activeConfigFile: this.activeConfigFile,
+                        availableEnvironments: this.getAvailableEnvironments(),
+                        configProfiles: this.getConfigProfiles(),
+                        error: res.error || res.message || '切換失敗',
+                    };
+                }
+                if (res?.activeConfigFile) {
+                    this.activeConfigFile = res.activeConfigFile;
+                }
+                if (res?.configProfiles) {
+                    this.configProfiles = { ...this.configProfiles, ...res.configProfiles };
+                }
                 bridgeUpdated = true;
             } else {
                 const res = await fetch(`${bridgeBase()}/esun/auth/environment`, {
@@ -155,7 +310,24 @@ export class EsunTradeService {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ environment: targetEnv }),
                 });
-                if (res.ok) bridgeUpdated = true;
+                if (res.ok) {
+                    const data = await res.json().catch(() => null);
+                    if (data?.activeConfigFile) this.activeConfigFile = data.activeConfigFile;
+                    if (data?.configProfiles) this.configProfiles = { ...this.configProfiles, ...data.configProfiles };
+                    bridgeUpdated = true;
+                } else {
+                    const errData = await res.json().catch(() => null);
+                    return {
+                        ok: false,
+                        environment: this.environment,
+                        entry: this.entryUrl,
+                        bridgeUpdated: false,
+                        activeConfigFile: this.activeConfigFile,
+                        availableEnvironments: this.getAvailableEnvironments(),
+                        configProfiles: this.getConfigProfiles(),
+                        error: errData?.error || `HTTP ${res.status}`,
+                    };
+                }
             }
         } catch {
             // bridge might be offline; continue updating local service state
@@ -163,6 +335,10 @@ export class EsunTradeService {
 
         this.environment = targetEnv;
         this.entryUrl = targetEnv === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY;
+        if (!this.activeConfigFile) {
+            this.activeConfigFile = this.configProfiles[targetEnv]?.fileName;
+        }
+
         try {
             if (typeof localStorage !== 'undefined') {
                 localStorage.setItem('esun_trading_environment', targetEnv);
@@ -170,8 +346,17 @@ export class EsunTradeService {
         } catch {
             // ignore
         }
+        this.updateSnapshot();
         this.emit();
-        return { ok: true, environment: targetEnv, entry: this.entryUrl, bridgeUpdated };
+        return {
+            ok: true,
+            environment: targetEnv,
+            entry: this.entryUrl,
+            bridgeUpdated,
+            activeConfigFile: this.activeConfigFile,
+            availableEnvironments: this.getAvailableEnvironments(),
+            configProfiles: this.getConfigProfiles(),
+        };
     }
 
     registerEsunAccount(accountOrId?: string | Account): Account {
@@ -730,21 +915,35 @@ export function useEsunEnvironment(): {
     environment: EsunEnvironment;
     isSimulation: boolean;
     entry: string;
+    activeConfigFile: string | null;
+    configProfiles: EsunConfigProfilesMap;
+    availableEnvironments: EsunEnvironment[];
+    isEnvironmentAvailable: (env: EsunEnvironment) => boolean;
     switchEnvironment: (env: EsunEnvironment) => Promise<{
         ok: boolean;
         environment: EsunEnvironment;
         entry: string;
         bridgeUpdated: boolean;
+        activeConfigFile?: string | null;
+        availableEnvironments?: EsunEnvironment[];
+        configProfiles?: EsunConfigProfilesMap;
+        error?: string;
     }>;
+    refreshConfigProfiles: () => Promise<EsunConfigProfilesMap>;
 } {
-    const env = useSyncExternalStore(
+    const snap = useSyncExternalStore(
         (l) => esunTradeService.subscribe(l),
-        () => esunTradeService.getEnvironment(),
+        () => esunTradeService.getSnapshot(),
     );
     return {
-        environment: env,
-        isSimulation: env === 'SIMULATION',
-        entry: esunTradeService.getEntryUrl(),
+        environment: snap.environment,
+        isSimulation: snap.isSimulation,
+        entry: snap.entry,
+        activeConfigFile: snap.activeConfigFile,
+        configProfiles: snap.configProfiles,
+        availableEnvironments: snap.availableEnvironments,
+        isEnvironmentAvailable: (env: EsunEnvironment) => esunTradeService.isEnvironmentAvailable(env),
         switchEnvironment: (target: EsunEnvironment) => esunTradeService.switchEnvironment(target),
+        refreshConfigProfiles: () => esunTradeService.refreshConfigProfiles(),
     };
 }

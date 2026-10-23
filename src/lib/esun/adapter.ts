@@ -1,6 +1,8 @@
 // src/lib/esun/adapter.ts — Driver interface for E.SUN Securities trading & portfolio
 
 import type {
+    EsunConfigProfilesMap,
+    EsunEnvironment,
     EsunOrderPayload,
     EsunOrderResult,
     EsunPlaceOrderResponse,
@@ -26,6 +28,9 @@ export interface EsunBridgeHealth {
     account: { broker_id: string; account_id: string } | null;
     loggedIn: boolean;
     loginError: string | null;
+    availableEnvironments?: EsunEnvironment[];
+    configProfiles?: EsunConfigProfilesMap;
+    activeConfigFile?: string | null;
 }
 
 /** 抽象驅動介面：支援不同執行環境（HTTP 橋接、Mock 模擬） */
@@ -94,6 +99,10 @@ export interface IEsunTradeDriver {
         environment: 'SIMULATION' | 'PRODUCTION';
         entry: string;
         message?: string;
+        activeConfigFile?: string | null;
+        availableEnvironments?: EsunEnvironment[];
+        configProfiles?: EsunConfigProfilesMap;
+        error?: string;
     }>;
 
     /** 登入 / 連線（可選） */

@@ -593,5 +593,74 @@ Account = 88401234567`;
             expect(acc.signed).toBe(true);
             expect(service.getAccounts()).toContainEqual(acc);
         });
+
+        it('manages config profile availability and refuses switching to unavailable profiles', async () => {
+            // Initially both available
+            expect(service.isEnvironmentAvailable('SIMULATION')).toBe(true);
+            expect(service.isEnvironmentAvailable('PRODUCTION')).toBe(true);
+            expect(service.getAvailableEnvironments()).toEqual(['SIMULATION', 'PRODUCTION']);
+
+            // Set PRODUCTION to unavailable
+            service.setConfigProfiles({
+                PRODUCTION: {
+                    available: false,
+                    fileName: null,
+                    expectedFileName: 'esun-config.production.ini',
+                    aliases: ['esun-config.production.ini', 'esun-config.prod.ini'],
+                    entry: ESUN_PRODUCTION_ENTRY,
+                },
+            });
+
+            expect(service.isEnvironmentAvailable('SIMULATION')).toBe(true);
+            expect(service.isEnvironmentAvailable('PRODUCTION')).toBe(false);
+            expect(service.getAvailableEnvironments()).toEqual(['SIMULATION']);
+
+            // Attempting to switch to PRODUCTION should be rejected
+            const res = await service.switchEnvironment('PRODUCTION');
+            expect(res.ok).toBe(false);
+            expect(res.error).toContain('未提供 esun-config.production.ini 設定檔');
+            expect(service.getEnvironment()).toBe('SIMULATION');
+
+            // Reset back to available
+            service.setConfigProfiles({
+                PRODUCTION: {
+                    available: true,
+                    fileName: 'esun-config.production.ini',
+                    expectedFileName: 'esun-config.production.ini',
+                    aliases: ['esun-config.production.ini', 'esun-config.prod.ini'],
+                    entry: ESUN_PRODUCTION_ENTRY,
+                },
+            });
+            expect(service.isEnvironmentAvailable('PRODUCTION')).toBe(true);
+            const resOk = await service.switchEnvironment('PRODUCTION');
+            expect(resOk.ok).toBe(true);
+            expect(service.getEnvironment()).toBe('PRODUCTION');
+        });
+
+        it('auto-switches environment if currently active environment becomes unavailable', () => {
+            expect(service.getEnvironment()).toBe('SIMULATION');
+
+            // Set SIMULATION unavailable while PRODUCTION is available
+            service.setConfigProfiles({
+                SIMULATION: {
+                    available: false,
+                    fileName: null,
+                    expectedFileName: 'esun-config.simulation.ini',
+                    aliases: [],
+                    entry: ESUN_SIMULATION_ENTRY,
+                },
+                PRODUCTION: {
+                    available: true,
+                    fileName: 'esun-config.production.ini',
+                    expectedFileName: 'esun-config.production.ini',
+                    aliases: [],
+                    entry: ESUN_PRODUCTION_ENTRY,
+                },
+            });
+
+            // Should have auto-switched to PRODUCTION
+            expect(service.getEnvironment()).toBe('PRODUCTION');
+            expect(service.isSimulation()).toBe(false);
+        });
     });
 });

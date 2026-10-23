@@ -150,6 +150,22 @@ describe('HudHeader Environment Detection & Switcher', () => {
         mockAccounts = [sinopacAccount, esunAccount];
         mockSelectedStock = sinopacAccount;
         mockSelectedFutures = null;
+        esunTradeService.setConfigProfiles({
+            SIMULATION: {
+                available: true,
+                fileName: 'esun-config.simulation.ini',
+                expectedFileName: 'esun-config.simulation.ini',
+                aliases: ['esun-config.simulation.ini', 'esun-config.sim.ini'],
+                entry: 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1',
+            },
+            PRODUCTION: {
+                available: true,
+                fileName: 'esun-config.production.ini',
+                expectedFileName: 'esun-config.production.ini',
+                aliases: ['esun-config.production.ini', 'esun-config.prod.ini'],
+                entry: 'https://esuntradingapi.esunsec.com.tw/api/v1',
+            },
+        }, 'esun-config.simulation.ini');
         await esunTradeService.switchEnvironment('SIMULATION');
     });
 
@@ -280,5 +296,103 @@ describe('HudHeader Environment Detection & Switcher', () => {
 
         badge = view!.root.findByProps({ 'data-testid': 'header-env-badge' });
         expect(extractText(badge)).toContain('玉山');
+    });
+
+    it('disables PRODUCTION option and prevents switching when production config is missing', async () => {
+        mockSelectedStock = esunAccount;
+
+        // Configure SIMULATION available, PRODUCTION missing
+        esunTradeService.setConfigProfiles({
+            SIMULATION: {
+                available: true,
+                fileName: 'esun-config.simulation.ini',
+                expectedFileName: 'esun-config.simulation.ini',
+                aliases: ['esun-config.simulation.ini'],
+                entry: 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1',
+            },
+            PRODUCTION: {
+                available: false,
+                fileName: null,
+                expectedFileName: 'esun-config.production.ini',
+                aliases: ['esun-config.production.ini'],
+                entry: 'https://esuntradingapi.esunsec.com.tw/api/v1',
+            },
+        }, 'esun-config.simulation.ini');
+
+        await act(async () => {
+            view = create(createElement(HudHeader, baseProps));
+        });
+
+        const badge = view!.root.findByProps({ 'data-testid': 'header-env-badge' });
+        await act(async () => {
+            badge.props.onClick();
+        });
+
+        const prodOpt = view!.root.findByProps({ 'data-testid': 'env-option-production' });
+        expect(prodOpt.props.disabled).toBe(true);
+        expect(prodOpt.props['aria-disabled']).toBe(true);
+
+        const prodText = extractText(prodOpt);
+        expect(prodText).toContain('未提供設定檔 (不可選)');
+        expect(prodText).toContain('esun-config.production.ini');
+
+        // Click on disabled PRODUCTION button
+        await act(async () => {
+            await prodOpt.props.onClick();
+        });
+
+        // Environment must remain SIMULATION
+        expect(esunTradeService.getEnvironment()).toBe('SIMULATION');
+        expect(esunTradeService.isSimulation()).toBe(true);
+    });
+
+    it('disables SIMULATION option and prevents switching when simulation config is missing', async () => {
+        mockSelectedStock = esunAccount;
+
+        // Configure SIMULATION missing, PRODUCTION available
+        esunTradeService.setConfigProfiles({
+            SIMULATION: {
+                available: false,
+                fileName: null,
+                expectedFileName: 'esun-config.simulation.ini',
+                aliases: ['esun-config.simulation.ini'],
+                entry: 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1',
+            },
+            PRODUCTION: {
+                available: true,
+                fileName: 'esun-config.production.ini',
+                expectedFileName: 'esun-config.production.ini',
+                aliases: ['esun-config.production.ini'],
+                entry: 'https://esuntradingapi.esunsec.com.tw/api/v1',
+            },
+        }, 'esun-config.production.ini');
+
+        expect(esunTradeService.getEnvironment()).toBe('PRODUCTION');
+
+        await act(async () => {
+            view = create(createElement(HudHeader, baseProps));
+        });
+
+        const badge = view!.root.findByProps({ 'data-testid': 'header-env-badge' });
+        await act(async () => {
+            badge.props.onClick();
+        });
+
+        const simOpt = view!.root.findByProps({ 'data-testid': 'env-option-simulation' });
+        expect(simOpt.props.disabled).toBe(true);
+        expect(simOpt.props['aria-disabled']).toBe(true);
+
+        const simText = extractText(simOpt);
+        expect(simText).toContain('未提供設定檔 (不可選)');
+        expect(simText).toContain('esun-config.simulation.ini');
+
+        // Click on disabled SIMULATION button
+        await act(async () => {
+            await simOpt.props.onClick();
+        });
+
+        // Environment must remain PRODUCTION
+        expect(esunTradeService.getEnvironment()).toBe('PRODUCTION');
+        expect(esunTradeService.isSimulation()).toBe(false);
     });
 });

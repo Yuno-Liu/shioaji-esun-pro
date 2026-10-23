@@ -405,6 +405,54 @@ export const checkIcon = style({
     flexShrink: 0,
 });
 
+export const envOptionDisabled = style([
+    envOptionBase,
+    {
+        borderColor: vars.color.border,
+        background: vars.color.inset,
+        color: vars.color.mutedForeground,
+        opacity: 0.48,
+        cursor: 'not-allowed',
+        ':hover': {
+            borderColor: vars.color.border,
+            background: vars.color.inset,
+        },
+    },
+]);
+
+export const configFileBadge = style({
+    fontFamily: vars.font.mono,
+    fontSize: '0.58rem',
+    fontWeight: 500,
+    color: vars.color.accent,
+    background: vars.color.accentDim,
+    padding: '1px 5px',
+    borderRadius: '2px',
+    border: `1px solid ${vars.color.accent}`,
+    whiteSpace: 'nowrap',
+});
+
+export const missingConfigBadge = style({
+    fontFamily: vars.font.display,
+    fontSize: '0.58rem',
+    fontWeight: 600,
+    color: vars.color.amber,
+    background: 'rgba(224, 164, 60, 0.12)',
+    padding: '1px 5px',
+    borderRadius: '2px',
+    border: '1px solid rgba(224, 164, 60, 0.4)',
+    whiteSpace: 'nowrap',
+});
+
+export const menuFooterHint = style({
+    fontFamily: vars.font.body,
+    fontSize: '0.58rem',
+    color: vars.color.mutedForeground,
+    lineHeight: 1.4,
+    padding: '4px 2px 2px 2px',
+    borderTop: `1px dashed ${vars.color.border}`,
+});
+
 export const settingsWrap = style({
     position: 'relative',
     // block 容器包 inline-flex 按鈕會產生 line box — wrapper 高度吃到

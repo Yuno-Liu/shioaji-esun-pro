@@ -13,6 +13,54 @@ export type EsunEnvironment = 'SIMULATION' | 'PRODUCTION';
 export const ESUN_SIMULATION_ENTRY = 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1';
 export const ESUN_PRODUCTION_ENTRY = 'https://esuntradingapi.esunsec.com.tw/api/v1';
 
+export const ESUN_SIMULATION_CONFIG_FILES = [
+    'esun-config.simulation.ini',
+    'esun-config.sim.ini',
+    'esun-config.test.ini',
+] as const;
+
+export const ESUN_PRODUCTION_CONFIG_FILES = [
+    'esun-config.production.ini',
+    'esun-config.prod.ini',
+] as const;
+
+export const ESUN_DEFAULT_CONFIG_FILE = 'esun-config.ini';
+
+export interface EsunConfigProfileInfo {
+    available: boolean;
+    fileName: string | null;
+    filePath?: string | null;
+    expectedFileName: string;
+    aliases: string[];
+    entry: string;
+}
+
+export interface EsunConfigProfilesMap {
+    SIMULATION: EsunConfigProfileInfo;
+    PRODUCTION: EsunConfigProfileInfo;
+}
+
+export function createDefaultEsunConfigProfiles(simAvailable = true, prodAvailable = true): EsunConfigProfilesMap {
+    return {
+        SIMULATION: {
+            available: simAvailable,
+            fileName: simAvailable ? 'esun-config.simulation.ini' : null,
+            filePath: null,
+            expectedFileName: 'esun-config.simulation.ini',
+            aliases: [...ESUN_SIMULATION_CONFIG_FILES],
+            entry: ESUN_SIMULATION_ENTRY,
+        },
+        PRODUCTION: {
+            available: prodAvailable,
+            fileName: prodAvailable ? 'esun-config.production.ini' : null,
+            filePath: null,
+            expectedFileName: 'esun-config.production.ini',
+            aliases: [...ESUN_PRODUCTION_CONFIG_FILES],
+            entry: ESUN_PRODUCTION_ENTRY,
+        },
+    };
+}
+
 export function parseEsunConfigEnvironment(iniContent: string): {
     environment: EsunEnvironment;
     entry: string;

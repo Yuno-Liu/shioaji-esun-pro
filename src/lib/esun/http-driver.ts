@@ -104,12 +104,20 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         environment: 'SIMULATION' | 'PRODUCTION';
         entry: string;
         message?: string;
+        activeConfigFile?: string | null;
+        availableEnvironments?: any[];
+        configProfiles?: any;
+        error?: string;
     }> {
         return this.request<{
             ok: boolean;
             environment: 'SIMULATION' | 'PRODUCTION';
             entry: string;
             message?: string;
+            activeConfigFile?: string | null;
+            availableEnvironments?: any[];
+            configProfiles?: any;
+            error?: string;
         }>('POST', '/esun/auth/environment', { environment: env });
     }
 
