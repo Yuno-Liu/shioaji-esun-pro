@@ -1,5 +1,6 @@
 // src/lib/esun/service.ts — E.SUN Securities trading and portfolio service manager
 
+import { useSyncExternalStore } from 'react';
 import type { ContractBase } from '../types/contract';
 import type { OrderResult, OrderStatusInfo, StockOrderReq, Trade } from '../types/order';
 import type { Account, AccountBalance, StockPosition } from '../types/portfolio';
@@ -22,7 +23,14 @@ import {
     validateEsunOrderQtyMutation,
     validateEsunStockOrder,
 } from './order-mapping';
-import { ESUN_BROKER_CODE, ESUN_BROKER_NAME, type EsunClientConfig } from './types';
+import {
+    ESUN_BROKER_CODE,
+    ESUN_BROKER_NAME,
+    ESUN_PRODUCTION_ENTRY,
+    ESUN_SIMULATION_ENTRY,
+    type EsunClientConfig,
+    type EsunEnvironment,
+} from './types';
 import { HttpEsunDriver, UnavailableEsunDriver } from './http-driver';
 
 /** esun-bridge 位址：預設同源（由 Vite proxy / Docker 轉發 /esun） */
@@ -56,9 +64,21 @@ export class EsunTradeService {
     private config: Partial<EsunClientConfig> = {};
     private bridgeProbe: Promise<EsunBridgeHealth | null> | null = null;
     private bridgeHealth: EsunBridgeHealth | null = null;
+    private environment: EsunEnvironment = 'SIMULATION';
+    private entryUrl: string = ESUN_SIMULATION_ENTRY;
+    private listeners = new Set<() => void>();
 
     constructor(initialDriver?: IEsunTradeDriver) {
         this.driver = initialDriver ?? defaultDriver();
+        try {
+            const saved = typeof localStorage !== 'undefined' ? localStorage.getItem('esun_trading_environment') : null;
+            if (saved === 'SIMULATION' || saved === 'PRODUCTION') {
+                this.environment = saved;
+                this.entryUrl = saved === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY;
+            }
+        } catch {
+            // ignore
+        }
         this.initFromEnv();
     }
 
@@ -75,6 +95,11 @@ export class EsunTradeService {
                     this.bridgeHealth = health;
                     this.setDriver(driver);
                     for (const a of accounts) this.registerAccount(a);
+                    if (health.environment === 'SIMULATION' || health.environment === 'PRODUCTION') {
+                        this.environment = health.environment;
+                        this.entryUrl = health.entry || (health.environment === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY);
+                        this.emit();
+                    }
                     if (!health.configured || health.loginError) {
                         console.warn(
                             '[esun] esun-bridge 已連線但尚未可下單：',
@@ -88,6 +113,90 @@ export class EsunTradeService {
             })();
         }
         return this.bridgeProbe;
+    }
+
+    getEnvironment(): EsunEnvironment {
+        return this.environment;
+    }
+
+    getEntryUrl(): string {
+        return this.entryUrl;
+    }
+
+    isSimulation(): boolean {
+        return this.environment === 'SIMULATION';
+    }
+
+    subscribe(listener: () => void): () => void {
+        this.listeners.add(listener);
+        return () => {
+            this.listeners.delete(listener);
+        };
+    }
+
+    private emit(): void {
+        this.listeners.forEach((l) => l());
+    }
+
+    async switchEnvironment(targetEnv: EsunEnvironment): Promise<{
+        ok: boolean;
+        environment: EsunEnvironment;
+        entry: string;
+        bridgeUpdated: boolean;
+    }> {
+        let bridgeUpdated = false;
+        try {
+            if (this.driver.switchEnvironment) {
+                await this.driver.switchEnvironment(targetEnv);
+                bridgeUpdated = true;
+            } else {
+                const res = await fetch(`${bridgeBase()}/esun/auth/environment`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ environment: targetEnv }),
+                });
+                if (res.ok) bridgeUpdated = true;
+            }
+        } catch {
+            // bridge might be offline; continue updating local service state
+        }
+
+        this.environment = targetEnv;
+        this.entryUrl = targetEnv === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY;
+        try {
+            if (typeof localStorage !== 'undefined') {
+                localStorage.setItem('esun_trading_environment', targetEnv);
+            }
+        } catch {
+            // ignore
+        }
+        this.emit();
+        return { ok: true, environment: targetEnv, entry: this.entryUrl, bridgeUpdated };
+    }
+
+    registerEsunAccount(accountOrId?: string | Account): Account {
+        let acc: Account;
+        if (!accountOrId || typeof accountOrId === 'string') {
+            const raw = accountOrId || '88400664718';
+            let brokerId = ESUN_BROKER_CODE;
+            let accountId = raw;
+            if (raw.length === 11 && (raw.startsWith('88') || raw.startsWith('96'))) {
+                brokerId = raw.slice(0, 4);
+                accountId = raw.slice(4);
+            }
+            acc = {
+                account_type: 'S',
+                broker_id: brokerId,
+                account_id: accountId,
+                signed: true,
+                username: ESUN_BROKER_NAME,
+                person_id: '',
+            };
+        } else {
+            acc = accountOrId;
+        }
+        this.registerAccount(acc);
+        return acc;
     }
 
     getBridgeHealth(): EsunBridgeHealth | null {
@@ -616,3 +725,26 @@ export class EsunTradeService {
 }
 
 export const esunTradeService = new EsunTradeService();
+
+export function useEsunEnvironment(): {
+    environment: EsunEnvironment;
+    isSimulation: boolean;
+    entry: string;
+    switchEnvironment: (env: EsunEnvironment) => Promise<{
+        ok: boolean;
+        environment: EsunEnvironment;
+        entry: string;
+        bridgeUpdated: boolean;
+    }>;
+} {
+    const env = useSyncExternalStore(
+        (l) => esunTradeService.subscribe(l),
+        () => esunTradeService.getEnvironment(),
+    );
+    return {
+        environment: env,
+        isSimulation: env === 'SIMULATION',
+        entry: esunTradeService.getEntryUrl(),
+        switchEnvironment: (target: EsunEnvironment) => esunTradeService.switchEnvironment(target),
+    };
+}

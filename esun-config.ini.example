@@ -13,14 +13,15 @@
 # - 每秒委託上限 20 筆 (AGR0002)，每日上限 2,000 筆 (AGR0001)。
 
 [Core]
-# API 主機位址 (Entry point)
-# 正式環境：https://esuntradingapi.esunsec.com.tw/api/v1
-# 模擬環境：https://esuntradingapi-simulation.esunsec.com.tw/api/v1
-Entry = https://esuntradingapi.esunsec.com.tw/api/v1
-
-# 運行環境 (Production / Simulation)
-# 注意：若設為 Simulation，Entry 網址必須包含 simulation 字眼
-Environment = Production
+# API 主機位址 (Entry point) 與運行環境判定規範：
+# 1. 模擬環境 (SIMULATION)：
+#    - Entry = https://esuntradingapi-simulation.esunsec.com.tw/api/v1
+#    - Environment = SIMULATION
+# 2. 正式環境 (PRODUCTION)：
+#    - Entry = https://esuntradingapi.esunsec.com.tw/api/v1
+#    - 正式環境不設定 Environment 欄位（不可有 Environment 鍵值）
+Entry = https://esuntradingapi-simulation.esunsec.com.tw/api/v1
+Environment = SIMULATION
 
 [Cert]
 # 憑證路徑 (.p12 檔案)

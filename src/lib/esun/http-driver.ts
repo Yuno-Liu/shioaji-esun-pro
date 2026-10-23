@@ -9,6 +9,7 @@ import type {
     EsunPriceFlag,
     EsunReplaceOrderResponse,
 } from './types';
+import { ESUN_PRODUCTION_ENTRY, ESUN_SIMULATION_ENTRY } from './types';
 import type { Account, AccountBalance, StockPosition } from '../types/portfolio';
 import type {
     Settlement,
@@ -96,6 +97,20 @@ export class HttpEsunDriver implements IEsunTradeDriver {
 
     accounts(timeoutMs?: number): Promise<Account[]> {
         return this.request<Account[]>('GET', '/esun/accounts', undefined, timeoutMs);
+    }
+
+    switchEnvironment(env: 'SIMULATION' | 'PRODUCTION'): Promise<{
+        ok: boolean;
+        environment: 'SIMULATION' | 'PRODUCTION';
+        entry: string;
+        message?: string;
+    }> {
+        return this.request<{
+            ok: boolean;
+            environment: 'SIMULATION' | 'PRODUCTION';
+            entry: string;
+            message?: string;
+        }>('POST', '/esun/auth/environment', { environment: env });
     }
 
     placeOrder(payload: EsunOrderPayload): Promise<EsunPlaceOrderResponse> {
@@ -256,4 +271,15 @@ export class UnavailableEsunDriver implements IEsunTradeDriver {
         return { stocks: [], account: { broker_id: '8840', account_id: '', account_type: 'S', signed: false, username: '', person_id: '' } };
     }
     async getCaExpire(): Promise<{ ca_expiretime: string }> { return { ca_expiretime: '' }; }
+    async switchEnvironment(env: 'SIMULATION' | 'PRODUCTION'): Promise<{
+        ok: boolean;
+        environment: 'SIMULATION' | 'PRODUCTION';
+        entry: string;
+    }> {
+        return {
+            ok: true,
+            environment: env,
+            entry: env === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY,
+        };
+    }
 }

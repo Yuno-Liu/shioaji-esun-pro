@@ -16,7 +16,7 @@ import type {
     TradingLimits,
     ReserveStocksSummary,
 } from '../shioaji';
-import { ESUN_BROKER_CODE, ESUN_BROKER_NAME } from './types';
+import { ESUN_BROKER_CODE, ESUN_BROKER_NAME, ESUN_PRODUCTION_ENTRY, ESUN_SIMULATION_ENTRY } from './types';
 
 export class MockEsunDriver implements IEsunTradeDriver {
     readonly name = 'mock';
@@ -24,6 +24,7 @@ export class MockEsunDriver implements IEsunTradeDriver {
     private seq = 1;
     private orders = new Map<string, EsunOrderPayload & { ordNo: string; celQty: number; orgQty: number }>();
     public simulateFailure: string | null = null;
+    private environment: 'SIMULATION' | 'PRODUCTION' = 'SIMULATION';
 
     private customPositions: StockPosition[] | null = null;
     private customBalance: AccountBalance | null = null;
@@ -56,10 +57,25 @@ export class MockEsunDriver implements IEsunTradeDriver {
             ok: true,
             configured: true,
             problems: [],
-            environment: 'SIMULATION',
+            environment: this.environment,
+            simulation: this.environment === 'SIMULATION',
+            entry: this.environment === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY,
             account: { broker_id: ESUN_BROKER_CODE, account_id: '0664718' },
             loggedIn: true,
             loginError: null,
+        };
+    }
+
+    async switchEnvironment(env: 'SIMULATION' | 'PRODUCTION'): Promise<{
+        ok: boolean;
+        environment: 'SIMULATION' | 'PRODUCTION';
+        entry: string;
+    }> {
+        this.environment = env;
+        return {
+            ok: true,
+            environment: env,
+            entry: env === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY,
         };
     }
 

@@ -9,6 +9,127 @@ export const ESUN_BROKER_CODE = '8840';
 export const ESUN_BROKER_CODE_LEGACY = '9600';
 export const ESUN_BROKER_NAME = '玉山證券';
 
+export type EsunEnvironment = 'SIMULATION' | 'PRODUCTION';
+export const ESUN_SIMULATION_ENTRY = 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1';
+export const ESUN_PRODUCTION_ENTRY = 'https://esuntradingapi.esunsec.com.tw/api/v1';
+
+export function parseEsunConfigEnvironment(iniContent: string): {
+    environment: EsunEnvironment;
+    entry: string;
+    hasEnvironmentKey: boolean;
+} {
+    const lines = iniContent.split(/\r?\n/);
+    let inCore = false;
+    let entry = '';
+    let envVal = '';
+    let hasEnvironmentKey = false;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+            const sec = trimmed.slice(1, -1).trim().toLowerCase();
+            inCore = sec === 'core';
+            continue;
+        }
+        if (!inCore) continue;
+
+        if (/^entry\s*[:=]/i.test(trimmed)) {
+            const val = trimmed.replace(/^entry\s*[:=]\s*/i, '').trim();
+            entry = val.replace(/\/+$/, '');
+        } else if (/^environment\s*[:=]/i.test(trimmed)) {
+            hasEnvironmentKey = true;
+            envVal = trimmed.replace(/^environment\s*[:=]\s*/i, '').trim().toUpperCase();
+        }
+    }
+
+    if (envVal === 'SIMULATION' && entry === ESUN_SIMULATION_ENTRY) {
+        return { environment: 'SIMULATION', entry, hasEnvironmentKey };
+    }
+    if ((!hasEnvironmentKey || envVal === '') && entry === ESUN_PRODUCTION_ENTRY) {
+        return { environment: 'PRODUCTION', entry, hasEnvironmentKey };
+    }
+    if (envVal === 'SIMULATION' || entry.toLowerCase().includes('simulation')) {
+        return { environment: 'SIMULATION', entry: entry || ESUN_SIMULATION_ENTRY, hasEnvironmentKey };
+    }
+    return { environment: 'PRODUCTION', entry: entry || ESUN_PRODUCTION_ENTRY, hasEnvironmentKey };
+}
+
+export function formatEsunConfigCoreSection(iniContent: string, targetEnv: EsunEnvironment): string {
+    const targetEntry = targetEnv === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY;
+    const lines = iniContent.split(/\r?\n/);
+    const result: string[] = [];
+    let inCore = false;
+    let coreSeen = false;
+    let entryUpdated = false;
+    let envUpdated = false;
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+            const sec = trimmed.slice(1, -1).trim().toLowerCase();
+            if (inCore) {
+                if (!entryUpdated) {
+                    result.push(`Entry = ${targetEntry}`);
+                    entryUpdated = true;
+                }
+                if (targetEnv === 'SIMULATION' && !envUpdated) {
+                    result.push('Environment = SIMULATION');
+                    envUpdated = true;
+                }
+                inCore = false;
+            }
+            if (sec === 'core') {
+                inCore = true;
+                coreSeen = true;
+            }
+            result.push(line);
+            continue;
+        }
+
+        if (inCore) {
+            if (/^entry\s*[:=]/i.test(trimmed)) {
+                result.push(`Entry = ${targetEntry}`);
+                entryUpdated = true;
+                continue;
+            }
+            if (/^environment\s*[:=]/i.test(trimmed)) {
+                if (targetEnv === 'SIMULATION') {
+                    result.push('Environment = SIMULATION');
+                    envUpdated = true;
+                } else {
+                    // Remove in PRODUCTION
+                    envUpdated = true;
+                }
+                continue;
+            }
+        }
+
+        result.push(line);
+    }
+
+    if (inCore) {
+        if (!entryUpdated) {
+            result.push(`Entry = ${targetEntry}`);
+            entryUpdated = true;
+        }
+        if (targetEnv === 'SIMULATION' && !envUpdated) {
+            result.push('Environment = SIMULATION');
+            envUpdated = true;
+        }
+    }
+
+    if (!coreSeen) {
+        const coreBlock = ['[Core]', `Entry = ${targetEntry}`];
+        if (targetEnv === 'SIMULATION') {
+            coreBlock.push('Environment = SIMULATION');
+        }
+        coreBlock.push('');
+        result.unshift(...coreBlock);
+    }
+
+    return result.join('\n');
+}
+
 /** E.SUN SDK ApCode (委託類別) */
 export enum EsunApCode {
     Common = '1',       // 整股 (以張為單位)

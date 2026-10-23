@@ -159,6 +159,12 @@ export const simBadge = style({
     display: 'inline-flex',
     alignItems: 'center',
     whiteSpace: 'nowrap',
+    cursor: 'pointer',
+    transition: 'all 0.12s',
+    ':hover': {
+        borderColor: 'rgba(224, 164, 60, 0.8)',
+        background: 'rgba(224, 164, 60, 0.15)',
+    },
 });
 
 export const prodBadge = style({
@@ -177,6 +183,226 @@ export const prodBadge = style({
     display: 'inline-flex',
     alignItems: 'center',
     whiteSpace: 'nowrap',
+    cursor: 'pointer',
+    transition: 'all 0.12s',
+    ':hover': {
+        filter: 'brightness(1.1)',
+    },
+});
+
+export const envMenuWrap = style({
+    position: 'relative',
+    display: 'flex',
+    alignItems: 'center',
+});
+
+export const envBadgeBroker = style({
+    fontFamily: vars.font.display,
+    fontSize: '0.58rem',
+    fontWeight: 700,
+    padding: '1px 4px',
+    borderRadius: '2px',
+    background: 'rgba(255, 255, 255, 0.15)',
+    marginRight: '4px',
+    letterSpacing: 0,
+});
+
+export const envChevron = style({
+    marginLeft: '4px',
+    opacity: 0.7,
+});
+
+export const envPopover = style({
+    position: 'absolute',
+    top: 'calc(100% + 6px)',
+    left: 0,
+    zIndex: 200,
+    width: '18.5rem',
+    background: 'rgba(13, 17, 26, 0.96)',
+    backdropFilter: 'blur(16px)',
+    border: `1px solid ${vars.color.borderBright}`,
+    borderRadius: vars.radius.md,
+    boxShadow: '0 16px 40px rgba(0, 0, 0, 0.55)',
+    padding: vars.space.sm,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: vars.space.sm,
+});
+
+export const envSection = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+});
+
+export const envSectionHeader = style({
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+});
+
+export const envSectionTitle = style({
+    fontFamily: vars.font.display,
+    fontSize: '0.62rem',
+    fontWeight: 700,
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase',
+    color: vars.color.mutedForeground,
+});
+
+export const envActiveTag = style({
+    fontFamily: vars.font.mono,
+    fontSize: '0.6rem',
+    color: vars.color.accent,
+});
+
+export const envAccountList = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '3px',
+    maxHeight: '130px',
+    overflowY: 'auto',
+});
+
+const envAccountItemBase = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    padding: '5px 8px',
+    borderRadius: vars.radius.sm,
+    border: '1px solid transparent',
+    background: vars.color.inset,
+    cursor: 'pointer',
+    textAlign: 'left',
+    transition: 'all 0.12s',
+});
+
+export const envAccountItem = style([
+    envAccountItemBase,
+    {
+        borderColor: vars.color.border,
+        color: vars.color.foreground,
+        ':hover': {
+            borderColor: vars.color.borderBright,
+            background: vars.color.panelRaised,
+        },
+    },
+]);
+
+export const envAccountItemActive = style([
+    envAccountItemBase,
+    {
+        borderColor: vars.color.accent,
+        background: vars.color.accentDim,
+        color: vars.color.accent,
+    },
+]);
+
+export const brokerBadgeSj = style({
+    fontSize: '0.58rem',
+    fontWeight: 700,
+    padding: '1px 4px',
+    borderRadius: '2px',
+    background: 'rgba(56, 189, 248, 0.15)',
+    color: '#38bdf8',
+});
+
+export const brokerBadgeEsun = style({
+    fontSize: '0.58rem',
+    fontWeight: 700,
+    padding: '1px 4px',
+    borderRadius: '2px',
+    background: 'rgba(52, 211, 153, 0.15)',
+    color: '#34d399',
+});
+
+export const envAccountName = style({
+    fontFamily: vars.font.mono,
+    fontSize: '0.68rem',
+    flex: 1,
+});
+
+export const envAccountAddBtn = style({
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '5px 8px',
+    borderRadius: vars.radius.sm,
+    border: `1px dashed ${vars.color.border}`,
+    background: 'transparent',
+    color: vars.color.mutedForeground,
+    fontSize: '0.64rem',
+    cursor: 'pointer',
+    transition: 'all 0.12s',
+    ':hover': {
+        borderColor: vars.color.accent,
+        color: vars.color.accent,
+    },
+});
+
+export const envOptionGroup = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '5px',
+});
+
+const envOptionBase = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '3px',
+    padding: '7px 9px',
+    borderRadius: vars.radius.sm,
+    border: '1px solid',
+    cursor: 'pointer',
+    textAlign: 'left',
+    transition: 'all 0.12s',
+});
+
+export const envOption = style([
+    envOptionBase,
+    {
+        borderColor: vars.color.border,
+        background: vars.color.inset,
+        color: vars.color.foreground,
+        ':hover': {
+            borderColor: vars.color.borderBright,
+            background: vars.color.panelRaised,
+        },
+    },
+]);
+
+export const envOptionActive = style([
+    envOptionBase,
+    {
+        borderColor: vars.color.accent,
+        background: vars.color.accentDim,
+        color: vars.color.foreground,
+    },
+]);
+
+export const envOptionTop = style({
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+});
+
+export const envOptionLabel = style({
+    fontFamily: vars.font.display,
+    fontSize: '0.72rem',
+    fontWeight: 600,
+});
+
+export const envOptionSubtitle = style({
+    fontFamily: vars.font.mono,
+    fontSize: '0.58rem',
+    color: vars.color.mutedForeground,
+    lineHeight: 1.35,
+    wordBreak: 'break-all',
+});
+
+export const checkIcon = style({
+    color: vars.color.accent,
+    flexShrink: 0,
 });
 
 export const settingsWrap = style({

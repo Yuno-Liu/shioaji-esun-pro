@@ -176,6 +176,23 @@ export function refreshAccounts(): Promise<void> {
     return startLoad();
 }
 
+/** 註冊外部帳戶（例如玉山證券帳戶），若尚未存在則加入 accounts 清單並更新選取 */
+export function registerExternalAccounts(external: Account[]): void {
+    if (!external || external.length === 0) return;
+    const merged = [...state.accounts];
+    let changed = false;
+    for (const a of external) {
+        if (!merged.some(ea => ea.broker_id === a.broker_id && ea.account_id === a.account_id)) {
+            merged.push(a);
+            changed = true;
+        }
+    }
+    if (changed) {
+        apply(merged);
+        emit();
+    }
+}
+
 export function selectAccount(account: Account) {
     // Production and unknown modes require signing; simulation does not.
     if (!canTrade(account)) return;

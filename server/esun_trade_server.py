@@ -112,6 +112,33 @@ apply_headless_keyring_patches()
 # 2. Config & Account Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
+ESUN_SIMULATION_ENTRY = "https://esuntradingapi-simulation.esunsec.com.tw/api/v1"
+ESUN_PRODUCTION_ENTRY = "https://esuntradingapi.esunsec.com.tw/api/v1"
+
+
+def detect_esun_environment(config: configparser.ConfigParser | None) -> str:
+    """
+    Detects whether an E.Sun configuration is SIMULATION or PRODUCTION based on [Core]:
+    - Simulation: Entry == ESUN_SIMULATION_ENTRY and Environment == SIMULATION
+    - Production: Entry == ESUN_PRODUCTION_ENTRY and (no Environment key or empty)
+    - Fallback: Environment == SIMULATION or "simulation" in Entry URL -> SIMULATION, else PRODUCTION.
+    """
+    if not config or not config.has_section("Core"):
+        return "UNKNOWN"
+    entry = config.get("Core", "Entry", fallback="").strip().rstrip("/")
+    has_env = config.has_option("Core", "Environment")
+    env_val = config.get("Core", "Environment", fallback="").strip().upper() if has_env else ""
+
+    if env_val == "SIMULATION" and entry == ESUN_SIMULATION_ENTRY:
+        return "SIMULATION"
+    if (not has_env or env_val == "") and entry == ESUN_PRODUCTION_ENTRY:
+        return "PRODUCTION"
+
+    if env_val == "SIMULATION" or "simulation" in entry.lower():
+        return "SIMULATION"
+    return "PRODUCTION"
+
+
 def split_account(aid: str | None) -> dict[str, str]:
     """Split 11-digit or 7-digit account into broker_id and account_id."""
     id_str = str(aid or "").strip()
@@ -180,10 +207,111 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
     if not cert_pw:
         problems.append("未設定 ESUN_CERT_PASSWORD（憑證密碼）")
 
-    entry = parser["Core"].get("Entry", "") if parser.has_section("Core") else ""
-    environment = "SIMULATION" if "simulation" in entry.lower() else "PRODUCTION"
+    environment = detect_esun_environment(parser)
 
     return parser, problems, environment
+
+
+def update_esun_config_environment(config_path: str, target_env: str) -> tuple[str, str]:
+    """
+    Updates the [Core] section of config_path to match target_env ('SIMULATION' or 'PRODUCTION').
+    - When 'SIMULATION':
+      Entry = https://esuntradingapi-simulation.esunsec.com.tw/api/v1
+      Environment = SIMULATION
+    - When 'PRODUCTION':
+      Entry = https://esuntradingapi.esunsec.com.tw/api/v1
+      Removes Environment key from [Core].
+    Preserves other sections and existing comments.
+    Returns (target_env, target_entry).
+    """
+    target_env_normalized = str(target_env or "").strip().upper()
+    if target_env_normalized not in ("SIMULATION", "PRODUCTION"):
+        raise ValueError(f"不支援的環境設定：{target_env}，僅支援 SIMULATION 或 PRODUCTION")
+
+    target_entry = (
+        ESUN_SIMULATION_ENTRY if target_env_normalized == "SIMULATION" else ESUN_PRODUCTION_ENTRY
+    )
+
+    if not os.path.exists(config_path):
+        dirname = os.path.dirname(os.path.abspath(config_path))
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        lines = ["[Core]\n", f"Entry = {target_entry}\n"]
+        if target_env_normalized == "SIMULATION":
+            lines.append("Environment = SIMULATION\n")
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        return target_env_normalized, target_entry
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        existing_lines = f.readlines()
+
+    new_lines: list[str] = []
+    in_core = False
+    core_seen = False
+    entry_updated = False
+    env_updated = False
+
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            sec_name = stripped[1:-1].strip()
+            if in_core:
+                if not entry_updated:
+                    new_lines.append(f"Entry = {target_entry}\n")
+                    entry_updated = True
+                if target_env_normalized == "SIMULATION" and not env_updated:
+                    new_lines.append("Environment = SIMULATION\n")
+                    env_updated = True
+                in_core = False
+            if sec_name.lower() == "core":
+                in_core = True
+                core_seen = True
+            new_lines.append(line)
+            continue
+
+        if in_core:
+            # Check if line sets Entry
+            if stripped.lower().startswith("entry") and ("=" in stripped or ":" in stripped):
+                sep = "=" if "=" in line else ":"
+                prefix = line.split(sep, 1)[0]
+                new_lines.append(f"{prefix}= {target_entry}\n")
+                entry_updated = True
+                continue
+
+            # Check if line sets Environment
+            if stripped.lower().startswith("environment") and ("=" in stripped or ":" in stripped):
+                if target_env_normalized == "SIMULATION":
+                    sep = "=" if "=" in line else ":"
+                    prefix = line.split(sep, 1)[0]
+                    new_lines.append(f"{prefix}= SIMULATION\n")
+                    env_updated = True
+                else:
+                    # PRODUCTION: Remove Environment key completely
+                    env_updated = True
+                continue
+
+        new_lines.append(line)
+
+    if in_core:
+        if not entry_updated:
+            new_lines.append(f"Entry = {target_entry}\n")
+            entry_updated = True
+        if target_env_normalized == "SIMULATION" and not env_updated:
+            new_lines.append("Environment = SIMULATION\n")
+            env_updated = True
+
+    if not core_seen:
+        core_block = ["[Core]\n", f"Entry = {target_entry}\n"]
+        if target_env_normalized == "SIMULATION":
+            core_block.append("Environment = SIMULATION\n")
+        core_block.append("\n")
+        new_lines = core_block + new_lines
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    return target_env_normalized, target_entry
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -638,6 +766,10 @@ class EsunTradeBridge:
         self.sdk_factory = sdk_factory or (lambda cfg: SDK(cfg))
         self.sdk: any = None
 
+        cfg, _, env = load_config(self.config_path)
+        self.environment = env
+        self.entry = cfg.get("Core", "Entry", fallback="").strip() if cfg and cfg.has_section("Core") else ""
+
         # Lockout & connection states
         self.logged_in = False
         self.login_locked = False
@@ -676,7 +808,10 @@ class EsunTradeBridge:
 
     def _attempt_initial_login(self) -> None:
         """Attempt login at most once at startup; never retry automatically on failure."""
-        cfg, problems, _ = load_config(self.config_path)
+        cfg, problems, env = load_config(self.config_path)
+        self.environment = env
+        if cfg and cfg.has_section("Core"):
+            self.entry = cfg.get("Core", "Entry", fallback="").strip()
         if problems or not cfg:
             self.login_locked = True
             self.login_error = "；".join(problems)
@@ -747,7 +882,10 @@ class EsunTradeBridge:
         self.reconnect_daily.increment()
 
         # Reload config and try login
-        cfg, problems, _ = load_config(self.config_path)
+        cfg, problems, env = load_config(self.config_path)
+        self.environment = env
+        if cfg and cfg.has_section("Core"):
+            self.entry = cfg.get("Core", "Entry", fallback="").strip()
         if problems or not cfg:
             self.login_locked = True
             self.login_error = "；".join(problems)
@@ -898,6 +1036,9 @@ class EsunTradeBridge:
 
     def get_health(self) -> dict:
         cfg, problems, env = load_config(self.config_path)
+        self.environment = env
+        if cfg and cfg.has_section("Core"):
+            self.entry = cfg.get("Core", "Entry", fallback="").strip()
         account = split_account(cfg["User"].get("Account")) if (cfg and cfg.has_section("User")) else None
 
         cert_info = None
@@ -922,7 +1063,9 @@ class EsunTradeBridge:
             "ok": True,
             "configured": len(problems) == 0,
             "problems": problems,
-            "environment": env,
+            "environment": self.environment,
+            "simulation": self.environment == "SIMULATION",
+            "entry": self.entry,
             "account": account,
             "loggedIn": self.logged_in,
             "loginLocked": self.login_locked,
@@ -936,6 +1079,51 @@ class EsunTradeBridge:
                 "reconnectToday": self.reconnect_daily.get_count(),
                 "reconnectDailyMax": 300,
             },
+        }
+
+    def switch_environment(self, target_env: str) -> dict[str, any]:
+        """
+        Switches between SIMULATION and PRODUCTION, updating esun-config.ini [Core] section.
+        """
+        target_env_normalized = str(target_env or "").strip().upper()
+        if target_env_normalized not in ("SIMULATION", "PRODUCTION"):
+            raise ValueError(f"不支援的環境設定：{target_env}，僅支援 SIMULATION 或 PRODUCTION")
+
+        env, entry = update_esun_config_environment(self.config_path, target_env_normalized)
+        cfg, problems, loaded_env = load_config(self.config_path)
+        self.environment = loaded_env
+        self.entry = entry
+        self.logged_in = False
+        self.sdk = None
+
+        if not problems and cfg:
+            try:
+                apply_headless_keyring_patches()
+                client = self.sdk_factory(cfg)
+                client.login()
+                self.sdk = client
+                self.logged_in = True
+                self.login_locked = False
+                self.login_error = None
+                self._start_websocket_thread()
+                threading.Thread(target=self._bootstrap_orders, daemon=True, name="EsunOrdersBootstrap").start()
+            except Exception as e:
+                err_msg = str(e)
+                self.logged_in = False
+                self.login_locked = True
+                self.login_error = err_msg
+                logger.warning(f"環境切換至 {self.environment} 後登入失敗 (非阻斷性)：{err_msg}")
+        else:
+            self.login_locked = True
+            self.login_error = "；".join(problems)
+
+        return {
+            "ok": True,
+            "environment": self.environment,
+            "simulation": self.environment == "SIMULATION",
+            "entry": self.entry,
+            "logged_in": self.logged_in,
+            "problems": problems,
         }
 
     @staticmethod
@@ -1436,6 +1624,18 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
             if path == "/esun/auth/reconnect":
                 _, res, code = self.bridge.reconnect()
                 self._send_json(code, res)
+            elif path in ("/esun/auth/environment", "/esun/environment"):
+                target = body.get("environment")
+                if target is None and "simulation" in body:
+                    target = "SIMULATION" if body["simulation"] else "PRODUCTION"
+                if not target:
+                    self._send_json(400, {"error": "缺少 environment 參數 (SIMULATION 或 PRODUCTION)"})
+                    return
+                try:
+                    res = self.bridge.switch_environment(str(target))
+                    self._send_json(200, res)
+                except ValueError as ve:
+                    self._send_json(400, {"error": str(ve)})
             elif path == "/esun/orders/place":
                 payload = body.get("payload") if "payload" in body else body
                 res, code = self.bridge.place_order(payload)
