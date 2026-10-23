@@ -17,7 +17,10 @@ import {
     type FlashTileLayout,
 } from '../lib/tauri';
 import { fmtMoney } from '../lib/utils/format';
+import type { WatchItem } from '../hooks/use-watchlist';
+import type { ContractInfo, SecurityType } from '../lib/types/contract';
 import type { Profile, Workspace } from '../lib/workspace';
+import { HeaderSymbolSearch } from './header-symbol-search';
 import { LayoutLibrary } from './layout-library';
 import { MarketBar } from './market-bar';
 import { ServerManager } from './server-manager';
@@ -196,6 +199,10 @@ export function HudHeader({
     workspaceUndo = null,
     onUndoWorkspace,
     flashCodes = [],
+    selected = null,
+    watchlistItems = [],
+    onSelectCode,
+    onAddWatchlist,
 }: {
     accBalance?: number;
     onOpenPanelLibrary: () => void;
@@ -211,6 +218,17 @@ export function HudHeader({
     // Agent 套用版面規格後可復原的那一步（#331）；null = 沒有可復原的變更
     workspaceUndo?: { label: string; at: number } | null;
     onUndoWorkspace?: () => void;
+    selected?: ContractInfo | null;
+    watchlistItems?: WatchItem[];
+    onSelectCode?: (
+        code: string,
+        type?: SecurityType,
+    ) => Promise<unknown> | unknown;
+    onAddWatchlist?: (
+        code: string,
+        type?: SecurityType,
+        resolved?: ContractInfo,
+    ) => Promise<unknown>;
 }) {
     const streamStatus = useStreamStatus();
     const privMoney = usePrivacyMoney();
@@ -286,6 +304,15 @@ export function HudHeader({
                     </span>
                 ))}
             <ForeignServerChip />
+
+            {headerItems.symbolSearch && (
+                <HeaderSymbolSearch
+                    selected={selected}
+                    watchlistItems={watchlistItems}
+                    onSelectCode={onSelectCode}
+                    onAddWatchlist={onAddWatchlist}
+                />
+            )}
 
             <MarketBar />
 

@@ -125,31 +125,102 @@ export function loadStockIndex(): Promise<StockMeta[]> {
     return detailsLoading;
 }
 
-// substring match on name, prefix match on code — ranked so the actual
+export function normalizeSearchText(value: string): string {
+    return value.trim().replace(/臺/g, '台').toUpperCase();
+}
+
+/**
+ * 若 query 的每個字元依序出現在 target 中（可不連續），回傳中間跳過的總字元數（gap）；
+ * 否則回傳 null。用於「元大50 → 元大台灣50」、「國泰高股息 → 國泰永續高股息」等模糊搜尋。
+ */
+export function fuzzySubsequenceGap(
+    target: string,
+    query: string,
+): number | null {
+    if (query.length < 2 || query.length > target.length) return null;
+    let tIdx = 0;
+    let firstMatch = -1;
+    let lastMatch = -1;
+    for (let qIdx = 0; qIdx < query.length; qIdx++) {
+        const ch = query[qIdx]!;
+        const found = target.indexOf(ch, tIdx);
+        if (found === -1) return null;
+        if (firstMatch === -1) firstMatch = found;
+        lastMatch = found;
+        tIdx = found + 1;
+    }
+    return lastMatch - firstMatch + 1 - query.length;
+}
+
+// substring / fuzzy match on name and code — ranked so the actual
 // stock beats its thousands of warrants (台積電 before 台積電XX購YY)
 export function searchStocks(
     index: StockMeta[],
     query: string,
     limit = 8,
 ): StockMeta[] {
-    const q = query.trim().toUpperCase();
+    const rawQ = normalizeSearchText(query);
+    if (!rawQ) return [];
+    const tokens = rawQ.split(/\s+/).filter(Boolean);
+    const q = tokens.join('');
     if (!q) return [];
+    const isPureDigits = /^\d+$/.test(q);
     const scored: { s: StockMeta; score: number }[] = [];
+
     for (const s of index) {
-        const name = s.name.toUpperCase();
-        const codeHit = s.code.startsWith(q);
+        const code = s.code.toUpperCase();
+        const codeNoZero = code.replace(/^0+/, '');
+        const name = normalizeSearchText(s.name);
+
+        const codeExact =
+            code === q ||
+            (isPureDigits && codeNoZero.length >= 2 && codeNoZero === q);
+        const nameExact = name === q;
+        const codeHit = code.startsWith(q);
+        const codeNoZeroHit =
+            isPureDigits && codeNoZero.length >= 2 && codeNoZero.startsWith(q);
+        const codeSubstr = q.length >= 2 && code.includes(q);
+        const namePrefix = name.startsWith(q);
         const nameHit = name.includes(q);
-        if (!codeHit && !nameHit) continue;
+        const multiTokenHit =
+            tokens.length > 1 &&
+            tokens.every((t) => code.includes(t) || name.includes(t));
+        const fuzzyGap =
+            !nameHit && !isPureDigits ? fuzzySubsequenceGap(name, q) : null;
+        const fuzzyHit = fuzzyGap !== null && fuzzyGap <= 6;
+
+        if (
+            !codeExact &&
+            !nameExact &&
+            !codeHit &&
+            !codeNoZeroHit &&
+            !codeSubstr &&
+            !nameHit &&
+            !multiTokenHit &&
+            !fuzzyHit
+        ) {
+            continue;
+        }
+
         let score = 0;
-        if (s.code === q || name === q) score -= 100; // exact
-        if (codeHit) score -= 10;
-        else if (name.startsWith(q)) score -= 5;
-        // plain 4-digit equities rank above warrants/ETNs (6-char codes)
-        score += s.code.length === 4 ? 0 : 50;
-        score += s.name.length; // shorter names first
+        if (code === q || nameExact) score = -200;
+        else if (codeExact) score = -160;
+        else if (codeHit) score = -110;
+        else if (codeNoZeroHit) score = -95;
+        else if (namePrefix) score = -85;
+        else if (codeSubstr) score = -65;
+        else if (nameHit) score = -55 + Math.min(10, name.indexOf(q));
+        else if (multiTokenHit) score = -45;
+        else if (fuzzyGap !== null) score = -25 + fuzzyGap * 3;
+
+        // plain 4-digit equities and 00-prefixed ETFs rank above warrants/ETNs (6-char codes)
+        score += code.length === 4 ? 0 : code.startsWith('00') ? 4 : 50;
+        score += name.length; // shorter names first
         scored.push({ s, score });
     }
-    scored.sort((a, b) => a.score - b.score);
+    scored.sort(
+        (a, b) => a.score - b.score || a.s.code.localeCompare(b.s.code),
+    );
     return scored.slice(0, limit).map((x) => x.s);
 }
 

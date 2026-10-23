@@ -95,7 +95,7 @@ import { notify } from './lib/trade';
 import { tradingActionObserved, useTradingState } from './lib/trading-state';
 import { ensureStream } from './lib/stream';
 import { ensureAccounts } from './lib/account-store';
-import type { ContractInfo } from './lib/types/contract';
+import type { ContractInfo, SecurityType } from './lib/types/contract';
 import {
     BLOCK_META,
     DEFAULT_WORKSPACE,
@@ -1680,13 +1680,13 @@ function MainApp() {
     });
 
     const jumpToCode = useCallback(
-        async (code: string) => {
+        async (code: string, type?: SecurityType) => {
             const existing = items.find((i) => i.contract.code === code);
             if (existing) {
                 setSelected(existing.contract);
                 return;
             }
-            const c = await ensureContract(code);
+            const c = await ensureContract(code, type);
             setSelected(c);
         },
         [items],
@@ -1741,6 +1741,10 @@ function MainApp() {
                 flashCodes={items
                     .filter((i) => i.contract.security_type !== 'IND')
                     .map((i) => i.contract.code)}
+                selected={selected}
+                watchlistItems={items}
+                onSelectCode={jumpToCode}
+                onAddWatchlist={addSymbol}
             />
 <EventToasts />
             <OrderConfirmHost />
