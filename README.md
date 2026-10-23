@@ -1,20 +1,13 @@
-# Shioaji Pro — 專業交易終端 Trading Terminal
+# Shioaji Esun Pro — 雙券商專業交易終端 Trading Terminal
 
-**[官方網站 / Landing Page](https://sinotrade.github.io/shioaji-pro-app/)** ・
-**[下載 Download](https://github.com/Sinotrade/shioaji-pro-app/releases/latest)**
+**[專案首頁 / GitHub](https://github.com/Yuno-Liu/shioaji-esun-pro)** ・
+**[原版 Shioaji Pro 官網](https://sinotrade.github.io/shioaji-pro-app/)**
 
-A professional, fully-customizable trading terminal for Taiwan markets
-(TWSE / TPEX / TAIFEX), built on the [Shioaji](https://sinotrade.github.io/)
-HTTP API + SSE streaming. React 19 + TypeScript + Vite, zero backend code —
-it talks directly to your local `shioaji server`.
+專為台灣市場（上市／上櫃／期交所）打造的雙券商專業交易終端，整合 **永豐金證券 Shioaji API 即時行情數據** 與 **玉山證券 API（`esun_trade 2.2.0`）下單與帳務**，並支援永豐金證券交易與雙券商動態切換。前端基於 React 19 + TypeScript + Vite，後端支援 Docker 網頁版三容器一鍵部署與桌面版。
 
-以 Shioaji HTTP API 打造的專業交易終端：即時行情、K 線、五檔、閃電下單、
-圖表點價下單、停損停利觸價單、圖表畫圖工具、
-可拖拉的自訂版面。
+以 Shioaji 即時行情與玉山交易 API 打造的專業終端：全市場即時行情、K 線、五檔、閃電下單、圖表點價下單、停損停利觸價單、圖表畫圖工具、雙券商帳務管理與可自由拖曳排版的自訂版面。
 
-**介面 100% 開源** — UI、行情串流、下單鏈路全部都在這個 repo，
-clone 下來就能 build 出完整的 Web 版終端。桌面版外殼（Tauri）、
-AI Agent 與策略回測為專屬模組，直接到 Releases 下載安裝檔即可使用。
+**支援雙券商並行架構** — 預設以永豐金證券提供全市場即時行情串流（免費模擬模式即可接收完整盤中真實行情），由玉山證券正式環境負責股票委託下單、改價、改量、刪單、持股庫存、交割款與損益計算。
 
 ![Shioaji Pro — futures night session](docs/shot-terminal-dark.png)
 
