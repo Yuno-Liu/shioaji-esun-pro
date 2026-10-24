@@ -16,6 +16,7 @@ import { esunTradeService } from './service';
 import {
     ESUN_STALE_CACHE_MESSAGE,
     esunAccountQuery,
+    esunCacheConflictMessage,
     esunCacheUpsertRow,
     esunConfirmBrokerLabel,
     esunConfirmGuard,
@@ -181,19 +182,49 @@ describe('cache rebuild row merge (esunCacheUpsertRow)', () => {
         };
     };
 
-    it('keeps the larger local fill and cancel quantities and recomputes the status', () => {
-        const merged = esunCacheUpsertRow(row(3, 0), row(2, 0));
-        expect(merged.status).toMatchObject({ deal_quantity: 3, cancel_quantity: 0, status: 'PartFilled', deals: [{ seq: 'd3', quantity: 3 }] });
-        expect(esunCacheUpsertRow(row(3, 2), row(3, 0)).status).toMatchObject({ deal_quantity: 3, cancel_quantity: 2, status: 'Cancelled' });
-        expect(esunCacheUpsertRow(row(5, 0), row(2, 0)).status).toMatchObject({ deal_quantity: 5, status: 'Filled' });
+    let hooks: { [K in keyof EsunTradingHooks]: ReturnType<typeof vi.fn> };
+    let stop: (() => void) | undefined;
+    beforeEach(() => {
+        hooks = { raise: vi.fn(), accountsChanged: vi.fn(async () => undefined), checkHealth: vi.fn(async () => undefined) };
+        stop?.();
+        stop = startEsunTradingState(hooks as unknown as EsunTradingHooks);
     });
 
-    it('takes the cache row when it is not behind, for other brokers, or when the two contradict', () => {
+    it('keeps the local row and raises snapshot-boundary when the cache is behind on fills or cancels (PB3-1)', () => {
+        const local = row(3, 0);
+        expect(esunCacheUpsertRow(local, row(2, 0))).toBe(local);
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', esunCacheConflictMessage('C0001'));
+        expect(esunCacheConflictMessage('C0001')).toContain('C0001');
+        hooks.raise.mockClear();
+        // 成交較多但取消較少：仍是矛盾，不合併兩邊
+        const cancelled = row(1, 2);
+        expect(esunCacheUpsertRow(cancelled, row(2, 0))).toBe(cancelled);
+        expect(hooks.raise).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps a local terminal row the cache reports as live (PB3-1)', () => {
+        for (const status of ['Failed', 'Cancelled', 'Filled']) {
+            hooks.raise.mockClear();
+            const local = row(0, 0, { status });
+            expect(esunCacheUpsertRow(local, row(0, 0))).toBe(local);
+            expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', esunCacheConflictMessage('C0001'));
+        }
+        hooks.raise.mockClear();
+        // 快取也是終態：採用快取列
+        const failed = row(0, 0, { status: 'Failed' });
+        expect(esunCacheUpsertRow(row(0, 0, { status: 'Cancelled' }), failed)).toBe(failed);
+        expect(hooks.raise).not.toHaveBeenCalled();
+    });
+
+    it('takes the cache row without a reason when it is not behind, and for other brokers', () => {
         const cached = row(4, 0);
         expect(esunCacheUpsertRow(row(3, 0), cached)).toBe(cached);
+        const same = row(3, 0);
+        expect(esunCacheUpsertRow(row(3, 0), same)).toBe(same);
         const sinopac = row(2, 0, { broker: '9A95' });
         expect(esunCacheUpsertRow(row(3, 0, { broker: '9A95' }), sinopac)).toBe(sinopac);
-        const contradicting = row(4, 0);
-        expect(esunCacheUpsertRow(row(0, 3), contradicting)).toBe(contradicting);
+        const sinopacLive = row(0, 0, { broker: '9A95' });
+        expect(esunCacheUpsertRow(row(0, 0, { broker: '9A95', status: 'Failed' }), sinopacLive)).toBe(sinopacLive);
+        expect(hooks.raise).not.toHaveBeenCalled();
     });
 });

@@ -77,6 +77,8 @@ async function emit(report: OrderEventReport) { await act(async () => { mocks.or
 async function signal(value: unknown) {
     await act(async () => { mocks.signals.forEach(l => l(value)); await vi.advanceTimersByTimeAsync(100); });
 }
+/** 讓跳號健康檢查的節流間隔過去 */
+async function idle() { await act(async () => { await vi.advanceTimersByTimeAsync(10_000); }); }
 async function authoritativeRead() {
     await act(async () => { vi.advanceTimersByTime(1600); await store.refreshTradingState('orders'); });
 }
@@ -132,26 +134,71 @@ describe('authoritative read racing an SSE fill (PB2-1)', () => {
     });
 });
 
-describe('cache rebuild of an E.SUN account (PB2-2)', () => {
-    it('never lowers the locally projected fill quantity below the cache row', async () => {
+/** bridge SSE 的 ACK（經前端轉換後進上游回報管線） */
+function ack(over: Record<string, unknown> = {}): OrderEventReport {
+    reportSeq += 1;
+    const result = toEsunReportWire('order', {
+        event_id: `boot1-${100 + reportSeq}`, report_stream: 'order', report_seq: reportSeq, session_generation: 1,
+        ts: '2026-10-23T09:05:00+08:00', environment: 'PRODUCTION', account: { broker_id: '8840', account_id: '1234567' },
+        op_type: 'New', ord_date: '20261023', ord_time: '090500000', ord_no: 'C0001', pre_ord_no: '',
+        stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R', trade: '0', od_price: 25.5,
+        org_qty: 5, org_qty_share: 5000, mat_qty: 0, mat_qty_share: 0, cel_qty: 0, cel_qty_share: 0,
+        err_code: '00000000', err_msg: '', ...over,
+    }, { environment: 'PRODUCTION', account });
+    if (result.kind !== 'report') throw new Error(result.reason);
+    return normalizeOrderEvent(result.wire)!;
+}
+
+describe('cache rebuild of an E.SUN account (PB2-2 / PB3-1)', () => {
+    it('keeps the local row when the cache is behind and raises a reason only an authoritative read clears', async () => {
         await emit(mat('000417', 1));
         await emit(mat('000418', 2));
         expect(local().status.deal_quantity).toBe(3);
-        // bridge 重啟後的快照只有 2 張（沒收到 MAT 的成交不在 event 量內）
+        // bridge 重啟後的快照只有 2 張；也可能是推播晚於查詢的本地高估——前端分不出哪邊對
         mocks.trades.mockReset().mockResolvedValue([row({ mat_qty: 2, mat_qty_share: 2000, avg_price: 25.5 })]);
         await signal({ kind: 'resync', reason: 'bridge_restarted' });
         expect(mocks.trades).toHaveBeenCalledWith('S', expect.objectContaining({ account_id: '1234567' }), { refresh: false });
         expect(reasons('orders')).not.toContain('sequence-gap'); // 快取重建已完成
         expect(local().status).toMatchObject({ deal_quantity: 3, status: 'PartFilled' });
         expect(local().status.deals.map(d => d.seq)).toEqual(['000417', '000418']);
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(store.getTradingState().queries.orders.error).toContain('C0001');
+        // 再一次快取重建不會解除（跳號的健康檢查有節流，先讓時間過去）
+        await idle();
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(local().status.deal_quantity).toBe(3);
+        // 權威讀取以券商快照為準並解除
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+        expect(local().status.deal_quantity).toBe(2);
     });
 
-    it('takes the cache row when it knows more than the local projection', async () => {
-        await emit(mat('000417', 1));
+    it('takes the cache row when it knows more than the local projection, without a reason', async () => {
+        await emit(mat('000417', 2));
+        mocks.trades.mockReset().mockResolvedValue([row({ mat_qty: 3, mat_qty_share: 3000, avg_price: 25.5 })]);
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(reasons('orders')).toEqual([]);
+        expect(local().status).toMatchObject({ deal_quantity: 3, status: 'PartFilled' });
+        await idle();
         mocks.trades.mockReset().mockResolvedValue([row({ mat_qty: 4, mat_qty_share: 4000, avg_price: 25.5, cel_qty: 1, cel_qty_share: 1000 })]);
         await signal({ kind: 'resync', reason: 'bridge_restarted' });
-        expect(reasons('orders')).not.toContain('sequence-gap');
+        expect(reasons('orders')).toEqual([]);
         expect(local().status).toMatchObject({ deal_quantity: 4, cancel_quantity: 1, status: 'Cancelled' });
+    });
+
+    it('keeps a locally Failed order the cache still lists as live, until an authoritative read', async () => {
+        await emit(ack({ err_code: '00000123', err_msg: '超過漲跌幅' }));
+        expect(local().status.status).toBe('Failed');
+        mocks.trades.mockReset().mockResolvedValue([row()]); // bridge 快取沒有記下失敗：仍是 Submitted
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(local().status.status).toBe('Failed');
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(reasons('orders')).not.toContain('sequence-gap');
+        mocks.trades.mockReset().mockResolvedValue([row({ err_code: '00000123', err_msg: '超過漲跌幅' })]);
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+        expect(local().status.status).toBe('Failed');
     });
 });
 

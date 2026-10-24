@@ -367,24 +367,30 @@ let hooks: EsunTradingHooks | null = null;
 
 export const ESUN_STALE_CACHE_MESSAGE = '玉山 bridge 重新連線後未能重讀委託，快取可能缺少斷線期間的成交／取消；請按更新確認';
 
+const ESUN_TERMINAL_STATUSES: readonly string[] = ['Filled', 'Cancelled', 'Failed'];
+
+/** 快取重建遇到矛盾、保留本地列時提出的待對帳訊息（cause 依委託 id 區分） */
+export function esunCacheConflictMessage(orderId: string): string {
+    return `玉山 bridge 快取的委託 ${orderId} 與本地不一致（成交／取消量較低或狀態未終結），已保留本地資料；請按更新確認`;
+}
+
 /**
- * trading-state 快取重建（refresh:false 的 upsert）合併一筆本地列時的玉山規則：bridge 快取可能落後
- * 本地投影（bridge 重啟後的快照、沒收到的 MAT），而成交量與取消量在現實中只增不減，所以各取
- * 本地與快取列的較大值，狀態依合併後的數量重算。非玉山帳戶、快取列不低於本地、或兩者合起來
- * 超過委託量（資料互相矛盾）時原樣回傳快取列（上游語意）。權威讀取（replace）不經過這裡。
+ * trading-state 快取重建（refresh:false 的 upsert）合併一筆本地列時的玉山規則。快取列的成交量與
+ * 取消量都不低於本地、且狀態不矛盾時採用快取列（補回漏收的回報，這是快取重建的目的）。
+ * 快取列的成交量或取消量低於本地，或本地已是終態（Filled／Cancelled／Failed）而快取列不是時，
+ * 前端無法判定哪一方正確（快照落後與推播落後的資料形狀相同）：保留本地列，並對 orders 提出
+ * snapshot-boundary（不在 CACHE_RESYNC_RESOLVES，只有權威讀取能解除）。非玉山帳戶原樣回傳快取列
+ * （上游語意）。權威讀取（replace）不經過這裡。
  */
 export function esunCacheUpsertRow<T extends Trade & { account?: Account }>(local: T, cached: T): T {
     if (!isEsunAccount(cached.account ?? local.account)) return cached;
-    const deal = Math.max(local.status.deal_quantity, cached.status.deal_quantity);
-    const cancel = Math.max(local.status.cancel_quantity, cached.status.cancel_quantity);
-    if (deal === cached.status.deal_quantity && cancel === cached.status.cancel_quantity) return cached;
-    const quantity = cached.order.quantity;
-    if (deal + cancel > quantity) return cached;
-    let status = cached.status.status;
-    if (deal + cancel >= quantity) status = cancel > 0 ? 'Cancelled' : 'Filled';
-    else if (deal > 0 && status !== 'Failed') status = 'PartFilled';
-    const deals = deal > cached.status.deal_quantity ? local.status.deals : cached.status.deals;
-    return { ...cached, status: { ...cached.status, status, deal_quantity: deal, cancel_quantity: cancel, deals } };
+    const behind = cached.status.deal_quantity < local.status.deal_quantity
+        || cached.status.cancel_quantity < local.status.cancel_quantity;
+    const reopened = ESUN_TERMINAL_STATUSES.includes(local.status.status)
+        && !ESUN_TERMINAL_STATUSES.includes(cached.status.status);
+    if (!behind && !reopened) return cached;
+    hooks?.raise('orders', 'snapshot-boundary', esunCacheConflictMessage(local.order.id));
+    return local;
 }
 
 function esunAccountKeys() {
