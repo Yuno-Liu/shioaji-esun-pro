@@ -5,10 +5,16 @@ Provides a local REST & SSE service (default http://127.0.0.1:8090) bridging
 the official Python SDK (`esun_trade`) with frontend trading & account interfaces.
 
 Key Protections & Features:
-1. Headless Keyring Injection: No interactive prompt (getpass) or native keyring hang.
-2. Login Single-Attempt Circuit Breaker: Attempts sdk.login() once. On failure (e.g. AGA0000),
-   locks out auto-retries to prevent the 3-strike account lockout.
-3. Official Rate Limiters & Sliding Windows:
+1. Headless Keyring Injection: No interactive prompt (getpass) or native keyring hang; the patch
+   is verified against the SDK and interactive getpass is hard-disabled.
+2. Login Circuit Breaker: startup, reconnect and environment switch share one guard. Credential
+   failures (e.g. AGA0000) are persisted in ESUN_STATE_DIR so restarts never auto-retry a wrong
+   password; only an explicit reconnect (with changed credentials, or force) lifts the lock.
+3. Access Control: Host allowlist, optional ESUN_BRIDGE_TOKEN, CSRF checks (Sec-Fetch-Site /
+   Origin vs Host), JSON-only POST bodies <= 64 KiB, allowlisted CORS only, socket timeouts.
+4. Immutable session snapshot (generation): /esun/health is read-only, environment switches never
+   write the user's ini files, mutations must match expected_environment / expected_account.
+5. Official Rate Limiters & Sliding Windows:
    - Order mutations: 18 req/sec sliding window (protecting 20 rps AGR0002) & 2,000 req/day (AGR0001).
    - Balance query: mandatory 180s TTL cache (1 call per 180s).
    - Settlements query: 25s TTL cache + 3 req/min limiter (AGR0006).
@@ -17,11 +23,14 @@ Key Protections & Features:
    - Profit/Loss query: 180-day range clamp + 10s TTL cache + 10 req/min limiter.
    - Trading limits query: 60s TTL cache.
    - Market status query: 300s TTL cache.
-   - Reconnect: 60s cooldown on AGR0000, 10 req/min limiter, 300 req/day counter (AGR0004).
-4. Reservation Order Guard: Rejects price/quantity modifications on reservation orders (AG0006).
-5. Price Modification Guard: Rejects price modifications on non-ROD or non-Limit orders.
-6. Singleton WebSocket -> SSE Fan-out: Single WebSocket daemon thread broadcasting ACK/MAT
-   events and 25s heartbeats to SSE subscribers.
+   - Login: 60s cooldown on AGR0000, 10 req/min limiter, 300 req/day counter (AGR0004).
+6. Mutation envelope: accepted / not_sent / rejected / unknown; replace-qty is reduce-by
+   (cancel_quantity + quantity_unit lot|share).
+7. Reservation Order Guard: Rejects price/quantity modifications on reservation orders (AG0006).
+8. Price Modification Guard: Rejects price modifications on non-ROD or non-Limit orders.
+9. Generation-scoped WebSocket supervisor (backoff reconnect, ping/pong, silence detection) ->
+   SSE fan-out with "<boot_id>-<seq>" ids, a 500-event replay ring, resync and session events.
+10. Graceful shutdown on SIGTERM / SIGINT; GET /esun/livez for container health checks.
 """
 
 from __future__ import annotations
@@ -304,6 +313,8 @@ def apply_websocket_patches() -> bool:
 
 
 WS_PATCH_ACTIVE = apply_websocket_patches()
+if ESUN_SDK_VERSION and not WS_PATCH_ACTIVE:
+    logger.warning("WebSocket keep-alive patch 未生效：無法主動關閉舊連線，ping/pong 斷線偵測停用（僅剩靜默偵測）")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2743,6 +2754,7 @@ class EsunTradeBridge:
             "wsConnected": bool(ws["connected"]),
             "wsLastMessageAt": ws["lastMessageAt"],
             "wsReconnects": ws["reconnects"],
+            "wsKeepalive": WS_PATCH_ACTIVE,
             "sseBootId": self.sse_fanout.boot_id,
             "sdkVersion": ESUN_SDK_VERSION,
             "rateLimits": {
@@ -3991,6 +4003,9 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (ConnectionError, TimeoutError, OSError):
             pass
+        except Exception:
+            # Headers are already sent: end the stream (the client reconnects with Last-Event-ID).
+            logger.error(f"SSE 串流錯誤：\n{redact(traceback.format_exc())}")
         finally:
             bridge.sse_fanout.unsubscribe(sub)
 

@@ -2424,6 +2424,94 @@ class TestReportEvents(_BridgeCase):
             server.server_close()
 
 
+class _MiniWsServer:
+    """Single-connection RFC 6455 server: answers pings with pongs and echoes close frames."""
+
+    def __init__(self):
+        import socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)
+        self.port = self.sock.getsockname()[1]
+        self.pings = 0
+        self.closed_by_client = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    @staticmethod
+    def _recv_exact(conn, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = conn.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("eof")
+            buf += chunk
+        return buf
+
+    def _serve(self):
+        import base64
+        import hashlib
+        import re as _re
+        import struct
+        conn, _ = self.sock.accept()
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            key = _re.search(rb"(?i)Sec-WebSocket-Key:\s*(\S+)", data).group(1)
+            accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+            while True:
+                head = self._recv_exact(conn, 2)
+                opcode, length = head[0] & 0x0F, head[1] & 0x7F
+                if length == 126:
+                    length = struct.unpack(">H", self._recv_exact(conn, 2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", self._recv_exact(conn, 8))[0]
+                mask = self._recv_exact(conn, 4) if head[1] & 0x80 else b""
+                payload = self._recv_exact(conn, length)
+                if mask:
+                    payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+                if opcode == 0x9:
+                    self.pings += 1
+                    conn.sendall(bytes([0x8A, len(payload)]) + payload)
+                elif opcode == 0x8:
+                    self.closed_by_client.set()
+                    conn.sendall(b"\x88\x00")
+                    break
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            conn.close()
+            self.sock.close()
+
+
+class TestWebSocketPatch(unittest.TestCase):
+    def test_patched_handler_reports_open_and_pong_and_closes(self):
+        import esun_trade.websocket as esun_ws
+        from server import esun_trade_server as bridge_module
+
+        self.assertTrue(bridge_module.WS_PATCH_ACTIVE)
+        self.assertTrue(hasattr(esun_trade.sdk.SDK, "close_websocket"))
+        server = _MiniWsServer()
+        handler = esun_ws.WebsocketHandler()
+        opened = threading.Event()
+        activity: list[float] = []
+        handler.bridge_open_hook = opened.set
+        handler.bridge_activity_hook = lambda: activity.append(time.monotonic())
+        with mock.patch.object(bridge_module, "WS_PING_INTERVAL_SECONDS", 1), \
+                mock.patch.object(bridge_module, "WS_PING_TIMEOUT_SECONDS", 0.5):
+            worker = threading.Thread(target=handler.connect_websocket, args=(f"ws://127.0.0.1:{server.port}/",), daemon=True)
+            worker.start()
+            self.assertTrue(opened.wait(5), "on_open hook must fire")
+            self.assertTrue(_wait_until(lambda: bool(activity), timeout=5), "pong must count as activity")
+            self.assertGreaterEqual(server.pings, 1)
+            handler.close_websocket()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "close_websocket must make run_forever return")
+        self.assertTrue(server.closed_by_client.wait(2))
+
+
 class TestGracefulShutdown(unittest.TestCase):
     def test_shutdown_handler_stops_serve_forever_and_bridge(self):
         with tempfile.TemporaryDirectory() as tmp:
