@@ -673,6 +673,15 @@ def taipei_today() -> datetime.date:
     return taipei_now().date()
 
 
+def session_generation_base() -> int:
+    """
+    Starting point for session generations: the bridge start time in milliseconds, so generations
+    keep increasing across restarts. Clients drop state whose generation is lower than one they have
+    already seen; counting from 1 on every start would make open pages ignore a restarted bridge.
+    """
+    return int(time.time() * 1000)
+
+
 class SlidingWindowRateLimiter:
     """Thread-safe sliding window rate limiter (monotonic clock: immune to wall-clock jumps)."""
 
@@ -2034,7 +2043,7 @@ class EsunTradeBridge:
         self._login_guard_lock = threading.Lock()  # atomic check-and-record of login limits
         self._orders_refresh_lock = threading.Lock()
         self._shutdown_event = threading.Event()
-        self._generation_seq = 0
+        self._generation_seq = session_generation_base()
 
         cfg, _, env = load_config(selected_path)
         self._session = self._offline_session(selected_path, cfg, env)

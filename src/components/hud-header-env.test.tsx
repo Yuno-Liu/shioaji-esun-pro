@@ -24,6 +24,7 @@ const { storage, mocks } = vi.hoisted(() => {
             refreshTradingState: vi.fn(async () => undefined),
             refreshTradingStateForModeChange: vi.fn(async () => undefined),
             serverInfo: { simulation: true } as { simulation: boolean } | undefined,
+            privacy: false,
         },
     };
 });
@@ -104,6 +105,8 @@ vi.mock('../lib/account-store', () => ({
             }
         }
     },
+    // esunTradeService 採用 bridge 帳號時會同步到帳戶清單；這裡的帳號清單由各測試直接控制
+    replaceExternalAccountsForBroker: vi.fn(),
     getAccountState: () => ({
         accounts: mockAccounts,
         selectedAccount: mockSelectedAccount,
@@ -149,7 +152,7 @@ vi.mock('../lib/privacy', async (importOriginal) => {
         ...actual,
         maskMoney: (m: string) => m,
         usePrivacyMoney: () => false,
-        usePrivacyMode: () => false,
+        usePrivacyMode: () => mocks.privacy,
     };
 });
 vi.mock('../lib/risk', () => ({ useRiskSettings: () => ({ locked: false }), setRiskSettings: vi.fn() }));
@@ -214,6 +217,8 @@ const PROFILES = {
 describe('HeaderEnvMenu', () => {
     let view: ReactTestRenderer | undefined;
     let bridge: EsunBridgeHealth | null;
+    // 同一個 bridge 行程：session 代次持續遞增（每個測試換新 driver 等於 bridge 重啟、代次歸零，會被 service 當成過期）
+    const mockBridge = new MockEsunDriver();
 
     const render = async () => {
         await act(async () => {
@@ -239,12 +244,13 @@ describe('HeaderEnvMenu', () => {
         vi.clearAllMocks();
         storage.clear();
         mocks.serverInfo = { simulation: true };
+        mocks.privacy = false;
         mocks.fetchInfo.mockResolvedValue({ simulation: true });
         bridge = health('SIMULATION');
         vi.spyOn(esunTradeService, 'connectBridge').mockImplementation(async () => bridge);
         vi.spyOn(esunTradeService, 'getBridgeHealth').mockImplementation(() => bridge);
         vi.spyOn(esunTradeService, 'refreshConfigProfiles').mockImplementation(async () => esunTradeService.getConfigProfiles());
-        esunTradeService.setDriver(new MockEsunDriver());
+        esunTradeService.setDriver(mockBridge);
         esunTradeService.setConfigProfiles(PROFILES, 'esun-config.simulation.ini');
         await esunTradeService.switchEnvironment('SIMULATION');
         mockAccounts = [sinopacAccount, esunAccount];
@@ -492,6 +498,8 @@ describe('HeaderEnvMenu', () => {
 
     it('缺少模擬設定檔時停用模擬選項', async () => {
         mockSelectedStock = esunAccount; mockSelectedAccount = esunAccount;
+        // 環境只以 bridge 回報為準（設定檔偵測不改寫已知環境），先讓 bridge 處於正式環境
+        await esunTradeService.switchEnvironment('PRODUCTION');
         esunTradeService.setConfigProfiles({
             ...PROFILES,
             SIMULATION: { ...PROFILES.SIMULATION, available: false, fileName: null },
@@ -505,6 +513,21 @@ describe('HeaderEnvMenu', () => {
         expect(extractText(simOpt)).toContain('esun-config.simulation.ini');
         await click(simOpt);
         expect(esunTradeService.getEnvironment()).toBe('PRODUCTION');
+    });
+
+    it('隱私模式遮罩帳號，玉山模擬帳戶不外露帳戶鍵的 -SIM 後綴', async () => {
+        mocks.privacy = true;
+        const esunSimAccount: Account = { ...esunAccount, broker_id: `${ESUN_BROKER_CODE}-SIM`, account_id: '7654321' };
+        mockAccounts = [sinopacAccount, esunSimAccount];
+        mockSelectedStock = esunSimAccount; mockSelectedAccount = esunSimAccount;
+        await render();
+        await openMenu();
+        const menu = extractText(find('header-env-menu'));
+        expect(menu).not.toContain(sinopacAccount.account_id);
+        expect(menu).not.toContain(esunSimAccount.account_id);
+        expect(menu).not.toContain('-SIM');
+        expect(extractText(find('header-route-S'))).toContain(`${ESUN_BROKER_CODE}-•••••21`);
+        expect(menu).toContain('9A95-•••••21');
     });
 
     it('選單為 dialog 語意，徽章宣告 aria-haspopup=dialog', async () => {

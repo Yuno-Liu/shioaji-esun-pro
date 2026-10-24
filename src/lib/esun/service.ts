@@ -474,7 +474,7 @@ export class EsunTradeService {
                 }
             }
             this.stateVersion++;
-            this.applyBridgeState({
+            const applied = this.applyBridgeState({
                 environment: res.environment,
                 entry: res.entry,
                 activeConfigFile: res.activeConfigFile ?? this.configProfiles[targetEnv]?.fileName ?? null,
@@ -487,6 +487,10 @@ export class EsunTradeService {
             this.emit();
             // 以 bridge 的 health 最後確認一次（例如另一個視窗同時又切換）
             void this.refreshHealth();
+            if (!applied) {
+                // 切換回應的 session 代次比已採用的舊：bridge 已被其他操作改到更新的 session，不能回報成功
+                return this.switchResult(false, { error: '玉山 bridge 已有更新的 session，這次切換結果未採用；請確認目前環境後再操作' });
+            }
             return this.switchResult(true, { environment: res.environment, account: res.account ?? null });
         })();
         this.switchInFlight = run;

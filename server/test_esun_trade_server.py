@@ -1493,7 +1493,9 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         before = bridge.get_health()
         self.assertTrue(before["loggedIn"])
         self.assertEqual(before["environment"], "PRODUCTION")
-        self.assertEqual(before["sessionGeneration"], 1)
+        first_generation = bridge.session.generation
+        self.assertGreater(first_generation, 0)
+        self.assertEqual(before["sessionGeneration"], first_generation)
         self.assertFalse(before["configDrift"])
         self.assertEqual(before["diskEnvironment"], "PRODUCTION")
         self.assertFalse(before["loginLocked"])
@@ -1509,7 +1511,7 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         self.assertFalse(health["simulation"])
         self.assertEqual(health["account"], {"broker_id": "8840", "account_id": "5555555"})
         self.assertTrue(health["configDrift"])
-        self.assertEqual(health["sessionGeneration"], 1)
+        self.assertEqual(health["sessionGeneration"], first_generation)
         self.assertEqual(bridge.config_path, prod)
         self.assertEqual(bridge.environment, "PRODUCTION")
         # Health never calls SDK network methods.
@@ -1531,6 +1533,7 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         bridge = self.make_bridge(sim, factory)
         events = bridge.sse_fanout.register()
         old_sdk = factory.instances[0]
+        old_generation = bridge.session.generation
         self.assertTrue(_wait_until(lambda: old_sdk.ws_connect_calls == 1))
 
         bridge.order_book_cache.update_from_ack({"ord_no": "O_SIM", "stock_no": "2330", "work_date": taipei_today_str()})
@@ -1544,7 +1547,7 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["environment"], "PRODUCTION")
         self.assertEqual(res["account"]["account_id"], "2222222")
-        self.assertEqual(res["sessionGeneration"], 2)
+        self.assertEqual(res["sessionGeneration"], old_generation + 1)
         # ini files untouched (byte content and mtime)
         self.assertEqual(self.file_fingerprint(sim), sim_before)
         self.assertEqual(self.file_fingerprint(prod), prod_before)
@@ -1562,7 +1565,7 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         session_events = [e for e in _drain(events, timeout=0.5) if e["event"] == "session"]
         self.assertTrue(session_events)
         self.assertEqual(session_events[-1]["data"]["environment"], "PRODUCTION")
-        self.assertEqual(session_events[-1]["data"]["generation"], 2)
+        self.assertEqual(session_events[-1]["data"]["generation"], old_generation + 1)
         self.assertTrue(session_events[-1]["data"]["loggedIn"])
         self.assertEqual(session_events[-1]["data"]["reason"], "switch")
 
@@ -1571,11 +1574,25 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
         factory = RecordingFactory()
         bridge = self.make_bridge(sim, factory)
+        generation = bridge.session.generation
         res, status = bridge.switch_environment_with_status("SIMULATION")
         self.assertEqual(status, 200)
         self.assertTrue(res["ok"])
         self.assertEqual(factory.login_calls, 1)
-        self.assertEqual(bridge.session.generation, 1)
+        self.assertEqual(bridge.session.generation, generation)
+
+    def test_session_generation_keeps_increasing_across_bridge_restarts(self):
+        # Clients drop state older than the newest generation they have seen; a restarted
+        # bridge (new process) must therefore never restart its generations from 1.
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        first = self.make_bridge(sim)
+        first_generation = first.session.generation
+        self.assertGreater(first_generation, 0)
+        time.sleep(0.01)
+        restarted = self.make_bridge(sim)
+        self.assertTrue(restarted.session.logged_in)
+        self.assertGreater(restarted.session.generation, first_generation)
+        self.assertGreater(restarted.get_health()["sessionGeneration"], first.get_health()["sessionGeneration"])
 
     def test_switch_failure_keeps_original_session(self):
         sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")

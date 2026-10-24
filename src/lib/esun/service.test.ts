@@ -253,6 +253,20 @@ describe('EsunTradeService', () => {
             expect(service.getEnvironment()).toBe('PRODUCTION');
         });
 
+        it('does not report success for a switch answered by an older session than the one adopted', async () => {
+            service.applySession({ generation: 5, environment: 'PRODUCTION', account: { broker_id: '8840', account_id: MOCK_ESUN_ACCOUNT_ID } });
+            const driver: any = {
+                name: 'custom',
+                health: vi.fn(async () => healthBody('PRODUCTION', 5)),
+                switchEnvironment: vi.fn(async () => ({ ok: true, environment: 'SIMULATION', entry: ESUN_SIMULATION_ENTRY, sessionGeneration: 3 })),
+            };
+            service.setDriver(driver);
+            const res = await service.switchEnvironment('SIMULATION');
+            expect(res.ok).toBe(false);
+            expect(res.environment).toBe('PRODUCTION');
+            expect(service.getEnvironment()).toBe('PRODUCTION');
+        });
+
         it('drops a slow health answer that started before a switch completed', async () => {
             let resolveHealth!: (value: unknown) => void;
             const driver: any = {

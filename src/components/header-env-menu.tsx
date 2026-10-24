@@ -20,11 +20,13 @@ import {
     ESUN_PRODUCTION_ENTRY,
     ESUN_SIMULATION_ENTRY,
     esunTradeService,
+    esunWireBrokerId,
     isEsunAccount,
     useEsunEnvironment,
     type EsunBridgeHealth,
     type EsunEnvironment,
 } from '../lib/esun';
+import { maskAccountId, usePrivacyMode } from '../lib/privacy';
 import { useServerInfo } from '../lib/server-info-store';
 import { fetchInfo } from '../lib/shioaji';
 import { notify } from '../lib/trade';
@@ -106,8 +108,11 @@ export function routesLabel(routes: HeaderRoute[]): string {
         .join(' ｜ ');
 }
 
-function accountText(acc: Account | null): string {
-    return acc ? `${acc.broker_id}-${acc.account_id}` : '伺服器預設帳號';
+// 玉山帳戶鍵的 -SIM 後綴只用於區分環境，畫面顯示實際分公司代號；隱私模式遮罩帳號
+function accountText(acc: Account | null, priv = false): string {
+    if (!acc) return '伺服器預設帳號';
+    const broker = isEsunAccount(acc) ? esunWireBrokerId(acc.broker_id) : acc.broker_id;
+    return `${broker}-${maskAccountId(acc.account_id, priv)}`;
 }
 
 export function HeaderEnvMenu({
@@ -120,6 +125,7 @@ export function HeaderEnvMenu({
 }) {
     const { accounts, selectedStock, selectedFutures } = useAccounts();
     const esunEnv = useEsunEnvironment();
+    const priv = usePrivacyMode();
     const serverInfo = useServerInfo();
     const [open, setOpen] = useState(false);
     const [switching, setSwitching] = useState<EsunEnvironment | null>(null);
@@ -221,13 +227,13 @@ export function HeaderEnvMenu({
     const pickAccount = (acc: Account) => {
         if (locked) return;
         if (!canTrade(acc)) {
-            notify({ kind: 'err', title: '無法切換帳號', body: `${accountText(acc)} 尚未簽署，正式或未知模式下不可用於下單` });
+            notify({ kind: 'err', title: '無法切換帳號', body: `${accountText(acc, priv)} 尚未簽署，正式或未知模式下不可用於下單` });
             return;
         }
         selectAccount(acc);
         const market = acc.account_type === 'S' || acc.account_type === 'F' ? acc.account_type : null;
         if (market && !sameAccount(accountFor(market), acc)) {
-            notify({ kind: 'err', title: '無法切換帳號', body: `${accountText(acc)} 目前不可用於下單` });
+            notify({ kind: 'err', title: '無法切換帳號', body: `${accountText(acc, priv)} 目前不可用於下單` });
             return;
         }
         invalidateAllQueries();
@@ -235,7 +241,7 @@ export function HeaderEnvMenu({
         notify({
             kind: 'ok',
             title: '帳號切換',
-            body: `${market ? MARKET_NAME[market] : ''}改走 ${isEsunAccount(acc) ? BROKER_NAME.esun : BROKER_NAME.sinopac} ${accountText(acc)}`,
+            body: `${market ? MARKET_NAME[market] : ''}改走 ${isEsunAccount(acc) ? BROKER_NAME.esun : BROKER_NAME.sinopac} ${accountText(acc, priv)}`,
         });
     };
 
@@ -384,7 +390,7 @@ export function HeaderEnvMenu({
                 aria-controls={open ? 'header-env-menu' : undefined}
                 onClick={toggle}
                 title={`${routes
-                    .map((r) => `${MARKET_NAME[r.market]}：${BROKER_NAME[r.broker]} ${accountText(r.account)} ${ENV_SHORT[r.env]}`)
+                    .map((r) => `${MARKET_NAME[r.market]}：${BROKER_NAME[r.broker]} ${accountText(r.account, priv)} ${ENV_SHORT[r.env]}`)
                     .join('；')}${externalLabel && hasSinopacRoute ? `；${externalLabel}` : ''}（點擊查看路由與切換）`}
             >
                 {routes.length > 1 && new Set(routes.map((r) => r.broker)).size > 1 ? (
@@ -426,7 +432,7 @@ export function HeaderEnvMenu({
                                     <div key={r.market} className={styles.routeRow} data-testid={`header-route-${r.market}`}>
                                         <span className={styles.routeMarket}>{MARKET_NAME[r.market]}</span>
                                         <span className={styles.brokerTag[r.broker]}>{BROKER_SHORT[r.broker]}</span>
-                                        <span className={styles.routeAccount}>{accountText(r.account)}</span>
+                                        <span className={styles.routeAccount}>{accountText(r.account, priv)}</span>
                                         <span className={styles.envTag[r.env]}>{ENV_SHORT[r.env]}</span>
                                     </div>
                                 ))}
@@ -457,7 +463,7 @@ export function HeaderEnvMenu({
                                                 {isEsun ? '玉山' : '永豐'}
                                             </span>
                                             <span className={styles.accountName}>
-                                                {acc.broker_id}-{acc.account_id} ({acc.account_type === 'F' ? '期貨' : '證券'})
+                                                {accountText(acc, priv)} ({acc.account_type === 'F' ? '期貨' : '證券'})
                                             </span>
                                             {!tradable && <span className={styles.accountNote}>未簽署</span>}
                                             {isSelected && <Check size={12} className={styles.checkIcon} />}
