@@ -24,6 +24,8 @@ import { ODD_LOT_MAX_SHARES } from '../lib/odd-lot';
 import { clipAncestors, fitPopover, visibleClipRect, type PopoverFit } from '../lib/popover-fit';
 import type { Account } from '../lib/types/portfolio';
 import * as styles from './chart-order-popover.css';
+import { HEADER_LOCK_TITLE, headerAccountLocked } from '../lib/order-route';
+import { OrderRoutingBadge } from './order-routing-badge';
 
 const FOLLOW = '__follow__';
 
@@ -325,8 +327,8 @@ export function OrderSettingsPanel({
                     <span className={styles.label}>帳號</span>
                     <select
                         className={styles.select}
-                        disabled={true}
-                        title="帳號由頂欄 (Header) 統一控管切換"
+                        disabled={headerAccountLocked(account.following)}
+                        title={headerAccountLocked(account.following) ? HEADER_LOCK_TITLE : undefined}
                         aria-label={`${layout.title.replace('設定', '')}帳號`}
                         value={settings.accountKey ?? FOLLOW}
                         onChange={e => set({ accountKey: e.target.value === FOLLOW ? undefined : e.target.value })}
@@ -339,6 +341,7 @@ export function OrderSettingsPanel({
                             <option key={flashAccountKey(a)} value={flashAccountKey(a)}>{account.long(a)}</option>
                         ))}
                     </select>
+                    <OrderRoutingBadge account={account.active} />
                 </div>
             )}
             {layout.unit && (

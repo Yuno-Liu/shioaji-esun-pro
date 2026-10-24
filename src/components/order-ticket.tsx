@@ -1,10 +1,12 @@
 import { isEsunBroker, useEsunEnvironment } from '../lib/esun';
+import { captureDisplayedRoute, captureRouteEnv, esunStockLegProblem, HEADER_LOCK_TITLE, headerAccountLocked, ROUTE_CHANGED_MESSAGE, routeConfirmNote } from '../lib/order-route';
+import { OrderRoutingBadge } from './order-routing-badge';
 import { canTrade } from '../lib/account-tradable';
 // src/components/order-ticket.tsx — buy/sell ticket with two-step EXECUTE.
 // Stock vs futures aware; price autofills from the live quote.
 
 import { classifyOrderError, OUTCOME_UNKNOWN_GUIDANCE, reconcileAfterUnknownOutcome, reportOrderError } from '../lib/order-outcome';
-// import { Check, ChevronDown } from 'lucide-react';
+import { Check, ChevronDown } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { ORDER_CONTEXT_CHANGED_MESSAGE, useOrderContext } from '../hooks/use-order-context';
 import { TICKET_ACTION_EVENT } from '../hooks/use-hotkeys';
@@ -30,6 +32,7 @@ import { usePickedPrice } from '../lib/price-sync';
 import { maskAccountId, maskName, secretAccount, usePrivacyMode } from '../lib/privacy';
 import { useRevealText } from '../lib/privacy-text';
 import {
+    selectAccount,
     useAccounts,
 } from '../lib/account-store';
 import { accountConfirmLabel, requestOrderConfirm } from '../lib/order-confirm';
@@ -119,7 +122,8 @@ export function OrderTicket({
     const captureContext = useOrderContext(contract, `${orderLot}:${action}:${orderCond}:${daytradeShort}`);
 
     // ---- multi-account: chip + split-order (分倉) state ----
-
+    const [acctMenuOpen, setAcctMenuOpen] = useState(false);
+    const chipRef = useRef<HTMLDivElement>(null);
     const [simulation, setSimulation] = useState<boolean | null>(null);
     const [splitOpen, setSplitOpen] = useState(false);
     const [splitMode, setSplitMode] = useState<'ratio' | 'fixed'>('ratio');
@@ -159,7 +163,7 @@ export function OrderTicket({
         setTakePrice('');
         setSplitOpen(false);
         setSplitArmed(false);
-
+        setAcctMenuOpen(false);
     }, [contract.code, isFutures]);
 
     // 正式環境判斷：chip 上的 danger 視覺（下錯戶的最後防線）
@@ -177,7 +181,17 @@ export function OrderTicket({
         };
     }, []);
 
-
+    // click outside closes the account menu
+    useEffect(() => {
+        if (!acctMenuOpen) return;
+        const onDown = (e: MouseEvent) => {
+            if (!chipRef.current?.contains(e.target as Node)) {
+                setAcctMenuOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', onDown);
+        return () => document.removeEventListener('mousedown', onDown);
+    }, [acctMenuOpen]);
 
     // any order-parameter change de-arms the split confirm step.
     // `price` is deliberately NOT a dep: the live-quote autofill mutates it
@@ -269,7 +283,8 @@ export function OrderTicket({
                 if (problem) throw new Error(problem);
             }
             if (!isFutures) {
-                const problem = stockOrderProblem({ quantity: qty, price_type: priceType, order_type: orderType, order_lot: orderLot, order_cond: orderCond, daytrade_short: action === 'Sell' && daytradeShort, action, day_trade: contract.day_trade });
+                const problem = esunStockLegProblem(activeAccount, contract, { action, price: Number(price), quantity: qty, price_type: priceType, order_type: orderType, order_lot: orderLot, order_cond: orderCond, daytrade_short: action === 'Sell' && daytradeShort })
+                    ?? stockOrderProblem({ quantity: qty, price_type: priceType, order_type: orderType, order_lot: orderLot, order_cond: orderCond, daytrade_short: action === 'Sell' && daytradeShort, action, day_trade: contract.day_trade });
                 if (problem) throw new Error(problem);
             }
             const p = priceType === 'LMT' ? Number(price) : 0;
@@ -328,6 +343,8 @@ export function OrderTicket({
             if (!orderAccount) {
                 throw new Error('缺少有效的下單帳戶，請重新選擇帳戶');
             }
+            const sameRoute = captureDisplayedRoute(activeAccount, isFutures ? 'F' : 'S');
+            sameRoute();
             if (getRiskSettings().confirmManualOrders) {
                 const approved = await requestOrderConfirm({
                     code: contract.code,
@@ -341,7 +358,7 @@ export function OrderTicket({
                             ? `・${orderCond === 'MarginTrading' ? '融資' : '融券'}`
                             : ''
                     }${!isFutures && daytradeShort && action === 'Sell' ? '・現股當沖' : ''}${
-                        bracketOwner === 'background' ? '・括號單由背景執行保護（成交後才盯停損停利，只平倉已成交口數）' : ''}`,
+                        bracketOwner === 'background' ? '・括號單由背景執行保護（成交後才盯停損停利，只平倉已成交口數）' : ''}・${routeConfirmNote(orderAccount)}`,
                     accountLabel: accountConfirmLabel(orderAccount),
                 }, { serverMode: sameServerMode });
                 if (!approved) throw new Error('已取消下單');
@@ -354,6 +371,7 @@ export function OrderTicket({
             if (!isSelectedAccountUnchanged(orderAccount)) {
                 throw new Error(ACCOUNT_CHANGED_MESSAGE);
             }
+            sameRoute();
             // when the entry really leaves — after the confirmation and every
             // gate, at the request itself (#184): the background engine files
             // the entry under this time's trading session
@@ -363,6 +381,7 @@ export function OrderTicket({
                 if (!sameServerMode()) throw Object.assign(new Error(SERVER_MODE_CHANGED_MESSAGE), { tradingGateRejected: true });
                 assertDayTradeStillAllowed();
                 if (!isSelectedAccountUnchanged(orderAccount)) throw Object.assign(new Error(ACCOUNT_CHANGED_MESSAGE), { tradingGateRejected: true });
+                sameRoute();
                 entrySentAt = Date.now();
             } };
             if (bracketOwner === 'background') {
@@ -494,10 +513,10 @@ export function OrderTicket({
 
     const qtyUnit = orderQtyUnit(isFutures, orderLot);
     const odd = !isFutures && isOddLot(orderLot);
-    const { accounts, selectedStock, selectedFutures, selectedAccount } = useAccounts();
+    const { accounts, selectedStock, selectedFutures } = useAccounts();
     const priv = usePrivacyMode();
     const reveal = useRevealText();
-    const activeAccount = (isFutures ? (selectedFutures ?? (selectedAccount?.account_type === 'F' ? selectedAccount : null)) : (selectedStock ?? (selectedAccount?.account_type === 'S' ? selectedAccount : null))) ?? selectedAccount ?? (isFutures ? selectedFutures : selectedStock);
+    const activeAccount = isFutures ? selectedFutures : selectedStock;
     // any selection change in this window (this ticket's menu or another
     // panel's) disarms the ticket so a pending second click can't route
     // elsewhere
@@ -512,6 +531,8 @@ export function OrderTicket({
         (a) => canTrade(a) && a.account_type === (isFutures ? 'F' : 'S'),
     );
     const multi = routable.length >= 2;
+    // fork：主視窗由頂欄控管帳號，下單票不開選單；popout 沒有頂欄，保留選單
+    const pickable = multi && !headerAccountLocked();
     const esunEnv = useEsunEnvironment();
     const production = activeAccount && isEsunBroker(activeAccount.broker_id) ? !esunEnv.isSimulation : simulation === false;
 
@@ -579,9 +600,11 @@ export function OrderTicket({
         setSplitBusy(true);
         const isContextCurrent = captureContext();
         const sameServerMode = captureServerMode();
+        const sameEnvs = allocation.map((e) => captureRouteEnv(e.account));
         const beforeDispatch = () => {
             if (!isContextCurrent()) throw Object.assign(new Error(ORDER_CONTEXT_CHANGED_MESSAGE), { tradingGateRejected: true });
             if (!sameServerMode()) throw Object.assign(new Error(SERVER_MODE_CHANGED_MESSAGE), { tradingGateRejected: true });
+            if (!sameEnvs.every((same) => same())) throw Object.assign(new Error(ROUTE_CHANGED_MESSAGE), { tradingGateRejected: true });
             assertDayTradeStillAllowed();
         };
         try {
@@ -594,7 +617,7 @@ export function OrderTicket({
             }
             if (!isFutures) {
                 for (const e of allocation) {
-                    const problem = stockOrderProblem({ quantity: e.qty, price_type: priceType, order_type: orderType, order_lot: orderLot, order_cond: orderCond, daytrade_short: action === 'Sell' && daytradeShort, action, day_trade: contract.day_trade });
+                    const problem = esunStockLegProblem(e.account, contract, { action, price: Number(price), quantity: e.qty, price_type: priceType, order_type: orderType, order_lot: orderLot, order_cond: orderCond, daytrade_short: action === 'Sell' && daytradeShort }) ?? stockOrderProblem({ quantity: e.qty, price_type: priceType, order_type: orderType, order_lot: orderLot, order_cond: orderCond, daytrade_short: action === 'Sell' && daytradeShort, action, day_trade: contract.day_trade });
                     if (problem) throw new Error(problem);
                 }
             }
@@ -611,7 +634,7 @@ export function OrderTicket({
                     price: priceType === 'LMT' ? p : null,
                     quantity: splitTotal,
                     unit: qtyUnit,
-                    note: `分倉送出 ${allocation.length} 個帳戶${odd ? `・${lotLabel(orderLot)}` : ''}`,
+                    note: `分倉送出 ${allocation.length} 個帳戶${odd ? `・${lotLabel(orderLot)}` : ''}・${[...new Set(allocation.map((e) => routeConfirmNote(e.account)))].join('、')}`,
                     accountLabel: `分倉 ${allocation.length} 戶：${allocation
                         .map((e) => `${accountConfirmLabel(e.account)}×${e.qty}`)
                         .join('、')}`,
@@ -760,23 +783,70 @@ export function OrderTicket({
     return (
         <div className={styles.body}>
                 {activeAccount && (
-                    <div className={styles.chipRow}>
+                    <div className={styles.chipRow} ref={chipRef}>
                         <button
                             className={
                                 styles.acctChip[
                                     production
-                                        ? 'dangerSingle'
-                                        : 'single'
+                                        ? pickable
+                                            ? 'dangerMulti'
+                                            : 'dangerSingle'
+                                        : pickable
+                                          ? 'multi'
+                                          : 'single'
                                 ]
                             }
-                            disabled={true}
-                            title="帳號由頂欄 (Header) 統一控管切換"
+                            onClick={
+                                pickable
+                                    ? () => setAcctMenuOpen((v) => !v)
+                                    : undefined
+                            }
+                            title={`下單帳號 ${maskName(activeAccount.username, priv)}${
+                                production ? '（正式環境）' : ''
+                            }${pickable ? ' — 點擊切換（與帳務查詢同步）' : multi ? `\n${HEADER_LOCK_TITLE}` : ''}`}
                         >
                             {acctTag} {activeAccount.broker_id}-
                             {maskAccountId(activeAccount.account_id, priv)}
+                            {pickable && <ChevronDown size={11} />}
                         </button>
                         {production && (
                             <span className={styles.prodTag}>正式</span>
+                        )}
+                        <OrderRoutingBadge account={activeAccount} />
+                        {acctMenuOpen && (
+                            <div className={styles.acctMenu}>
+                                {routable.map((a) => {
+                                    const on =
+                                        acctKey(a) === acctKey(activeAccount);
+                                    return (
+                                        <button
+                                            key={acctKey(a)}
+                                            className={
+                                                styles.acctMenuItem[
+                                                    on ? 'on' : 'off'
+                                                ]
+                                            }
+                                            onClick={() => {
+                                                // 全域切換 — dock/帳務同步
+                                                selectAccount(a);
+                                                setAcctMenuOpen(false);
+                                                setArmed(false);
+                                            }}
+                                        >
+                                            {on ? (
+                                                <Check size={11} />
+                                            ) : (
+                                                <span
+                                                    style={{ width: 11 }}
+                                                />
+                                            )}
+                                            {acctTag} {a.broker_id}-
+                                            {maskAccountId(a.account_id, priv)}
+                                            （{maskName(a.username, priv)}）
+                                        </button>
+                                    );
+                                })}
+                            </div>
                         )}
                     </div>
                 )}

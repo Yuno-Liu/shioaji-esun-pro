@@ -1,3 +1,5 @@
+import { captureRouteEnv, HEADER_LOCK_TITLE, headerAccountLocked, routeConfirmNote } from '../lib/order-route';
+import { OrderRoutingBadge } from './order-routing-badge';
 import { canTrade } from '../lib/account-tradable';
 import { reconcileAfterUnknownOutcome, reportOrderError } from '../lib/order-outcome';
 import { ORDER_CONTEXT_CHANGED_MESSAGE, useOrderContext } from '../hooks/use-order-context';
@@ -454,9 +456,7 @@ export function FlashOrder({
     const market: FlashMarket = contract.security_type === 'STK' ? 'S' : 'F';
     const [localKeys, setLocalKeys] = useState<FlashAccountKeys>(accountKeys ?? {});
     const panelKeys = onAccountKeysChange ? (accountKeys ?? {}) : localKeys;
-    const globalAccount = (market === 'S'
-        ? (accountState.selectedStock ?? (accountState.selectedAccount?.account_type === 'S' ? accountState.selectedAccount : null))
-        : (accountState.selectedFutures ?? (accountState.selectedAccount?.account_type === 'F' ? accountState.selectedAccount : null))) ?? accountState.selectedAccount;
+    const globalAccount = market === 'S' ? accountState.selectedStock : accountState.selectedFutures;
     const eligible = accountState.accounts.filter(a => canTrade(a) && a.account_type === market);
     const resolved = resolveFlashAccount(accountState.accounts, market, panelKeys[market], globalAccount, followMain);
     const activeAccount = resolved.account;
@@ -1069,7 +1069,11 @@ export function FlashOrder({
 
     // the panel must still trade with the account captured at click time —
     // re-checked after the (optional) confirmation dialog
-    const stillPanelAccount = useCallback((captured: Account) => () => accountMatches(accountRef.current, captured), []);
+    const stillPanelAccount = useCallback((captured: Account) => {
+        // fork：玉山環境在確認或送出期間改變（例如切到正式）就不送
+        const sameRoute = captureRouteEnv(captured);
+        return () => accountMatches(accountRef.current, captured) && sameRoute();
+    }, []);
 
     const send = useCallback(async (action: Action, price: number | null) => {
         const capturedAccount = accountRef.current;
@@ -1176,6 +1180,7 @@ export function FlashOrder({
                     account: capturedAccount,
                     isAccountCurrent: stillPanelAccount(capturedAccount),
                     serverMode,
+                    confirmNote: routeConfirmNote(capturedAccount),
                     // 確認之後重新查可否融資券（不用快取）：確認期間變成 0 就不送；
                     // 查詢失敗照樣不擋（由券商端決定）
                     ...(gate?.afterConfirm ? { afterConfirm: gate.afterConfirm } : {}),
@@ -1632,6 +1637,7 @@ export function FlashOrder({
                 {orderTags.map(t => (
                     <span key={t} className={styles.creditTag.ok} data-testid='flash-order-tag' title={`這個面板的委託條件：${t}`}>{t}</span>
                 ))}
+                <OrderRoutingBadge account={activeAccount} />
                 {symbolExtra}
                 <span className={styles.symbolMeta}>{symbolLabel.meta}</span>
             </div>
@@ -1647,10 +1653,10 @@ export function FlashOrder({
                     <ChevronDown size={10} aria-hidden />
                     <select
                         className={styles.accountSelect}
-                        disabled={true}
+                        disabled={headerAccountLocked(resolved.following)}
                         aria-label="閃電下單帳戶"
                         // 透明 select 蓋住標籤，完整帳號＋戶名的 tooltip 要放在 select 上
-                        title={`帳號由頂欄 (Header) 統一控管切換\n${accountTitle}`}
+                        title={headerAccountLocked(resolved.following) ? `${HEADER_LOCK_TITLE}\n${accountTitle}` : `${accountTitle}\n${resolved.following ? '跟隨主畫面帳戶 — 選擇帳戶後此視窗固定使用該帳戶' : '此視窗固定帳戶，不影響其他視窗與主畫面'}`}
                         value={resolved.following ? FOLLOW_GLOBAL : resolved.unset ? '' : panelKeys[market]}
                         onChange={e => {
                             armedRef.current = false;
