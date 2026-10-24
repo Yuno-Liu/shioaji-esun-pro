@@ -197,41 +197,22 @@ export function refreshAccounts(): Promise<void> {
     return startLoad();
 }
 
-/** 註冊外部帳戶（例如玉山證券帳戶），若尚未存在則加入 accounts 清單並更新選取 */
+const sameAccount = (a: Account, b: Account) =>
+    a.account_type === b.account_type && keyOf(a) === keyOf(b);
+
+/** 註冊外部帳戶（例如玉山證券帳戶）：同一帳戶（類別＋券商＋帳號）更新資料，其餘加入清單 */
 export function registerExternalAccounts(external: Account[]): void {
     if (!external || external.length === 0) return;
     const merged = [...state.accounts];
     let changed = false;
     for (const a of external) {
-        const sameTypeIndex = merged.findIndex(
-            (ea) => ea.broker_id === a.broker_id && ea.account_type === a.account_type,
-        );
-        if (sameTypeIndex >= 0) {
-            const old = merged[sameTypeIndex]!;
-            if (old.account_id !== a.account_id) {
-                merged[sameTypeIndex] = a;
-                changed = true;
-                if (state.selectedAccount && keyOf(state.selectedAccount) === keyOf(old)) {
-                    state.selectedAccount = a;
-                }
-                if (state.selectedStock && keyOf(state.selectedStock) === keyOf(old)) {
-                    state.selectedStock = a;
-                }
-                if (state.selectedFutures && keyOf(state.selectedFutures) === keyOf(old)) {
-                    state.selectedFutures = a;
-                }
-            } else if (old.signed !== a.signed || old.username !== a.username) {
-                merged[sameTypeIndex] = a;
-                changed = true;
-            }
-        } else {
-            const exactIndex = merged.findIndex(
-                (ea) => ea.broker_id === a.broker_id && ea.account_id === a.account_id,
-            );
-            if (exactIndex < 0) {
-                merged.push(a);
-                changed = true;
-            }
+        const index = merged.findIndex((ea) => sameAccount(ea, a));
+        if (index < 0) {
+            merged.push(a);
+            changed = true;
+        } else if (merged[index]!.signed !== a.signed || merged[index]!.username !== a.username || merged[index]!.person_id !== a.person_id) {
+            merged[index] = a;
+            changed = true;
         }
     }
     if (changed) {
@@ -241,22 +222,26 @@ export function registerExternalAccounts(external: Account[]): void {
     }
 }
 
-/** 依券商條件替換外部帳戶（例如玉山環境切換時），自動更新選取 */
+/** 依券商條件替換外部帳戶（例如玉山環境切換時，帳戶鍵含環境），被替換掉的選取改指向新帳戶 */
 export function replaceExternalAccountsForBroker(
     isBrokerMatch: (brokerId: string) => boolean,
     nextAccounts: Account[],
 ): void {
     const retained = state.accounts.filter((a) => !isBrokerMatch(a.broker_id));
     const merged = [...retained, ...nextAccounts];
-    if (state.selectedAccount && isBrokerMatch(state.selectedAccount.broker_id)) {
-        state.selectedAccount = nextAccounts[0] ?? null;
-    }
-    if (state.selectedStock && isBrokerMatch(state.selectedStock.broker_id)) {
-        state.selectedStock = nextAccounts.find((a) => a.account_type === 'S') ?? null;
-    }
-    if (state.selectedFutures && isBrokerMatch(state.selectedFutures.broker_id)) {
-        state.selectedFutures = nextAccounts.find((a) => a.account_type === 'F') ?? null;
-    }
+    // 先換掉舊的選取（不改寫目前快照物件），再交給 apply 補上預設
+    const replace = (picked: Account | null | undefined, type?: string) => {
+        if (!picked || !isBrokerMatch(picked.broker_id)) return picked;
+        return nextAccounts.find((a) => sameAccount(a, picked))
+            ?? nextAccounts.find((a) => a.account_type === (type ?? picked.account_type))
+            ?? null;
+    };
+    state = {
+        ...state,
+        selectedAccount: replace(state.selectedAccount),
+        selectedStock: replace(state.selectedStock, 'S') ?? null,
+        selectedFutures: replace(state.selectedFutures, 'F') ?? null,
+    };
     apply(merged);
     persistSelection();
     emit();

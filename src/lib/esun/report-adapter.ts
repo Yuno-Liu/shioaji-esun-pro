@@ -1,0 +1,229 @@
+// src/lib/esun/report-adapter.ts — esun-bridge SSE 委託／成交回報 → 上游回報管線的 wire 形狀
+//
+// bridge（§5 契約）每筆 `order`（ACK）／`deal`（MAT）事件帶 SDK 原始欄位，另外固定附上
+// event_id（<boot_id>-<seq>）、seq、ts（ISO8601 +08:00）、environment、account、order_no、
+// op_type。上游 normalizeOrderEvent／projectOrderReport／projectTradeDeal 需要的是 Shioaji
+// 的 {state, data:{StockOrder|StockDeal:{…}}} 形狀，帶 order.account、status.exchange_ts、
+// contract.security_type、trade_id、exchange_seq，event_id 為 `v1:<stream>:<reset>:<seq>`
+// （才能做去重與跳號偵測）。這裡只做轉換，不讀網路、不改狀態。
+//
+// 數量一律換成 App 單位：整股／盤後為張，零股／興櫃為股（零股的 *_qty 是張的小數）。
+
+import type { Exchange } from '../types/contract';
+import type { Account } from '../types/portfolio';
+import {
+    esunAccountForEnvironment,
+    esunOrderId,
+    esunQuantityFromFields,
+    esunTimestamp,
+    isEsunFailureCode,
+} from './order-mapping';
+import { EsunApCode, EsunTradeType, type EsunEnvironment } from './types';
+
+type Rec = Record<string, unknown>;
+const rec = (v: unknown): Rec | null => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Rec) : null);
+const str = (v: unknown): string => (v === undefined || v === null ? '' : String(v).trim());
+const num = (v: unknown): number | null => {
+    if (v === undefined || v === null || v === '') return null;
+    const n = typeof v === 'number' ? v : Number(String(v).trim());
+    return Number.isFinite(n) ? n : null;
+};
+
+/** 本地已知的同一筆委託（用來把累計取消量換成「這次」的取消量） */
+export interface EsunKnownOrder {
+    quantity: number;
+    dealQuantity: number;
+    cancelQuantity: number;
+    price: number;
+}
+
+export interface EsunReportContext {
+    /** 目前 bridge 環境（與事件不同時事件一律丟棄） */
+    environment: EsunEnvironment;
+    /** bridge 目前登入的帳號（舊版 bridge 事件沒有 account 時使用） */
+    account: Pick<Account, 'broker_id' | 'account_id'> | null;
+    /** App 合約快取的交易所 */
+    exchangeOf?: (code: string) => Exchange | undefined;
+    /** 本地同一帳戶、同一 id 的委託 */
+    lookup?: (orderId: string, account: Account) => EsunKnownOrder | undefined;
+}
+
+export type EsunReportResult =
+    | { kind: 'report'; wire: Rec; orderId: string; account: Account }
+    | { kind: 'skip'; reason: 'environment' | 'malformed' };
+
+/** <boot_id>-<seq> → v1:esun-<env>:<boot_id>:<seq>（同一 bridge 行程內單調遞增） */
+export function esunEventId(rawId: unknown, rawSeq: unknown, environment: EsunEnvironment): string {
+    const id = str(rawId);
+    const seqNum = num(rawSeq);
+    const dash = id.lastIndexOf('-');
+    const boot = dash > 0 ? id.slice(0, dash) : '';
+    const tail = dash > 0 ? id.slice(dash + 1) : '';
+    const seq = seqNum !== null && Number.isSafeInteger(seqNum) && seqNum >= 0 ? String(seqNum) : /^\d+$/.test(tail) ? tail : '';
+    if (!boot || !seq || boot.includes(':')) return '';
+    return `v1:esun-${environment === 'SIMULATION' ? 'sim' : 'prod'}:${boot}:${seq}`;
+}
+
+/** ISO8601（含時區）或 epoch → epoch 秒 */
+function epochSeconds(v: unknown): number | undefined {
+    const n = num(v);
+    if (n !== null) {
+        if (n > 1e14) return n / 1e9;
+        if (n > 1e11) return n / 1e3;
+        return n > 0 ? n : undefined;
+    }
+    const text = str(v);
+    if (!text) return undefined;
+    const ms = Date.parse(text);
+    return Number.isFinite(ms) ? ms / 1000 : undefined;
+}
+
+/** 舊版 bridge 的包裝形狀 {state, data:{StockOrder|StockDeal}} 解回扁平欄位 */
+function flatten(payload: Rec): Rec {
+    const data = rec(payload.data);
+    const body = rec(data?.StockOrder) ?? rec(data?.StockDeal);
+    return body ? { ...body, event_id: body.event_id ?? payload.event_id } : payload;
+}
+
+const OP_TYPES: Record<string, string> = {
+    NEW: 'New',
+    CANCEL: 'Cancel',
+    DELETE: 'Cancel',
+    MODIFYPRICE: 'UpdatePrice',
+    UPDATEPRICE: 'UpdatePrice',
+    MODIFYQTY: 'UpdateQty',
+    UPDATEQTY: 'UpdateQty',
+    REJECT: 'Reject',
+};
+
+function orderLotOf(apCode: string): string {
+    if (apCode === EsunApCode.IntradayOdd || apCode === EsunApCode.Emg) return 'IntradayOdd';
+    if (apCode === EsunApCode.Odd) return 'Odd';
+    if (apCode === EsunApCode.AfterMarket) return 'Fixing';
+    return 'Common';
+}
+
+function condOf(trade: string): { cond: string; daytradeShort: boolean } {
+    if (trade === EsunTradeType.Margin) return { cond: 'MarginTrading', daytradeShort: false };
+    if (trade === EsunTradeType.Short) return { cond: 'ShortSelling', daytradeShort: false };
+    return { cond: 'Cash', daytradeShort: trade === EsunTradeType.DayTradingSell };
+}
+
+/**
+ * 轉換一筆 bridge 回報。`event` 為 SSE 事件名稱（order、deal，或舊版 order_event）。
+ * 環境不符（舊 session 的事件）或缺少必要欄位時回 skip。
+ */
+export function toEsunReportWire(event: string, payload: unknown, ctx: EsunReportContext): EsunReportResult {
+    const outer = rec(payload);
+    if (!outer) return { kind: 'skip', reason: 'malformed' };
+    const raw = flatten(outer);
+    const legacyState = str(outer.state);
+    const isDeal = event === 'deal' || legacyState === 'StockDeal';
+
+    const envText = str(raw.environment).toUpperCase();
+    if (envText && envText !== ctx.environment) return { kind: 'skip', reason: 'environment' };
+
+    const accountRef = rec(raw.account);
+    const accountId = str(accountRef?.account_id ?? raw.account_id) || str(ctx.account?.account_id);
+    const brokerId = str(accountRef?.broker_id ?? raw.broker_id) || str(ctx.account?.broker_id);
+    if (!accountId) return { kind: 'skip', reason: 'malformed' };
+    const account = esunAccountForEnvironment({ broker_id: brokerId, account_id: accountId }, ctx.environment);
+
+    // 與委託查詢相同的穩定識別（pre_ord_no 優先），bridge 的 order_no 只作備援
+    const orderId = esunOrderId(raw) || str(raw.order_no);
+    const code = str(raw.stock_no ?? raw.stockNo ?? raw.code);
+    const side = str(raw.buy_sell ?? raw.buySell).toUpperCase();
+    const legacyAction = rec(raw.order)?.action ?? raw.action;
+    const action = side.startsWith('B') ? 'Buy' : side.startsWith('S') ? 'Sell'
+        : legacyAction === 'Buy' || legacyAction === 'Sell' ? legacyAction : '';
+    const apCode = str(raw.ap_code ?? raw.apCode) || EsunApCode.Common;
+    const eventId = esunEventId(raw.event_id, raw.seq, ctx.environment);
+    const ts = epochSeconds(raw.ts) ?? esunTimestamp(raw.mat_date ?? raw.ord_date ?? raw.work_date, raw.mat_time ?? raw.ord_time);
+    const { cond, daytradeShort } = condOf(str(raw.trade));
+    const orderLot = orderLotOf(apCode);
+    const exchange: Exchange = apCode === EsunApCode.Emg ? 'OES' : (ctx.exchangeOf?.(code) ?? 'TSE');
+    if (!orderId || !code || !action) return { kind: 'skip', reason: 'malformed' };
+
+    if (isDeal) {
+        const quantity = esunQuantityFromFields({
+            mat_qty: raw.mat_qty ?? raw.deal_qty ?? raw.qty,
+            mat_qty_share: raw.mat_qty_share ?? raw.deal_qty_share,
+        }, 'mat', apCode);
+        const price = num(raw.mat_price ?? raw.deal_price ?? raw.price);
+        const seq = str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no)
+            || (eventId ? eventId.slice(eventId.indexOf(':') + 1) : '');
+        if (quantity === null || quantity <= 0 || price === null || price <= 0) return { kind: 'skip', reason: 'malformed' };
+        const body: Rec = {
+            trade_id: orderId,
+            exchange_seq: seq,
+            code,
+            action,
+            price,
+            quantity,
+            order_lot: orderLot,
+            order_cond: cond,
+            broker_id: account.broker_id,
+            account_id: account.account_id,
+            seqno: orderId,
+            ordno: str(raw.ord_no ?? raw.ordNo),
+            ...(ts !== undefined ? { ts } : {}),
+            event_id: eventId,
+        };
+        return { kind: 'report', orderId, account, wire: { state: 'StockDeal', data: { StockDeal: body } } };
+    }
+
+    const quantity = esunQuantityFromFields(raw, 'org', apCode);
+    if (quantity === null || quantity <= 0) return { kind: 'skip', reason: 'malformed' };
+    const dealt = esunQuantityFromFields(raw, 'mat', apCode) ?? 0;
+    const cancelledTotal = esunQuantityFromFields(raw, 'cel', apCode) ?? 0;
+    const price = num(raw.od_price ?? raw.odPrice ?? rec(raw.order)?.price) ?? 0;
+    const known = ctx.lookup?.(orderId, account);
+
+    let opType = OP_TYPES[str(raw.op_type ?? rec(raw.operation)?.op_type).toUpperCase().replace(/[^A-Z]/g, '')] ?? '';
+    if (!opType && known) {
+        // bridge 推不出操作別（Unknown）：依本地同一筆委託的累計量推斷
+        if (cancelledTotal > known.cancelQuantity) opType = dealt + cancelledTotal >= quantity ? 'Cancel' : 'UpdateQty';
+        else if (price > 0 && price !== known.price) opType = 'UpdatePrice';
+    }
+    // 累計取消量 → 這次操作的取消量（Cancel 依本地已知取消量累加；UpdateQty 以委託剩餘量為準）
+    const previous = known?.cancelQuantity ?? 0;
+    const thisCancel = opType === 'Cancel' || opType === 'UpdateQty'
+        ? Math.max(0, cancelledTotal - (known ? previous : 0))
+        : cancelledTotal;
+    const errCode = str(raw.err_code ?? raw.errCode ?? rec(raw.operation)?.op_code);
+    const failed = isEsunFailureCode(errCode);
+    const body: Rec = {
+        operation: {
+            op_type: opType,
+            op_code: failed ? errCode : '00',
+            op_msg: str(raw.err_msg ?? raw.errMsg ?? rec(raw.operation)?.op_msg),
+        },
+        order: {
+            id: orderId,
+            seqno: orderId,
+            ordno: str(raw.ord_no ?? raw.ordNo),
+            action,
+            price,
+            quantity,
+            order_type: str(raw.bs_flag ?? raw.bsFlag).toUpperCase() === 'I' ? 'IOC' : str(raw.bs_flag ?? raw.bsFlag).toUpperCase() === 'F' ? 'FOK' : 'ROD',
+            price_type: str(raw.price_flag ?? raw.priceFlag) === '4' ? 'MKT' : 'LMT',
+            order_lot: orderLot,
+            order_cond: cond,
+            daytrade_short: daytradeShort,
+            ...(str(raw.user_def ?? raw.memo) ? { custom_field: str(raw.user_def ?? raw.memo) } : {}),
+            account: { broker_id: account.broker_id, account_id: account.account_id, account_type: 'S' },
+        },
+        status: {
+            id: orderId,
+            ...(ts !== undefined ? { exchange_ts: ts } : {}),
+            // 減量回報：order_quantity 為減量後的委託量（委託量 − 累計取消量）
+            order_quantity: opType === 'UpdateQty' ? Math.max(0, quantity - cancelledTotal) : quantity,
+            deal_quantity: dealt,
+            cancel_quantity: thisCancel,
+            modified_price: opType === 'UpdatePrice' ? price : 0,
+        },
+        contract: { security_type: 'STK', exchange, code },
+        event_id: eventId,
+    };
+    return { kind: 'report', orderId, account, wire: { state: 'StockOrder', data: { StockOrder: body } } };
+}

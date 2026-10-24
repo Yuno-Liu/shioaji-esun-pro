@@ -1,7 +1,12 @@
 // src/lib/esun/mock-driver.ts — Mock driver for testing and simulation
+//
+// 回傳形狀比照 esun_trade SDK 實際欄位（snake_case；sdk.py 以 order_result["ap_code"]
+// 等鍵存取）：零股／興櫃（ap_code 3、4、5）的 *_qty 為「張」的小數、*_qty_share 為股數。
+// 環境綁定與 bridge 相同：expected_environment 不符時回 409（確定未送出）。
 
-import type { IEsunTradeDriver, EsunBridgeHealth } from './adapter';
+import type { IEsunTradeDriver, EsunBridgeHealth, EsunMutationOptions } from './adapter';
 import type {
+    EsunOrderMutationPayload,
     EsunOrderPayload,
     EsunOrderResult,
     EsunPlaceOrderResponse,
@@ -17,14 +22,28 @@ import type {
     ReserveStocksSummary,
 } from '../shioaji';
 import { ESUN_BROKER_CODE, ESUN_BROKER_NAME, ESUN_PRODUCTION_ENTRY, ESUN_SIMULATION_ENTRY } from './types';
+import { EsunBridgeError } from './http-driver';
+import { fromEsunInventoryToPosition } from './order-mapping';
+
+/** 測試用的佔位帳號（非真實帳號） */
+export const MOCK_ESUN_ACCOUNT_ID = '1234567';
+
+type MockOrder = EsunOrderPayload & { ordNo: string; celQty: number; matQty: number; orgQty: number };
+
+const isShareUnit = (apCode: string) => apCode === '3' || apCode === '4' || apCode === '5';
 
 export class MockEsunDriver implements IEsunTradeDriver {
     readonly name = 'mock';
 
     private seq = 1;
-    private orders = new Map<string, EsunOrderPayload & { ordNo: string; celQty: number; orgQty: number }>();
+    private orders = new Map<string, MockOrder>();
     public simulateFailure: string | null = null;
     private environment: 'SIMULATION' | 'PRODUCTION' = 'SIMULATION';
+    private generation = 1;
+    /** 最後一筆委託類請求帶的預期環境／帳號（測試檢查用） */
+    public lastGuard: EsunMutationOptions['guard'] | undefined;
+    /** 最後一筆減量請求的數量單位（測試檢查用） */
+    public lastUnit: EsunMutationOptions['unit'] | undefined;
 
     private customPositions: StockPosition[] | null = null;
     private customBalance: AccountBalance | null = null;
@@ -52,6 +71,18 @@ export class MockEsunDriver implements IEsunTradeDriver {
         this.customTradingLimits = limits;
     }
 
+    /** 模擬另一個視窗把 bridge 切到別的環境（不經過這個 service） */
+    setBridgeEnvironment(env: 'SIMULATION' | 'PRODUCTION'): void {
+        this.environment = env;
+        this.generation += 1;
+    }
+
+    /** 模擬券商端成交（測試用） */
+    fill(orderNo: string, quantity: number): void {
+        const existing = this.orders.get(orderNo);
+        if (existing) existing.matQty = Math.min(existing.orgQty - existing.celQty, existing.matQty + quantity);
+    }
+
     async health(): Promise<EsunBridgeHealth> {
         return {
             ok: true,
@@ -60,9 +91,10 @@ export class MockEsunDriver implements IEsunTradeDriver {
             environment: this.environment,
             simulation: this.environment === 'SIMULATION',
             entry: this.environment === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY,
-            account: { broker_id: ESUN_BROKER_CODE, account_id: '0664718' },
+            account: { broker_id: ESUN_BROKER_CODE, account_id: MOCK_ESUN_ACCOUNT_ID },
             loggedIn: true,
             loginError: null,
+            sessionGeneration: this.generation,
         };
     }
 
@@ -71,12 +103,16 @@ export class MockEsunDriver implements IEsunTradeDriver {
         environment: 'SIMULATION' | 'PRODUCTION';
         entry: string;
         account?: { broker_id: string; account_id: string } | null;
+        sessionGeneration?: number;
     }> {
         this.environment = env;
+        this.generation += 1;
         return {
             ok: true,
             environment: env,
             entry: env === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY,
+            account: { broker_id: ESUN_BROKER_CODE, account_id: MOCK_ESUN_ACCOUNT_ID },
+            sessionGeneration: this.generation,
         };
     }
 
@@ -85,7 +121,7 @@ export class MockEsunDriver implements IEsunTradeDriver {
             {
                 account_type: 'S',
                 broker_id: ESUN_BROKER_CODE,
-                account_id: '0664718',
+                account_id: MOCK_ESUN_ACCOUNT_ID,
                 signed: true,
                 username: ESUN_BROKER_NAME,
                 person_id: 'A123456789',
@@ -93,16 +129,32 @@ export class MockEsunDriver implements IEsunTradeDriver {
         ];
     }
 
-    async placeOrder(payload: EsunOrderPayload): Promise<EsunPlaceOrderResponse> {
+    /** 與 bridge 相同的前置檢查：環境不符 → 409 not_sent */
+    private checkGuard(opts?: EsunMutationOptions): void {
+        this.lastGuard = opts?.guard;
+        const expected = opts?.guard?.expected_environment;
+        if (expected && expected !== this.environment) {
+            throw new EsunBridgeError(`玉山目前為 ${this.environment}，與預期環境 ${expected} 不符`, 409, {
+                mutation: true, outcome: 'not_sent', code: 'ESUN_ENV_MISMATCH', environment: this.environment,
+            });
+        }
+    }
+
+    private failure(time: string): EsunReplaceOrderResponse {
+        return { ret_code: '999999', ret_msg: this.simulateFailure ?? '', ord_date: '20261023', ord_time: time };
+    }
+
+    async placeOrder(payload: EsunOrderPayload, opts?: EsunMutationOptions): Promise<EsunPlaceOrderResponse> {
+        this.checkGuard(opts);
         if (this.simulateFailure) {
             return {
-                retCode: '999999',
-                retMsg: this.simulateFailure,
-                workDate: '20261023',
-                ordType: '0',
-                ordNo: '',
-                ordDate: '20261023',
-                ordTime: '090000',
+                ret_code: '999999',
+                ret_msg: this.simulateFailure,
+                work_date: '20261023',
+                ord_type: '0',
+                ord_no: '',
+                ord_date: '20261023',
+                ord_time: '090000',
             };
         }
 
@@ -112,31 +164,28 @@ export class MockEsunDriver implements IEsunTradeDriver {
             ordNo,
             orgQty: payload.quantity,
             celQty: 0,
+            matQty: 0,
         });
 
         return {
-            retCode: '000000',
-            retMsg: '委託成功',
-            workDate: '20261023',
-            ordType: '0',
-            ordNo,
-            ordDate: '20261023',
-            ordTime: '090000',
+            ret_code: '000000',
+            ret_msg: '委託成功',
+            work_date: '20261023',
+            ord_type: '0',
+            ord_no: ordNo,
+            ord_date: '20261023',
+            ord_time: '090000',
         };
     }
 
     async replacePrice(
         orderNo: string,
         price: number | EsunPriceFlag,
+        _payload?: EsunOrderMutationPayload,
+        opts?: EsunMutationOptions,
     ): Promise<EsunReplaceOrderResponse> {
-        if (this.simulateFailure) {
-            return {
-                retCode: '999999',
-                retMsg: this.simulateFailure,
-                ordDate: '20261023',
-                ordTime: '090100',
-            };
-        }
+        this.checkGuard(opts);
+        if (this.simulateFailure) return this.failure('090100');
 
         const existing = this.orders.get(orderNo);
         if (existing && typeof price === 'number') {
@@ -144,92 +193,92 @@ export class MockEsunDriver implements IEsunTradeDriver {
         }
 
         return {
-            retCode: '000000',
-            retMsg: '改價成功',
-            ordDate: '20261023',
-            ordTime: '090100',
+            ret_code: '000000',
+            ret_msg: '改價成功',
+            ord_date: '20261023',
+            ord_time: '090100',
         };
     }
 
+    /** 減量：cancelQuantity 為減少量（SDK cancel_order(cel_qty=…) 語意） */
     async replaceQuantity(
         orderNo: string,
-        quantity: number,
-        _payload?: Partial<EsunOrderPayload>,
+        cancelQuantity: number,
+        _payload?: EsunOrderMutationPayload,
+        opts?: EsunMutationOptions,
     ): Promise<EsunReplaceOrderResponse> {
-        if (this.simulateFailure) {
-            return {
-                retCode: '999999',
-                retMsg: this.simulateFailure,
-                ordDate: '20261023',
-                ordTime: '090200',
-            };
-        }
+        this.checkGuard(opts);
+        this.lastUnit = opts?.unit;
+        if (this.simulateFailure) return this.failure('090200');
 
         const existing = this.orders.get(orderNo);
         if (existing) {
-            existing.quantity = quantity;
+            const remaining = existing.orgQty - existing.matQty - existing.celQty;
+            if (!(cancelQuantity > 0) || cancelQuantity > remaining) {
+                throw new EsunBridgeError(`減少數量 ${cancelQuantity} 超過剩餘量 ${remaining}`, 400, {
+                    mutation: true, outcome: 'not_sent', code: 'INVALID_QTY',
+                });
+            }
+            existing.celQty += cancelQuantity;
         }
 
         return {
-            retCode: '000000',
-            retMsg: '改量成功',
-            ordDate: '20261023',
-            ordTime: '090200',
+            ret_code: '000000',
+            ret_msg: '改量成功',
+            ord_date: '20261023',
+            ord_time: '090200',
         };
     }
 
-    async cancelOrder(orderNo: string): Promise<EsunReplaceOrderResponse> {
-        if (this.simulateFailure) {
-            return {
-                retCode: '999999',
-                retMsg: this.simulateFailure,
-                ordDate: '20261023',
-                ordTime: '090300',
-            };
-        }
+    async cancelOrder(orderNo: string, _payload?: EsunOrderMutationPayload, opts?: EsunMutationOptions): Promise<EsunReplaceOrderResponse> {
+        this.checkGuard(opts);
+        if (this.simulateFailure) return this.failure('090300');
 
         const existing = this.orders.get(orderNo);
         if (existing) {
-            existing.celQty = existing.quantity;
-            existing.quantity = 0;
+            existing.celQty = existing.orgQty - existing.matQty;
         }
 
         return {
-            retCode: '000000',
-            retMsg: '刪單成功',
-            ordDate: '20261023',
-            ordTime: '090300',
+            ret_code: '000000',
+            ret_msg: '刪單成功',
+            ord_date: '20261023',
+            ord_time: '090300',
         };
     }
 
     async getOrders(): Promise<EsunOrderResult[]> {
         const out: EsunOrderResult[] = [];
         for (const o of this.orders.values()) {
+            // App 數量：整股為張、零股為股；SDK 的 *_qty 一律為張（零股為小數）
+            const share = isShareUnit(o.apCode);
+            const lots = (n: number) => (share ? n / 1000 : n);
+            const shares = (n: number) => (share ? n : n * 1000);
             out.push({
-                workDate: '20261023',
-                ordDate: '20261023',
-                ordTime: '090000',
-                ordStatus: o.celQty >= o.orgQty ? 'Cancel' : 'Submitted',
-                ordNo: o.ordNo,
-                preOrdNo: o.ordNo,
-                stockNo: o.stockNo,
-                buySell: o.buySell,
-                apCode: o.apCode,
-                priceFlag: o.priceFlag,
+                work_date: '20261023',
+                ord_date: '20261023',
+                ord_time: '090000000',
+                ord_status: '2',
+                ord_no: o.ordNo,
+                pre_ord_no: '',
+                stock_no: o.stockNo,
+                buy_sell: o.buySell,
+                ap_code: o.apCode,
+                price_flag: o.priceFlag,
+                bs_flag: o.bsFlag,
                 trade: o.trade,
-                odPrice: String(o.price),
-                orgQty: String(o.orgQty),
-                orgQtyShare: String(o.orgQty * (o.apCode === '1' ? 1000 : 1)),
-                matQty: '0',
-                matQtyShare: '0',
-                celQty: String(o.celQty),
-                celQtyShare: String(o.celQty * (o.apCode === '1' ? 1000 : 1)),
-                celable: o.celQty < o.orgQty ? 'Y' : 'N',
-                errCode: '000000',
-                errMsg: '',
-                avgPrice: '0',
-                bsFlag: o.bsFlag,
-                memo: o.userDef || '',
+                od_price: o.price,
+                org_qty: lots(o.orgQty),
+                org_qty_share: shares(o.orgQty),
+                mat_qty: lots(o.matQty),
+                mat_qty_share: shares(o.matQty),
+                cel_qty: lots(o.celQty),
+                cel_qty_share: shares(o.celQty),
+                celable: o.celQty + o.matQty < o.orgQty ? '1' : '2',
+                err_code: '00000000',
+                err_msg: '',
+                avg_price: o.matQty > 0 ? o.price : 0,
+                user_def: o.userDef || '',
             });
         }
         return out;
@@ -239,20 +288,17 @@ export class MockEsunDriver implements IEsunTradeDriver {
         if (this.customPositions) {
             return this.customPositions;
         }
-        const mult = unit === 'Share' ? 1000 : 1;
-        return [
-            {
-                id: 1,
-                code: '2884',
-                direction: 'Buy',
-                quantity: 2 * mult,
-                price: 25.0,
-                last_price: 26.5,
-                pnl: 3000,
-                yd_quantity: 2 * mult,
-                cond: 'Cash',
-            },
-        ];
+        // get_inventories 的 stk_sums 形狀（cost_qty 為股數、trade 為交易類別）
+        const raw = [{
+            stk_no: '2884',
+            cost_qty: 2000,
+            price_avg: 25.0,
+            price_mkt: 26.5,
+            make_a_sum: 3000,
+            qty_l: 2000,
+            trade: '0',
+        }];
+        return raw.map((item, idx) => fromEsunInventoryToPosition(item, unit, idx + 1));
     }
 
     async getBalance(): Promise<AccountBalance> {
@@ -337,22 +383,12 @@ export class MockEsunDriver implements IEsunTradeDriver {
     }
 
     async getStockReserveSummary(): Promise<ReserveStocksSummary> {
+        // 玉山只有圈存金額，沒有逐檔圈存股數（見 fromEsunBalanceToReserveSummary）
         return {
-            stocks: [
-                {
-                    contract: {
-                        code: 'TOTAL',
-                        security_type: 'STK',
-                        exchange: 'TSE',
-                        target_code: null,
-                    },
-                    available_share: 0,
-                    reserved_share: 15000,
-                },
-            ],
+            stocks: [],
             account: {
                 broker_id: ESUN_BROKER_CODE,
-                account_id: '0664718',
+                account_id: MOCK_ESUN_ACCOUNT_ID,
                 account_type: 'S',
                 signed: true,
                 username: ESUN_BROKER_NAME,

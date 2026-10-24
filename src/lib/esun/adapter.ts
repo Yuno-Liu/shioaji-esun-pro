@@ -3,10 +3,13 @@
 import type {
     EsunConfigProfilesMap,
     EsunEnvironment,
+    EsunMutationGuard,
+    EsunOrderMutationPayload,
     EsunOrderPayload,
     EsunOrderResult,
     EsunPlaceOrderResponse,
     EsunPriceFlag,
+    EsunQuantityUnit,
     EsunReplaceOrderResponse,
 } from './types';
 import type { Account, AccountBalance, StockPosition } from '../types/portfolio';
@@ -31,6 +34,25 @@ export interface EsunBridgeHealth {
     availableEnvironments?: EsunEnvironment[];
     configProfiles?: EsunConfigProfilesMap;
     activeConfigFile?: string | null;
+    /** session 快照代次：登入／切換成功才 +1（esun-bridge §3） */
+    sessionGeneration?: number | null;
+    /** 磁碟上偵測到的設定與目前 session 不一致 */
+    configDrift?: boolean;
+    diskEnvironment?: EsunEnvironment | null;
+    wsConnected?: boolean;
+    wsLastMessageAt?: string | null;
+    loginLocked?: boolean;
+    loginLockReason?: string | null;
+}
+
+/** 每筆委託類請求附帶的選項 */
+export interface EsunMutationOptions {
+    /** 預期環境與帳號；bridge 不符時回 409（確定未送出） */
+    guard?: EsunMutationGuard;
+    /** 改量的數量單位（只用於 replaceQuantity） */
+    unit?: EsunQuantityUnit;
+    /** 改價的價格旗標（只用於 replacePrice） */
+    priceFlag?: EsunPriceFlag;
 }
 
 /** 抽象驅動介面：支援不同執行環境（HTTP 橋接、Mock 模擬） */
@@ -38,26 +60,29 @@ export interface IEsunTradeDriver {
     readonly name: string;
 
     /** 送出委託 */
-    placeOrder(payload: EsunOrderPayload): Promise<EsunPlaceOrderResponse>;
+    placeOrder(payload: EsunOrderPayload, opts?: EsunMutationOptions): Promise<EsunPlaceOrderResponse>;
 
     /** 改價 */
     replacePrice(
         orderNo: string,
         price: number | EsunPriceFlag,
-        payload?: Partial<EsunOrderPayload>,
+        payload?: EsunOrderMutationPayload,
+        opts?: EsunMutationOptions,
     ): Promise<EsunReplaceOrderResponse>;
 
-    /** 減量 / 改量 */
+    /** 減量：cancelQuantity 為「減少量」（與上游 update_qty、SDK cancel_order(cel_qty) 相同語意） */
     replaceQuantity(
         orderNo: string,
-        quantity: number,
-        payload?: Partial<EsunOrderPayload>,
+        cancelQuantity: number,
+        payload?: EsunOrderMutationPayload,
+        opts?: EsunMutationOptions,
     ): Promise<EsunReplaceOrderResponse>;
 
-    /** 刪單 */
+    /** 刪單（刪除全部剩餘量） */
     cancelOrder(
         orderNo: string,
-        payload?: Partial<EsunOrderPayload>,
+        payload?: EsunOrderMutationPayload,
+        opts?: EsunMutationOptions,
     ): Promise<EsunReplaceOrderResponse>;
 
     /** 查詢當日委託（可選，refresh: 強制打 API 刷新） */
@@ -103,6 +128,7 @@ export interface IEsunTradeDriver {
         activeConfigFile?: string | null;
         availableEnvironments?: EsunEnvironment[];
         configProfiles?: EsunConfigProfilesMap;
+        sessionGeneration?: number | null;
         error?: string;
     }>;
 
