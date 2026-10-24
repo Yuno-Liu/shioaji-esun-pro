@@ -687,6 +687,13 @@ function handleOrderEvent(raw: string) {
     orderEventListeners.forEach((l) => l(report));
 }
 
+/** Fork hook (src/lib/esun/stream.ts): a second report stream shares this pipeline and the follower fan-out. */
+export function publishStreamEvent(name: string, raw: string) {
+    if (name !== 'order_event') return dispatchNamed(name, raw);
+    shared?.publish({ kind: 'event', name, raw });
+    handleOrderEvent(raw);
+}
+
 // #285: a stream that is already open (e.g. a reload that skipped the boot
 // hold) is closed the moment boot refuses the server it points at
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
@@ -845,7 +852,7 @@ export function ensureStream() {
             onRelease: () => {
                 ownerListeners.forEach(listener => listener());
                 pendingConnect = false;
-                es?.close(); disconnectEsunOrderStream();
+                es?.close();
                 es = null;
                 if (retryTimer) clearTimeout(retryTimer);
                 retryTimer = null;
@@ -949,55 +956,8 @@ export function onContractEvent(
 // 模組層有 SSE 連線、計時器與 listener 註冊 — HMR 熱換會疊出第二條
 // SSE 連線與殭屍 listener（每 tick 重複灌、CPU 飆高）。一變更就整頁
 // 重載，開發期不會再累積疊層。
-let esunEs: EventSource | null = null;
-let esunRetryTimer: ReturnType<typeof setTimeout> | null = null;
-
-export function connectEsunOrderStream(url = '/esun/stream/orders'): () => void {
-    if (typeof EventSource === 'undefined') return () => {};
-    if (esunEs) return () => disconnectEsunOrderStream();
-
-    try {
-        esunEs = new EventSource(url);
-    } catch {
-        return () => {};
-    }
-
-    esunEs.addEventListener('order_event', (event: MessageEvent) => {
-        try {
-            handleOrderEvent(event.data);
-        } catch {
-            // ignore malformed event
-        }
-    });
-
-    esunEs.onerror = () => {
-        if (esunEs) {
-            esunEs.close();
-            esunEs = null;
-            if (esunRetryTimer) clearTimeout(esunRetryTimer);
-            esunRetryTimer = setTimeout(() => {
-                esunRetryTimer = null;
-                connectEsunOrderStream(url);
-            }, 5000);
-        }
-    };
-
-    return () => disconnectEsunOrderStream();
-}
-
-export function disconnectEsunOrderStream(): void {
-    if (esunRetryTimer) {
-        clearTimeout(esunRetryTimer);
-        esunRetryTimer = null;
-    }
-    if (esunEs) {
-        esunEs.close();
-        esunEs = null;
-    }
-}
-
 if (import.meta.hot) {
-    import.meta.hot.dispose(() => { if (watchdogTimer) clearInterval(watchdogTimer); shared?.close(); es?.close(); disconnectEsunOrderStream(); });
+    import.meta.hot.dispose(() => { if (watchdogTimer) clearInterval(watchdogTimer); shared?.close(); es?.close(); });
     import.meta.hot.accept(() => {
         import.meta.hot?.invalidate();
     });

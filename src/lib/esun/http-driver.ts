@@ -1,15 +1,23 @@
 // src/lib/esun/http-driver.ts — Browser driver: forwards E.SUN orders and portfolio queries
 // to the Python Sidecar / HTTP bridge over same-origin /esun/* JSON endpoints.
+//
+// Mutation 回應信封（esun-bridge 契約）：
+//   accepted（200）→ 回傳 result；not_sent（4xx／503）與 rejected（422）→ 確定未成立
+//   （mutationNotStarted）；unknown（502／504）、5xx、網路錯誤、逾時、無法解析的回應
+//   → 結果未知（mutationOutcomeUnknown／orderOutcomeUnknown），一律不重送。
+// 舊版 bridge 沒有信封時：2xx 視為 SDK 原始回傳；送單前就擋下的已知錯誤碼與 4xx
+// （408／409 除外）視為未送出；其餘一律結果未知。GET 失敗照一般錯誤處理。
 
-import type { IEsunTradeDriver, EsunBridgeHealth } from './adapter';
+import type { IEsunTradeDriver, EsunBridgeHealth, EsunMutationOptions } from './adapter';
 import type {
+    EsunMutationOutcome,
+    EsunOrderMutationPayload,
     EsunOrderPayload,
     EsunOrderResult,
     EsunPlaceOrderResponse,
     EsunPriceFlag,
     EsunReplaceOrderResponse,
 } from './types';
-import { ESUN_PRODUCTION_ENTRY, ESUN_SIMULATION_ENTRY } from './types';
 import type { Account, AccountBalance, StockPosition } from '../types/portfolio';
 import type {
     Settlement,
@@ -33,13 +41,92 @@ export type { EsunBridgeHealth } from './adapter';
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** 委託送出後的等待上限：逾時只代表「不知道」，絕不當成未送出 */
+export const ESUN_MUTATION_TIMEOUT_MS = 15_000;
+const QUERY_TIMEOUT_MS = 15_000;
+
+/** 舊版 bridge（無信封）在呼叫 SDK 之前就回絕的錯誤碼 */
+const PRE_DISPATCH_CODES = new Set([
+    'INVALID_PARAMS',
+    'INVALID_ORDER_PARAMS',
+    'INVALID_QTY',
+    'AG_INVALID_QUANTITY',
+    'AG_INVALID_PRICE_MODIFY',
+    'AG0006',
+    'AGR0001',
+    'AGR0002',
+    'NOT_LOGGED_IN',
+]);
+
+export const ESUN_OUTCOME_UNKNOWN_MESSAGE = '玉山委託送出結果未確認；請求可能已送達券商，請先查詢委託，勿直接重送';
+
+interface EsunBridgeErrorDetail {
+    code?: string;
+    outcome?: EsunMutationOutcome;
+    /** true：委託類請求，依 outcome 標記未送出或結果未知 */
+    mutation?: boolean;
+    timedOut?: boolean;
+    environment?: string;
+    result?: unknown;
+}
+
+/**
+ * bridge 錯誤。旗標只在成立時才出現在物件上（有些呼叫端以 `'mutationNotStarted' in e`
+ * 判斷，宣告成 undefined 的欄位會被誤判）。
+ */
 export class EsunBridgeError extends Error {
-    readonly mutationNotStarted?: true;
-    constructor(message: string, readonly status: number) {
+    declare readonly mutationNotStarted?: true;
+    declare readonly mutationOutcomeUnknown?: true;
+    declare readonly orderOutcomeUnknown?: true;
+    declare readonly requestTimedOut?: true;
+    declare readonly code?: string;
+    declare readonly outcome?: EsunMutationOutcome;
+    declare readonly httpStatus?: number;
+    declare readonly environment?: string;
+    declare readonly result?: unknown;
+    constructor(message: string, readonly status: number, detail: EsunBridgeErrorDetail = {}) {
         super(message);
         this.name = 'EsunBridgeError';
-        this.mutationNotStarted = true;
+        const extra: Record<string, unknown> = {};
+        if (detail.code) extra.code = detail.code;
+        if (detail.outcome) extra.outcome = detail.outcome;
+        if (detail.environment) extra.environment = detail.environment;
+        if (detail.result !== undefined) extra.result = detail.result;
+        if (detail.timedOut) extra.requestTimedOut = true;
+        if (detail.mutation) {
+            if (detail.outcome === 'not_sent' || detail.outcome === 'rejected') extra.mutationNotStarted = true;
+            else Object.assign(extra, { mutationOutcomeUnknown: true, orderOutcomeUnknown: true, httpStatus: status });
+        }
+        Object.assign(this, extra);
     }
+}
+
+/** 是否為「確定沒有成立」的玉山 mutation 錯誤（not_sent／rejected） */
+export function isEsunNotSent(error: unknown): boolean {
+    return !!error && typeof error === 'object' && (error as { mutationNotStarted?: unknown }).mutationNotStarted === true;
+}
+
+type Json = Record<string, unknown>;
+const isRecord = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array.isArray(v);
+
+function messageOf(data: unknown, fallback: string): string {
+    if (isRecord(data)) {
+        const text = data.error ?? data.message;
+        if (typeof text === 'string' && text.trim()) return text.trim();
+    }
+    return fallback;
+}
+
+function codeOf(data: unknown): string | undefined {
+    return isRecord(data) && typeof data.code === 'string' && data.code ? data.code : undefined;
+}
+
+/** 舊版 bridge（沒有 outcome 欄位）的錯誤分類 */
+function legacyOutcome(status: number, data: unknown): EsunMutationOutcome {
+    const code = codeOf(data);
+    if (code && PRE_DISPATCH_CODES.has(code)) return 'not_sent';
+    if (status >= 400 && status < 500 && status !== 408 && status !== 409) return 'not_sent';
+    return 'unknown';
 }
 
 export class HttpEsunDriver implements IEsunTradeDriver {
@@ -50,45 +137,117 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         private readonly fetchImpl: FetchLike = (input, init) => fetch(input, init),
     ) {}
 
-    private async request<T>(
-        method: 'GET' | 'POST',
-        path: string,
-        body?: unknown,
-        timeoutMs = 15_000,
-    ): Promise<T> {
+    private async send(method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number) {
         const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
-        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
-        let res: Response;
+        let timedOut = false;
+        const timer = controller ? setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs) : undefined;
         try {
-            res = await this.fetchImpl(`${this.base}${path}`, {
+            const res = await this.fetchImpl(`${this.base}${path}`, {
                 method,
                 headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
                 body: body === undefined ? undefined : JSON.stringify(body),
                 signal: controller?.signal,
             });
+            const text = await res.text();
+            let data: unknown = null;
+            let parsed = true;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                parsed = false;
+            }
+            return { res, data, parsed };
         } catch (err) {
-            throw new EsunBridgeError(
-                `無法連線玉山下單服務 (esun-bridge)：${err instanceof Error ? err.message : String(err)}`,
-                0,
-            );
+            const aborted = timedOut || (err instanceof Error && err.name === 'AbortError');
+            throw Object.assign(err instanceof Error ? err : new Error(String(err)), { esunAborted: aborted });
         } finally {
             if (timer) clearTimeout(timer);
         }
+    }
 
-        const text = await res.text();
-        let data: unknown = null;
+    /** 查詢類（GET）與非委託 POST：失敗照一般錯誤，不帶委託結果旗標 */
+    private async request<T>(
+        method: 'GET' | 'POST',
+        path: string,
+        body?: unknown,
+        timeoutMs = QUERY_TIMEOUT_MS,
+    ): Promise<T> {
+        let reply: Awaited<ReturnType<HttpEsunDriver['send']>>;
         try {
-            data = text ? JSON.parse(text) : null;
-        } catch {
-            throw new EsunBridgeError(`玉山下單服務回應格式錯誤（HTTP ${res.status}）`, res.status);
+            reply = await this.send(method, path, body, timeoutMs);
+        } catch (err) {
+            const aborted = (err as { esunAborted?: boolean }).esunAborted === true;
+            throw new EsunBridgeError(
+                aborted
+                    ? `玉山下單服務 (esun-bridge) 回應逾時（${Math.round(timeoutMs / 1000)} 秒）`
+                    : `無法連線玉山下單服務 (esun-bridge)：${err instanceof Error ? err.message : String(err)}`,
+                0,
+                { timedOut: aborted },
+            );
         }
+        const { res, data, parsed } = reply;
+        if (!parsed) throw new EsunBridgeError(`玉山下單服務回應格式錯誤（HTTP ${res.status}）`, res.status);
         if (!res.ok) {
-            const msg = (data as { error?: string; message?: string } | null)?.error
-                ?? (data as { error?: string; message?: string } | null)?.message
-                ?? `HTTP ${res.status}`;
-            throw new EsunBridgeError(msg, res.status);
+            throw new EsunBridgeError(messageOf(data, `HTTP ${res.status}`), res.status, {
+                code: codeOf(data),
+                environment: isRecord(data) && typeof data.environment === 'string' ? data.environment : undefined,
+            });
         }
         return data as T;
+    }
+
+    /** 委託類 POST：解析回應信封；只有 not_sent／rejected 才是確定未送出 */
+    private async mutate<T>(path: string, body: Json): Promise<T> {
+        let reply: Awaited<ReturnType<HttpEsunDriver['send']>>;
+        try {
+            reply = await this.send('POST', path, body, ESUN_MUTATION_TIMEOUT_MS);
+        } catch (err) {
+            const aborted = (err as { esunAborted?: boolean }).esunAborted === true;
+            const reason = aborted
+                ? `等待超過 ${Math.round(ESUN_MUTATION_TIMEOUT_MS / 1000)} 秒`
+                : `連線中斷：${err instanceof Error ? err.message : String(err)}`;
+            throw new EsunBridgeError(`${ESUN_OUTCOME_UNKNOWN_MESSAGE}（${reason}）`, 0, {
+                mutation: true, outcome: 'unknown', timedOut: aborted, code: 'ESUN_OUTCOME_UNKNOWN',
+            });
+        }
+        const { res, data, parsed } = reply;
+        if (!parsed) {
+            const outcome = legacyOutcome(res.status, null);
+            throw new EsunBridgeError(
+                outcome === 'not_sent'
+                    ? `玉山下單服務拒絕請求（HTTP ${res.status}），未送出`
+                    : `${ESUN_OUTCOME_UNKNOWN_MESSAGE}（回應無法解析，HTTP ${res.status}）`,
+                res.status,
+                { mutation: true, outcome },
+            );
+        }
+        const envelope = isRecord(data) && typeof data.outcome === 'string' ? data : null;
+        if (envelope) {
+            const outcome = envelope.outcome as string;
+            if (outcome === 'accepted' && res.ok) return (envelope.result ?? {}) as T;
+            const known: EsunMutationOutcome = outcome === 'not_sent' || outcome === 'rejected' ? outcome : 'unknown';
+            const fallback = known === 'unknown' ? ESUN_OUTCOME_UNKNOWN_MESSAGE : `HTTP ${res.status}`;
+            const text = messageOf(envelope, fallback);
+            throw new EsunBridgeError(
+                known === 'unknown' && text !== ESUN_OUTCOME_UNKNOWN_MESSAGE ? `${ESUN_OUTCOME_UNKNOWN_MESSAGE}（${text}）` : text,
+                res.status,
+                {
+                    mutation: true,
+                    outcome: known,
+                    code: codeOf(envelope) ?? (known === 'unknown' ? 'ESUN_OUTCOME_UNKNOWN' : undefined),
+                    environment: typeof envelope.environment === 'string' ? envelope.environment : undefined,
+                    result: envelope.result,
+                },
+            );
+        }
+        if (res.ok) return (data ?? {}) as T; // 舊版 bridge：SDK 原始回傳
+        const outcome = legacyOutcome(res.status, data);
+        const text = messageOf(data, `HTTP ${res.status}`);
+        throw new EsunBridgeError(
+            outcome === 'unknown' ? `${ESUN_OUTCOME_UNKNOWN_MESSAGE}（${text}）` : text,
+            res.status,
+            { mutation: true, outcome, code: codeOf(data) },
+        );
     }
 
     health(timeoutMs?: number): Promise<EsunBridgeHealth> {
@@ -108,66 +267,83 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         activeConfigFile?: string | null;
         availableEnvironments?: any[];
         configProfiles?: any;
+        sessionGeneration?: number;
         error?: string;
     }> {
-        return this.request<{
-            ok: boolean;
-            environment: 'SIMULATION' | 'PRODUCTION';
-            entry: string;
-            account?: { broker_id: string; account_id: string } | null;
-            message?: string;
-            activeConfigFile?: string | null;
-            availableEnvironments?: any[];
-            configProfiles?: any;
-            error?: string;
-        }>('POST', '/esun/auth/environment', { environment: env });
+        // 切換需重新登入券商（數秒）；逾時由 service 視為失敗並以 health 重新同步
+        return this.request('POST', '/esun/auth/environment', { environment: env }, 30_000);
     }
 
-    placeOrder(payload: EsunOrderPayload): Promise<EsunPlaceOrderResponse> {
-        return this.request<EsunPlaceOrderResponse>('POST', '/esun/orders/place', { payload });
+    placeOrder(payload: EsunOrderPayload, opts?: EsunMutationOptions): Promise<EsunPlaceOrderResponse> {
+        return this.mutate<EsunPlaceOrderResponse>('/esun/orders/place', {
+            payload,
+            ...opts?.guard,
+        });
     }
 
     replacePrice(
         orderNo: string,
         price: number | EsunPriceFlag,
-        payload?: Partial<EsunOrderPayload>,
+        payload?: EsunOrderMutationPayload,
+        opts?: EsunMutationOptions,
     ): Promise<EsunReplaceOrderResponse> {
-        return this.request<EsunReplaceOrderResponse>('POST', '/esun/orders/replace-price', {
-            orderNo,
+        return this.mutate<EsunReplaceOrderResponse>('/esun/orders/replace-price', {
+            order_no: orderNo,
             price,
-            payload,
+            ...(opts?.priceFlag ? { price_flag: opts.priceFlag } : {}),
+            ...(payload ? { payload } : {}),
+            ...opts?.guard,
         });
     }
 
     replaceQuantity(
         orderNo: string,
-        quantity: number,
-        payload?: Partial<EsunOrderPayload>,
+        cancelQuantity: number,
+        payload?: EsunOrderMutationPayload,
+        opts?: EsunMutationOptions,
     ): Promise<EsunReplaceOrderResponse> {
-        return this.request<EsunReplaceOrderResponse>('POST', '/esun/orders/replace-qty', {
-            orderNo,
-            quantity,
-            payload,
+        return this.mutate<EsunReplaceOrderResponse>('/esun/orders/replace-qty', {
+            order_no: orderNo,
+            cancel_quantity: cancelQuantity,
+            quantity_unit: opts?.unit ?? 'lot',
+            ...(payload ? { payload } : {}),
+            ...opts?.guard,
         });
     }
 
     cancelOrder(
         orderNo: string,
-        payload?: Partial<EsunOrderPayload>,
+        payload?: EsunOrderMutationPayload,
+        opts?: EsunMutationOptions,
     ): Promise<EsunReplaceOrderResponse> {
-        return this.request<EsunReplaceOrderResponse>('POST', '/esun/orders/cancel', {
-            orderNo,
-            payload,
+        return this.mutate<EsunReplaceOrderResponse>('/esun/orders/cancel', {
+            order_no: orderNo,
+            ...(payload ? { payload } : {}),
+            ...opts?.guard,
         });
     }
 
-    getOrders(refresh = false): Promise<EsunOrderResult[]> {
-        return this.request<EsunOrderResult[]>('GET', `/esun/orders?refresh=${Boolean(refresh)}`);
+    /**
+     * refresh=true 是「向券商重新查詢」的權威讀取：bridge 若標示回傳的是快取
+     * （節流、未登入、SDK 失敗時退回快取）就視為讀取失敗，不能當成券商回讀。
+     */
+    async getOrders(refresh = false): Promise<EsunOrderResult[]> {
+        const raw = await this.request<unknown>('GET', `/esun/orders?refresh=${refresh ? 'true' : 'false'}`);
+        if (Array.isArray(raw)) return raw as EsunOrderResult[];
+        if (isRecord(raw) && Array.isArray(raw.orders)) {
+            const cached = raw.source === 'cache' || raw.refreshed === false;
+            if (refresh && cached) {
+                const why = typeof raw.reason === 'string' && raw.reason ? `：${raw.reason}` : '';
+                throw new EsunBridgeError(`玉山委託未能向券商重新查詢（bridge 回傳快取${why}）`, 200, { code: 'ESUN_REFRESH_SKIPPED' });
+            }
+            return raw.orders as EsunOrderResult[];
+        }
+        throw new EsunBridgeError('玉山委託回應格式錯誤', 200);
     }
 
     async getPositions(unit: 'Common' | 'Share' = 'Common'): Promise<StockPosition[]> {
-        const raw = await this.request<any[]>('GET', `/esun/portfolio/positions?unit=${unit}`);
-        if (!Array.isArray(raw)) return [];
+        const raw = await this.request<any[]>('GET', `/esun/portfolio/positions?unit=${encodeURIComponent(unit)}`);
+        if (!Array.isArray(raw)) throw new EsunBridgeError('玉山庫存回應格式錯誤', 200);
         return raw.map((item, idx) => fromEsunInventoryToPosition(item, unit, idx + 1));
     }
 
@@ -181,39 +357,29 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         return fromEsunSettlements(raw);
     }
 
-    async getProfitLoss(beginDate: string, endDate: string): Promise<StockProfitLoss[]> {
+    private profitLossPath(beginDate: string, endDate: string) {
         const clamped = clampEsunDateRange180Days(beginDate, endDate);
-        const raw = await this.request<any[]>(
-            'GET',
-            `/esun/portfolio/profit-loss?begin_date=${clamped.beginDate}&end_date=${clamped.endDate}`,
-        );
+        return {
+            clamped,
+            path: `/esun/portfolio/profit-loss?begin_date=${encodeURIComponent(clamped.beginDate)}&end_date=${encodeURIComponent(clamped.endDate)}`,
+        };
+    }
+
+    async getProfitLoss(beginDate: string, endDate: string): Promise<StockProfitLoss[]> {
+        const raw = await this.request<any[]>('GET', this.profitLossPath(beginDate, endDate).path);
         return fromEsunTransactionsToProfitLoss(raw);
     }
 
     async getProfitLossSummary(beginDate: string, endDate: string): Promise<ProfitLossSummaryTotal> {
-        const clamped = clampEsunDateRange180Days(beginDate, endDate);
-        const raw = await this.request<any>(
-            'GET',
-            `/esun/portfolio/profit-loss?begin_date=${clamped.beginDate}&end_date=${clamped.endDate}`,
-        );
+        const { clamped, path } = this.profitLossPath(beginDate, endDate);
+        const raw = await this.request<any>('GET', path);
         if (Array.isArray(raw)) {
             return fromEsunTransactionsToProfitLossSummary(raw, clamped.beginDate, clamped.endDate);
         }
         if (raw && typeof raw === 'object' && 'profitloss_sum' in raw && 'total' in raw) {
             return raw as ProfitLossSummaryTotal;
         }
-        return {
-            profitloss_sum: [],
-            total: {
-                entry_amount: 0,
-                cover_amount: 0,
-                quantity: 0,
-                buy_cost: 0,
-                sell_cost: 0,
-                pnl: 0,
-                pr_ratio: 0,
-            },
-        };
+        throw new EsunBridgeError('玉山已實現損益回應格式錯誤', 200);
     }
 
     async getTradingLimits(): Promise<TradingLimits> {
@@ -226,20 +392,15 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         return fromEsunBalanceToReserveSummary(raw);
     }
 
-    async getCaExpire(personId?: string): Promise<{ ca_expiretime: string }> {
-        try {
-            const res = await this.request<{ ca_expiretime: string }>(
-                'GET',
-                `/esun/ca_expiretime${personId ? `?person_id=${personId}` : ''}`,
-            );
-            return res;
-        } catch {
-            return { ca_expiretime: '' };
-        }
+    getCaExpire(personId?: string): Promise<{ ca_expiretime: string }> {
+        return this.request<{ ca_expiretime: string }>(
+            'GET',
+            `/esun/ca_expiretime${personId ? `?person_id=${encodeURIComponent(personId)}` : ''}`,
+        );
     }
 }
 
-/** 預設驅動：尚未連上 esun-bridge 時，任何委託都明確失敗（絕不假裝成功）。 */
+/** 預設驅動：尚未連上 esun-bridge 時，委託與查詢都明確失敗（絕不假裝成功或回空帳戶）。 */
 export class UnavailableEsunDriver implements IEsunTradeDriver {
     readonly name = 'unavailable';
 
@@ -249,48 +410,35 @@ export class UnavailableEsunDriver implements IEsunTradeDriver {
         throw Object.assign(new Error(this.reason), { mutationNotStarted: true as const });
     }
 
+    private unavailable(): never {
+        throw new Error('玉山下單服務 (esun-bridge) 未連線，無法查詢玉山帳務');
+    }
+
     async placeOrder(): Promise<EsunPlaceOrderResponse> { return this.fail(); }
     async replacePrice(): Promise<EsunReplaceOrderResponse> { return this.fail(); }
     async replaceQuantity(): Promise<EsunReplaceOrderResponse> { return this.fail(); }
     async cancelOrder(): Promise<EsunReplaceOrderResponse> { return this.fail(); }
-    async getOrders(): Promise<EsunOrderResult[]> { return []; }
-    async getPositions(): Promise<StockPosition[]> { return []; }
-    async getBalance(): Promise<AccountBalance> { return { acc_balance: 0, date: '', errmsg: this.reason }; }
-    async getSettlements(): Promise<Settlement[]> { return []; }
-    async getProfitLoss(): Promise<StockProfitLoss[]> { return []; }
-    async getProfitLossSummary(): Promise<ProfitLossSummaryTotal> {
-        return {
-            profitloss_sum: [],
-            total: { entry_amount: 0, cover_amount: 0, quantity: 0, buy_cost: 0, sell_cost: 0, pnl: 0, pr_ratio: 0 },
-        };
-    }
-    async getTradingLimits(): Promise<TradingLimits> {
-        return {
-            trading_limit: 0,
-            trading_used: 0,
-            trading_available: 0,
-            margin_limit: 0,
-            margin_used: 0,
-            margin_available: 0,
-            short_limit: 0,
-            short_used: 0,
-            short_available: 0,
-        };
-    }
-    async getStockReserveSummary(): Promise<ReserveStocksSummary> {
-        return { stocks: [], account: { broker_id: '8840', account_id: '', account_type: 'S', signed: false, username: '', person_id: '' } };
-    }
-    async getCaExpire(): Promise<{ ca_expiretime: string }> { return { ca_expiretime: '' }; }
+    async getOrders(): Promise<EsunOrderResult[]> { return this.unavailable(); }
+    async getPositions(): Promise<StockPosition[]> { return this.unavailable(); }
+    async getBalance(): Promise<AccountBalance> { return this.unavailable(); }
+    async getSettlements(): Promise<Settlement[]> { return this.unavailable(); }
+    async getProfitLoss(): Promise<StockProfitLoss[]> { return this.unavailable(); }
+    async getProfitLossSummary(): Promise<ProfitLossSummaryTotal> { return this.unavailable(); }
+    async getTradingLimits(): Promise<TradingLimits> { return this.unavailable(); }
+    async getStockReserveSummary(): Promise<ReserveStocksSummary> { return this.unavailable(); }
+    async getCaExpire(): Promise<{ ca_expiretime: string }> { return this.unavailable(); }
     async switchEnvironment(env: 'SIMULATION' | 'PRODUCTION'): Promise<{
         ok: boolean;
         environment: 'SIMULATION' | 'PRODUCTION';
         entry: string;
         account?: { broker_id: string; account_id: string } | null;
+        error?: string;
     }> {
         return {
-            ok: true,
+            ok: false,
             environment: env,
-            entry: env === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY,
+            entry: '',
+            error: '玉山下單服務 (esun-bridge) 未連線，無法切換環境',
         };
     }
 }
