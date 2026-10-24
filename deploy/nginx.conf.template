@@ -1,10 +1,50 @@
+# Shioaji Pro Web — nginx 反向代理模板（官方映像啟動時以 envsubst 產生 conf.d/default.conf）
+# 只有名稱符合 NGINX_ENVSUBST_FILTER 且已定義的環境變數會被替換；
+# 小寫的 $host、$http_origin 等是 nginx 變數，不會被 envsubst 動到。
+
+# 跨來源防護：Origin 必須與 Host 相同（不比 scheme，方便前面再接 TLS 代理），
+# 沒有 Origin（curl、同源 GET）則放行；Origin 為 null 或其他網站一律視為跨來源。
+map "$http_origin|$http_host" $shioaji_pro_cross_origin {
+    default 1;
+    "~^\|" 0;
+    "~*^https?://([^/|]+)\|\1$" 0;
+}
+
+# 瀏覽器的 Sec-Fetch-Site：只接受同源或使用者直接開啟（none）；沒有此標頭（非瀏覽器）放行
+map $http_sec_fetch_site $shioaji_pro_cross_site {
+    default 1;
+    "" 0;
+    same-origin 0;
+    none 0;
+}
+
+# 預設 server：Host 不在允許清單（例如 DNS rebinding、以 IP 從區網直連）一律斷線
+server {
+    listen ${PORT} default_server;
+    server_name _;
+    server_tokens off;
+    return 444;
+}
+
 server {
     listen ${PORT};
-    listen [::]:${PORT};
-    server_name localhost;
+    # 允許的 Host：本機 + WEB_SERVER_NAMES（以空白分隔，例如 "trade.lan 192.168.1.20"）
+    server_name localhost 127.0.0.1 ${WEB_SERVER_NAMES};
+    server_tokens off;
 
     root /usr/share/nginx/html;
     index index.html;
+
+    include /etc/nginx/snippets/security-headers.conf;
+
+    # 選用的 Basic Auth：WEB_BASIC_AUTH 預設 off；要開放區網時設成任意 realm 名稱，
+    # 並把 htpasswd 檔唯讀掛載到 /etc/nginx/auth/htpasswd（見 docs/fork/esun.md）
+    auth_basic "${WEB_BASIC_AUTH}";
+    auth_basic_user_file /etc/nginx/auth/htpasswd;
+
+    # 執行期解析上游（由官方 entrypoint 依 /etc/resolv.conf 匯出），
+    # esun-bridge 尚未啟動或 IP 改變時 nginx 仍可啟動，/esun/ 只回 502
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
     # Enable gzip compression for fast asset transfers
     gzip on;
@@ -13,15 +53,27 @@ server {
     gzip_comp_level 6;
     gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
 
-    # Dedicated HTML pages
+    # 容器 healthcheck（無副作用、免 Basic Auth）
+    location = /healthz {
+        auth_basic off;
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Dedicated HTML pages（不快取，重新部署後立即生效）
     location = /approval.html {
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/security-headers.conf;
         try_files /approval.html =404;
     }
 
-    # Static assets with long-term caching
-    location ~* \.(?:css|js|jpg|jpeg|gif|png|ico|cur|gz|svg|svgz|mp4|ogg|ogv|webm|htc|woff|woff2)$ {
-        expires 1y;
-        add_header Cache-Control "public, max-age=31536000, immutable";
+    # 只有 Vite 產出的帶雜湊資產（vite.config.ts 設 assetsDir: ''，檔名形如 main-D_2YXx_3.js）
+    # 才可長期快取；public/ 內無雜湊的檔案走下方 location / 的 no-cache。
+    # /api/、/esun/ 使用 ^~，不會被這個 regex 搶先比對。
+    location ~* "-[A-Za-z0-9_-]{8}\.(?:js|mjs|css|woff2?|ttf|png|jpe?g|gif|svg|webp|avif|ico|wasm)$" {
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        include /etc/nginx/snippets/security-headers.conf;
         try_files $uri =404;
     }
 
@@ -31,18 +83,29 @@ server {
     }
 
     # Reverse-proxy /esun/ to E.Sun Bridge Sidecar with full SSE streaming support
-    location /esun/ {
-        proxy_pass ${ESUN_BRIDGE_UPSTREAM}/esun/;
+    location ^~ /esun/ {
+        if ($shioaji_pro_cross_origin) {
+            return 403;
+        }
+        if ($shioaji_pro_cross_site) {
+            return 403;
+        }
+
+        # proxy_pass 帶變數時不可再附 URI：原始的 /esun/... 路徑會原樣轉送
+        set $esun_bridge_upstream ${ESUN_BRIDGE_UPSTREAM};
+        proxy_pass $esun_bridge_upstream;
         proxy_http_version 1.1;
         proxy_set_header Connection '';
         proxy_buffering off;
         proxy_cache off;
-        chunked_transfer_encoding off;
         proxy_next_upstream off;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
 
-        proxy_set_header Host $host;
+        # 保留 port，供橋接比對 Origin 與 Host；token 由 nginx 注入（瀏覽器不持有），
+        # 值為空時 nginx 不送出此標頭，也會移除客戶端自帶的同名標頭
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Esun-Bridge-Token "${ESUN_BRIDGE_TOKEN}";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -54,13 +117,19 @@ server {
     }
 
     # Reverse-proxy /api/ to SinoPac Shioaji API Upstream with full SSE streaming support
-    location /api/ {
+    location ^~ /api/ {
+        if ($shioaji_pro_cross_origin) {
+            return 403;
+        }
+        if ($shioaji_pro_cross_site) {
+            return 403;
+        }
+
         proxy_pass ${SHIOAJI_API_UPSTREAM}/api/;
         proxy_http_version 1.1;
         proxy_set_header Connection '';
         proxy_buffering off;
         proxy_cache off;
-        chunked_transfer_encoding off;
         proxy_next_upstream off;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
@@ -71,8 +140,10 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # SPA routing fallback
+    # SPA routing fallback（index.html 與 public/ 內無雜湊的檔案一律重新驗證）
     location / {
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/security-headers.conf;
         try_files $uri $uri/ /index.html;
     }
 }
