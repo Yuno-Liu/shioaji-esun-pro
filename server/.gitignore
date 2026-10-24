@@ -1,0 +1,2 @@
+# Runtime state of the E.SUN bridge (login circuit breaker); never commit.
+.state/
