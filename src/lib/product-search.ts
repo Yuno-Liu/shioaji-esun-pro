@@ -149,13 +149,33 @@ function findRoot(
         )[0]?.root;
 }
 
+// 根代碼、名稱或別名完全相符（不含子字串／模糊命中）
+function isExactRoot(
+    root: { root: string; name: string },
+    lookup: string,
+    raw: string,
+) {
+    const keys = [normalizeSearchText(lookup), normalizeSearchText(raw)];
+    const code = normalizeSearchText(root.root);
+    return [code, normalizeSearchText(root.name), ...(ROOT_ALIASES[code] ?? []).map(normalizeSearchText)]
+        .some((value) => keys.includes(value));
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+    if (signal?.aborted) {
+        throw signal.reason ?? new Error('search aborted');
+    }
+}
+
 export async function searchProducts(
     rawQuery: string,
     limit = 10,
-    options: { includeWarrants?: boolean } = {},
+    options: { includeWarrants?: boolean; signal?: AbortSignal } = {},
 ): Promise<ProductSuggestion[]> {
     const raw = rawQuery.trim();
     if (!raw) return [];
+    const { signal } = options;
+    throwIfAborted(signal);
     const warrantQuery = /(?:權證|warrant)/i.test(raw);
     if (warrantQuery && options.includeWarrants !== true) return [];
     const wantsWarrants = options.includeWarrants === true && warrantQuery;
@@ -173,6 +193,7 @@ export async function searchProducts(
         loadStockCatalog(),
         loadRoots(),
     ]);
+    throwIfAborted(signal);
     const stockMatches = searchStocks(catalog, lookup, limit);
     const strictExactStock = stockMatches.find(
         (stock) =>
@@ -195,6 +216,7 @@ export async function searchProducts(
             canonicalIndex,
             canonicalIndex !== normalized ? 'IND' : undefined,
         ).catch(() => null);
+        throwIfAborted(signal);
         if (
             direct &&
             (direct.security_type !== 'WRT' || options.includeWarrants)
@@ -204,6 +226,7 @@ export async function searchProducts(
     }
 
     if (exactStock && (wantsFutures || /期$/.test(raw))) {
+        throwIfAborted(signal);
         const futures = await fetchFutures({
             underlyingCode: exactStock.code,
         }).catch((): ContractInfo[] => []);
@@ -225,6 +248,7 @@ export async function searchProducts(
     }
 
     if (exactStock && wantsWarrants) {
+        throwIfAborted(signal);
         const warrants = await fetchWarrants(exactStock.code, {
             expiryFrom: todayStr(),
         }).catch(
@@ -249,8 +273,17 @@ export async function searchProducts(
         );
     }
 
+    // 名稱子字串／模糊命中的期貨根（例如以標的命名的個股期根「台積電」）只在
+    // 沒有任何股票命中時才補上；根代碼、名稱或別名完全相符才優先列出
     const matchingFutureRoot = findRoot(roots.futures, lookup, raw);
-    if (matchingFutureRoot && (wantsFutures || !strictExactStock)) {
+    if (
+        matchingFutureRoot &&
+        (wantsFutures ||
+            (!strictExactStock &&
+                (stockMatches.length === 0 ||
+                    isExactRoot(matchingFutureRoot, lookup, raw))))
+    ) {
+        throwIfAborted(signal);
         const futures = await fetchFutures({
             root: matchingFutureRoot.root,
         }).catch((): ContractInfo[] => []);
@@ -264,6 +297,7 @@ export async function searchProducts(
 
     const matchingOptionRoot = findRoot(roots.options, lookup, raw);
     if (matchingOptionRoot && wantsOptions) {
+        throwIfAborted(signal);
         const options = await fetchOptions(matchingOptionRoot.root).catch(
             (): ContractInfo[] => [],
         );
@@ -318,6 +352,7 @@ export async function searchProducts(
         })),
     );
 
+    throwIfAborted(signal);
     const seen = new Set<string>();
     return results.filter((item) => {
         const key = `${item.security_type}:${item.code}`;
