@@ -38,6 +38,7 @@ from unittest import mock
 import urllib.request
 import urllib.error
 
+import esun_trade.sdk
 import esun_trade.util
 from server.esun_trade_server import (
     AccessPolicy,
@@ -679,6 +680,9 @@ class TestFullHttpIntegration(unittest.TestCase):
         self.assertEqual(ca_expire["ca_expiretime"], "2027/12/31")
 
     def test_order_lifecycle_http(self):
+        # Contract change (§4): every mutation carries expected_environment (+ optional
+        # expected_account) and answers with an outcome envelope; replace-qty is reduce-by.
+        env = {"expected_environment": "SIMULATION", "expected_account": "1234567"}
         # 1. Place Order
         order_payload = {
             "payload": {
@@ -689,11 +693,15 @@ class TestFullHttpIntegration(unittest.TestCase):
                 "apCode": "1",
                 "priceFlag": "0",
                 "bsFlag": "R",
-            }
+            },
+            **env,
         }
         placed, code = self._post("/esun/orders/place", order_payload)
         self.assertEqual(code, 200)
-        ord_no = placed["ord_no"]
+        self.assertTrue(placed["ok"])
+        self.assertEqual(placed["outcome"], "accepted")
+        self.assertEqual(placed["environment"], "SIMULATION")
+        ord_no = placed["result"]["ord_no"]
         self.assertTrue(ord_no.startswith("O"))
 
         # 2. Get Orders (cached)
@@ -703,30 +711,42 @@ class TestFullHttpIntegration(unittest.TestCase):
 
         # 3. Replace Price
         rep_price_payload = {
-            "orderNo": ord_no,
+            "order_no": ord_no,
             "price": 955.0,
+            **env,
         }
         res_price, code = self._post("/esun/orders/replace-price", rep_price_payload)
         self.assertEqual(code, 200)
-        self.assertEqual(res_price["status"], "PriceModified")
+        self.assertEqual(res_price["outcome"], "accepted")
+        self.assertEqual(res_price["result"]["status"], "PriceModified")
 
-        # 4. Replace Qty
+        # 4. Replace Qty: reduce BY one lot
         rep_qty_payload = {
-            "orderNo": ord_no,
-            "quantity": 0,
-            "cel_qty": 1,
+            "order_no": ord_no,
+            "cancel_quantity": 1,
+            "quantity_unit": "lot",
+            **env,
         }
         res_qty, code = self._post("/esun/orders/replace-qty", rep_qty_payload)
         self.assertEqual(code, 200)
-        self.assertEqual(res_qty["status"], "VolumeModified")
+        self.assertEqual(res_qty["result"]["status"], "VolumeModified")
+        self.assertEqual(res_qty["result"]["cel_qty"], 1)
 
         # 5. Cancel Order
         cancel_payload = {
-            "orderNo": ord_no,
+            "order_no": ord_no,
+            **env,
         }
         res_cancel, code = self._post("/esun/orders/cancel", cancel_payload)
         self.assertEqual(code, 200)
-        self.assertEqual(res_cancel["status"], "Cancelled")
+        self.assertEqual(res_cancel["result"]["status"], "Cancelled")
+
+        # Wrong environment is refused before anything else (not sent).
+        res, code = self._post("/esun/orders/cancel", {"order_no": ord_no, "expected_environment": "PRODUCTION"})
+        self.assertEqual(code, 409)
+        self.assertEqual(res["code"], "ESUN_ENV_MISMATCH")
+        self.assertEqual(res["outcome"], "not_sent")
+        self.assertEqual(res["environment"], "SIMULATION")
 
     def test_reservation_order_rejection_http(self):
         # Prepopulate reservation order
@@ -734,22 +754,25 @@ class TestFullHttpIntegration(unittest.TestCase):
             "ord_no": "RES001",
             "ord_status": "1",
             "stock_no": "2330",
+            "ap_code": "1",
             "bs_flag": "R",
             "price_flag": "0",
         })
+        env = {"expected_environment": "SIMULATION"}
 
         # Replace price on reservation order -> 400 AG0006
-        res, code = self._post("/esun/orders/replace-price", {"orderNo": "RES001", "price": 960.0})
+        res, code = self._post("/esun/orders/replace-price", {"order_no": "RES001", "price": 960.0, **env})
         self.assertEqual(code, 400)
         self.assertEqual(res.get("code"), "AG0006")
+        self.assertEqual(res.get("outcome"), "not_sent")
 
         # Replace qty on reservation order -> 400 AG0006
-        res, code = self._post("/esun/orders/replace-qty", {"orderNo": "RES001", "cel_qty": 1})
+        res, code = self._post("/esun/orders/replace-qty", {"order_no": "RES001", "cel_qty": 1, **env})
         self.assertEqual(code, 400)
         self.assertEqual(res.get("code"), "AG0006")
 
         # Cancellation on reservation order IS permitted
-        res, code = self._post("/esun/orders/cancel", {"orderNo": "RES001"})
+        res, code = self._post("/esun/orders/cancel", {"order_no": "RES001", **env})
         self.assertEqual(code, 200)
 
     def test_portfolio_endpoints_http(self):
@@ -1948,6 +1971,276 @@ class TestConfigHardening(_BridgeCase):
         self.assertTrue(HEADLESS_PATCH_STATE["ok"])
         with self.assertRaises(RuntimeError):
             esun_trade.util.getpass("Enter esun account password:")
+
+
+class FakeCore:
+    """
+    Stand-in for esun_trade._trade_core.CoreSDK (the Rust core). Returns JSON shaped like the
+    core's structs (Payload501: 7 fields, PayloadModify: 4 fields, no ord_no) so the REAL
+    esun_trade.sdk.SDK code (recover_order_result, cancel_order unit conversion, type checks) runs.
+    """
+
+    instances: list["FakeCore"] = []
+
+    def __init__(self, entry, account, cert_path, cert_password, api_key, api_secret):
+        self.entry = entry
+        self.account = account
+        self.calls: list[tuple] = []
+        self.order_results: list[dict] = []
+        self.order_response: any = None
+        self.modify_response: any = None
+        FakeCore.instances.append(self)
+
+    @staticmethod
+    def _wrap(data):
+        if isinstance(data, BaseException):
+            raise data
+        return json.dumps({"data": data})
+
+    def login(self, account, password):
+        self.calls.append(("login", account))
+
+    def get_volume_per_unit(self, stock_no):
+        return 1000
+
+    def get_certinfo(self):
+        return json.dumps({"serial": "01", "is_valid": True, "not_after": 1893456000, "cn": "A123456789-00"})
+
+    def get_ws_url(self):
+        raise RuntimeError("websocket disabled in unit tests")
+
+    def order(self, order_object, user_def):
+        fields = ("buy_sell", "price", "stock_no", "quantity", "ap_code", "bs_flag", "price_flag", "trade", "user_def")
+        self.calls.append(("order", {k: getattr(order_object, k) for k in fields}))
+        default = {"ord_date": "20261024", "ord_time": "093001123", "ord_type": "2", "ord_no": "A0001",
+                   "ret_code": "000000", "ret_msg": "", "work_date": "20261024"}
+        return self._wrap(self.order_response if self.order_response is not None else default)
+
+    def _modify_default(self):
+        return {"ord_date": "20261024", "ord_time": "093501000", "ret_code": "000000", "ret_msg": ""}
+
+    def modify_volume(self, order_result, cel_qty):
+        self.calls.append(("modify_volume", dict(order_result), cel_qty))
+        return self._wrap(self.modify_response if self.modify_response is not None else self._modify_default())
+
+    def modify_price(self, order_result, new_price, new_price_flag):
+        self.calls.append(("modify_price", dict(order_result), new_price, new_price_flag))
+        return self._wrap(self.modify_response if self.modify_response is not None else self._modify_default())
+
+    def get_order_results(self):
+        return json.dumps({"data": {"order_results": list(self.order_results)}})
+
+
+class TestMutationContractWithRealSdk(_BridgeCase):
+    """§4 mutation contract driven through the real esun_trade.sdk.SDK (fake core)."""
+
+    def setUp(self):
+        super().setUp()
+        FakeCore.instances = []
+        self._core_patch = mock.patch("esun_trade.sdk.CoreSDK", FakeCore)
+        self._core_patch.start()
+        self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
+        self.bridge = self.make_bridge(self.sim, factory=lambda cfg: esun_trade.sdk.SDK(cfg), websocket_enabled=False)
+        self.assertTrue(self.bridge.logged_in)
+        self.core = FakeCore.instances[-1]
+        self.env = {"expected_environment": "SIMULATION", "expected_account": "1234567"}
+        # let the login bootstrap (empty snapshot) settle before tests install their own snapshot
+        _wait_until(lambda: self.bridge.orders_refresh_limiter.timestamps != [], timeout=1)
+        time.sleep(0.05)
+
+    def tearDown(self):
+        self._core_patch.stop()
+        super().tearDown()
+
+    def _snapshot(self, *orders):
+        self.core.order_results = [dict(o) for o in orders]
+        self.bridge.last_orders_refresh_time = 0.0
+        return self.bridge.get_orders(refresh=True)
+
+    def _place(self, **overrides):
+        payload = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1",
+                   "priceFlag": "0", "bsFlag": "R", "trade": "0"}
+        payload.update(overrides)
+        return self.bridge.place_order({"payload": payload, **self.env})
+
+    def _core_calls(self, name):
+        return [c for c in self.core.calls if c[0] == name]
+
+    def _lot_order(self, **overrides):
+        order = {"ord_no": "A0101", "stock_no": "2330", "ap_code": "1", "buy_sell": "B", "bs_flag": "R",
+                 "price_flag": "0", "trade": "0", "od_price": 950.0, "org_qty": 5, "mat_qty": 2, "cel_qty": 0,
+                 "work_date": taipei_today_str(), "ord_status": "2"}
+        order.update(overrides)
+        return order
+
+    def test_place_accepted_envelope_and_cache_entry(self):
+        res, status = self._place()
+        self.assertEqual(status, 200)
+        self.assertEqual((res["ok"], res["outcome"]), (True, "accepted"))
+        self.assertEqual(res["environment"], "SIMULATION")
+        self.assertEqual(res["sessionGeneration"], self.bridge.session.generation)
+        self.assertEqual(res["result"]["ord_no"], "A0001")
+        sent = self._core_calls("order")[-1][1]
+        self.assertEqual((sent["stock_no"], sent["quantity"], sent["price"]), ("2330", 1, 950.0))
+        cached = self.bridge.order_book_cache.get("A0001")
+        # Payload501 lacks stock/ap_code: the cache entry combines request fields and the response.
+        self.assertEqual((cached["stock_no"], cached["ap_code"], cached["org_qty"]), ("2330", "1", 1))
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 1)
+
+    def test_market_order_sends_price_none(self):
+        res, status = self._place(priceFlag="4", price=0)
+        self.assertEqual(status, 200, res)
+        self.assertIsNone(self._core_calls("order")[-1][1]["price"])  # SDK core rule O00014
+
+    def test_broker_rejection_is_422_rejected(self):
+        self.core.order_response = {"ord_date": "", "ord_time": "", "ord_type": "2", "ord_no": "",
+                                    "ret_code": "AG0099", "ret_msg": "餘額不足", "work_date": "20261024"}
+        res, status = self._place()
+        self.assertEqual(status, 422)
+        self.assertEqual((res["ok"], res["outcome"], res["code"]), (False, "rejected", "AG0099"))
+        self.assertIn("餘額不足", res["error"])
+        self.assertEqual(res["result"]["ret_code"], "AG0099")
+        self.assertEqual(self.bridge.order_book_cache.get_all(), [])
+
+    def test_exception_during_sdk_call_is_unknown_outcome(self):
+        self.core.order_response = RuntimeError("A00004: response error")
+        res, status = self._place()
+        self.assertEqual(status, 502)
+        self.assertEqual((res["ok"], res["outcome"], res["code"]), (False, "unknown", "ESUN_OUTCOME_UNKNOWN"))
+        self.core.order_response = TimeoutError("operation timed out")
+        res, status = self._place()
+        self.assertEqual((status, res["outcome"]), (504, "unknown"))
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 2)  # both reached the SDK
+
+    def test_sdk_core_local_validation_error_is_not_sent(self):
+        self.core.order_response = RuntimeError("SDKError { code: \"O00008\", message: \"quantity must <= 499\" }")
+        res, status = self._place()
+        self.assertEqual((status, res["outcome"], res["code"]), (400, "not_sent", "ESUN_SDK_VALIDATION"))
+
+    def test_invalid_parameters_are_not_sent_and_not_counted(self):
+        cases = [
+            dict(apCode="intraday_odd"), dict(apCode=None), dict(buySell="long"), dict(trade="MarginTrading"),
+            dict(quantity=0), dict(quantity="1e3"), dict(quantity=True), dict(quantity=500),
+            dict(price=0), dict(price="955"), dict(price=float("nan")),
+            dict(apCode="2", priceFlag="4"), dict(apCode="4", trade="3", quantity=1000),
+            dict(trade="A", buySell="B"), dict(stockNo=""), dict(stockNo="23 30"), dict(bsFlag="GTC"),
+        ]
+        for overrides in cases:
+            res, status = self._place(**overrides)
+            self.assertEqual(status, 400, overrides)
+            self.assertEqual(res["outcome"], "not_sent", overrides)
+        self.assertEqual(self._core_calls("order"), [])
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
+
+    def test_environment_and_account_checks(self):
+        res, status = self.bridge.place_order({"payload": {"stockNo": "2330"}, "expected_environment": "PRODUCTION"})
+        self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ENV_MISMATCH", "not_sent"))
+        self.assertEqual(res["environment"], "SIMULATION")
+        res, status = self.bridge.place_order({"payload": {"stockNo": "2330"}})
+        self.assertEqual((status, res["code"]), (409, "ESUN_ENV_MISMATCH"))
+        res, status = self.bridge.replace_qty({"order_no": "X", "cancel_quantity": 1, "quantity_unit": "lot",
+                                               "expected_environment": "SIMULATION", "expected_account": "7654321"})
+        self.assertEqual((status, res["code"]), (409, "ESUN_ACCOUNT_MISMATCH"))
+        res, status = self.bridge.cancel_order({"order_no": "X", "expected_environment": "SIMULATION",
+                                                "expected_account": "96001234567"})
+        self.assertEqual((status, res["code"]), (409, "ESUN_ACCOUNT_MISMATCH"))
+        self.assertEqual(self.core.calls[1:], [])  # only the login call
+        # Accepted forms: lower-case environment, 11-digit account with the right branch.
+        res, status = self.bridge.place_order({
+            "payload": {"stockNo": "2330", "buySell": "S", "quantity": 1, "price": 951.0, "apCode": "1"},
+            "expectedEnvironment": "simulation", "expectedAccount": "88401234567",
+        })
+        self.assertEqual(status, 200, res)
+
+    def test_not_logged_in_is_503_not_sent(self):
+        bridge = self.make_bridge(self.sim, RecordingFactory(login_fail_msg="error sending request"))
+        res, status = bridge.place_order({"payload": {}, **self.env})
+        self.assertEqual((status, res["code"], res["outcome"]), (503, "ESUN_NOT_LOGGED_IN", "not_sent"))
+
+    def test_replace_qty_lot_reduce_by_and_remaining_validation(self):
+        self._snapshot(self._lot_order())  # remaining = 5 - 2 - 0 = 3 lots
+        body = {"order_no": "A0101", "cancel_quantity": 4, "quantity_unit": "lot", **self.env}
+        res, status = self.bridge.replace_qty(body)
+        self.assertEqual((status, res["code"]), (400, "ESUN_QTY_EXCEEDS_REMAINING"))
+        res, status = self.bridge.replace_qty({**body, "cancel_quantity": 1, "quantity_unit": "share"})
+        self.assertEqual((status, res["code"]), (400, "ESUN_QTY_UNIT_MISMATCH"))
+        res, status = self.bridge.replace_qty({"order_no": "A0101", "quantity": 2, **self.env})
+        self.assertEqual((status, res["code"]), (400, "ESUN_QTY_SEMANTICS"))
+        res, status = self.bridge.replace_qty({**body, "cancel_quantity": 0})
+        self.assertEqual(status, 400)
+        self.assertEqual(self._core_calls("modify_volume"), [])
+
+        res, status = self.bridge.replace_qty({**body, "cancel_quantity": 3})
+        self.assertEqual((status, res["outcome"]), (200, "accepted"))
+        _, order_result, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual(executed, 3)  # SDK cel_qty for a lot order == lots to cancel
+        self.assertEqual(order_result["org_qty"], 5)
+        self.assertNotIn("ord_no", res["result"])  # PayloadModify has no ord_no ...
+        self.assertEqual(len(self.bridge.order_book_cache.get_all()), 1)  # ... and creates no phantom row
+
+        # Once the order was touched, remaining is unknown until the next snapshot: the broker decides.
+        res, status = self.bridge.replace_qty({**body, "cancel_quantity": 10})
+        self.assertEqual(status, 200)
+        self.assertEqual(self._core_calls("modify_volume")[-1][2], 10)
+
+    def test_replace_qty_odd_lot_uses_shares(self):
+        odd = self._lot_order(ord_no="B0201", ap_code="5", org_qty=0.05, mat_qty=0.01, cel_qty=0.0,
+                              org_qty_share=50, mat_qty_share=10, cel_qty_share=0)
+        self._snapshot(odd)  # remaining = 50 - 10 - 0 = 40 shares
+        body = {"order_no": "B0201", "cancel_quantity": 41, "quantity_unit": "share", **self.env}
+        res, status = self.bridge.replace_qty(body)
+        self.assertEqual((status, res["code"]), (400, "ESUN_QTY_EXCEEDS_REMAINING"))
+        res, status = self.bridge.replace_qty({**body, "cancel_quantity": 1, "quantity_unit": "lot"})
+        self.assertEqual((status, res["code"]), (400, "ESUN_QTY_UNIT_MISMATCH"))
+        res, status = self.bridge.replace_qty({**body, "cancel_quantity": 40})
+        self.assertEqual(status, 200, res)
+        _, order_result, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual(executed, 40)  # cel_qty_share for odd lots == shares
+        # recover_order_result turned the fractional lots back into shares for the core
+        self.assertEqual((order_result["org_qty"], order_result["mat_qty"]), (50, 10))
+
+    def test_cancel_requires_order_details_then_cancels_all(self):
+        body = {"order_no": "C0301", "payload": {"stockNo": "2330"}, **self.env}
+        res, status = self.bridge.cancel_order(body)
+        self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ORDER_DETAILS_MISSING", "not_sent"))
+        res, status = self.bridge.cancel_order({**body, "payload": {"stockNo": "2330", "apCode": "bogus"}})
+        self.assertEqual(status, 400)
+        self.assertEqual(self._core_calls("modify_volume"), [])
+        res, status = self.bridge.cancel_order({**body, "payload": {"stockNo": "2330", "apCode": "1", "buySell": "S"}})
+        self.assertEqual(status, 200, res)
+        _, order_result, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual(executed, 0)  # modify_volume(order, 0) == cancel all
+        self.assertEqual((order_result["ord_no"], order_result["ap_code"], order_result["buy_sell"]), ("C0301", "1", "S"))
+        self.assertNotIn("org_qty", order_result)  # payload never supplies quantities
+
+    def test_rejected_cancel_is_422(self):
+        self._snapshot(self._lot_order())
+        self.core.modify_response = {"ord_date": "", "ord_time": "", "ret_code": "AG0011", "ret_msg": "委託已全部成交"}
+        res, status = self.bridge.cancel_order({"order_no": "A0101", **self.env})
+        self.assertEqual((status, res["outcome"], res["code"]), (422, "rejected", "AG0011"))
+
+    def test_replace_price_guards(self):
+        self._snapshot(self._lot_order(ord_no="D0401"))
+        body = {"order_no": "D0401", "price": 955.0, **self.env}
+        for bad in ({"price": "955"}, {"price": -1}, {"price_flag": "4"}, {"price": 950.0}):
+            res, status = self.bridge.replace_price({**body, **bad})
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(res["outcome"], "not_sent")
+        res, status = self.bridge.replace_price(body)
+        self.assertEqual(status, 200, res)
+        _, order_result, new_price, new_flag = self._core_calls("modify_price")[-1]
+        self.assertEqual((new_price, new_flag, order_result["ord_no"]), (955.0, "0", "D0401"))
+        self.assertEqual(self.bridge.order_book_cache.get("D0401")["od_price"], 955.0)
+        # limit-up flag: price is not sent
+        res, status = self.bridge.replace_price({"order_no": "D0401", "price_flag": "3", **self.env})
+        self.assertEqual(status, 200, res)
+        self.assertIsNone(self._core_calls("modify_price")[-1][2])
+
+        self._snapshot(self._lot_order(ord_no="E1", bs_flag="I"), self._lot_order(ord_no="E2", ap_code="5"),
+                       self._lot_order(ord_no="E3", ord_status="1"))
+        for ord_no, code in (("E1", "AG_INVALID_PRICE_MODIFY"), ("E2", "AG_INVALID_PRICE_MODIFY"), ("E3", "AG0006")):
+            res, status = self.bridge.replace_price({**body, "order_no": ord_no})
+            self.assertEqual((status, res["code"]), (400, code), ord_no)
 
 
 class TestGracefulShutdown(unittest.TestCase):

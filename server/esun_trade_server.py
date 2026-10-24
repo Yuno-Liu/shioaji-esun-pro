@@ -906,71 +906,128 @@ def check_and_clamp_date_range(start_str: str, end_str: str) -> tuple[str, str, 
     return s_date.strftime("%Y-%m-%d"), e_date.strftime("%Y-%m-%d"), None
 
 
-# Enum mapping helpers
-def to_action(val: any) -> any:
-    if Action and isinstance(val, Action):
+# Strict request parsing: unknown values are rejected (400) instead of silently mapping to a
+# default (e.g. an unknown apCode used to become "Common" and turn 100 shares into 100 lots).
+
+class EsunValidationError(ValueError):
+    """A request refused locally before any SDK call (envelope outcome: not_sent)."""
+
+    def __init__(self, message: str, code: str = "ESUN_INVALID_PARAMS", status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+_ACTION_ALIASES = {"B": "B", "BUY": "B", "ACTION.BUY": "B", "S": "S", "SELL": "S", "ACTION.SELL": "S"}
+_AP_CODE_ALIASES = {
+    "1": "1", "COMMON": "1", "APCODE.COMMON": "1",
+    "2": "2", "AFTERMARKET": "2", "APCODE.AFTERMARKET": "2",
+    "3": "3", "ODD": "3", "APCODE.ODD": "3",
+    "4": "4", "EMG": "4", "APCODE.EMG": "4",
+    "5": "5", "INTRADAYODD": "5", "APCODE.INTRADAYODD": "5",
+}
+_BS_FLAG_ALIASES = {
+    "R": "R", "ROD": "R", "BSFLAG.ROD": "R",
+    "I": "I", "IOC": "I", "BSFLAG.IOC": "I",
+    "F": "F", "FOK": "F", "BSFLAG.FOK": "F",
+}
+_PRICE_FLAG_ALIASES = {
+    "0": "0", "LIMIT": "0", "LMT": "0", "PRICEFLAG.LIMIT": "0",
+    "1": "1", "FLAT": "1", "PRICEFLAG.FLAT": "1",
+    "2": "2", "LIMITDOWN": "2", "PRICEFLAG.LIMITDOWN": "2",
+    "3": "3", "LIMITUP": "3", "PRICEFLAG.LIMITUP": "3",
+    "4": "4", "MARKET": "4", "MKT": "4", "PRICEFLAG.MARKET": "4",
+}
+_TRADE_ALIASES = {
+    "0": "0", "CASH": "0", "TRADE.CASH": "0",
+    "3": "3", "MARGIN": "3", "TRADE.MARGIN": "3",
+    "4": "4", "SHORT": "4", "TRADE.SHORT": "4",
+    "A": "A", "DAYTRADINGSELL": "A", "TRADE.DAYTRADINGSELL": "A",
+}
+
+
+def _parse_enum(val: any, aliases: dict[str, str], enum_cls: any, field: str, default: str | None) -> any:
+    if enum_cls is not None and isinstance(val, enum_cls):
         return val
-    s = str(val or "B").strip().upper()
-    if Action:
-        return Action.Buy if s in ("B", "BUY", "ACTION.BUY") else Action.Sell
-    return s
+    if val is None or (isinstance(val, str) and not val.strip()):
+        if default is None:
+            raise EsunValidationError(f"缺少必要欄位 {field}")
+        val = default
+    if isinstance(val, bool) or not isinstance(val, (str, int)):
+        raise EsunValidationError(f"{field} 格式錯誤：{val!r}")
+    raw = aliases.get(str(val).strip().upper())
+    if raw is None:
+        raise EsunValidationError(f"不支援的 {field}：{val}")
+    return enum_cls(raw) if enum_cls is not None else raw
 
 
-def to_ap_code(val: any) -> any:
-    if APCode and isinstance(val, APCode):
-        return val
-    s = str(val or "1").strip().upper()
-    mapping = {
-        "1": "1", "COMMON": "1",
-        "2": "2", "AFTERMARKET": "2",
-        "3": "3", "ODD": "3",
-        "4": "4", "EMG": "4",
-        "5": "5", "INTRADAYODD": "5",
-    }
-    raw = mapping.get(s, "1")
-    return APCode(raw) if APCode else raw
+def enum_value(val: any) -> str:
+    """'1' for APCode.Common, '1' for '1'."""
+    return str(getattr(val, "value", val))
 
 
-def to_bs_flag(val: any) -> any:
-    if BSFlag and isinstance(val, BSFlag):
-        return val
-    s = str(val or "R").strip().upper()
-    mapping = {
-        "R": "R", "ROD": "R",
-        "I": "I", "IOC": "I",
-        "F": "F", "FOK": "F",
-    }
-    raw = mapping.get(s, "R")
-    return BSFlag(raw) if BSFlag else raw
+def to_action(val: any, default: str | None = None) -> any:
+    return _parse_enum(val, _ACTION_ALIASES, Action, "buySell", default)
 
 
-def to_price_flag(val: any) -> any:
-    if PriceFlag and isinstance(val, PriceFlag):
-        return val
-    s = str(val or "0").strip().upper()
-    mapping = {
-        "0": "0", "LIMIT": "0", "LMT": "0",
-        "1": "1", "FLAT": "1",
-        "2": "2", "LIMITDOWN": "2",
-        "3": "3", "LIMITUP": "3",
-        "4": "4", "MARKET": "4", "MKT": "4",
-    }
-    raw = mapping.get(s, "0")
-    return PriceFlag(raw) if PriceFlag else raw
+def to_ap_code(val: any, default: str | None = None) -> any:
+    return _parse_enum(val, _AP_CODE_ALIASES, APCode, "apCode", default)
 
 
-def to_trade(val: any) -> any:
-    if Trade and isinstance(val, Trade):
-        return val
-    s = str(val or "0").strip().upper()
-    mapping = {
-        "0": "0", "CASH": "0",
-        "3": "3", "MARGIN": "3",
-        "4": "4", "SHORT": "4",
-        "A": "A", "DAYTRADINGSELL": "A",
-    }
-    raw = mapping.get(s, "0")
-    return Trade(raw) if Trade else raw
+def to_bs_flag(val: any, default: str | None = "R") -> any:
+    return _parse_enum(val, _BS_FLAG_ALIASES, BSFlag, "bsFlag", default)
+
+
+def to_price_flag(val: any, default: str | None = "0") -> any:
+    return _parse_enum(val, _PRICE_FLAG_ALIASES, PriceFlag, "priceFlag", default)
+
+
+def to_trade(val: any, default: str | None = "0") -> any:
+    return _parse_enum(val, _TRADE_ALIASES, Trade, "trade", default)
+
+
+_STOCK_NO_RE = re.compile(r"[0-9A-Za-z]{1,12}")
+_ORDER_NO_RE = re.compile(r"[0-9A-Za-z_:\-]{1,32}")
+
+
+def parse_positive_int(value: any, field: str) -> int:
+    """JSON integer (or integral float / digit string) > 0; anything else is a 400."""
+    if value is None or isinstance(value, bool):
+        raise EsunValidationError(f"{field} 必須為正整數")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        number = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"\s*[0-9]+\s*", value):
+        number = int(value)
+    else:
+        raise EsunValidationError(f"{field} 必須為正整數（目前為 {value!r}）")
+    if number <= 0:
+        raise EsunValidationError(f"{field} 必須大於 0（目前為 {number}）")
+    return number
+
+
+def parse_price(value: any, field: str = "price") -> float:
+    """JSON number, finite and > 0. Strings are refused so a price flag can never be read as a price."""
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise EsunValidationError(f"{field} 必須為大於 0 的數值")
+    price = float(value)
+    if not math.isfinite(price) or price <= 0:
+        raise EsunValidationError(f"{field} 必須為大於 0 的有限數值（目前為 {value!r}）")
+    return price
+
+
+def parse_order_no(body: dict) -> str:
+    value = body.get("order_no", body.get("orderNo"))
+    if not isinstance(value, str) or not _ORDER_NO_RE.fullmatch(value.strip()):
+        raise EsunValidationError("缺少或無效的委託書號 (order_no)")
+    return value.strip()
+
+
+def is_success_ret_code(code: any) -> bool:
+    """Success = empty or all zeros ('0', '00', '000000', '00000000'), per the existing client convention."""
+    text = str(code).strip()
+    return text == "" or set(text) <= {"0"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1640,6 +1697,43 @@ class EsunQueryError(Exception):
         if self.retry_after:
             body["retry_after"] = int(math.ceil(self.retry_after))
         return body
+
+
+def not_sent(status: int, code: str, error: str, **extra: any) -> tuple[dict, int]:
+    """Mutation envelope for requests that were definitely NOT sent to the broker."""
+    body: dict[str, any] = {"ok": False, "outcome": "not_sent", "code": code, "error": error}
+    body.update(extra)
+    return body, status
+
+
+def account_matches(expected: any, account: dict | None) -> bool:
+    """expected_account: 7-digit account (no branch code) or the full 11-digit broker+account."""
+    if not account:
+        return False
+    text = re.sub(r"[\s-]", "", str(expected))
+    account_id = str(account.get("account_id") or "")
+    broker_id = str(account.get("broker_id") or "")
+    if len(text) == 11 and text.isdigit():
+        return text == broker_id + account_id
+    return bool(text) and text == account_id
+
+
+def remaining_quantity(order: dict, unit: str) -> float | None:
+    """
+    org - mat - cel in the request's unit: lots use *_qty (ap_code 1/2); shares use *_qty_share
+    (the SDK's *_qty of odd-lot / emerging orders are fractional lots). None when unknown.
+    """
+    keys = ("org_qty", "mat_qty", "cel_qty") if unit == "lot" else ("org_qty_share", "mat_qty_share", "cel_qty_share")
+    org = _to_number(order.get(keys[0]))
+    if org is None:
+        return None
+    mat = _to_number(order.get(keys[1])) or 0.0
+    cel = _to_number(order.get(keys[2])) or 0.0
+    return max(org - mat - cel, 0.0)
+
+
+# esun_trade core input checks (O00001-O00021) are raised before any request is sent.
+_SDK_LOCAL_VALIDATION_RE = re.compile(r"\bO000(0[1-9]|1[0-9]|2[01])\b")
 
 
 class _WsRuntime:
@@ -2659,193 +2753,398 @@ class EsunTradeBridge:
             return f"玉山尚未登入：{self.login_error}"
         return "玉山證券尚未登入"
 
-    def _require_session(self) -> EsunSession:
+    # Contract (§4): access control -> JSON -> logged-in session (503) -> expected_environment (409)
+    # -> expected_account (409) -> rate limits (429) -> local validation (400/409) -> quota consumed
+    # -> SDK call. Envelope: accepted 200 / not_sent 4xx,503 / rejected 422 / unknown 502,504.
+
+    _PAYLOAD_ORDER_FIELDS = (
+        ("stock_no", ("stockNo", "stock_no")),
+        ("buy_sell", ("buySell", "buy_sell")),
+        ("ap_code", ("apCode", "ap_code")),
+        ("price_flag", ("priceFlag", "price_flag")),
+        ("bs_flag", ("bsFlag", "bs_flag")),
+        ("trade", ("trade",)),
+        ("pre_ord_no", ("preOrdNo", "pre_ord_no")),
+        ("od_price", ("price", "od_price", "odPrice")),
+        ("work_date", ("workDate", "work_date")),
+    )
+    # Bridge-side bookkeeping fields that are not part of the SDK's order result.
+    _BRIDGE_ONLY_ORDER_KEYS = frozenset({"deal_qty", "status", "mat_time"})
+
+    def _mutation_prelude(self, body: any) -> tuple[EsunSession | None, tuple[dict, int] | None]:
+        if not isinstance(body, dict):
+            return None, not_sent(400, "ESUN_INVALID_JSON", "請求本文必須為 JSON 物件")
         session = self._session
         if not session.logged_in:
-            raise PermissionError(self._not_logged_in_message())
-        return session
-
-    def _build_synthetic_order_result(self, order_no: str, payload: dict) -> dict:
-        return {
-            "ord_no": order_no,
-            "pre_ord_no": payload.get("preOrdNo") or payload.get("pre_ord_no") or "",
-            "stock_no": payload.get("stockNo") or payload.get("stock_no") or "",
-            "buy_sell": str(payload.get("buySell") or payload.get("buy_sell") or "B"),
-            "ap_code": str(payload.get("apCode") or payload.get("ap_code") or "1"),
-            "price_flag": str(payload.get("priceFlag") or payload.get("price_flag") or "0"),
-            "bs_flag": str(payload.get("bsFlag") or payload.get("bs_flag") or "R"),
-            "trade": str(payload.get("trade") or "0"),
-            "od_price": str(payload.get("price") or "0"),
-            "org_qty": int(payload.get("quantity") or 1),
-        }
-
-    def place_order(self, payload: dict) -> tuple[any, int]:
-        session = self._require_session()
-
-        # Rate limits
+            return None, not_sent(503, "ESUN_NOT_LOGGED_IN", self._not_logged_in_message())
+        context = {"environment": session.environment, "sessionGeneration": session.generation}
+        raw_env = body.get("expected_environment", body.get("expectedEnvironment"))
+        if raw_env is None or not str(raw_env).strip():
+            return None, not_sent(409, "ESUN_ENV_MISMATCH", "缺少 expected_environment：請重新取得玉山環境後再送出（委託未送出）", **context)
+        if normalize_environment(raw_env) != session.environment:
+            return None, not_sent(
+                409, "ESUN_ENV_MISMATCH",
+                f"環境不符：畫面為 {raw_env}，玉山 bridge 目前為 {session.environment}（委託未送出）", **context,
+            )
+        raw_account = body.get("expected_account", body.get("expectedAccount"))
+        if raw_account not in (None, "") and not account_matches(raw_account, session.account):
+            return None, not_sent(
+                409, "ESUN_ACCOUNT_MISMATCH", "帳號不符：玉山 bridge 目前登入的帳號與畫面不同（委託未送出）",
+                account=dict(session.account) if session.account else None, **context,
+            )
         if not self.order_mutation_daily.can_increment():
-            return {"error": "已達每日委託上限 2,000 次 (AGR0001)", "code": "AGR0001"}, 429
+            return None, not_sent(429, "AGR0001", "已達每日委託上限 2,000 次 (AGR0001)")
+        if self.order_mutation_limiter.time_until_available() > 0.5:
+            return None, not_sent(429, "AGR0002", "委託頻率過高，超過每秒 18 次限制 (AGR0002)", retry_after=1)
+        return session, None
+
+    def _consume_mutation_quota(self) -> tuple[dict, int] | None:
+        """Consumes the per-second slot and the daily count right before the SDK call."""
         if not self.order_mutation_limiter.acquire(timeout=0.5):
-            return {"error": "委託下單頻率過高，超過每秒 18 次限制 (AGR0002)", "code": "AGR0002"}, 429
-        self.order_mutation_daily.increment()
+            return not_sent(429, "AGR0002", "委託頻率過高，超過每秒 18 次限制 (AGR0002)", retry_after=1)
+        if not self.order_mutation_daily.increment():
+            return not_sent(429, "AGR0001", "已達每日委託上限 2,000 次 (AGR0001)")
+        return None
 
-        stock_no = payload.get("stockNo") or payload.get("stock_no")
-        buy_sell = payload.get("buySell") or payload.get("buy_sell")
-        quantity = payload.get("quantity")
-        price = payload.get("price")
-        ap_code = payload.get("apCode") or payload.get("ap_code") or "1"
-        price_flag = payload.get("priceFlag") or payload.get("price_flag") or "0"
-        bs_flag = payload.get("bsFlag") or payload.get("bs_flag") or "R"
-        trade = payload.get("trade") or "0"
-        user_def = payload.get("userDef") or payload.get("user_def") or ""
-
-        if not stock_no or not buy_sell or quantity is None:
-            return {"error": "委託內容不完整（stockNo, buySell, quantity 為必填）", "code": "INVALID_PARAMS"}, 400
-
-        # Validate quantity against official limits
-        valid_qty, qty_err = validate_order_quantity(str(ap_code), quantity)
-        if not valid_qty:
-            return {"error": qty_err, "code": "AG_INVALID_QUANTITY"}, 400
-
-        # Build OrderObject
+    def _call_sdk_mutation(self, session: EsunSession, label: str, call: any) -> tuple[dict, int]:
         try:
-            action_enum = to_action(buy_sell)
-            ap_code_enum = to_ap_code(ap_code)
-            bs_flag_enum = to_bs_flag(bs_flag)
-            price_flag_enum = to_price_flag(price_flag)
-            trade_enum = to_trade(trade)
+            result = call()
+        except Exception as e:
+            message = redact(e)
+            if _SDK_LOCAL_VALIDATION_RE.search(message):
+                # O000xx are the SDK core's own input checks, raised before any request is built.
+                logger.warning(f"{label}未送出（SDK 本地驗證）：{message}")
+                return not_sent(400, "ESUN_SDK_VALIDATION", f"{label}未送出：{message}")
+            low = message.lower()
+            timed_out = isinstance(e, TimeoutError) or "timed out" in low or "timeout" in low
+            logger.error(f"{label}結果未知（SDK 呼叫期間或之後拋出例外）：{message}")
+            return {
+                "ok": False,
+                "outcome": "unknown",
+                "code": "ESUN_OUTCOME_UNKNOWN",
+                "error": f"{label}結果未知，無法確認玉山是否已收到：{message}（請以委託查詢確認，切勿直接重送）",
+                "environment": session.environment,
+                "sessionGeneration": session.generation,
+            }, (504 if timed_out else 502)
+        return self._classify_mutation_result(session, label, result)
 
+    @staticmethod
+    def _classify_mutation_result(session: EsunSession, label: str, result: any) -> tuple[dict, int]:
+        ret_code = None
+        if isinstance(result, dict):
+            for key in ("ret_code", "retCode"):
+                if result.get(key) is not None:
+                    ret_code = str(result[key]).strip()
+                    break
+        if ret_code is not None and not is_success_ret_code(ret_code):
+            ret_msg = str(result.get("ret_msg") or result.get("retMsg") or "").strip()
+            return {
+                "ok": False,
+                "outcome": "rejected",
+                "code": ret_code,
+                "error": f"玉山證券拒絕{label} [{ret_code}]" + (f"：{ret_msg}" if ret_msg else ""),
+                "result": result,
+                "environment": session.environment,
+                "sessionGeneration": session.generation,
+            }, 422
+        return {
+            "ok": True,
+            "outcome": "accepted",
+            "result": result,
+            "environment": session.environment,
+            "sessionGeneration": session.generation,
+        }, 200
+
+    def _resolve_order(self, order_no: str, body: dict) -> tuple[dict, dict | None, dict, bool]:
+        """
+        Cached order merged with payload hints. The payload only fills fields the cache lacks and
+        never supplies quantities (their units differ between lots and odd-lot shares).
+        Returns (order, cache_meta, payload, known_in_cache).
+        """
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        cached, meta = self.order_book_cache.get_with_meta(order_no)
+        order = dict(cached) if cached else {}
+        normalizers = {
+            "buy_sell": to_action,
+            "ap_code": to_ap_code,
+            "price_flag": lambda v: to_price_flag(v, default=None),
+            "bs_flag": lambda v: to_bs_flag(v, default=None),
+            "trade": lambda v: to_trade(v, default=None),
+        }
+        for field, aliases in self._PAYLOAD_ORDER_FIELDS:
+            if order.get(field) not in (None, ""):
+                continue
+            value = next((payload[a] for a in aliases if payload.get(a) not in (None, "")), None)
+            if value is None:
+                continue
+            if field in normalizers:
+                value = enum_value(normalizers[field](value))
+            elif field == "stock_no":
+                if not isinstance(value, str) or not _STOCK_NO_RE.fullmatch(value.strip()):
+                    raise EsunValidationError("payload.stockNo 格式錯誤")
+                value = value.strip()
+            elif field == "od_price":
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+            else:
+                value = str(value).strip()
+            order[field] = value
+        if not order.get("ord_no") and not order.get("pre_ord_no"):
+            order["ord_no"] = order_no
+        return order, meta, payload, cached is not None
+
+    @staticmethod
+    def _require_order_details(order: dict) -> None:
+        """recover_order_result() needs ap_code and stock_no: refuse instead of guessing defaults."""
+        if not str(order.get("ap_code") or "").strip() or not str(order.get("stock_no") or "").strip():
+            raise EsunValidationError(
+                "委託資料不完整（缺 ap_code 或 stock_no）：請先更新委託（refresh=true）或於 payload 提供 apCode/stockNo",
+                "ESUN_ORDER_DETAILS_MISSING",
+                409,
+            )
+
+    def _sdk_order_dict(self, order: dict) -> dict:
+        return {k: v for k, v in order.items() if k not in self._BRIDGE_ONLY_ORDER_KEYS}
+
+    def _safe_mark_event(self, session: EsunSession, order_no: str, updates: dict | None = None) -> None:
+        try:
+            self.order_book_cache.mark_event(order_no, generation=session.generation, updates=updates)
+        except Exception:
+            logger.error(f"更新委託快取失敗（委託已送出）：\n{redact(traceback.format_exc())}")
+
+    def _build_order_object(self, payload: dict) -> tuple[any, dict]:
+        """Strictly validates a place-order payload and builds the SDK OrderObject (no SDK call)."""
+        stock_no = payload.get("stockNo", payload.get("stock_no"))
+        if not isinstance(stock_no, str) or not _STOCK_NO_RE.fullmatch(stock_no.strip()):
+            raise EsunValidationError("委託內容不完整或格式錯誤（stockNo）")
+        stock_no = stock_no.strip()
+        action = to_action(payload.get("buySell", payload.get("buy_sell")))
+        ap_code = to_ap_code(payload.get("apCode", payload.get("ap_code")))
+        bs_flag = to_bs_flag(payload.get("bsFlag", payload.get("bs_flag")))
+        price_flag = to_price_flag(payload.get("priceFlag", payload.get("price_flag")))
+        trade = to_trade(payload.get("trade"))
+        quantity = parse_positive_int(payload.get("quantity"), "quantity")
+
+        ap, flag, trade_code, side = enum_value(ap_code), enum_value(price_flag), enum_value(trade), enum_value(action)
+        valid_qty, qty_err = validate_order_quantity(ap, quantity)
+        if not valid_qty:
+            raise EsunValidationError(qty_err, "AG_INVALID_QUANTITY")
+        # SDK core rule O00014: price must be None unless the price flag is Limit.
+        price = parse_price(payload.get("price")) if flag == "0" else None
+        if ap == "2" and flag != "0":
+            raise EsunValidationError("盤後定價交易僅支援限價 (O00012)")
+        if ap == "4" and flag != "0":
+            raise EsunValidationError("興櫃僅支援限價 (O00015)")
+        if ap == "4" and trade_code != "0":
+            raise EsunValidationError("興櫃僅支援現股 (O00016)")
+        if trade_code == "A" and side != "S":
+            raise EsunValidationError("現股當沖賣 (trade=A) 只能搭配賣出")
+
+        user_def = payload.get("userDef", payload.get("user_def"))
+        user_def = "" if user_def is None else str(user_def)[:50]
+        if OrderObject is None:
+            raise EsunValidationError("esun_trade SDK 未安裝，無法建立委託", "ESUN_SDK_UNAVAILABLE", 503)
+        try:
             order_obj = OrderObject(
-                buy_sell=action_enum,
-                price=float(price or 0.0),
-                stock_no=str(stock_no),
-                quantity=int(quantity),
-                ap_code=ap_code_enum,
-                bs_flag=bs_flag_enum,
-                price_flag=price_flag_enum,
-                trade=trade_enum,
-                user_def=str(user_def)[:50],
+                buy_sell=action,
+                price=price,
+                stock_no=stock_no,
+                quantity=quantity,
+                ap_code=ap_code,
+                bs_flag=bs_flag,
+                price_flag=price_flag,
+                trade=trade,
+                user_def=user_def,
             )
         except Exception as e:
-            return {"error": f"委託參數格式錯誤：{redact(e)}", "code": "INVALID_ORDER_PARAMS"}, 400
+            raise EsunValidationError(f"委託參數格式錯誤：{redact(e)}", "INVALID_ORDER_PARAMS")
+        normalized = {
+            "stock_no": stock_no,
+            "buy_sell": side,
+            "ap_code": ap,
+            "price_flag": flag,
+            "bs_flag": enum_value(bs_flag),
+            "trade": trade_code,
+            "od_price": price,
+            "quantity": quantity,
+        }
+        return order_obj, normalized
 
-        try:
-            res = session.sdk.place_order(order_obj)
-            if isinstance(res, dict):
-                self.order_book_cache.upsert(res, generation=session.generation, source="local")
-            return res, 200
-        except Exception as e:
-            return {"error": f"玉山下單失敗：{redact(e)}", "code": "PLACE_ORDER_ERROR"}, 502
-
-    def replace_price(self, body: dict) -> tuple[any, int]:
-        session = self._require_session()
-        order_no = body.get("orderNo") or body.get("order_no")
-        price = body.get("price")
-        if not order_no or price is None:
-            return {"error": "缺少委託書號 (orderNo) 或價格 (price)", "code": "INVALID_PARAMS"}, 400
-
-        # Rate limits
-        if not self.order_mutation_daily.can_increment():
-            return {"error": "已達每日委託上限 2,000 次 (AGR0001)", "code": "AGR0001"}, 429
-        if not self.order_mutation_limiter.acquire(timeout=0.5):
-            return {"error": "委託改價頻率過高 (AGR0002)", "code": "AGR0002"}, 429
-        self.order_mutation_daily.increment()
-
-        order = self.order_book_cache.get(order_no)
-        payload = body.get("payload") or {}
-
-        # Reservation Guard (AG0006)
-        if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
-            return {"error": "預約單不可改單 (AG0006)，請先刪單後重新下單", "code": "AG0006"}, 400
-
-        # Price Modify Guard (ROD Limit only)
-        target = order or payload
-        if target and not OrderBookCache.can_modify_price(target):
-            return {"error": "玉山證券僅支援 ROD 限價單改價，市價單或 IOC/FOK 請先刪單再重新下單", "code": "AG_INVALID_PRICE_MODIFY"}, 400
-
-        in_order_result = order or self._build_synthetic_order_result(order_no, payload)
-        price_flag_val = body.get("priceFlag") or body.get("price_flag") or "0"
-        price_flag_enum = to_price_flag(price_flag_val)
-
-        try:
-            res = session.sdk.modify_price(in_order_result, target_price=float(price), price_flag=price_flag_enum)
-            self.order_book_cache.mark_event(order_no, generation=session.generation)
-            return res, 200
-        except Exception as e:
-            return {"error": f"玉山改價失敗：{redact(e)}", "code": "REPLACE_PRICE_ERROR"}, 502
-
-    def replace_qty(self, body: dict) -> tuple[any, int]:
-        session = self._require_session()
-        order_no = body.get("orderNo") or body.get("order_no")
-        if not order_no:
-            return {"error": "缺少委託書號 (orderNo)", "code": "INVALID_PARAMS"}, 400
-
-        # Rate limits
-        if not self.order_mutation_daily.can_increment():
-            return {"error": "已達每日委託上限 2,000 次 (AGR0001)", "code": "AGR0001"}, 429
-        if not self.order_mutation_limiter.acquire(timeout=0.5):
-            return {"error": "委託改量頻率過高 (AGR0002)", "code": "AGR0002"}, 429
-        self.order_mutation_daily.increment()
-
-        order = self.order_book_cache.get(order_no)
-        payload = body.get("payload") or {}
-
-        # Reservation Guard (AG0006)
-        if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
-            return {"error": "預約單不可改單 (AG0006)，請先刪單後重新下單", "code": "AG0006"}, 400
-
-        in_order_result = order or self._build_synthetic_order_result(order_no, payload)
-
-        cancel_kwargs = {}
-        if "cel_qty" in body:
-            cancel_kwargs["cel_qty"] = int(body["cel_qty"])
-        elif "cel_qty_share" in body:
-            cancel_kwargs["cel_qty_share"] = int(body["cel_qty_share"])
-        elif "quantity" in body:
-            target_qty = int(body["quantity"])
-            current_qty = int(in_order_result.get("org_qty") or in_order_result.get("quantity") or 0)
-            cel = current_qty - target_qty
-            if cel <= 0:
-                return {"error": f"改量目標數量 ({target_qty}) 必須小於原委託數量 ({current_qty})", "code": "INVALID_QTY"}, 400
-            ap_code = str(in_order_result.get("ap_code") or in_order_result.get("apCode") or "1")
-            if ap_code in ("3", "4", "5"):
-                cancel_kwargs["cel_qty_share"] = cel
-            else:
-                cancel_kwargs["cel_qty"] = cel
+    def _remember_placed_order(self, session: EsunSession, normalized: dict, result: any) -> None:
+        """Caches an accepted order as request fields + response (the response alone lacks stock/ap_code)."""
+        if not isinstance(result, dict) or not (result.get("ord_no") or result.get("pre_ord_no")):
+            return
+        entry = {k: normalized[k] for k in ("stock_no", "buy_sell", "ap_code", "price_flag", "bs_flag", "trade", "od_price")}
+        if normalized["ap_code"] in ("1", "2"):
+            entry["org_qty"] = normalized["quantity"]  # lots, same unit as order results
         else:
-            return {"error": "缺少改量參數 (quantity, cel_qty, 或 cel_qty_share)", "code": "INVALID_PARAMS"}, 400
-
+            entry["org_qty_share"] = normalized["quantity"]  # shares (order results use fractional lots in *_qty)
+        entry.update(result)
         try:
-            res = session.sdk.cancel_order(in_order_result, **cancel_kwargs)
-            self.order_book_cache.mark_event(order_no, generation=session.generation)
-            return res, 200
-        except Exception as e:
-            return {"error": f"玉山改量失敗：{redact(e)}", "code": "REPLACE_QTY_ERROR"}, 502
+            self.order_book_cache.upsert(entry, generation=session.generation, source="local")
+        except Exception:
+            logger.error(f"寫入委託快取失敗（委託已送出）：\n{redact(traceback.format_exc())}")
 
-    def cancel_order(self, body: dict) -> tuple[any, int]:
-        session = self._require_session()
-        order_no = body.get("orderNo") or body.get("order_no")
-        if not order_no:
-            return {"error": "缺少委託書號 (orderNo)", "code": "INVALID_PARAMS"}, 400
-
-        # Rate limits
-        if not self.order_mutation_daily.can_increment():
-            return {"error": "已達每日委託上限 2,000 次 (AGR0001)", "code": "AGR0001"}, 429
-        if not self.order_mutation_limiter.acquire(timeout=0.5):
-            return {"error": "刪單頻率過高 (AGR0002)", "code": "AGR0002"}, 429
-        self.order_mutation_daily.increment()
-
-        order = self.order_book_cache.get(order_no)
-        payload = body.get("payload") or {}
-        in_order_result = order or self._build_synthetic_order_result(order_no, payload)
-
+    def place_order(self, body: dict) -> tuple[dict, int]:
+        """POST /esun/orders/place: {payload, expected_environment, expected_account}."""
+        if not isinstance(body, dict):
+            return not_sent(400, "ESUN_INVALID_JSON", "請求本文必須為 JSON 物件")
+        if "payload" in body:
+            payload = body.get("payload")
+            if not isinstance(payload, dict):
+                return not_sent(400, "ESUN_INVALID_PARAMS", "payload 必須為物件")
+        else:
+            payload = body  # legacy: order fields at the top level
+        session, refusal = self._mutation_prelude(body)
+        if refusal:
+            return refusal
         try:
-            # sdk.cancel_order without cel_qty cancels all
-            res = session.sdk.cancel_order(in_order_result)
-            self.order_book_cache.mark_event(order_no, generation=session.generation)
-            return res, 200
-        except Exception as e:
-            return {"error": f"玉山刪單失敗：{redact(e)}", "code": "CANCEL_ORDER_ERROR"}, 502
+            order_obj, normalized = self._build_order_object(payload)
+        except EsunValidationError as e:
+            return not_sent(e.status, e.code, str(e))
+        refusal = self._consume_mutation_quota()
+        if refusal:
+            return refusal
+        envelope, status = self._call_sdk_mutation(session, "下單", lambda: session.sdk.place_order(order_obj))
+        if envelope.get("outcome") == "accepted":
+            self._remember_placed_order(session, normalized, envelope.get("result"))
+        return envelope, status
+
+    def replace_price(self, body: dict) -> tuple[dict, int]:
+        """POST /esun/orders/replace-price: {order_no, price, price_flag?, payload?, expected_*}."""
+        session, refusal = self._mutation_prelude(body)
+        if refusal:
+            return refusal
+        try:
+            order_no = parse_order_no(body)
+            price_flag = to_price_flag(body.get("price_flag", body.get("priceFlag")))
+            flag = enum_value(price_flag)
+            if flag == "4":
+                raise EsunValidationError("不可將委託改為市價 (O00019)，請刪單後重新下單", "AG_INVALID_PRICE_MODIFY")
+            price = parse_price(body.get("price")) if flag == "0" else None
+            order, _meta, payload, _known = self._resolve_order(order_no, body)
+            # Reservation Guard (AG0006)
+            if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
+                raise EsunValidationError("預約單不可改單 (AG0006)，請先刪單後重新下單", "AG0006")
+            # Price Modify Guard (ROD Limit only), applied whenever the order type is known
+            bs = str(order.get("bs_flag") or order.get("bsFlag") or "").strip().upper()
+            current_flag = str(order.get("price_flag") or order.get("priceFlag") or "").strip().upper()
+            if (bs and bs not in ("R", "ROD")) or (current_flag and current_flag not in ("0", "LIMIT", "LMT")):
+                raise EsunValidationError(
+                    "玉山證券僅支援 ROD 限價單改價，市價單或 IOC/FOK 請先刪單再重新下單", "AG_INVALID_PRICE_MODIFY"
+                )
+            if str(order.get("ap_code") or "").strip() in ("3", "5"):
+                raise EsunValidationError("零股委託不支援改價，請刪單後重新下單", "AG_INVALID_PRICE_MODIFY")
+            current_price = _to_number(order.get("od_price"))
+            if price is not None and current_price is not None and abs(current_price - price) < 1e-9:
+                raise EsunValidationError("新價格與原委託價格相同 (O00021)", "AG_INVALID_PRICE_MODIFY")
+            self._require_order_details(order)
+        except EsunValidationError as e:
+            return not_sent(e.status, e.code, str(e))
+        refusal = self._consume_mutation_quota()
+        if refusal:
+            return refusal
+        sdk_order = self._sdk_order_dict(order)
+        envelope, status = self._call_sdk_mutation(
+            session, "改價", lambda: session.sdk.modify_price(sdk_order, target_price=price, price_flag=price_flag)
+        )
+        if envelope.get("outcome") == "accepted":
+            updates = {"price_flag": flag}
+            if price is not None:
+                updates["od_price"] = price
+            self._safe_mark_event(session, order_no, updates)
+        return envelope, status
+
+    @staticmethod
+    def _parse_cancel_quantity(body: dict) -> tuple[int, str]:
+        """reduce-by semantics: cancel_quantity + quantity_unit ('lot' | 'share'); legacy cel_qty / cel_qty_share."""
+        has_cancel = any(body.get(k) is not None for k in ("cancel_quantity", "cancelQuantity"))
+        legacy = [k for k in ("cel_qty", "cel_qty_share") if body.get(k) is not None]
+        if not has_cancel and not legacy:
+            if body.get("quantity") is not None:
+                raise EsunValidationError(
+                    "quantity（目標量語意）已停用：請改送 cancel_quantity（要減少的數量）與 quantity_unit",
+                    "ESUN_QTY_SEMANTICS",
+                )
+            raise EsunValidationError("缺少 cancel_quantity（要減少的數量）")
+        if has_cancel and legacy or len(legacy) > 1:
+            raise EsunValidationError("cancel_quantity、cel_qty、cel_qty_share 只能擇一提供")
+        if has_cancel:
+            value = body.get("cancel_quantity", body.get("cancelQuantity"))
+            unit = str(body.get("quantity_unit", body.get("quantityUnit")) or "").strip().lower()
+            if unit not in ("lot", "share"):
+                raise EsunValidationError("quantity_unit 必須為 lot（整股／盤後，張）或 share（零股／興櫃，股）")
+        else:
+            value = body[legacy[0]]
+            unit = "lot" if legacy[0] == "cel_qty" else "share"
+        return parse_positive_int(value, "cancel_quantity"), unit
+
+    def replace_qty(self, body: dict) -> tuple[dict, int]:
+        """
+        POST /esun/orders/replace-qty: reduce an order BY cancel_quantity (same semantics as
+        upstream updateOrderQty and SDK cancel_order(cel_qty=...)).
+        lot -> cel_qty for ap_code 1/2; share -> cel_qty_share for ap_code 3/4/5.
+        """
+        session, refusal = self._mutation_prelude(body)
+        if refusal:
+            return refusal
+        try:
+            order_no = parse_order_no(body)
+            cancel_quantity, unit = self._parse_cancel_quantity(body)
+            order, meta, payload, known = self._resolve_order(order_no, body)
+            # Reservation Guard (AG0006)
+            if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
+                raise EsunValidationError("預約單不可改單 (AG0006)，請先刪單後重新下單", "AG0006")
+            self._require_order_details(order)
+            ap = str(order.get("ap_code")).strip()
+            expected_unit = "lot" if ap in ("1", "2") else ("share" if ap in ("3", "4", "5") else None)
+            if expected_unit is None:
+                raise EsunValidationError(f"未知的委託類別 ap_code={ap}")
+            if unit != expected_unit:
+                raise EsunValidationError(
+                    f"quantity_unit={unit} 與委託類別不符（ap_code {ap} 應使用 {expected_unit}）", "ESUN_QTY_UNIT_MISMATCH"
+                )
+            # Remaining quantity is only "known" from an untouched broker snapshot.
+            remaining = remaining_quantity(order, unit) if (known and meta and meta.get("source") == "snapshot") else None
+            if remaining is not None:
+                if remaining <= 0:
+                    raise EsunValidationError("此委託已無剩餘量可減少（已全部成交或取消）", "ESUN_QTY_EXCEEDS_REMAINING")
+                if cancel_quantity > remaining + 1e-9:
+                    raise EsunValidationError(
+                        f"減少量 {cancel_quantity} 超過剩餘量 {_num_out(remaining)}（{unit}）", "ESUN_QTY_EXCEEDS_REMAINING"
+                    )
+        except EsunValidationError as e:
+            return not_sent(e.status, e.code, str(e))
+        refusal = self._consume_mutation_quota()
+        if refusal:
+            return refusal
+        kwargs = {"cel_qty": cancel_quantity} if unit == "lot" else {"cel_qty_share": cancel_quantity}
+        sdk_order = self._sdk_order_dict(order)
+        envelope, status = self._call_sdk_mutation(session, "改量", lambda: session.sdk.cancel_order(sdk_order, **kwargs))
+        if envelope.get("outcome") == "accepted":
+            self._safe_mark_event(session, order_no)
+        return envelope, status
+
+    def cancel_order(self, body: dict) -> tuple[dict, int]:
+        """POST /esun/orders/cancel: cancels the whole remaining quantity."""
+        session, refusal = self._mutation_prelude(body)
+        if refusal:
+            return refusal
+        try:
+            order_no = parse_order_no(body)
+            order, _meta, _payload, _known = self._resolve_order(order_no, body)
+            self._require_order_details(order)
+        except EsunValidationError as e:
+            return not_sent(e.status, e.code, str(e))
+        refusal = self._consume_mutation_quota()
+        if refusal:
+            return refusal
+        sdk_order = self._sdk_order_dict(order)
+        # sdk.cancel_order without cel_qty cancels all
+        envelope, status = self._call_sdk_mutation(session, "刪單", lambda: session.sdk.cancel_order(sdk_order))
+        if envelope.get("outcome") == "accepted":
+            self._safe_mark_event(session, order_no)
+        return envelope, status
 
     # ─────────────────────────────────────────────────────────────────────────
     # Portfolio Queries with Tiered Caching & Rate Limiting
@@ -3472,22 +3771,19 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
                 except ValueError as ve:
                     self._send_error_json(400, "ESUN_INVALID_PARAMS", str(ve))
             elif path == "/esun/orders/place":
-                payload = body.get("payload") if "payload" in body else body
-                res, code = self.bridge.place_order(payload)
-                self._send_json(code, res)
+                res, code = self.bridge.place_order(body)
+                self._send_json(code, res, self._retry_headers(res))
             elif path == "/esun/orders/replace-price":
                 res, code = self.bridge.replace_price(body)
-                self._send_json(code, res)
+                self._send_json(code, res, self._retry_headers(res))
             elif path == "/esun/orders/replace-qty":
                 res, code = self.bridge.replace_qty(body)
-                self._send_json(code, res)
+                self._send_json(code, res, self._retry_headers(res))
             elif path == "/esun/orders/cancel":
                 res, code = self.bridge.cancel_order(body)
-                self._send_json(code, res)
+                self._send_json(code, res, self._retry_headers(res))
             else:
                 self._send_error_json(404, "ESUN_NOT_FOUND", f"未知的端點 POST {path}")
-        except PermissionError as pe:
-            self._send_error_json(503, "NOT_LOGGED_IN", redact(pe))
         except Exception:
             self._send_internal_error()
 
@@ -3547,6 +3843,13 @@ class EsunThreadingHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request: any, client_address: any) -> None:
         if not self._connection_slots.acquire(blocking=False):
+            try:
+                # Consume the pending request first: closing a socket with unread data sends an
+                # RST that can reach the client before the 503 does.
+                request.settimeout(0.5)
+                request.recv(65536)
+            except OSError:
+                pass
             try:
                 request.sendall(
                     b"HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\n"
