@@ -81,6 +81,8 @@ services:
       target: esun-bridge
     restart: unless-stopped
     init: true
+    # SIGTERM 後橋接最多等 8 秒讓進行中的委託完成並回應，再關閉 WebSocket／SSE；預設 10 秒不夠
+    stop_grace_period: 15s
     # 不發佈到主機；排錯請用 docker compose exec esun-bridge curl -s localhost:8090/esun/livez
     expose:
       - "8090"

@@ -46,11 +46,24 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ProjectRoot = Split-Path -Parent $ScriptDir
+# 測試時可用 DEPLOY_PROJECT_ROOT 指定專案根目錄（與 deploy-docker.sh 相同）
+$ProjectRoot = if ($env:DEPLOY_PROJECT_ROOT) { $env:DEPLOY_PROJECT_ROOT } else { Split-Path -Parent $ScriptDir }
 Set-Location $ProjectRoot
 
 $PidFile = Join-Path $ProjectRoot ".esun-bridge.pid"
 $EnvFile = Join-Path $ProjectRoot ".env"
+
+# 腳本會改動的行程環境變數：先記下原值，結束時（最外層 finally）還原，原本不存在的移除。
+# 以 .\scripts\deploy-docker.ps1 執行時 $env: 的修改會留在 PowerShell session，不還原會讓下一次執行
+# 沿用殘留的上游與舊密碼（compose 以 shell 環境優先於 .env）。
+$ManagedEnvNames = @(
+    "ESUN_BRIDGE_UPSTREAM", "WEB_PORT", "ESUN_SERVER_HOST", "ESUN_SERVER_PORT", "ESUN_BRIDGE_TOKEN",
+    "ESUN_ACCOUNT_PASSWORD", "ESUN_PASSWORD", "ESUN_CERT_PASSWORD", "ESUN_ALLOWED_HOSTS"
+)
+$OriginalEnv = @{}
+foreach ($name in $ManagedEnvNames) {
+    $OriginalEnv[$name] = [Environment]::GetEnvironmentVariable($name)
+}
 
 function Write-Info($msg) {
     Write-Host "[INFO] $msg" -ForegroundColor Cyan
@@ -75,16 +88,36 @@ function Assert-LastExitCode([string]$what) {
     }
 }
 
+# 與 docker compose 相同：同名鍵重複時以最後一行為準
 function Get-DotEnvValue([string]$name) {
     if (-not (Test-Path $EnvFile)) { return $null }
     $pattern = '^\s*' + [regex]::Escape($name) + '\s*=\s*(.*?)\s*$'
+    $value = $null
     foreach ($line in [System.IO.File]::ReadAllLines($EnvFile)) {
         $m = [regex]::Match($line, $pattern)
         if ($m.Success) {
-            return $m.Groups[1].Value.Trim('"', "'")
+            $value = $m.Groups[1].Value.Trim('"', "'")
         }
     }
-    return $null
+    return $value
+}
+
+# 設定行程環境變數；值為空時移除
+function Set-ProcessEnv([System.Collections.IDictionary]$values) {
+    foreach ($name in @($values.Keys)) {
+        if ($values[$name]) {
+            [Environment]::SetEnvironmentVariable($name, [string]$values[$name])
+        } else {
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# 把指定的變數還原成腳本啟動時的值（$OriginalEnv）；原本不存在的移除
+function Restore-ProcessEnv([string[]]$names) {
+    $saved = [ordered]@{}
+    foreach ($name in $names) { $saved[$name] = $script:OriginalEnv[$name] }
+    Set-ProcessEnv $saved
 }
 
 # compose 的變數優先序：shell 環境變數 > .env > 預設值
@@ -113,17 +146,22 @@ function Initialize-BridgeToken {
         Write-Warn "找不到 .env，略過 ESUN_BRIDGE_TOKEN 產生"
         return
     }
+    $content = [System.IO.File]::ReadAllText($EnvFile)
+    $linePattern = '(?m)^[ \t]*ESUN_BRIDGE_TOKEN[ \t]*=.*?(?=\r?$)'
+    $tokenLines = [regex]::Matches($content, $linePattern)
+    if ($tokenLines.Count -gt 1) {
+        Write-Warn "偵測到 .env 有重複的 ESUN_BRIDGE_TOKEN（$($tokenLines.Count) 行），以最後一行為準（與 docker compose 相同），請刪除多餘的行"
+    }
     if (Get-DotEnvValue "ESUN_BRIDGE_TOKEN") {
         return
     }
 
-    $content = [System.IO.File]::ReadAllText($EnvFile)
     $newline = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
     $token = New-BridgeToken
-    $linePattern = '(?m)^[ \t]*ESUN_BRIDGE_TOKEN[ \t]*=.*?(?=\r?$)'
-    if ([regex]::IsMatch($content, $linePattern)) {
-        $re = New-Object System.Text.RegularExpressions.Regex($linePattern)
-        $content = $re.Replace($content, "ESUN_BRIDGE_TOKEN=$token", 1)
+    if ($tokenLines.Count -gt 0) {
+        # 改寫 compose 實際生效的最後一行
+        $last = $tokenLines[$tokenLines.Count - 1]
+        $content = $content.Substring(0, $last.Index) + "ESUN_BRIDGE_TOKEN=$token" + $content.Substring($last.Index + $last.Length)
     } else {
         if ($content.Length -gt 0 -and -not $content.EndsWith("`n")) {
             $content += $newline
@@ -260,9 +298,18 @@ function Start-HostBridgeProcess {
         exit 1
     }
 
-    # 檢查並安裝 esun_trade（install_sdk.py 會驗證 SHA256 並挑選 Windows wheel）
-    python -c "import esun_trade" 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    # 檢查並安裝 esun_trade（install_sdk.py 會驗證 SHA256 並挑選 Windows wheel）。
+    # Windows PowerShell 5.1 會把被導向的原生 stderr 包成 ErrorRecord，在 Stop 下直接中止，
+    # 因此檢查期間暫時改為 Continue，只看結束碼
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        python -c "import esun_trade" 2>$null
+        $sdkMissing = ($LASTEXITCODE -ne 0)
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
+    if ($sdkMissing) {
         Write-Info "正在安裝玉山 SDK 與相依套件..."
         python -m pip install -r deploy/requirements-esun-bridge.txt
         Assert-LastExitCode "安裝 deploy/requirements-esun-bridge.txt"
@@ -277,25 +324,35 @@ function Start-HostBridgeProcess {
         return
     }
 
-    # 子程序沿用目前環境：從 .env 帶入橋接需要的值（shell 已設定者優先）
+    # 子程序沿用目前環境：腳本啟動前使用者自行設定的值優先，否則每次從 .env 重新讀取最新值
+    $bridgeEnv = [ordered]@{}
     foreach ($name in @("ESUN_BRIDGE_TOKEN", "ESUN_ACCOUNT_PASSWORD", "ESUN_PASSWORD", "ESUN_CERT_PASSWORD", "ESUN_ALLOWED_HOSTS")) {
-        if (-not [Environment]::GetEnvironmentVariable($name)) {
-            $value = Get-DotEnvValue $name
-            if ($value) { [Environment]::SetEnvironmentVariable($name, $value) }
-        }
+        $value = $script:OriginalEnv[$name]
+        if (-not $value) { $value = Get-DotEnvValue $name }
+        $bridgeEnv[$name] = $value
+    }
+    # 與 compose 的 ESUN_ALLOWED_HOSTS=${WEB_SERVER_NAMES} 一致（shell > .env > 空）
+    if (-not $bridgeEnv["ESUN_ALLOWED_HOSTS"]) {
+        $bridgeEnv["ESUN_ALLOWED_HOSTS"] = Get-EffectiveSetting "WEB_SERVER_NAMES" ""
     }
     $bindHost = Get-EffectiveSetting "ESUN_HOST_BRIDGE_BIND" "127.0.0.1"
-    $env:ESUN_SERVER_HOST = $bindHost
-    $env:ESUN_SERVER_PORT = "$BridgePort"
+    $bridgeEnv["ESUN_SERVER_HOST"] = $bindHost
+    $bridgeEnv["ESUN_SERVER_PORT"] = "$BridgePort"
     $logFile = Join-Path $ProjectRoot "esun-bridge.log"
     $errLogFile = Join-Path $ProjectRoot "esun-bridge.err.log"
 
-    $p = Start-Process -FilePath "python" `
-        -ArgumentList "-u", "server/esun_trade_server.py" `
-        -RedirectStandardOutput $logFile `
-        -RedirectStandardError $errLogFile `
-        -WindowStyle Hidden `
-        -PassThru
+    # 秘密只在 Start-Process 前設定，子程序啟動後立即還原，不留在 PowerShell session
+    try {
+        Set-ProcessEnv $bridgeEnv
+        $p = Start-Process -FilePath "python" `
+            -ArgumentList "-u", "server/esun_trade_server.py" `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError $errLogFile `
+            -WindowStyle Hidden `
+            -PassThru
+    } finally {
+        Restore-ProcessEnv @($bridgeEnv.Keys)
+    }
 
     Set-Content -Path $PidFile -Value $p.Id
     Write-Success "Windows 宿主機玉山 Sidecar 已在背景啟動 (PID: $($p.Id), 綁定 ${bindHost}:$BridgePort)，日誌記錄於 $logFile / $errLogFile"
@@ -324,9 +381,9 @@ function Action-Up {
     } else {
         # 全容器化模式
         Stop-HostBridgeProcess
-        if (-not (Get-DotEnvValue "ESUN_BRIDGE_UPSTREAM")) {
-            $env:ESUN_BRIDGE_UPSTREAM = "http://esun-bridge:8090"
-        }
+        # 明確決定上游（.env 值或預設），不沿用 session 殘留的 host.docker.internal
+        $upstream = Get-DotEnvValue "ESUN_BRIDGE_UPSTREAM"
+        $env:ESUN_BRIDGE_UPSTREAM = if ($upstream) { $upstream } else { "http://esun-bridge:8090" }
         Write-Info "以全容器化模式啟動 Shioaji Pro Web 與 esun-bridge 容器..."
         docker @composeArgs
         Assert-LastExitCode "docker compose up"
@@ -416,4 +473,6 @@ try {
 } catch {
     Write-Err $_.Exception.Message
     exit 1
+} finally {
+    Restore-ProcessEnv $ManagedEnvNames
 }
