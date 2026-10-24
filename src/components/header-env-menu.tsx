@@ -535,7 +535,7 @@ export function HeaderEnvMenu({
                                         <span>切換後將以真實帳戶下單，委託會送到交易所並可能成交。</span>
                                         <span className={styles.optionSubtitle}>
                                             <span className={styles.line}>
-                                                帳號：{esunAccounts.length > 0 ? esunAccounts.map(accountText).join('、') : '由 bridge 登入帳號決定'}
+                                                帳號：{esunAccounts.length > 0 ? esunAccounts.map((a) => accountText(a, priv)).join('、') : '由 bridge 登入帳號決定'}
                                             </span>
                                             <span className={styles.line}>設定檔：{prodProfile?.fileName ?? 'esun-config.production.ini'}</span>
                                             <span className={styles.line}>Entry：{ESUN_PRODUCTION_ENTRY}</span>
