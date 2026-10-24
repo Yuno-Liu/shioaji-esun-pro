@@ -24,21 +24,30 @@ Covers:
 from __future__ import annotations
 
 import configparser
+import contextlib
 import datetime
+import http.client
+import io
 import json
 import os
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.request
 import urllib.error
 
 import esun_trade.util
 from server.esun_trade_server import (
+    AccessPolicy,
     DailyCounter,
     EsunHTTPRequestHandler,
     EsunTradeBridge,
+    MAX_REQUEST_BODY_BYTES,
+    make_shutdown_handler,
+    redact,
+    register_secret,
     OrderBookCache,
     SlidingWindowRateLimiter,
     TTLCache,
@@ -1004,6 +1013,317 @@ class TestConfigProfilesDiscovery(unittest.TestCase):
             self.assertEqual(bridge.config_path, sim_file)
         finally:
             os.environ.pop("ESUN_CONFIG_DIR", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers for the review-fix regression tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_profile(directory: str, file_name: str, environment: str, account: str = "88401234567",
+                   key: str | None = None, secret: str | None = None) -> str:
+    """Writes a profile ini (and its c.p12) into directory; returns the absolute path."""
+    cert = os.path.join(directory, "c.p12")
+    if not os.path.exists(cert):
+        with open(cert, "w") as f:
+            f.write("cert")
+    if environment == "SIMULATION":
+        core = f"[Core]\nEntry={ESUN_SIMULATION_ENTRY}\nEnvironment=SIMULATION\n"
+    else:
+        core = f"[Core]\nEntry={ESUN_PRODUCTION_ENTRY}\n"
+    key = key or f"{environment.lower()}_key"
+    secret = secret or f"{environment.lower()}_secret_value"
+    path = os.path.join(directory, file_name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{core}[Cert]\nPath=c.p12\n[Api]\nKey={key}\nSecret={secret}\n[User]\nAccount={account}\n")
+    return os.path.abspath(path)
+
+
+def _raw_request(port: int, method: str, path: str, headers: dict | None = None,
+                 body: bytes | None = None, send_length: bool = True):
+    """Sends a request with full header control (Host included); returns (status, headers, json-or-bytes)."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        hdrs = dict(headers or {})
+        hdrs.setdefault("Host", f"127.0.0.1:{port}")
+        for k, v in hdrs.items():
+            if v is not None:
+                conn.putheader(k, v)
+        if body is not None and send_length:
+            conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders(body if (body is not None and send_length) else None)
+        resp = conn.getresponse()
+        raw = resp.read()
+        resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw else None
+        except ValueError:
+            data = raw
+        return resp.status, resp_headers, data
+    finally:
+        conn.close()
+
+
+def _serve(server):
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    return thread
+
+
+class TestAccessControlHttp(unittest.TestCase):
+    """§2 access control: Host allowlist -> token -> CSRF, bounded JSON bodies, CORS allowlist only."""
+
+    TOKEN = "unit-test-bridge-token-0123456789"
+    ALLOWED_ORIGIN = "http://localhost:5173"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.sim_file = _write_profile(cls.temp_dir.name, "esun-config.simulation.ini", "SIMULATION")
+        os.environ["ESUN_ACCOUNT_PASSWORD"] = "pw"
+        os.environ["ESUN_CERT_PASSWORD"] = "cpw"
+        cls.mock_sdk = MockSDK()
+        cls.bridge = EsunTradeBridge(config_path=cls.sim_file, sdk_factory=lambda cfg: cls.mock_sdk, auto_login=True)
+        cls.open_server = create_server(
+            host="127.0.0.1", port=0, bridge=cls.bridge,
+            access_policy=AccessPolicy(allowed_hosts=["trader.lan", "*.corp.example"], allowed_origins=[cls.ALLOWED_ORIGIN]),
+        )
+        cls.token_server = create_server(host="127.0.0.1", port=0, bridge=cls.bridge, access_policy=AccessPolicy(token=cls.TOKEN))
+        cls.open_port = cls.open_server.server_address[1]
+        cls.token_port = cls.token_server.server_address[1]
+        _serve(cls.open_server)
+        _serve(cls.token_server)
+
+    @classmethod
+    def tearDownClass(cls):
+        for server in (cls.open_server, cls.token_server):
+            server.shutdown()
+            server.server_close()
+        cls.temp_dir.cleanup()
+        os.environ.pop("ESUN_ACCOUNT_PASSWORD", None)
+        os.environ.pop("ESUN_CERT_PASSWORD", None)
+
+    def _get(self, path, headers=None, port=None):
+        return _raw_request(port or self.open_port, "GET", path, headers=headers)
+
+    def _post(self, path, body=b"{}", headers=None, port=None, send_length=True):
+        hdrs = {"Content-Type": "application/json"}
+        hdrs.update(headers or {})
+        return _raw_request(port or self.open_port, "POST", path, headers=hdrs, body=body, send_length=send_length)
+
+    def test_livez_is_unauthenticated_and_side_effect_free(self):
+        status, _, data = self._get("/esun/livez", headers={"Host": "evil.example"})
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"ok": True})
+        status, _, data = self._get("/esun/livez", port=self.token_port)
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"ok": True})
+
+    def test_host_allowlist(self):
+        for host in ("evil.example", "evil.example:8090", "127.0.0.1.evil.example", "localhost.evil:80"):
+            status, _, data = self._get("/esun/health", headers={"Host": host})
+            self.assertEqual(status, 421, host)
+            self.assertEqual(data["code"], "ESUN_HOST_NOT_ALLOWED")
+        for host in ("localhost:8090", "LOCALHOST", "[::1]:8090", "esun-bridge:8090", "host.docker.internal",
+                     "trader.lan:8080", "desk.corp.example"):
+            status, _, _ = self._get("/esun/health", headers={"Host": host})
+            self.assertEqual(status, 200, host)
+        # A missing Host header is refused as well (DNS-rebinding protection needs it).
+        conn = http.client.HTTPConnection("127.0.0.1", self.open_port, timeout=10)
+        try:
+            conn.putrequest("GET", "/esun/health", skip_host=True, skip_accept_encoding=True)
+            conn.endheaders()
+            self.assertEqual(conn.getresponse().status, 421)
+        finally:
+            conn.close()
+
+    def test_sec_fetch_site_blocks_cross_site(self):
+        for site in ("cross-site", "same-site"):
+            status, _, data = self._get("/esun/health", headers={"Sec-Fetch-Site": site})
+            self.assertEqual(status, 403, site)
+            self.assertEqual(data["code"], "ESUN_CROSS_SITE")
+        for site in ("same-origin", "none"):
+            status, _, _ = self._get("/esun/health", headers={"Sec-Fetch-Site": site})
+            self.assertEqual(status, 200, site)
+        # An allowlisted origin may call cross-site (dev server on another port).
+        status, headers, _ = self._get("/esun/health", headers={"Sec-Fetch-Site": "same-site", "Origin": self.ALLOWED_ORIGIN})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("access-control-allow-origin"), self.ALLOWED_ORIGIN)
+
+    def test_origin_must_match_host_when_not_allowlisted(self):
+        port = self.open_port
+        status, _, data = self._post("/esun/__probe", headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertEqual(data["code"], "ESUN_CROSS_SITE")
+        status, _, _ = self._post("/esun/__probe", headers={"Origin": "null"})
+        self.assertEqual(status, 403)
+        status, _, _ = self._post("/esun/__probe", headers={"Origin": f"http://localhost:{port + 1}", "Host": f"localhost:{port}"})
+        self.assertEqual(status, 403)
+        # Same origin (port included, default port filled in) passes the guard and reaches routing (404).
+        status, _, data = self._post("/esun/__probe", headers={"Origin": f"http://127.0.0.1:{port}"})
+        self.assertEqual(status, 404)
+        status, _, _ = self._post("/esun/__probe", headers={"Origin": "http://localhost", "Host": "localhost"})
+        self.assertEqual(status, 404)
+        status, _, _ = self._post("/esun/__probe", headers={"Origin": "http://localhost:80", "Host": "localhost"})
+        self.assertEqual(status, 404)
+
+    def test_cors_headers_only_for_allowlisted_origins_never_wildcard(self):
+        status, headers, _ = self._get("/esun/health", headers={"Origin": self.ALLOWED_ORIGIN})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("access-control-allow-origin"), self.ALLOWED_ORIGIN)
+        self.assertEqual(headers.get("vary"), "Origin")
+        status, headers, _ = self._get("/esun/health", headers={"Origin": f"http://127.0.0.1:{self.open_port}"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("access-control-allow-origin", headers)
+        status, headers, _ = self._get("/esun/health")
+        self.assertNotIn("access-control-allow-origin", headers)
+        self.assertNotIn("access-control-allow-methods", headers)
+
+    def test_options_preflight(self):
+        status, headers, _ = _raw_request(self.open_port, "OPTIONS", "/esun/orders/place", headers={
+            "Origin": self.ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type,x-esun-bridge-token",
+        })
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("access-control-allow-origin"), self.ALLOWED_ORIGIN)
+        self.assertEqual(headers.get("vary"), "Origin")
+        self.assertEqual(headers.get("access-control-allow-methods"), "GET, POST")
+        self.assertEqual(headers.get("access-control-allow-headers"), "Content-Type, X-Esun-Bridge-Token")
+        status, headers, _ = _raw_request(self.open_port, "OPTIONS", "/esun/orders/place", headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertNotIn("access-control-allow-origin", headers)
+        status, _, _ = _raw_request(self.open_port, "OPTIONS", "/esun/orders/place")
+        self.assertEqual(status, 403)
+
+    def test_post_requires_bounded_json_object(self):
+        status, _, data = self._post("/esun/__probe", headers={"Content-Type": "text/plain"})
+        self.assertEqual(status, 415)
+        self.assertEqual(data["code"], "ESUN_UNSUPPORTED_MEDIA_TYPE")
+        status, _, _ = self._post("/esun/__probe", headers={"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(status, 415)
+        status, _, _ = self._post("/esun/__probe", headers={"Content-Type": "application/json; charset=utf-8"})
+        self.assertEqual(status, 404)
+        status, _, data = self._post("/esun/__probe", body=None)
+        self.assertEqual(status, 411)
+        self.assertEqual(data["code"], "ESUN_LENGTH_REQUIRED")
+        status, _, _ = self._post("/esun/__probe", body=None, headers={"Content-Length": "abc"})
+        self.assertEqual(status, 411)
+        status, _, _ = self._post("/esun/__probe", body=None, headers={"Content-Length": "-5"})
+        self.assertEqual(status, 411)
+        # Oversized body: declared length alone triggers 413 (the body is never read).
+        status, _, data = self._post("/esun/__probe", body=None, headers={"Content-Length": str(MAX_REQUEST_BODY_BYTES + 1)})
+        self.assertEqual(status, 413)
+        self.assertEqual(data["code"], "ESUN_PAYLOAD_TOO_LARGE")
+        status, _, data = self._post("/esun/__probe", body=b"{not json")
+        self.assertEqual(status, 400)
+        self.assertEqual(data["code"], "ESUN_INVALID_JSON")
+        status, _, data = self._post("/esun/__probe", body=b"[1, 2]")
+        self.assertEqual(status, 400)
+        self.assertEqual(data["code"], "ESUN_INVALID_JSON")
+
+    def test_mutation_path_refusals_are_not_sent_envelopes(self):
+        status, _, data = self._post("/esun/orders/place", headers={"Content-Type": "text/plain"})
+        self.assertEqual(status, 415)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["outcome"], "not_sent")
+        status, _, data = self._post("/esun/orders/cancel", headers={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(status, 403)
+        self.assertEqual(data["outcome"], "not_sent")
+
+    def test_token_required_when_configured(self):
+        status, _, data = self._get("/esun/health", port=self.token_port)
+        self.assertEqual(status, 401)
+        self.assertEqual(data["code"], "ESUN_UNAUTHORIZED")
+        status, _, _ = self._get("/esun/health", port=self.token_port, headers={"X-Esun-Bridge-Token": "wrong"})
+        self.assertEqual(status, 401)
+        status, _, data = self._get("/esun/health", port=self.token_port, headers={"X-Esun-Bridge-Token": self.TOKEN})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        # Host is checked before the token.
+        status, _, data = self._get("/esun/health", port=self.token_port, headers={"Host": "evil.example"})
+        self.assertEqual(status, 421)
+        # SSE is protected as well.
+        status, _, _ = self._get("/esun/stream/orders", port=self.token_port)
+        self.assertEqual(status, 401)
+
+    def test_internal_error_does_not_leak_exception_text(self):
+        with mock.patch.object(self.bridge, "get_health", side_effect=RuntimeError("super-secret-detail")):
+            with contextlib.redirect_stderr(io.StringIO()):
+                status, _, data = self._get("/esun/health")
+        self.assertEqual(status, 500)
+        self.assertEqual(data["code"], "ESUN_INTERNAL_ERROR")
+        self.assertNotIn("super-secret-detail", json.dumps(data, ensure_ascii=False))
+        self.assertTrue(data.get("requestId"))
+
+    def test_request_log_omits_query_string(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            status, _, _ = self._get("/esun/ca_expiretime?person_id=A123456789")
+        self.assertEqual(status, 200)
+        log = buf.getvalue()
+        self.assertIn("/esun/ca_expiretime", log)
+        self.assertNotIn("A123456789", log)
+        self.assertNotIn("person_id", log)
+
+    def test_access_policy_from_env_parsing(self):
+        policy = AccessPolicy.from_env({
+            "ESUN_ALLOWED_HOSTS": "a.lan, *.corp  .home 192.168.1.10:8080 _ ~^regex$",
+            "ESUN_ALLOWED_ORIGINS": "http://localhost:5173,https://x.example:443, not-an-origin",
+            "ESUN_BRIDGE_TOKEN": "  tok  ",
+        })
+        self.assertEqual(policy.token, "tok")
+        for host in ("a.lan", "A.LAN:1", "x.corp", "home", "pc.home", "192.168.1.10", "localhost"):
+            self.assertTrue(policy.host_allowed(host), host)
+        for host in ("corp", "b.lan", "evil", "", None):
+            self.assertFalse(policy.host_allowed(host), host)
+        self.assertTrue(policy.origin_allowed("http://localhost:5173"))
+        self.assertTrue(policy.origin_allowed("https://x.example"))
+        self.assertFalse(policy.origin_allowed("http://localhost:5174"))
+        self.assertFalse(policy.origin_allowed("null"))
+
+    def test_connection_cap_rejects_excess_connections(self):
+        server = create_server(host="127.0.0.1", port=0, bridge=self.bridge, access_policy=AccessPolicy(), max_connections=1)
+        port = server.server_address[1]
+        _serve(server)
+        sse = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            sse.request("GET", "/esun/stream/orders", headers={"Host": f"127.0.0.1:{port}"})
+            sse_resp = sse.getresponse()
+            self.assertEqual(sse_resp.status, 200)
+            sse_resp.readline()  # first heartbeat line: the slot is now held by the SSE stream
+            status, _, _ = _raw_request(port, "GET", "/esun/livez")
+            self.assertEqual(status, 503)
+        finally:
+            sse.close()
+            server.shutdown()
+            server.server_close()
+
+    def test_redact_masks_secrets_and_national_ids(self):
+        register_secret("MySecretApiValue")
+        with mock.patch.dict(os.environ, {"ESUN_ACCOUNT_PASSWORD": "Passw0rd!x"}):
+            text = redact("login failed pw=Passw0rd!x secret=MySecretApiValue id=A123456789 acct=88401234567")
+        self.assertNotIn("Passw0rd!x", text)
+        self.assertNotIn("MySecretApiValue", text)
+        self.assertNotIn("A123456789", text)
+        self.assertIn("88401234567", text)
+
+
+class TestGracefulShutdown(unittest.TestCase):
+    def test_shutdown_handler_stops_serve_forever_and_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sim = _write_profile(tmp, "esun-config.simulation.ini", "SIMULATION")
+            with mock.patch.dict(os.environ, {"ESUN_ACCOUNT_PASSWORD": "pw", "ESUN_CERT_PASSWORD": "cpw"}):
+                bridge = EsunTradeBridge(config_path=sim, sdk_factory=lambda cfg: MockSDK(cfg), auto_login=True)
+            server = create_server(host="127.0.0.1", port=0, bridge=bridge, access_policy=AccessPolicy())
+            thread = _serve(server)
+            handler = make_shutdown_handler(server, bridge)
+            handler(15, None)
+            handler(15, None)  # idempotent
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive(), "serve_forever must return after SIGTERM")
+            self.assertTrue(bridge.is_shutting_down())
+            server.server_close()
 
 
 if __name__ == "__main__":

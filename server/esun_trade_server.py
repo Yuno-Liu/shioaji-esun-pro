@@ -29,15 +29,22 @@ from __future__ import annotations
 import configparser
 import datetime
 import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import logging
+import math
 import os
 import queue
+import re
+import secrets
+import signal
 import sys
 import threading
 import time
-from urllib.parse import parse_qs, urlparse
+import traceback
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 # Configure logging
 logging.basicConfig(
@@ -62,6 +69,45 @@ except ImportError:
     PriceFlag = None  # type: ignore
     Trade = None  # type: ignore
     logger.warning("esun_trade package not imported at top level; will rely on injected SDK in mock environments.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0. Secret Redaction (responses & logs never carry passwords / secrets / IDs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SECRET_ENV_KEYS = ("ESUN_ACCOUNT_PASSWORD", "ESUN_PASSWORD", "ESUN_CERT_PASSWORD", "ESUN_BRIDGE_TOKEN")
+_REDACT_LOCK = threading.Lock()
+_REDACTED_VALUES: set[str] = set()
+# 台灣身分證／居留證號格式：1 個英文字母 + 9 碼（第 2 碼 1/2/8/9 或 A-D）
+_NATIONAL_ID_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z])[1289A-D][0-9]{8}(?![A-Za-z0-9])")
+
+
+def register_secret(value: any) -> None:
+    """Registers a secret value (e.g. [Api] Secret) so redact() masks it everywhere."""
+    s = str(value or "").strip()
+    if len(s) >= 4:
+        with _REDACT_LOCK:
+            _REDACTED_VALUES.add(s)
+
+
+def redact(text: any) -> str:
+    """Masks passwords, API secrets, the bridge token and national IDs in free text."""
+    s = str(text)
+    candidates = {v for v in (os.environ.get(k) for k in _SECRET_ENV_KEYS) if v and len(v) >= 4}
+    with _REDACT_LOCK:
+        candidates |= _REDACTED_VALUES
+    for value in sorted(candidates, key=len, reverse=True):
+        if value in s:
+            s = s.replace(value, "***")
+    return _NATIONAL_ID_RE.sub(lambda m: m.group(1) + "*********", s)
+
+
+def mask_identifier(value: any) -> str:
+    """Masks an identifier for display/logging: A123456789 -> A*******89."""
+    s = str(value or "")
+    if len(s) <= 4:
+        return "*" * len(s)
+    return s[:1] + "*" * (len(s) - 3) + s[-2:]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -916,6 +962,16 @@ class SSEFanoutManager:
         with self.lock:
             return len(self.subscribers)
 
+    def close_all(self) -> None:
+        """Wakes every SSE handler with a None sentinel so connections end on shutdown."""
+        with self.lock:
+            active_subs = list(self.subscribers)
+        for q in active_subs:
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Bridge Core Engine
@@ -994,10 +1050,44 @@ class EsunTradeBridge:
         self.order_book_cache = OrderBookCache()
         self.sse_fanout = SSEFanoutManager()
         self.ws_thread: threading.Thread | None = None
+        self._shutdown_event = threading.Event()
 
         # Startup login attempt (at most once)
         if auto_login:
             self._attempt_initial_login()
+
+    def attempt_initial_login(self) -> None:
+        """Public entry point used by main() after the HTTP port is bound."""
+        self._attempt_initial_login()
+
+    def is_shutting_down(self) -> bool:
+        return self._shutdown_event.is_set()
+
+    def shutdown(self) -> None:
+        """Graceful shutdown: stop accepting SSE work and release subscribers."""
+        if self._shutdown_event.is_set():
+            return
+        self._shutdown_event.set()
+        self.sse_fanout.close_all()
+
+    def get_config_profiles(self) -> dict:
+        discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
+        return {
+            "ok": True,
+            "availableEnvironments": discovery["availableEnvironments"],
+            "configProfiles": {
+                k: {
+                    "available": v["available"],
+                    "fileName": v["fileName"],
+                    "expectedFileName": v["expectedFileName"],
+                    "aliases": v["aliases"],
+                    "entry": v["entry"],
+                }
+                for k, v in discovery["profiles"].items()
+            },
+            "activeConfigFile": os.path.basename(self.config_path) if self.config_path and os.path.exists(self.config_path) else None,
+            "activeEnvironment": self.environment,
+        }
 
     def _attempt_initial_login(self) -> None:
         """Attempt login at most once at startup; never retry automatically on failure."""
@@ -1850,119 +1940,465 @@ class EsunTradeBridge:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. HTTP & SSE Request Handler
+# 8. Access Control (Host allowlist -> token -> CSRF) & HTTP / SSE Handler
 # ─────────────────────────────────────────────────────────────────────────────
+
+BRIDGE_TOKEN_HEADER = "X-Esun-Bridge-Token"
+BUILTIN_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "::1", "esun-bridge", "host.docker.internal")
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+REQUEST_SOCKET_TIMEOUT_SECONDS = 30.0
+MAX_CONCURRENT_CONNECTIONS = 96
+MUTATION_PATHS = frozenset({
+    "/esun/orders/place",
+    "/esun/orders/replace-price",
+    "/esun/orders/replace-qty",
+    "/esun/orders/cancel",
+})
+
+_PORT_RE = re.compile(r"[0-9]{1,5}")
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
+
+
+def _split_host_port(value: str | None) -> tuple[str, int | None] | None:
+    """Parses a Host header value: "host", "host:port", "[::1]", "[::1]:port" or a bare IPv6 literal."""
+    v = str(value or "").strip()
+    if not v:
+        return None
+    port: int | None = None
+    if v.startswith("["):
+        end = v.find("]")
+        if end == -1:
+            return None
+        host = v[1:end]
+        rest = v[end + 1:]
+        if rest:
+            if not rest.startswith(":") or not _PORT_RE.fullmatch(rest[1:]):
+                return None
+            port = int(rest[1:])
+    elif v.count(":") == 1:
+        host, _, raw_port = v.partition(":")
+        if not _PORT_RE.fullmatch(raw_port):
+            return None
+        port = int(raw_port)
+    else:
+        host = v  # plain hostname or a bare IPv6 literal
+    host = host.strip().lower().rstrip(".")
+    if not host or any(c in host for c in "/@ \t\\"):
+        return None
+    if port is not None and not (0 < port < 65536):
+        return None
+    return host, port
+
+
+def _parse_origin(origin: str | None) -> tuple[str, str, int] | None:
+    """Parses an Origin header into (scheme, host, port) with the scheme's default port filled in."""
+    v = str(origin or "").strip()
+    if not v or v.lower() == "null":
+        return None
+    try:
+        parts = urlsplit(v)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https") or not parts.hostname:
+        return None
+    if parts.path not in ("", "/") or parts.query or parts.fragment or parts.username or parts.password:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, parts.hostname.lower().rstrip("."), port
+
+
+def _normalize_origin(origin: str | None) -> str | None:
+    parsed = _parse_origin(origin)
+    if not parsed:
+        return None
+    scheme, host, port = parsed
+    host_fmt = f"[{host}]" if ":" in host else host
+    default_port = 443 if scheme == "https" else 80
+    return f"{scheme}://{host_fmt}" if port == default_port else f"{scheme}://{host_fmt}:{port}"
+
+
+def _origin_matches_host(origin: str | None, host_header: str | None) -> bool:
+    """Same-origin check: Origin host:port must equal the request Host header (default ports filled in)."""
+    parsed_origin = _parse_origin(origin)
+    parsed_host = _split_host_port(host_header)
+    if not parsed_origin or not parsed_host:
+        return False
+    scheme, origin_host, origin_port = parsed_origin
+    host, host_port = parsed_host
+    if host_port is None:
+        host_port = 443 if scheme == "https" else 80
+    return origin_host == host and origin_port == host_port
+
+
+def _is_loopback_bind(host: str | None) -> bool:
+    h = str(host or "").strip().lower().strip("[]")
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+class AccessPolicy:
+    """
+    Request access control (checked in order): Host allowlist -> shared token -> CSRF.
+    - ESUN_BRIDGE_TOKEN: when set, every request except GET /esun/livez must carry X-Esun-Bridge-Token.
+    - ESUN_ALLOWED_HOSTS: extra Host names (comma/whitespace separated; "*.lan" / ".lan" suffix forms).
+    - ESUN_ALLOWED_ORIGINS: CORS allowlist of full origins; empty means no CORS headers at all.
+    """
+
+    def __init__(
+        self,
+        token: str | None = None,
+        allowed_hosts: any = (),
+        allowed_origins: any = (),
+    ):
+        self.token = str(token or "").strip()
+        self.exact_hosts: set[str] = set(BUILTIN_ALLOWED_HOSTS)
+        self.suffix_hosts: list[str] = []
+        for raw in allowed_hosts or ():
+            self._add_host(raw)
+        self.allowed_origins: set[str] = set()
+        for raw in allowed_origins or ():
+            normalized = _normalize_origin(raw)
+            if normalized:
+                self.allowed_origins.add(normalized)
+            elif str(raw or "").strip():
+                logger.warning("忽略無效的 ESUN_ALLOWED_ORIGINS 項目：%s", raw)
+
+    @classmethod
+    def from_env(cls, environ: dict | None = None) -> "AccessPolicy":
+        env = os.environ if environ is None else environ
+        hosts = [h for h in re.split(r"[\s,]+", env.get("ESUN_ALLOWED_HOSTS", "") or "") if h]
+        origins = [o for o in re.split(r"[\s,]+", env.get("ESUN_ALLOWED_ORIGINS", "") or "") if o]
+        return cls(token=env.get("ESUN_BRIDGE_TOKEN", ""), allowed_hosts=hosts, allowed_origins=origins)
+
+    def _add_host(self, raw: any) -> None:
+        v = str(raw or "").strip().lower()
+        if not v or v == "_" or v.startswith("~"):
+            return  # nginx catch-all / regex server_name entries are not host names
+        if v.startswith("*."):
+            self.suffix_hosts.append(v[1:])
+            return
+        if v.startswith("."):
+            self.suffix_hosts.append(v)
+            self.exact_hosts.add(v[1:])
+            return
+        parsed = _split_host_port(v)
+        if parsed:
+            self.exact_hosts.add(parsed[0])
+        else:
+            logger.warning("忽略無效的 ESUN_ALLOWED_HOSTS 項目：%s", raw)
+
+    def host_allowed(self, host_header: str | None) -> bool:
+        parsed = _split_host_port(host_header)
+        if not parsed:
+            return False
+        host = parsed[0]
+        if host in self.exact_hosts:
+            return True
+        return any(host.endswith(sfx) and len(host) > len(sfx) for sfx in self.suffix_hosts)
+
+    def origin_allowed(self, origin: str | None) -> bool:
+        normalized = _normalize_origin(origin) if origin else None
+        return bool(normalized) and normalized in self.allowed_origins
+
+    def token_valid(self, provided: str | None) -> bool:
+        if not self.token:
+            return True
+        return hmac.compare_digest(str(provided or "").encode("utf-8"), self.token.encode("utf-8"))
+
+    def check(
+        self,
+        method: str,
+        host: str | None,
+        origin: str | None,
+        sec_fetch_site: str | None,
+        token: str | None,
+    ) -> tuple[int, str, str] | None:
+        """Returns (status, code, message) when the request must be refused, else None."""
+        if not self.host_allowed(host):
+            return 421, "ESUN_HOST_NOT_ALLOWED", "Host 不在允許清單內（請設定 ESUN_ALLOWED_HOSTS）"
+        if method == "OPTIONS":
+            # Preflights never carry custom headers (the token), so only the CORS allowlist applies.
+            if origin is not None and self.origin_allowed(origin):
+                return None
+            return 403, "ESUN_CROSS_SITE", "不允許的跨來源預檢請求"
+        if not self.token_valid(token):
+            return 401, "ESUN_UNAUTHORIZED", f"缺少或錯誤的 {BRIDGE_TOKEN_HEADER}"
+        origin_ok = origin is not None and self.origin_allowed(origin)
+        if sec_fetch_site is not None:
+            site = sec_fetch_site.strip().lower()
+            if site not in ("same-origin", "none") and not origin_ok:
+                return 403, "ESUN_CROSS_SITE", "拒絕跨站請求（Sec-Fetch-Site）"
+        if origin is not None and not origin_ok and not _origin_matches_host(origin, host):
+            return 403, "ESUN_CROSS_SITE", "拒絕跨來源請求（Origin 與 Host 不符）"
+        return None
+
+
+def _json_default(obj: any) -> any:
+    """JSON fallback for SDK enums, sets and datetimes inside SDK results."""
+    value = getattr(obj, "value", None)
+    if value is not None and not callable(value):
+        return value
+    if isinstance(obj, (set, frozenset)):
+        return list(obj)
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", "replace")
+    return str(obj)
+
 
 class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
     """Handles /esun/* REST and SSE requests with ThreadingHTTPServer."""
 
     bridge: EsunTradeBridge
+    access_policy: AccessPolicy | None = None
+    # StreamRequestHandler.setup() applies this to the client socket: slow-loris reads and
+    # writes stalled for 30 seconds (including SSE) drop the connection.
+    timeout = REQUEST_SOCKET_TIMEOUT_SECONDS
+    server_version = "EsunBridge"
+    sys_version = ""
 
-    def _send_json(self, status_code: int, data: any) -> None:
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    _cors_origin: str | None = None
+    _route_path: str = ""
+
+    def log_request(self, code: any = "-", size: any = "-") -> None:
+        """Logs method and path only: query strings may carry identifiers (e.g. person_id)."""
+        code_val = getattr(code, "value", code)
+        path = urlsplit(self.path or "").path or "-"
+        self.log_message('"%s %s" %s %s', self.command, path, str(code_val), str(size))
+
+    def _policy(self) -> AccessPolicy:
+        policy = self.access_policy
+        if policy is None:
+            policy = AccessPolicy.from_env()
+            type(self).access_policy = policy
+        return policy
+
+    def _is_mutation_path(self) -> bool:
+        return self._route_path in MUTATION_PATHS
+
+    def _send_cors_headers(self) -> None:
+        if self._cors_origin:
+            self.send_header("Access-Control-Allow-Origin", self._cors_origin)
+            self.send_header("Vary", "Origin")
+
+    def _send_json(self, status_code: int, data: any, headers: dict[str, str] | None = None) -> None:
+        body = json.dumps(data, ensure_ascii=False, default=_json_default).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_cors_headers()
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def _retry_headers(data: any) -> dict[str, str] | None:
+        if isinstance(data, dict):
+            retry_after = data.get("retry_after") or data.get("cooldown_remaining_sec")
+            if isinstance(retry_after, (int, float)) and retry_after > 0:
+                return {"Retry-After": str(max(1, int(math.ceil(retry_after))))}
+        return None
+
+    def _send_error_json(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        body: dict[str, any] = {"ok": False, "code": code, "error": message}
+        if self._is_mutation_path():
+            body["outcome"] = "not_sent"
+        if extra:
+            body.update(extra)
+        headers = {"Retry-After": str(max(1, int(math.ceil(retry_after))))} if retry_after else None
+        self._send_json(status_code, body, headers)
+
+    def _send_internal_error(self) -> None:
+        request_id = secrets.token_hex(4)
+        logger.error(
+            "內部錯誤 request_id=%s %s %s\n%s",
+            request_id,
+            self.command,
+            self._route_path,
+            redact(traceback.format_exc()),
+        )
+        body: dict[str, any] = {
+            "ok": False,
+            "code": "ESUN_INTERNAL_ERROR",
+            "error": f"伺服器內部錯誤（request id：{request_id}）",
+            "requestId": request_id,
+        }
+        if self._is_mutation_path():
+            # The failure may have happened after the SDK call: never claim "not sent".
+            body["outcome"] = "unknown"
+        try:
+            self._send_json(500, body)
+        except OSError:
+            pass
+
+    def _guard(self, method: str) -> bool:
+        """Applies Host allowlist -> token -> CSRF checks; sends the refusal and returns False on failure."""
+        policy = self._policy()
+        origin = self.headers.get("Origin")
+        self._cors_origin = origin.strip() if (origin is not None and policy.origin_allowed(origin)) else None
+        failure = policy.check(
+            method,
+            self.headers.get("Host"),
+            origin,
+            self.headers.get("Sec-Fetch-Site"),
+            self.headers.get(BRIDGE_TOKEN_HEADER),
+        )
+        if failure:
+            status, code, message = failure
+            self.close_connection = True
+            self._send_error_json(status, code, message)
+            return False
+        return True
+
+    def _read_json_body(self) -> dict | None:
+        """Reads a bounded application/json object body; sends the error and returns None on failure."""
+        content_type = self.headers.get("Content-Type", "") or ""
+        mime = content_type.split(";", 1)[0].strip().lower()
+        if mime != "application/json":
+            self.close_connection = True
+            self._send_error_json(415, "ESUN_UNSUPPORTED_MEDIA_TYPE", "POST 必須使用 Content-Type: application/json")
+            return None
+        raw_length = (self.headers.get("Content-Length") or "").strip()
+        if not _CONTENT_LENGTH_RE.fullmatch(raw_length):
+            self.close_connection = True
+            self._send_error_json(411, "ESUN_LENGTH_REQUIRED", "缺少或無效的 Content-Length")
+            return None
+        length = int(raw_length)
+        if length > MAX_REQUEST_BODY_BYTES:
+            self.close_connection = True
+            self._send_error_json(413, "ESUN_PAYLOAD_TOO_LARGE", "請求本文超過 64 KiB 上限")
+            return None
+        raw = self.rfile.read(length) if length else b""
+        if len(raw) != length:
+            self.close_connection = True
+            self._send_error_json(400, "ESUN_INVALID_JSON", "請求本文不完整")
+            return None
+        if not raw.strip():
+            return {}
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._send_error_json(400, "ESUN_INVALID_JSON", "JSON 格式錯誤")
+            return None
+        if not isinstance(body, dict):
+            self._send_error_json(400, "ESUN_INVALID_JSON", "請求本文必須為 JSON 物件")
+            return None
+        return body
+
     def do_OPTIONS(self) -> None:
+        self._cors_origin = None
+        self._route_path = urlsplit(self.path or "").path.rstrip("/")
+        if not self._guard("OPTIONS"):
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self._send_cors_headers()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST")
+        self.send_header("Access-Control-Allow-Headers", f"Content-Type, {BRIDGE_TOKEN_HEADER}")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self) -> None:
+        self._cors_origin = None
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+        self._route_path = path
+
+        if path == "/esun/livez":
+            # Liveness only: no authentication, no SDK, no disk access, no state.
+            self._send_json(200, {"ok": True})
+            return
+        if not self._guard("GET"):
+            return
         qs = parse_qs(parsed.query)
 
-        if path == "/esun/health":
-            self._send_json(200, self.bridge.get_health())
-        elif path == "/esun/accounts":
-            self._send_json(200, self.bridge.get_accounts())
-        elif path in ("/esun/ca_expiretime", "/esun/ca_expire"):
-            self._send_json(200, self.bridge.get_ca_expiretime())
-        elif path == "/esun/orders":
-            refresh = qs.get("refresh", ["false"])[0].lower() == "true"
-            self._send_json(200, self.bridge.get_orders(refresh=refresh))
-        elif path == "/esun/portfolio/positions":
-            data, code = self.bridge.get_inventories()
-            self._send_json(code, data)
-        elif path == "/esun/portfolio/balance":
-            data, code = self.bridge.get_balance()
-            self._send_json(code, data)
-        elif path == "/esun/portfolio/settlements":
-            data, code = self.bridge.get_settlements()
-            self._send_json(code, data)
-        elif path == "/esun/portfolio/profit-loss":
-            start = qs.get("begin_date", [None])[0] or qs.get("start", [None])[0] or qs.get("start_date", [None])[0]
-            end = qs.get("end_date", [None])[0] or qs.get("end", [None])[0]
-            data, code = self.bridge.get_profit_loss(start, end)
-            self._send_json(code, data)
-        elif path == "/esun/portfolio/trading-limits":
-            data, code = self.bridge.get_trade_status()
-            self._send_json(code, data)
-        elif path == "/esun/market_status":
-            data, code = self.bridge.get_market_status()
-            self._send_json(code, data)
-        elif path == "/esun/config-profiles":
-            discovery = discover_esun_config_profiles(self.bridge.base_dir, self.bridge.config_path)
-            self._send_json(200, {
-                "ok": True,
-                "availableEnvironments": discovery["availableEnvironments"],
-                "configProfiles": {
-                    k: {
-                        "available": v["available"],
-                        "fileName": v["fileName"],
-                        "expectedFileName": v["expectedFileName"],
-                        "aliases": v["aliases"],
-                        "entry": v["entry"],
-                    }
-                    for k, v in discovery["profiles"].items()
-                },
-                "activeConfigFile": os.path.basename(self.bridge.config_path) if self.bridge.config_path and os.path.exists(self.bridge.config_path) else None,
-                "activeEnvironment": self.bridge.environment,
-            })
-        elif path == "/esun/stream/orders":
-            self._handle_sse()
-        else:
-            self._send_json(404, {"error": f"未知的端點 GET {path}"})
+        try:
+            if path == "/esun/health":
+                self._send_json(200, self.bridge.get_health())
+            elif path == "/esun/accounts":
+                self._send_json(200, self.bridge.get_accounts())
+            elif path in ("/esun/ca_expiretime", "/esun/ca_expire"):
+                self._send_json(200, self.bridge.get_ca_expiretime())
+            elif path == "/esun/orders":
+                refresh = qs.get("refresh", ["false"])[0].lower() == "true"
+                self._send_json(200, self.bridge.get_orders(refresh=refresh))
+            elif path == "/esun/portfolio/positions":
+                data, code = self.bridge.get_inventories()
+                self._send_json(code, data, self._retry_headers(data))
+            elif path == "/esun/portfolio/balance":
+                data, code = self.bridge.get_balance()
+                self._send_json(code, data, self._retry_headers(data))
+            elif path == "/esun/portfolio/settlements":
+                data, code = self.bridge.get_settlements()
+                self._send_json(code, data, self._retry_headers(data))
+            elif path == "/esun/portfolio/profit-loss":
+                start = qs.get("begin_date", [None])[0] or qs.get("start", [None])[0] or qs.get("start_date", [None])[0]
+                end = qs.get("end_date", [None])[0] or qs.get("end", [None])[0]
+                data, code = self.bridge.get_profit_loss(start, end)
+                self._send_json(code, data, self._retry_headers(data))
+            elif path == "/esun/portfolio/trading-limits":
+                data, code = self.bridge.get_trade_status()
+                self._send_json(code, data, self._retry_headers(data))
+            elif path == "/esun/market_status":
+                data, code = self.bridge.get_market_status()
+                self._send_json(code, data, self._retry_headers(data))
+            elif path == "/esun/config-profiles":
+                self._send_json(200, self.bridge.get_config_profiles())
+            elif path == "/esun/stream/orders":
+                self._handle_sse(qs)
+            else:
+                self._send_error_json(404, "ESUN_NOT_FOUND", f"未知的端點 GET {path}")
+        except Exception:
+            self._send_internal_error()
 
     def do_POST(self) -> None:
+        self._cors_origin = None
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+        self._route_path = path
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        body_bytes = self.rfile.read(content_length) if content_length > 0 else b"{}"
-        try:
-            body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
-        except Exception:
-            self._send_json(400, {"error": "JSON 格式錯誤"})
+        if not self._guard("POST"):
+            return
+        body = self._read_json_body()
+        if body is None:
             return
 
         try:
             if path == "/esun/auth/reconnect":
                 _, res, code = self.bridge.reconnect()
-                self._send_json(code, res)
+                self._send_json(code, res, self._retry_headers(res))
             elif path in ("/esun/auth/environment", "/esun/environment"):
                 target = body.get("environment")
                 if target is None and "simulation" in body:
                     target = "SIMULATION" if body["simulation"] else "PRODUCTION"
                 if not target:
-                    self._send_json(400, {"error": "缺少 environment 參數 (SIMULATION 或 PRODUCTION)"})
+                    self._send_error_json(400, "ESUN_INVALID_PARAMS", "缺少 environment 參數 (SIMULATION 或 PRODUCTION)")
                     return
                 try:
                     res = self.bridge.switch_environment(str(target))
                     status_code = 200 if res.get("ok") else 400
                     self._send_json(status_code, res)
                 except ValueError as ve:
-                    self._send_json(400, {"error": str(ve)})
+                    self._send_error_json(400, "ESUN_INVALID_PARAMS", str(ve))
             elif path == "/esun/orders/place":
                 payload = body.get("payload") if "payload" in body else body
                 res, code = self.bridge.place_order(payload)
@@ -1977,20 +2413,24 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
                 res, code = self.bridge.cancel_order(body)
                 self._send_json(code, res)
             else:
-                self._send_json(404, {"error": f"未知的端點 POST {path}"})
+                self._send_error_json(404, "ESUN_NOT_FOUND", f"未知的端點 POST {path}")
         except PermissionError as pe:
-            self._send_json(503, {"error": str(pe), "code": "NOT_LOGGED_IN"})
-        except Exception as e:
-            self._send_json(500, {"error": f"伺服器錯誤：{e}"})
+            self._send_error_json(503, "NOT_LOGGED_IN", redact(pe))
+        except Exception:
+            self._send_internal_error()
 
-    def _handle_sse(self) -> None:
+    def _handle_sse(self, qs: dict) -> None:
         """Handles /esun/stream/orders SSE connections with fan-out and 25s heartbeats."""
+        if self.bridge.is_shutting_down():
+            self._send_error_json(503, "ESUN_SHUTTING_DOWN", "服務關閉中")
+            return
         self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_cors_headers()
         self.end_headers()
 
         q = self.bridge.sse_fanout.register()
@@ -2000,10 +2440,12 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(initial_hb.encode("utf-8"))
             self.wfile.flush()
 
-            while True:
+            while not self.bridge.is_shutting_down():
                 try:
                     # Wait for next event or 25-second heartbeat
                     msg = q.get(timeout=25.0)
+                    if msg is None:
+                        break
                     self.wfile.write(msg)
                     self.wfile.flush()
                 except queue.Empty:
@@ -2018,43 +2460,148 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. Server Factory & Main Entry Point
+# 9. Server Factory, Graceful Shutdown & Main Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
+
+class EsunThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a bounded number of concurrent connections (SSE included)."""
+
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, server_address: any, handler_class: any, max_connections: int = MAX_CONCURRENT_CONNECTIONS):
+        self._connection_slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(server_address, handler_class)
+
+    def process_request(self, request: any, client_address: any) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request: any, client_address: any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
+
 
 def create_server(
     host: str = "127.0.0.1",
     port: int = 8090,
     bridge: EsunTradeBridge | None = None,
+    access_policy: AccessPolicy | None = None,
+    max_connections: int = MAX_CONCURRENT_CONNECTIONS,
 ) -> ThreadingHTTPServer:
-    """Creates a ThreadingHTTPServer instance bound to the provided or default EsunTradeBridge."""
+    """Creates a bounded ThreadingHTTPServer bound to the provided or default EsunTradeBridge."""
     if bridge is None:
         bridge = EsunTradeBridge()
+    policy = access_policy if access_policy is not None else AccessPolicy.from_env()
 
     class BoundHandler(EsunHTTPRequestHandler):
         pass
 
     BoundHandler.bridge = bridge
-    server = ThreadingHTTPServer((host, port), BoundHandler)
+    BoundHandler.access_policy = policy
+    server = EsunThreadingHTTPServer((host, port), BoundHandler, max_connections=max_connections)
+    server.bridge = bridge
+    server.access_policy = policy
     return server
 
 
-if __name__ == "__main__":
+def make_shutdown_handler(server: ThreadingHTTPServer, bridge: EsunTradeBridge) -> any:
+    """
+    Builds the SIGTERM/SIGINT handler: stops the bridge (WebSocket, SSE) and calls
+    server.shutdown() from a helper thread (calling it on the serve_forever thread deadlocks).
+    """
+    started = threading.Event()
+
+    def _handler(signum: any = None, frame: any = None) -> None:
+        if started.is_set():
+            return
+        started.set()
+        logger.info("收到停止訊號（%s），開始優雅關閉…", signum)
+
+        def _stop() -> None:
+            try:
+                bridge.shutdown()
+            finally:
+                server.shutdown()
+
+        threading.Thread(target=_stop, daemon=True, name="EsunShutdown").start()
+
+    return _handler
+
+
+def install_signal_handlers(server: ThreadingHTTPServer, bridge: EsunTradeBridge) -> any:
+    handler = make_shutdown_handler(server, bridge)
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass  # not on the main thread or unsupported on this platform
+    return handler
+
+
+def main() -> int:
     host = os.environ.get("ESUN_SERVER_HOST") or os.environ.get("ESUN_BRIDGE_HOST") or "127.0.0.1"
     port = int(os.environ.get("ESUN_SERVER_PORT") or os.environ.get("ESUN_BRIDGE_PORT") or 8090)
 
-    bridge = EsunTradeBridge()
-    server = create_server(host=host, port=port, bridge=bridge)
+    policy = AccessPolicy.from_env()
+    if not policy.token and not _is_loopback_bind(host):
+        logger.warning("=" * 78)
+        logger.warning(
+            "WARNING: esun-bridge 綁定在非 loopback 位址 %s 但未設定 ESUN_BRIDGE_TOKEN；"
+            "任何能連到此埠的主機都能下單、刪單與切換環境。請設定 ESUN_BRIDGE_TOKEN 並僅經由反向代理存取。",
+            host,
+        )
+        logger.warning("=" * 78)
+
+    bridge = EsunTradeBridge(auto_login=False)
+    server = create_server(host=host, port=port, bridge=bridge, access_policy=policy)
     logger.info(f"玉山證券交易 Sidecar 啟動中：http://{host}:{port}")
 
     status = bridge.get_health()
     if status["account"]:
-        logger.info(f"綁定帳號：{status['account']['broker_id']}-{status['account']['account_id']} 環境：{status['environment']}")
+        account = status["account"]
+        logger.info(
+            "綁定帳號：%s-%s 環境：%s",
+            account.get("broker_id"),
+            mask_identifier(account.get("account_id")),
+            status["environment"],
+        )
     if status["problems"]:
         for p in status["problems"]:
             logger.warning(f"設定問題：{p}")
 
+    install_signal_handlers(server, bridge)
+    # Bind first, then log in (in the background) so /esun/livez answers immediately.
+    threading.Thread(target=bridge.attempt_initial_login, daemon=True, name="EsunInitialLogin").start()
+
     try:
-        server.serve_forever()
+        server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
-        logger.info("伺服器已正常停止")
+        pass
+    finally:
+        bridge.shutdown()
         server.server_close()
+        logger.info("伺服器已正常停止")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
