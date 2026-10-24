@@ -205,6 +205,18 @@ export function updateEsunOrderQty(tradeId: string, trade: Trade, account: Accou
 // 最近一次權威委託讀取（refresh:true）時的 bridge session 代次：代次變了就不能拿快取重建
 let authoritativeGeneration: number | null | undefined;
 
+const ESUN_DOWN_MESSAGE = '玉山回報串流中斷，期間可能漏收委託／成交回報；重新連線後請確認';
+let lastDownMessage = ESUN_DOWN_MESSAGE;
+
+/**
+ * 權威讀取在玉山回報串流中斷期間完成：trading-state 會以這次讀取 resolve 讀取開始前的
+ * disconnect（它只看永豐串流），但讀取之後到串流恢復之前的回報仍會漏收。讀取完成時重新
+ * 提出（新的原因時間晚於讀取開始），等串流恢復後由 reconnect 的健康檢查／對帳處理。
+ */
+function keepDisconnectWhileDown(scope: 'orders' | 'positions') {
+    if (getEsunStreamStatus() === 'down') hooks?.raise(scope, 'disconnect', lastDownMessage);
+}
+
 /** 玉山的 trade_cache_health：依回報串流與 session 連續性回報（不呼叫券商） */
 export function esunCacheHealth(): TradeCacheHealth {
     if (!isEsunStreamStarted()) return { state: 'Degraded', reasons: [{ event_type: 'StockOrder', reason: 'NotSubscribed' }] };
@@ -228,7 +240,10 @@ export function esunAccountQuery<T>(path: string, account: Account, extra: Recor
                 if (skipped > 0) {
                     hooks?.raise('orders', 'pending-report', `玉山委託資料有 ${skipped} 筆缺少必要欄位，已略過；請手動對帳`);
                 }
-                if (refresh) authoritativeGeneration = generation;
+                if (refresh) {
+                    authoritativeGeneration = generation;
+                    keepDisconnectWhileDown('orders');
+                }
                 return rows as T;
             });
         }
@@ -236,7 +251,10 @@ export function esunAccountQuery<T>(path: string, account: Account, extra: Recor
             return Promise.resolve(esunCacheHealth() as T);
         case '/api/v1/portfolio/position_unit': {
             const unit = (extra.unit === 'Share' ? 'Share' : 'Common') as 'Common' | 'Share';
-            return esunTradeService.fetchPositions(account, unit) as Promise<T>;
+            return esunTradeService.fetchPositions(account, unit).then(rows => {
+                keepDisconnectWhileDown('positions');
+                return rows;
+            }) as Promise<T>;
         }
         case '/api/v1/portfolio/account_balance':
             return esunTradeService.fetchAccountBalance(account) as Promise<T>;
@@ -319,7 +337,7 @@ export type EsunReconcileScope = 'orders' | 'positions' | 'account';
 
 export interface EsunTradingHooks {
     /** 提出待對帳原因（trading-state 的 raise） */
-    raise(scope: EsunReconcileScope, reason: 'disconnect' | 'sequence-gap' | 'pending-report', message: string): void;
+    raise(scope: EsunReconcileScope, reason: 'disconnect' | 'sequence-gap' | 'pending-report' | 'untrackable-event', message: string): void;
     /** 玉山帳戶出現、被替換（環境切換）或 bridge 重新登入：清掉離開清單的帳戶資料並立即重讀
      *  （trading-state 在第一次串流連線前不讀，初次讀取本來就會包含目前的帳戶） */
     accountsChanged(): Promise<void>;
@@ -350,10 +368,16 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
     const stopStream = onEsunStreamSignal(signal => {
         if (!esunTradeService.getAccounts().length) return;
         if (signal.kind === 'down') {
-            next.raise('orders', 'disconnect', signal.message);
-            next.raise('positions', 'disconnect', signal.message);
+            lastDownMessage = signal.message || ESUN_DOWN_MESSAGE;
+            next.raise('orders', 'disconnect', lastDownMessage);
+            next.raise('positions', 'disconnect', lastDownMessage);
         } else if (signal.kind === 'reconnected') {
             void esunTradeService.refreshHealth().then(() => next.checkHealth('reconnect'));
+        } else if (signal.kind === 'untrackable') {
+            // 收到但無法轉換的回報：不能投影，也不能靜默丟棄
+            const message = '玉山回報無法解析（欄位不足或環境未知），已略過；請手動對帳';
+            next.raise('orders', 'untrackable-event', message);
+            if (signal.deal) next.raise('positions', 'untrackable-event', message);
         } else {
             const message = '玉山回報漏收超過 bridge 補送範圍；以 bridge 委託快取重建中，必要時請手動對帳';
             next.raise('orders', 'sequence-gap', message);

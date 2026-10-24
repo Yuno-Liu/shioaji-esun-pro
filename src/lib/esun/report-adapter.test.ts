@@ -24,7 +24,7 @@ const ctx = (over: Partial<EsunReportContext> = {}): EsunReportContext => ({
 });
 
 const ack = (seq: number, over: Record<string, unknown> = {}) => ({
-    event_id: `b7f3a2-${seq}`, seq, ts: '2026-10-23T09:05:12.345+08:00', environment: 'SIMULATION',
+    event_id: `b7f3a2-${seq}`, seq, report_stream: 'order', report_seq: seq, session_generation: 1, ts: '2026-10-23T09:05:12.345+08:00', environment: 'SIMULATION',
     account: { broker_id: '8840', account_id: '1234567' }, order_no: 'C0001', op_type: 'New',
     work_date: '20261023', ord_date: '20261023', ord_time: '090512345', ord_no: 'C0001', pre_ord_no: '',
     stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R', trade: '0', od_price: 25.5,
@@ -34,7 +34,7 @@ const ack = (seq: number, over: Record<string, unknown> = {}) => ({
 });
 
 const mat = (seq: number, over: Record<string, unknown> = {}) => ({
-    event_id: `b7f3a2-${seq}`, seq, ts: '2026-10-23T09:06:00+08:00', environment: 'SIMULATION',
+    event_id: `b7f3a2-${seq}`, seq, report_stream: 'deal', report_seq: seq, session_generation: 1, ts: '2026-10-23T09:06:00+08:00', environment: 'SIMULATION',
     account: { broker_id: '8840', account_id: '1234567' }, order_no: 'C0001', op_type: 'Deal',
     ord_no: 'C0001', stock_no: '2884', buy_sell: 'B', ap_code: '1', trade: '0', mat_price: 25.5, mat_qty: 2,
     mat_qty_share: 2000, mat_no: 'M000123', mat_time: '090600000', work_date: '20261023',
@@ -47,20 +47,71 @@ function wire(event: string, payload: unknown, c: EsunReportContext = ctx()) {
     return result.wire;
 }
 
+const ids = (stream: 'order' | 'deal', reportSeq: unknown, generation: unknown, sseSeq = 1, boot = 'b7f3a2') => ({
+    event_id: `${boot}-${sseSeq}`, report_stream: stream, report_seq: reportSeq, session_generation: generation,
+});
+const orderEventId = (w: Record<string, unknown>) => (w.data as Record<string, Record<string, unknown>>).StockOrder!.event_id as string;
+
 describe('esun event id', () => {
-    it('becomes a supported v1 id so dedup and gap detection work', () => {
-        const id = esunEventId('b7f3a2-41', 41, 'SIMULATION');
-        expect(id).toBe('v1:esun-sim:b7f3a2:41');
-        expect(parseEventId(id)).toEqual({ stream: 'v1:esun-sim', reset: 'b7f3a2', sequence: 41n });
-        expect(esunEventId('esun-ack-C0001-abcdef12', undefined, 'PRODUCTION')).toBe('');
+    it('becomes a v1 id per report stream and session generation (bridge report_seq, not the SSE seq)', () => {
+        const id = esunEventId(ids('order', 3, 7, 41), 'SIMULATION');
+        expect(id).toBe('v1:esun-sim-order:b7f3a2.g7:3');
+        expect(parseEventId(id)).toEqual({ stream: 'v1:esun-sim-order', reset: 'b7f3a2.g7', sequence: 3n });
+        expect(esunEventId(ids('deal', 1, 2), 'PRODUCTION')).toBe('v1:esun-prod-deal:b7f3a2.g2:1');
     });
 
-    it('lets the report ledger detect a skipped sequence', () => {
+    it('produces no v1 id without report_seq or session_generation (no sequence inference)', () => {
+        expect(esunEventId({ event_id: 'b7f3a2-41', seq: 41 }, 'SIMULATION')).toBe('');
+        expect(esunEventId(ids('order', undefined, 1), 'SIMULATION')).toBe('');
+        expect(esunEventId(ids('order', 1, undefined), 'SIMULATION')).toBe('');
+        expect(esunEventId(ids('order', 0, 1), 'SIMULATION')).toBe('');
+        expect(esunEventId({ ...ids('order', 1, 1), event_id: 'esun:ack-1' }, 'SIMULATION')).toBe('');
+        expect(esunEventId({ ...ids('order', 1, 1), report_stream: 'session' }, 'SIMULATION')).toBe('');
+        // 舊版 bridge（只有 SSE 的 event_id／seq）：回報照常轉換，但不帶 v1 id
+        expect(orderEventId(wire('order', ack(5, { report_seq: undefined })))).toBe('');
+        expect(orderEventId(wire('order', ack(6, { session_generation: undefined })))).toBe('');
+    });
+
+    it('lets the report ledger detect a really skipped report', () => {
         const ledger = createReportLedger();
         const env = { base: 'http://127.0.0.1:8080', simulation: true };
-        ledger.admit(env, esunEventId('boot-1', 1, 'SIMULATION'), 'order');
-        expect(ledger.admit(env, esunEventId('boot-3', 3, 'SIMULATION'), 'order').gapOpened).toBe(true);
-        expect(ledger.admit(env, esunEventId('boot-3', 3, 'SIMULATION'), 'order').duplicate).toBe(true);
+        ledger.admit(env, esunEventId(ids('order', 1, 1, 1), 'SIMULATION'), 'order');
+        expect(ledger.admit(env, esunEventId(ids('order', 3, 1, 3), 'SIMULATION'), 'order').gapOpened).toBe(true);
+        expect(ledger.admit(env, esunEventId(ids('order', 3, 1, 3), 'SIMULATION'), 'order').duplicate).toBe(true);
+    });
+
+    it('does not report a gap after a session / resync event took an SSE seq', () => {
+        const ledger = createReportLedger();
+        const env = { base: 'http://127.0.0.1:8080', simulation: true };
+        // SSE seq 1 = order#1、2 = session（重新連線失敗，同一代次）、3 = resync、4 = order#2
+        const first = toEsunReportWire('order', ack(1, { event_id: 'b7f3a2-1', report_seq: 1 }), ctx());
+        const next = toEsunReportWire('order', ack(4, { event_id: 'b7f3a2-4', report_seq: 2 }), ctx());
+        if (first.kind !== 'report' || next.kind !== 'report') throw new Error('skipped');
+        ledger.admit(env, orderEventId(first.wire), 'order');
+        expect(ledger.admit(env, orderEventId(next.wire), 'order')).toMatchObject({ gapOpened: false, duplicate: false });
+    });
+
+    it('keeps order and deal reports in separate ledger streams', () => {
+        const ledger = createReportLedger();
+        const env = { base: 'http://127.0.0.1:8080', simulation: true };
+        ledger.admit(env, esunEventId(ids('order', 1, 1, 1), 'SIMULATION'), 'order');
+        ledger.admit(env, esunEventId(ids('deal', 1, 1, 2), 'SIMULATION'), 'deal');
+        expect(ledger.admit(env, esunEventId(ids('order', 2, 1, 3), 'SIMULATION'), 'order').gapOpened).toBe(false);
+        expect(ledger.admit(env, esunEventId(ids('deal', 3, 1, 4), 'SIMULATION'), 'deal').gapOpened).toBe(true);
+        expect(ledger.takeGaps(env.base)).toEqual(new Set(['deal']));
+    });
+
+    it('does not report a gap after switching SIM → PROD → SIM (each login is a new generation)', () => {
+        const ledger = createReportLedger();
+        const env = { base: 'http://127.0.0.1:8080', simulation: true };
+        const prod = ctx({ environment: 'PRODUCTION' });
+        // SSE seq：1、2 = SIM g1 的委託；3 = session（切到 PROD）；4 = PROD g2 的委託；5、6 = session（切回 SIM）；7 = SIM g3
+        const admit = (payload: Record<string, unknown>, c = ctx()) => ledger.admit(env, orderEventId(wire('order', payload, c)), 'order');
+        admit(ack(1, { report_seq: 1, session_generation: 1 }));
+        admit(ack(2, { report_seq: 2, session_generation: 1 }));
+        expect(admit(ack(4, { report_seq: 1, session_generation: 2, environment: 'PRODUCTION' }), prod).gapOpened).toBe(false);
+        expect(admit(ack(7, { report_seq: 1, session_generation: 3 })).gapOpened).toBe(false);
+        expect(ledger.openGapCount(env.base)).toBe(0);
     });
 });
 
@@ -82,18 +133,18 @@ describe('ACK → projected order (C-05)', () => {
         const rows = projectOrderReport([], normalizeOrderEvent(wire('order', ack(1)))!, [account])!;
         // 先減量 1，再刪單：SDK 回報的 cel_qty 是累計值
         const reduced = projectOrderReport(rows, normalizeOrderEvent(wire('order', ack(2, { op_type: 'ModifyQty', cel_qty: 1, cel_qty_share: 1000 }), ctx({
-            lookup: () => ({ quantity: 5, dealQuantity: 0, cancelQuantity: 0, price: 25.5 }),
+            lookup: () => ({ id: 'C0001', quantity: 5, dealQuantity: 0, cancelQuantity: 0, price: 25.5 }),
         })))!, [account])!;
         expect(reduced[0]!.status.cancel_quantity).toBe(1);
         const cancelled = projectOrderReport(reduced, normalizeOrderEvent(wire('order', ack(3, { op_type: 'Cancel', cel_qty: 5, cel_qty_share: 5000 }), ctx({
-            lookup: () => ({ quantity: 5, dealQuantity: 0, cancelQuantity: 1, price: 25.5 }),
+            lookup: () => ({ id: 'C0001', quantity: 5, dealQuantity: 0, cancelQuantity: 1, price: 25.5 }),
         })))!, [account])!;
         expect(cancelled[0]!.status).toMatchObject({ status: 'Cancelled', cancel_quantity: 5 });
     });
 
     it('reports a reduction as UpdateQty carrying exactly the reduction (mutation intent can confirm it)', () => {
         const report = normalizeOrderEvent(wire('order', ack(4, { op_type: 'ModifyQty', cel_qty: 4, cel_qty_share: 4000 }), ctx({
-            lookup: () => ({ quantity: 5, dealQuantity: 0, cancelQuantity: 0, price: 25.5 }),
+            lookup: () => ({ id: 'C0001', quantity: 5, dealQuantity: 0, cancelQuantity: 0, price: 25.5 }),
         })));
         expect(report).toMatchObject({ opType: 'UpdateQty', cancelQuantity: 4, orderQuantity: 1 });
     });
@@ -105,7 +156,7 @@ describe('ACK → projected order (C-05)', () => {
 
     it('infers the operation from the known order when the bridge says Unknown', () => {
         const report = normalizeOrderEvent(wire('order', ack(6, { op_type: 'Unknown', cel_qty: 5, cel_qty_share: 5000 }), ctx({
-            lookup: () => ({ quantity: 5, dealQuantity: 0, cancelQuantity: 0, price: 25.5 }),
+            lookup: () => ({ id: 'C0001', quantity: 5, dealQuantity: 0, cancelQuantity: 0, price: 25.5 }),
         })));
         expect(report).toMatchObject({ kind: 'order', opType: 'Cancel' });
     });
@@ -121,7 +172,7 @@ describe('ACK → projected order (C-05)', () => {
     });
 
     it('accepts the legacy wrapped bridge shape', () => {
-        const legacy = { state: 'StockOrder', event_id: 'esun-ack-C0001-1a2b3c4d', data: { StockOrder: { ...ack(9), event_id: undefined, seq: undefined } } };
+        const legacy = { state: 'StockOrder', event_id: 'esun-ack-C0001-1a2b3c4d', data: { StockOrder: { ...ack(9), event_id: undefined, seq: undefined, report_stream: undefined, report_seq: undefined, session_generation: undefined } } };
         const report = normalizeOrderEvent(wire('order_event', legacy));
         expect(report).toMatchObject({ kind: 'order', id: 'C0001', eventId: '' });
     });
@@ -141,6 +192,34 @@ describe('MAT → projected fill', () => {
     it('keeps odd-lot fill quantities in shares', () => {
         const deal = normalizeOrderEvent(wire('deal', mat(3, { ap_code: '5', mat_qty: 0.03, mat_qty_share: 30 })));
         expect(deal).toMatchObject({ quantity: 30, orderLot: 'IntradayOdd' });
+    });
+
+    it('dedups fills by the bridge key mkt_seq_num before the other SDK fields', () => {
+        const body = (w: Record<string, unknown>) => (w.data as Record<string, Record<string, unknown>>).StockDeal!;
+        expect(body(wire('deal', mat(4, { mkt_seq_num: '000417' }))).exchange_seq).toBe('000417');
+        expect(body(wire('deal', mat(5, { mktSeqNum: '000418' }))).exchange_seq).toBe('000418');
+        expect(body(wire('deal', mat(6))).exchange_seq).toBe('M000123');
+        // 同一筆 MAT 重送（event id 不同、mat_no 不同）仍是同一個成交序號，不會重複計入
+        const rows = projectOrderReport([], normalizeOrderEvent(wire('order', ack(1)))!, [account])! as AccountedTrade[];
+        const once = projectTradeDeal(rows, normalizeOrderEvent(wire('deal', mat(7, { mkt_seq_num: '000419' })))!)!;
+        const again = projectTradeDeal(once, normalizeOrderEvent(wire('deal', mat(2, { event_id: 'c0ffee-2', mkt_seq_num: '000419', mat_no: 'M999' })))!)!;
+        expect(again[0]!.status.deal_quantity).toBe(2);
+    });
+
+    it('matches a fill without pre_ord_no to the local reservation order by ord_no', () => {
+        // 預約單：本地 id 為 pre_ord_no（P0001），開盤後的 MAT 只帶 ord_no（C0009）
+        const reserved = projectOrderReport([], normalizeOrderEvent(wire('order', ack(1, { pre_ord_no: 'P0001', ord_no: 'C0009', order_no: 'C0009' })))!, [account])! as AccountedTrade[];
+        expect(reserved[0]!.order).toMatchObject({ id: 'P0001', ordno: 'C0009' });
+        const lookup: EsunReportContext['lookup'] = (orderId, acc, by) => {
+            const row = reserved.find(t => (by === 'ordno' ? t.order.ordno : t.order.id) === orderId
+                && t.account?.broker_id === acc.broker_id && t.account?.account_id === acc.account_id);
+            return row ? { id: row.order.id, quantity: row.order.quantity, dealQuantity: row.status.deal_quantity, cancelQuantity: row.status.cancel_quantity, price: row.order.price } : undefined;
+        };
+        const deal = normalizeOrderEvent(wire('deal', mat(2, { ord_no: 'C0009', order_no: 'C0009', pre_ord_no: '' }), ctx({ lookup })));
+        expect(deal).toMatchObject({ kind: 'deal', tradeId: 'P0001' });
+        expect(projectTradeDeal(reserved, deal!)![0]!.status.deal_quantity).toBe(2);
+        // 本地找不到時維持 ord_no
+        expect(normalizeOrderEvent(wire('deal', mat(3, { ord_no: 'C0010', order_no: 'C0010' }), ctx({ lookup })))).toMatchObject({ tradeId: 'C0010' });
     });
 });
 

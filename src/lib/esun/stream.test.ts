@@ -31,12 +31,12 @@ class FakeEventSource {
     onopen: (() => void) | null = null;
     onerror: (() => void) | null = null;
     closed = false;
-    private handlers = new Map<string, ((e: { data: string }) => void)[]>();
+    private handlers = new Map<string, ((e: { data: string; lastEventId: string }) => void)[]>();
     constructor(readonly url: string) { FakeEventSource.instances.push(this); }
-    addEventListener(name: string, h: (e: { data: string }) => void) { this.handlers.set(name, [...(this.handlers.get(name) ?? []), h]); }
+    addEventListener(name: string, h: (e: { data: string; lastEventId: string }) => void) { this.handlers.set(name, [...(this.handlers.get(name) ?? []), h]); }
     close() { this.closed = true; this.readyState = 2; }
     open() { this.readyState = 1; this.onopen?.(); }
-    fire(name: string, data: unknown) { for (const h of this.handlers.get(name) ?? []) h({ data: typeof data === 'string' ? data : JSON.stringify(data) }); }
+    fire(name: string, data: unknown, lastEventId = '') { for (const h of this.handlers.get(name) ?? []) h({ data: typeof data === 'string' ? data : JSON.stringify(data), lastEventId }); }
     fail(closed = false) { this.readyState = closed ? 2 : 0; this.onerror?.(); }
 }
 
@@ -65,6 +65,7 @@ describe('E.SUN order stream', () => {
     afterEach(() => {
         stopSignals();
         stopEsunOrderStream();
+        vi.restoreAllMocks();
         vi.useRealTimers();
         vi.unstubAllGlobals();
     });
@@ -85,13 +86,14 @@ describe('E.SUN order stream', () => {
         ensureEsunOrderStream();
         latest().open();
         latest().fire('order', {
-            event_id: 'boot1-1', seq: 1, ts: '2026-10-23T09:05:12+08:00', environment: 'SIMULATION',
+            event_id: 'boot1-1', seq: 1, report_stream: 'order', report_seq: 1, session_generation: 1,
+            ts: '2026-10-23T09:05:12+08:00', environment: 'SIMULATION',
             account: { broker_id: '8840', account_id: '1234567' }, op_type: 'New',
             ord_no: 'C0001', stock_no: '2884', buy_sell: 'B', ap_code: '1', od_price: 25, org_qty: 1, org_qty_share: 1000, err_code: '00000000',
         });
         const [report] = published('order_event');
         const body = JSON.parse(report!.raw).data.StockOrder;
-        expect(body).toMatchObject({ event_id: 'v1:esun-sim:boot1:1', order: { id: 'C0001', account: { broker_id: '8840-SIM', account_id: '1234567' } } });
+        expect(body).toMatchObject({ event_id: 'v1:esun-sim-order:boot1.g1:1', order: { id: 'C0001', account: { broker_id: '8840-SIM', account_id: '1234567' } } });
     });
 
     it('drops events of another environment and re-syncs the session', () => {
@@ -126,18 +128,50 @@ describe('E.SUN order stream', () => {
         expect(seen.map(s => s.kind)).toEqual(['down', 'reconnected']);
     });
 
-    it('ignores the resync of the first connection but forwards it after a lost connection', () => {
+    it('forwards the ws_reconnected resync of the first connection (bridge broker WebSocket reconnected)', () => {
+        // 第一條連線不帶 Last-Event-ID，bridge 不會在訂閱時送 resync；這條連線上收到的 resync
+        // 只會是 bridge 對券商 WebSocket 重連後發出的 ws_reconnected，必須交給 trading-state 對帳
+        ensureEsunOrderStream();
+        latest().open();
+        latest().fire('resync', { reason: 'ws_reconnected', generation: 1, cacheRefreshed: true }, 'boot1-9');
+        expect(seen.map(s => s.kind)).toEqual(['resync']);
+    });
+
+    it('recreates a closed EventSource from the last received event id (bridge replays or sends resync)', () => {
         vi.useFakeTimers();
         ensureEsunOrderStream();
         latest().open();
-        latest().fire('resync', { reason: 'no Last-Event-ID' });
-        expect(seen.some(s => s.kind === 'resync')).toBe(false);
-        latest().fail(true); // CLOSED：自行以退避重建（新連線沒有 Last-Event-ID）
+        latest().fire('order', {
+            event_id: 'boot1-7', seq: 7, report_stream: 'order', report_seq: 3, session_generation: 1, environment: 'SIMULATION',
+            account: { broker_id: '8840', account_id: '1234567' }, op_type: 'New',
+            ord_no: 'C0001', stock_no: '2884', buy_sell: 'B', ap_code: '1', od_price: 25, org_qty: 1, err_code: '00000000',
+        }, 'boot1-7');
+        latest().fire('heartbeat', { time: 'now' });
+        latest().fail(true); // CLOSED：自行重建，原生的 Last-Event-ID 不會帶到新的 EventSource
         vi.advanceTimersByTime(1_000);
         expect(FakeEventSource.instances).toHaveLength(2);
+        expect(latest().url).toBe('/esun/stream/orders?last_event_id=boot1-7');
+    });
+
+    it('surfaces a report it cannot convert as untrackable instead of dropping it silently', () => {
+        ensureEsunOrderStream();
         latest().open();
-        latest().fire('resync', { reason: 'buffer exceeded' });
-        expect(seen.some(s => s.kind === 'resync')).toBe(true);
+        latest().fire('deal', { event_id: 'boot1-3', seq: 3, account: { broker_id: '8840', account_id: '1234567' }, ord_no: 'C1', stock_no: '2884', mat_qty: 1 });
+        latest().fire('order', 'not json');
+        expect(published('order_event')).toHaveLength(0);
+        expect(seen).toEqual([{ kind: 'untrackable', deal: true }, { kind: 'untrackable', deal: false }]);
+    });
+
+    it('surfaces a report received while the bridge environment is unknown as untrackable', () => {
+        vi.spyOn(esunTradeService, 'isEnvironmentKnown').mockReturnValue(false);
+        const refresh = vi.spyOn(esunTradeService, 'refreshHealth');
+        ensureEsunOrderStream();
+        latest().open();
+        refresh.mockClear();
+        latest().fire('deal', { event_id: 'boot1-4', seq: 4, ord_no: 'C1', stock_no: '2884', buy_sell: 'B', mat_qty: 1, mat_price: 25 });
+        expect(published('order_event')).toHaveLength(0);
+        expect(seen).toEqual([{ kind: 'untrackable', deal: true }]);
+        expect(refresh).toHaveBeenCalled();
     });
 
     it('forwards a resync that follows a native reconnect of the same connection', () => {
