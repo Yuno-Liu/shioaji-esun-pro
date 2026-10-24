@@ -106,6 +106,7 @@ import {
 } from '../lib/price-band';
 import { notify, placeQuickOrder } from '../lib/trade';
 import { captureServerMode } from '../lib/server-info-store';
+import { captureRouteEnv, routeConfirmNote } from '../lib/order-route';
 import { creditEnquireCond, creditSideBlocks, creditStatus, prepareCreditOrder, useCreditEnquire, type CreditCheck } from '../lib/credit-eligibility';
 import { creditLabel } from '../lib/odd-lot';
 import { octypeLabel, quickOrderNote } from '../lib/order-conditions';
@@ -418,9 +419,7 @@ export function CandleChart({
     const orderAccountView: ChartOrderAccountView = useMemo(() => {
         const m = orderMarket ?? 'S';
         const eligible = accountState.accounts.filter(a => canTrade(a) && a.account_type === m);
-        const global = (m === 'S'
-            ? (accountState.selectedStock ?? (accountState.selectedAccount?.account_type === 'S' ? accountState.selectedAccount : null))
-            : (accountState.selectedFutures ?? (accountState.selectedAccount?.account_type === 'F' ? accountState.selectedAccount : null))) ?? accountState.selectedAccount;
+        const global = m === 'S' ? accountState.selectedStock : accountState.selectedFutures;
         const resolved = resolveFlashAccount(accountState.accounts, m, orderSettings.accountKey, global, true);
         const labels = flashAccountLabels(eligible, privacy);
         return { eligible, active: resolved.account, following: resolved.following, missing: resolved.missing, ...labels };
@@ -449,6 +448,7 @@ export function CandleChart({
             if (gate?.afterConfirm && !isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
             const trade = await placeQuickOrder(c, action, price, qty, {
                 ...chartPlaceOptions(settings, market), account, isAccountCurrent, serverMode,
+                confirmNote: routeConfirmNote(account),
                 ...(gate?.afterConfirm ? { afterConfirm: gate.afterConfirm } : {}),
                 beforeSend: () => {
                     if (!isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
@@ -722,7 +722,8 @@ export function CandleChart({
             }
             // a pinned account must still be this chart's account when the
             // (optional) confirmation returns
-            const isAccountCurrent = () => accountMatches(orderAccountRef.current.active, account);
+            const sameRoute = captureRouteEnv(account); // fork：玉山環境在確認期間改變就不送
+            const isAccountCurrent = () => accountMatches(orderAccountRef.current.active, account) && sameRoute();
             if (m === 'buy' || m === 'sell') {
                 void sendPointOrderRef.current(c, m === 'buy' ? 'Buy' : 'Sell', price, settings, market, account as Account, isAccountCurrent);
                 return;

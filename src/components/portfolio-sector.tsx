@@ -21,7 +21,7 @@ import { slotLabel, type FlowBook } from '../lib/chain-flow';
 import { connectChainFlow, type FeedMember } from '../lib/chain-flow-feed';
 import { fmtSignedPct, fmtTwd, memberCodes, stockContract } from '../lib/chain-map';
 import { useAccounts } from '../lib/account-store';
-import { useEsunEnvironment } from '../lib/esun';
+import { AccountScopeLabel } from './order-routing-badge';
 import type { Theme } from '../lib/company-data/types';
 import {
     buildAssigner,
@@ -84,11 +84,9 @@ export function PortfolioSector({
     onFormChange?: (form: HoldingForm) => void;
     onGroupingChange?: (grouping: Grouping) => void;
 }) {
-    const { accounts, selectedAccount } = useAccounts();
-    const esunEnv = useEsunEnvironment();
-    const activeAccount = selectedAccount ?? null;
-    const effectiveAccounts = selectedAccount ? accounts.filter(a => a.account_type === selectedAccount.account_type && a.broker_id === selectedAccount.broker_id && a.account_id === selectedAccount.account_id) : accounts;
-    const holdings = useHoldings(activeAccount);
+    const { accounts, selectedStock } = useAccounts();
+    // fork：持股只算頂欄對應的證券帳戶（市場槽位），並標示範圍
+    const holdings = useHoldings(selectedStock);
     const { cards, error: cardsError } = useCards(true);
     const privacyMoney = usePrivacyMoney();
     const [savedForm, setFormState] = useSharedPref<HoldingForm>(panelForm, () => readPref(FORM_KEY, FORMS, 'bubble'));
@@ -114,7 +112,7 @@ export function PortfolioSector({
                       .map((h) => ({ code: h.code, contract: stockContract(h.code, cards.get(h.code)?.market), shares: null })),
         [holdings.holdings, universe, cards],
     );
-    const extraKey = `${extra.map((m) => `${m.code}@${m.contract.exchange}`).sort().join(',')}:${esunEnv.environment}`;
+    const extraKey = extra.map((m) => `${m.code}@${m.contract.exchange}`).sort().join(',');
     useEffect(() => (extra.length > 0 ? connectChainFlow(extra, 'drill') : undefined),
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [extraKey]);
@@ -129,7 +127,7 @@ export function PortfolioSector({
                 : null,
         // the book and the recorder mutate in place: the revisions are the change signals
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [assign, holdings.holdings, revision, icRevision, now, nameOf, effective, esunEnv.environment],
+        [assign, holdings.holdings, revision, icRevision, now, nameOf, effective],
     );
 
     // flip alerts: a held group turns from net inflow to net outflow (or back)
@@ -197,7 +195,7 @@ export function PortfolioSector({
     );
 
     // ── empty states ──
-    if (effectiveAccounts.length === 0 && !holdings.holdings.length) {
+    if (accounts.length === 0 && !holdings.holdings.length) {
         return (
             <div className={s.root}>
                 <div className={s.empty}>
@@ -245,6 +243,7 @@ export function PortfolioSector({
                 <div className={s.empty}>
                     <Briefcase size={22} className={s.emptyIcon} aria-hidden='true' />
                     <span className={s.emptyTitle}>目前沒有現股庫存</span>
+                    <AccountScopeLabel account={selectedStock} />
                     <span>買進股票後，這裡會依族群、產業鏈或題材顯示持股與各分組的即時資金流向。</span>
                 </div>
             </div>
@@ -283,6 +282,7 @@ export function PortfolioSector({
                     <span className={s.kpiValue}>
                         {maskMoney(fmtTwd(view.total), privacyMoney)}
                         <span className={s.kpiSub}>{view.stocks.length} 檔・{view.groups.length} 個{GROUPING_LABEL[effective]}</span>
+                        <AccountScopeLabel account={selectedStock} className={s.kpiSub} />
                     </span>
                 </div>
                 <div className={s.kpi} title={`持股市值中，所屬${GROUPING_LABEL[effective]}近 10 分鐘為淨流入的比重`}>
