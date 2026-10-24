@@ -40,6 +40,7 @@ import urllib.error
 
 import esun_trade.sdk
 import esun_trade.util
+from server import esun_trade_server as bridge_module
 from server.esun_trade_server import (
     AccessPolicy,
     DailyCounter,
@@ -1860,13 +1861,16 @@ class TestQuerySemanticsAndCaches(_BridgeCase):
         factory = RecordingFactory()
         bridge = self.make_bridge(sim, factory)
         bridge.last_orders_refresh_time = 0.0
-        bridge.get_orders(refresh=True)
-        with self.assertRaises(EsunQueryError) as ctx:
-            bridge.get_orders(refresh=True)  # within 5 s
-        self.assertEqual((ctx.exception.status, ctx.exception.code), (429, "AGR0005"))
-        self.assertGreater(ctx.exception.retry_after, 0)
-
         sdk = factory.instances[0]
+        with mock.patch.object(bridge_module, "ORDERS_REFRESH_MIN_INTERVAL_SECONDS", 0.3):
+            bridge.get_orders(refresh=True)
+            calls = sdk.orders_calls
+            started = time.monotonic()
+            bridge.get_orders(refresh=True)  # within the interval: waits for it instead of 429
+            self.assertGreaterEqual(time.monotonic() - started, 0.2)
+            self.assertEqual(sdk.orders_calls, calls + 1)
+
+
         sdk.get_order_results = mock.Mock(side_effect=RuntimeError("upstream exploded"))
         bridge.last_orders_refresh_time = 0.0
         with self.assertRaises(EsunQueryError) as ctx:
@@ -2271,6 +2275,39 @@ class TestMutationContractWithRealSdk(_BridgeCase):
             res, status = self.bridge.replace_price({**body, "order_no": ord_no})
             self.assertEqual((status, res["code"]), (400, code), ord_no)
 
+    def test_cache_miss_keeps_ord_no_and_pre_ord_no_from_payload(self):
+        # R2-02: a reservation that became a regular order (ordNo + preOrdNo) is unknown to the cache.
+        payload = {"stockNo": "2330", "apCode": "1", "buySell": "B", "bsFlag": "R", "priceFlag": "0", "trade": "0",
+                   "price": 950.0, "ordNo": "A0601", "preOrdNo": "R0601"}
+        self.assertIsNone(self.bridge.order_book_cache.get("A0601"))
+        res, status = self.bridge.replace_price({"order_no": "A0601", "price": 955.0, "payload": payload, **self.env})
+        self.assertEqual(status, 200, res)
+        sent = self._core_calls("modify_price")[-1][1]
+        self.assertEqual((sent["ord_no"], sent["pre_ord_no"]), ("A0601", "R0601"))
+
+        res, status = self.bridge.replace_qty({"order_no": "A0601", "cancel_quantity": 1, "quantity_unit": "lot",
+                                               "payload": payload, **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual((sent["ord_no"], sent["pre_ord_no"], executed), ("A0601", "R0601", 1))
+
+        res, status = self.bridge.cancel_order({"order_no": "A0601", "payload": payload, **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual((sent["ord_no"], sent["pre_ord_no"], executed), ("A0601", "R0601", 0))
+
+        # Only pre_ord_no: still a reservation order.
+        reservation = {k: v for k, v in payload.items() if k != "ordNo"}
+        res, status = self.bridge.replace_price({"order_no": "R0602", "price": 955.0,
+                                                 "payload": {**reservation, "preOrdNo": "R0602"}, **self.env})
+        self.assertEqual((status, res["code"], res["outcome"]), (400, "AG0006", "not_sent"))
+        # payload ordNo must be a valid order number equal to order_no
+        for bad in ("A9999", "bad no"):
+            res, status = self.bridge.replace_price({"order_no": "A0601", "price": 956.0,
+                                                     "payload": {**payload, "ordNo": bad}, **self.env})
+            self.assertEqual((status, res["outcome"]), (400, "not_sent"), bad)
+        self.assertEqual(len(self._core_calls("modify_price")), 1)
+
 
 class TestSseEventLog(unittest.TestCase):
     """§5: <boot_id>-<seq> ids, 500-event replay ring, Last-Event-ID replay, resync, overflow."""
@@ -2402,6 +2439,20 @@ class TestReportEvents(_BridgeCase):
         self.assertEqual(deals[0]["data"]["mat_price"], 26.0)
         self.assertTrue(deals[0]["data"]["ts"].endswith("10:35:12.345+08:00"))
         self.assertEqual(self.bridge.order_book_cache.get("A0002")["deal_qty"], 1)
+
+    def test_mat_without_pre_ord_no_gets_it_from_cached_order(self):
+        # R3-07: a converted reservation is identified by pre_ord_no on the client; MAT only carries ord_no.
+        self.bridge.order_book_cache.update_from_ack({"ord_no": "A0700", "pre_ord_no": "R0700", "stock_no": "2330",
+                                                      "ap_code": "1", "org_qty": 2})
+        mat = {"kind": "MAT", "ord_no": "A0700", "pre_ord_no": "", "stock_no": "2330", "ap_code": "1", "buy_sell": "B",
+               "mat_qty": 1, "mat_price": 950.0, "mkt_seq_num": "000777"}
+        self.bridge._handle_mat(dict(mat))
+        self.bridge._handle_mat({**mat, "ord_no": "Z0001", "mkt_seq_num": "000778"})  # unknown order
+        deals = [e for e in _drain(self.events, timeout=0.5) if e["event"] == "deal"]
+        self.assertEqual(len(deals), 2)
+        self.assertEqual(deals[0]["data"]["pre_ord_no"], "R0700")
+        self.assertEqual(deals[0]["data"]["ord_no"], "A0700")
+        self.assertEqual(deals[1]["data"]["pre_ord_no"], "")
 
     def test_last_event_id_replay_over_http(self):
         server = create_server(host="127.0.0.1", port=0, bridge=self.bridge, access_policy=AccessPolicy())
@@ -2544,6 +2595,491 @@ class TestGracefulShutdown(unittest.TestCase):
             self.assertFalse(thread.is_alive(), "serve_forever must return after SIGTERM")
             self.assertTrue(bridge.is_shutting_down())
             server.server_close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-review fixes
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOfflineSessionGeneration(_BridgeCase):
+    """R1-01 / R3-08: a restarted bridge that is not logged in must not report generation 0."""
+
+    def test_failed_login_after_restart_reports_a_newer_generation(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        first = self.make_bridge(sim)
+        self.assertTrue(first.logged_in)
+        first_generation = first.session.generation
+        time.sleep(0.01)
+        factory = RecordingFactory(login_fail_msg="error sending request: connection reset")
+        restarted = self.make_bridge(sim, factory, auto_login=False)
+        events = restarted.sse_fanout.register()
+        self.assertFalse(restarted.attempt_initial_login())
+        offline_generation = restarted.get_health()["sessionGeneration"]
+        self.assertGreater(offline_generation, first_generation)
+        failed = [e for e in _drain(events, timeout=0.3) if e["event"] == "session"]
+        self.assertEqual(failed[-1]["data"]["reason"], "startup_failed")
+        self.assertGreater(failed[-1]["data"]["generation"], first_generation)
+        # The first successful login of the new process is newer than its offline snapshot.
+        factory.login_fail_msg = None
+        restarted.last_reconnect_time = 0.0
+        ok, body, code = restarted.reconnect()
+        self.assertEqual((ok, code), (True, 200), body)
+        self.assertGreater(body["sessionGeneration"], offline_generation)
+
+    def test_circuit_breaker_after_restart_reports_a_newer_generation(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        first = self.make_bridge(sim)
+        first_generation = first.session.generation
+        time.sleep(0.01)
+        self.make_bridge(sim, RecordingFactory(login_fail_msg="AGA0000 密碼錯誤"))  # trips the breaker
+        factory = RecordingFactory()
+        restarted = self.make_bridge(sim, factory)
+        self.assertEqual(factory.login_calls, 0)
+        health = restarted.get_health()
+        self.assertTrue(health["loginLocked"])
+        self.assertFalse(health["loggedIn"])
+        self.assertGreater(health["sessionGeneration"], first_generation)
+        self.assertGreater(restarted.get_config_profiles()["sessionGeneration"], first_generation)
+
+
+class TimedOrdersSDK(MockSDK):
+    """get_order_results() captures its snapshot when called; `gate` can hold the call open."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.order_call_times: list[float] = []
+        self.snapshot_rows: list[dict] = []
+        self.gate: threading.Event | None = None
+        self.fail_with: Exception | None = None
+
+    def get_order_results(self) -> list[dict]:
+        self.orders_calls += 1
+        self.order_call_times.append(time.monotonic())
+        rows = [dict(o) for o in self.snapshot_rows]
+        failure = self.fail_with
+        if self.gate is not None:
+            self.gate.wait(5)
+        if failure is not None:
+            raise failure
+        return rows
+
+
+class TestOrdersRefreshCoalescing(_BridgeCase):
+    """R2-01: refresh=true returns a snapshot started after the request arrived (waits instead of 429)."""
+
+    def setUp(self):
+        super().setUp()
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory(mock_cls=TimedOrdersSDK)
+        self.bridge = self.make_bridge(sim, factory, websocket_enabled=False)
+        self.sdk = factory.instances[0]
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls >= 1))  # login bootstrap
+        time.sleep(0.05)
+        self.interval = mock.patch.object(bridge_module, "ORDERS_REFRESH_MIN_INTERVAL_SECONDS", 0.4)
+        self.interval.start()
+
+    def tearDown(self):
+        self.interval.stop()
+        super().tearDown()
+
+    def _row(self, ord_no):
+        return {"ord_no": ord_no, "stock_no": "2330", "ap_code": "1", "buy_sell": "B", "org_qty": 1,
+                "work_date": taipei_today_str()}
+
+    def _refresh_in_threads(self, count):
+        results: list = []
+
+        def run():
+            try:
+                results.append(self.bridge.get_orders(refresh=True))
+            except Exception as e:  # noqa: BLE001 - collected for assertions
+                results.append(e)
+
+        threads = [threading.Thread(target=run) for _ in range(count)]
+        for t in threads:
+            t.start()
+        return threads, results
+
+    def test_second_refresh_within_interval_waits_then_succeeds(self):
+        self.bridge.get_orders(refresh=True)
+        first_start = self.sdk.order_call_times[-1]
+        self.sdk.snapshot_rows = [self._row("N0001")]
+        orders = self.bridge.get_orders(refresh=True)
+        self.assertEqual([o["ord_no"] for o in orders], ["N0001"])
+        self.assertGreaterEqual(self.sdk.order_call_times[-1] - first_start, 0.35)
+
+    def test_simultaneous_refreshes_share_one_sdk_call(self):
+        self.bridge.get_orders(refresh=True)
+        calls = self.sdk.orders_calls
+        self.sdk.snapshot_rows = [self._row("N0002")]
+        threads, results = self._refresh_in_threads(4)
+        for t in threads:
+            t.join(5)
+        self.assertEqual(self.sdk.orders_calls, calls + 1)
+        self.assertEqual(len(results), 4)
+        for result in results:
+            self.assertIsInstance(result, list, result)
+            self.assertEqual([o["ord_no"] for o in result], ["N0002"])
+
+    def test_in_flight_query_older_than_the_request_is_not_shared(self):
+        self.sdk.gate = threading.Event()
+        calls = self.sdk.orders_calls
+        first_threads, first_results = self._refresh_in_threads(1)
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == calls + 1))  # A started (old snapshot)
+        self.sdk.snapshot_rows = [self._row("N0003")]  # an order placed after A's snapshot began
+        second_threads, second_results = self._refresh_in_threads(1)
+        time.sleep(0.1)
+        self.sdk.gate.set()
+        for t in first_threads + second_threads:
+            t.join(5)
+        self.assertEqual(self.sdk.orders_calls, calls + 2)
+        self.assertIsInstance(second_results[0], list, second_results)
+        self.assertEqual([o["ord_no"] for o in second_results[0]], ["N0003"])
+        self.assertIsInstance(first_results[0], list, first_results)
+
+    def test_rate_limiter_wait_and_total_wait_cap(self):
+        limiter = self.bridge.orders_refresh_limiter
+        # Quota frees up in 0.3 s: wait for it instead of failing.
+        limiter.timestamps = [time.monotonic() - limiter.window_seconds + 0.3] * limiter.max_requests
+        calls = self.sdk.orders_calls
+        self.bridge.get_orders(refresh=True)
+        self.assertEqual(self.sdk.orders_calls, calls + 1)
+        # Quota frees up only after the 12 s cap: 429 AGR0005 right away, no SDK call.
+        limiter.timestamps = [time.monotonic()] * limiter.max_requests
+        started = time.monotonic()
+        with self.assertRaises(EsunQueryError) as ctx:
+            self.bridge.get_orders(refresh=True)
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (429, "AGR0005"))
+        self.assertGreater(ctx.exception.retry_after, 12)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(self.sdk.orders_calls, calls + 1)
+        self.assertEqual(bridge_module.ORDERS_REFRESH_MAX_WAIT_SECONDS, 12.0)
+        # The minimum interval beyond the cap is refused the same way.
+        limiter.timestamps = []
+        with mock.patch.object(bridge_module, "ORDERS_REFRESH_MAX_WAIT_SECONDS", 0.2):
+            self.bridge.last_orders_refresh_time = time.monotonic()
+            with self.assertRaises(EsunQueryError) as ctx:
+                self.bridge.get_orders(refresh=True)
+            self.assertEqual((ctx.exception.status, ctx.exception.code), (429, "AGR0005"))
+            self.assertGreater(ctx.exception.retry_after, 0)
+
+    def test_errors_go_to_the_sharing_requests_only_and_are_not_cached(self):
+        self.bridge.get_orders(refresh=True)
+        calls = self.sdk.orders_calls
+        self.sdk.fail_with = RuntimeError("upstream exploded")
+        threads, results = self._refresh_in_threads(2)
+        for t in threads:
+            t.join(5)
+        self.assertEqual(self.sdk.orders_calls, calls + 1)
+        self.assertEqual(len(results), 2)
+        for result in results:
+            self.assertIsInstance(result, EsunQueryError)
+            self.assertEqual(result.status, 502)
+        self.sdk.fail_with = None
+        self.sdk.snapshot_rows = [self._row("N0004")]
+        orders = self.bridge.get_orders(refresh=True)
+        self.assertEqual([o["ord_no"] for o in orders], ["N0004"])
+        self.assertEqual(self.sdk.orders_calls, calls + 2)
+
+
+class TestOrderBookCacheEventQuantities(unittest.TestCase):
+    """R3-02: cached rows never report less filled / cancelled quantity than the reports received."""
+
+    def setUp(self):
+        self.cache = OrderBookCache()
+        self.cache.reset(7)
+        self.today = taipei_today_str()
+
+    def _row(self, **overrides):
+        row = {"ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "buy_sell": "B", "org_qty": 5,
+               "mat_qty": 0, "cel_qty": 0, "work_date": self.today}
+        row.update(overrides)
+        return row
+
+    def _snapshot(self, *rows):
+        self.assertTrue(self.cache.update_from_order_results([dict(r) for r in rows], generation=7))
+
+    def _mat(self, seq, **overrides):
+        mat = {"kind": "MAT", "ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "mat_qty": 2,
+               "mat_price": 950.0, "mkt_seq_num": seq}
+        mat.update(overrides)
+        return self.cache.update_from_mat(mat, generation=7)
+
+    def _views(self, order_id="A0001"):
+        return [self.cache.get_all()[0], self.cache.get(order_id), self.cache.get_with_meta(order_id)[0]]
+
+    def test_mat_after_snapshot_is_reflected_in_every_read(self):
+        self._snapshot(self._row())
+        self.assertTrue(self._mat("001"))
+        for view in self._views():
+            self.assertEqual((view["mat_qty"], view["mat_qty_share"]), (2, 2000))
+            self.assertEqual(view["status"], "PartFilled")
+
+    def test_older_snapshot_after_the_mat_does_not_roll_back(self):
+        self._snapshot(self._row())
+        self._mat("001")
+        self._snapshot(self._row())  # query started before the deal
+        for view in self._views():
+            self.assertEqual((view["mat_qty"], view["mat_qty_share"]), (2, 2000))
+
+    def test_snapshot_including_the_deal_is_not_double_counted(self):
+        self._snapshot(self._row())
+        self._mat("001")
+        self._snapshot(self._row(mat_qty=2))
+        self.assertFalse(self._mat("001"))  # replayed MAT
+        self.assertEqual(self.cache.get("A0001")["mat_qty"], 2)
+        self.assertTrue(self._mat("002", mat_qty=3))
+        view = self.cache.get("A0001")
+        self.assertEqual((view["mat_qty"], view["mat_qty_share"], view["status"]), (5, 5000, "Filled"))
+
+    def test_odd_lot_mat_quantities_are_converted_to_shares(self):
+        # esunQuantityFromFields: *_qty_share first; *_qty >= 1 is already shares, < 1 is lots
+        self._snapshot(self._row(ap_code="5", org_qty=0.1, org_qty_share=100, mat_qty=0.0, mat_qty_share=0))
+        self._mat("001", ap_code="5", mat_qty=30)
+        self._mat("002", ap_code="5", mat_qty=0.5, mat_qty_share=20)
+        self._mat("003", ap_code="5", mat_qty=0.01)
+        self._snapshot(self._row(ap_code="5", org_qty=0.1, org_qty_share=100, mat_qty=0.0, mat_qty_share=0))
+        view = self.cache.get("A0001")
+        self.assertEqual(view["mat_qty_share"], 60)
+        self.assertAlmostEqual(view["mat_qty"], 0.06)
+        self.assertNotIn("status", view)  # bridge status is only derived for lot rows
+
+    def test_cancel_quantity_does_not_roll_back(self):
+        self._snapshot(self._row())
+        accepted, _ = self.cache.update_from_ack({"ord_no": "A0001", "ap_code": "1", "org_qty": 5, "cel_qty": 3},
+                                                 generation=7)
+        self.assertTrue(accepted)
+        self._snapshot(self._row())  # older snapshot without the cancellation
+        view = self.cache.get("A0001")
+        self.assertEqual((view["cel_qty"], view["cel_qty_share"]), (3, 3000))
+        self._mat("001")
+        view = self.cache.get("A0001")
+        self.assertEqual((view["mat_qty"], view["cel_qty"], view["status"]), (2, 3, "Cancelled"))
+
+    def test_refresh_false_serves_event_quantities(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"ESUN_ACCOUNT_PASSWORD": "pw", "ESUN_CERT_PASSWORD": "cpw",
+                                             "ESUN_STATE_DIR": tmp}):
+            sim = _write_profile(tmp, "esun-config.simulation.ini", "SIMULATION")
+            bridge = EsunTradeBridge(config_path=sim, sdk_factory=lambda cfg: MockSDK(cfg), websocket_enabled=False)
+            try:
+                time.sleep(0.05)  # login bootstrap
+                generation = bridge.session.generation
+                bridge.order_book_cache.update_from_order_results([self._row()], generation=generation)
+                bridge._handle_mat({"kind": "MAT", "ord_no": "A0001", "stock_no": "2330", "ap_code": "1",
+                                    "mat_qty": 2, "mat_price": 950.0, "mkt_seq_num": "9"})
+                row = next(o for o in bridge.get_orders(refresh=False) if o["ord_no"] == "A0001")
+                self.assertEqual((row["mat_qty"], row["mat_qty_share"]), (2, 2000))
+            finally:
+                bridge.shutdown()
+
+
+class TestReportSequence(_BridgeCase):
+    """R3-03: order/deal events carry report_stream + report_seq scoped to (session, stream)."""
+
+    def setUp(self):
+        super().setUp()
+        self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        self.bridge = self.make_bridge(self.sim, RecordingFactory(), websocket_enabled=False)
+        self.events = self.bridge.sse_fanout.register()
+
+    def _ack(self, ord_no, **kwargs):
+        return self.bridge._handle_ack({"ord_no": ord_no, "stock_no": "2330", "ap_code": "1", "org_qty": 1,
+                                        "work_date": taipei_today_str()}, **kwargs)
+
+    def _mat(self, seq, **kwargs):
+        return self.bridge._handle_mat({"ord_no": "R1", "stock_no": "2330", "ap_code": "1", "mat_qty": 1,
+                                        "mat_price": 950.0, "mkt_seq_num": seq}, **kwargs)
+
+    def _reports(self):
+        events = _drain(self.events, timeout=0.3)
+        return events, {
+            stream: [(e["data"]["report_stream"], e["data"]["report_seq"]) for e in events if e["event"] == stream]
+            for stream in ("order", "deal")
+        }
+
+    def test_report_seq_is_per_stream_and_skips_session_and_resync_events(self):
+        generation = self.bridge.session.generation
+        self._ack("R1")
+        self.bridge._publish_session_event("switch_unchanged")
+        self.bridge.sse_fanout.publish("resync", {"reason": "ws_reconnected", "generation": generation})
+        self._mat("9")
+        self.assertIsNone(self._mat("9"))  # duplicate: dropped, takes no number
+        self.assertIsNone(self._ack("R9", generation=generation - 1))  # old session: dropped
+        self._ack("R2")
+        self._mat("10")
+        events, reports = self._reports()
+        self.assertEqual(reports["order"], [("order", 1), ("order", 2)])
+        self.assertEqual(reports["deal"], [("deal", 1), ("deal", 2)])
+        for event in events:
+            if event["event"] in ("session", "resync"):
+                self.assertNotIn("report_seq", event["data"])
+            else:
+                self.assertEqual(event["data"]["session_generation"], generation)
+        seqs = [int(e["id"].rsplit("-", 1)[1]) for e in events]
+        self.assertEqual(seqs, sorted(seqs))  # SSE ids stay global <boot_id>-<seq>
+        self.assertEqual(len(set(seqs)), len(seqs))
+
+    def test_new_session_restarts_report_seq_from_one(self):
+        self._ack("R1")
+        self._ack("R2")
+        self._mat("1")
+        self.bridge.last_reconnect_time = 0.0
+        ok, body, code = self.bridge.reconnect()
+        self.assertEqual((ok, code), (True, 200), body)
+        _drain(self.events, timeout=0.2)
+        self._ack("R3")
+        self.bridge.order_book_cache.update_from_ack({"ord_no": "R1", "stock_no": "2330", "ap_code": "1"})
+        self._mat("1")
+        events, reports = self._reports()
+        self.assertEqual(reports["order"], [("order", 1)])
+        self.assertEqual(reports["deal"], [("deal", 1)])
+        order = next(e for e in events if e["event"] == "order")
+        self.assertEqual(order["data"]["session_generation"], body["sessionGeneration"])
+
+
+class OpenHookSDK(MockSDK):
+    """MockSDK with a websocket handler whose open hook fires `open_delays[n]` seconds into connection n."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._SDK__wsHandler = type("Handler", (), {})()
+        self.open_delays = [0.0, 0.4]
+        self.open_times: list[float] = []
+        self.order_call_times: list[float] = []
+
+    def connect_websocket(self) -> None:
+        index = self.ws_connect_calls
+        delay = self.open_delays[min(index, len(self.open_delays) - 1)]
+
+        def fire():
+            self.open_times.append(time.monotonic())
+            hook = getattr(self._SDK__wsHandler, "bridge_open_hook", None)
+            if hook is not None:
+                hook()
+
+        threading.Timer(delay, fire).start()
+        super().connect_websocket()
+
+    def get_order_results(self) -> list[dict]:
+        self.order_call_times.append(time.monotonic())
+        return super().get_order_results()
+
+
+class TestReconnectResyncWaitsForNewOpen(_BridgeCase):
+    def test_resync_snapshot_happens_after_the_new_connection_opens(self):
+        # R1-02: the opened flag of the previous connection must not release the resync early.
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory(mock_cls=OpenHookSDK)
+        bridge = self.make_bridge(sim, factory, auto_login=False)
+        bridge.ws_backoff_initial = 0.05
+        bridge.attempt_initial_login()
+        sdk = factory.instances[0]
+        events = bridge.sse_fanout.register()
+        self.assertTrue(_wait_until(lambda: len(sdk.open_times) == 1))
+        self.assertTrue(_wait_until(lambda: len(sdk.order_call_times) >= 1))  # login bootstrap
+        dropped_at = time.monotonic()
+        sdk.close_websocket()
+        self.assertTrue(_wait_until(lambda: len(sdk.open_times) == 2, timeout=5))
+        resync = [e for e in _drain(events, timeout=2.0) if e["event"] == "resync"]
+        self.assertEqual(len(resync), 1)
+        after_drop = [t for t in sdk.order_call_times if t > dropped_at]
+        self.assertTrue(after_drop)
+        self.assertGreaterEqual(after_drop[0], sdk.open_times[1])
+
+
+class TestGracefulShutdownMutations(_BridgeCase):
+    """R1-03: no new mutation after shutdown starts; in-flight ones finish and answer first."""
+
+    def setUp(self):
+        super().setUp()
+        self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
+        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1"},
+                     "expected_environment": "SIMULATION", "expected_account": "1234567"}
+
+    def _post(self, port, body):
+        return _raw_request(port, "POST", "/esun/orders/place",
+                            headers={"Content-Type": "application/json"}, body=json.dumps(body).encode("utf-8"))
+
+    def test_mutations_after_shutdown_started_are_not_sent(self):
+        factory = RecordingFactory()
+        bridge = self.make_bridge(self.sim, factory, websocket_enabled=False)
+        server = create_server(host="127.0.0.1", port=0, bridge=bridge, access_policy=AccessPolicy())
+        thread = _serve(server)
+        try:
+            bridge._shutdown_event.set()  # shutdown has started while the server still answers
+            status, _, data = self._post(server.server_address[1], self.body)
+            self.assertEqual((status, data["code"], data["outcome"]), (503, "ESUN_SHUTTING_DOWN", "not_sent"))
+            for call in (bridge.place_order, bridge.replace_price, bridge.replace_qty, bridge.cancel_order):
+                res, code = call({**self.body, "order_no": "A0001", "price": 951.0,
+                                  "cancel_quantity": 1, "quantity_unit": "lot"})
+                self.assertEqual((code, res["code"], res["outcome"]), (503, "ESUN_SHUTTING_DOWN", "not_sent"))
+            self.assertEqual(factory.instances[0].placed_orders, [])
+        finally:
+            server.shutdown()
+            thread.join(5)
+            server.server_close()
+
+    def test_in_flight_mutation_completes_before_websocket_close_and_exit(self):
+        entered, release = threading.Event(), threading.Event()
+        timeline: list[str] = []
+
+        class SlowPlaceSDK(MockSDK):
+            def place_order(self, order_obj):
+                entered.set()
+                release.wait(5)
+                timeline.append(f"placed(ws_close_calls={self.ws_close_calls})")
+                return super().place_order(order_obj)
+
+        factory = RecordingFactory(mock_cls=SlowPlaceSDK)
+        bridge = self.make_bridge(self.sim, factory)
+        sdk = factory.instances[0]
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 1))
+        server = create_server(host="127.0.0.1", port=0, bridge=bridge, access_policy=AccessPolicy())
+        port = server.server_address[1]
+        serve_thread = _serve(server)
+        responses: list = []
+        client = threading.Thread(target=lambda: responses.append(self._post(port, self.body)))
+        client.start()
+        self.assertTrue(entered.wait(5))
+
+        make_shutdown_handler(server, bridge)(15, None)  # SIGTERM
+        serve_thread.join(5)
+        self.assertFalse(serve_thread.is_alive(), "accept loop stops first")
+        threading.Timer(0.3, release.set).start()
+        bridge.shutdown()  # main(): returns only after the in-flight mutation answered
+        timeline.append("shutdown_returned")
+        client.join(5)
+        server.server_close()
+        self.assertEqual(timeline, ["placed(ws_close_calls=0)", "shutdown_returned"])
+        status, _, data = responses[0]
+        self.assertEqual((status, data["outcome"]), (200, "accepted"))
+        self.assertGreaterEqual(sdk.ws_close_calls, 1)  # WebSocket closed after the mutation
+
+    def test_shutdown_grace_is_bounded(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class StuckPlaceSDK(MockSDK):
+            def place_order(self, order_obj):
+                entered.set()
+                release.wait(10)
+                return super().place_order(order_obj)
+
+        bridge = self.make_bridge(self.sim, RecordingFactory(mock_cls=StuckPlaceSDK), websocket_enabled=False)
+        worker = threading.Thread(target=lambda: bridge.place_order(dict(self.body)))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            with mock.patch.object(bridge_module, "SHUTDOWN_MUTATION_GRACE_SECONDS", 0.3):
+                started = time.monotonic()
+                bridge.shutdown()
+                elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, 0.25)
+            self.assertLess(elapsed, 3.0)
+            self.assertEqual(bridge_module.SHUTDOWN_MUTATION_GRACE_SECONDS, 8.0)
+        finally:
+            release.set()
+            worker.join(5)
 
 
 if __name__ == "__main__":

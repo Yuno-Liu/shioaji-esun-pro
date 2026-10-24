@@ -1085,6 +1085,87 @@ def _order_keys(data: dict) -> tuple[str, str]:
     return ord_no, pre_ord_no
 
 
+SHARES_PER_LOT = 1000
+_SHARE_UNIT_AP_CODES = ("3", "4", "5")  # odd lot, emerging, intraday odd lot
+
+
+def _first_present(raw: dict, *keys: str) -> any:
+    """JavaScript `a ?? b`: the first value that is not None (missing keys count as None)."""
+    for key in keys:
+        value = raw.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _js_finite_number(value: any) -> float | None:
+    """finiteNumber() of src/lib/esun/order-mapping.ts (Number(String(v).trim()), finite only)."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip()
+        if "_" in text:
+            return None
+        try:
+            number = float(text) if text else 0.0
+        except ValueError:
+            return None
+    return number if math.isfinite(number) else None
+
+
+def _js_round(value: float) -> int:
+    return int(math.floor(value + 0.5))  # Math.round
+
+
+def _row_ap_code(*rows: dict | None) -> str:
+    for row in rows:
+        if row:
+            text = str(_first_present(row, "ap_code", "apCode") or "").strip()
+            if text:
+                return text
+    return "1"
+
+
+def esun_quantity_from_fields(raw: dict, base: str, ap_code: str) -> int | None:
+    """
+    Port of esunQuantityFromFields() in src/lib/esun/order-mapping.ts (keep them identical):
+    ap_code 1/2 read *_qty (lots); 3/4/5 read *_qty_share (shares) first, otherwise *_qty, where a
+    value >= 1 is already shares (except emerging, ap_code 4) and a smaller one is lots x 1000.
+    Returns the App unit: lots for ap_code 1/2, shares for 3/4/5.
+    """
+    camel = {"org": "orgQty", "mat": "matQty", "cel": "celQty"}[base]
+    lots = _js_finite_number(_first_present(raw, f"{base}_qty", camel))
+    if ap_code not in _SHARE_UNIT_AP_CODES:
+        return None if lots is None else _js_round(lots)
+    shares = _js_finite_number(_first_present(raw, f"{base}_qty_share", f"{camel}Share"))
+    if shares is not None:
+        return _js_round(shares)
+    if lots is None:
+        return None
+    if ap_code != "4" and lots >= 1:
+        return _js_round(lots)
+    return _js_round(lots * SHARES_PER_LOT)
+
+
+def esun_quantity_shares(raw: dict, base: str, ap_code: str) -> int | None:
+    """esun_quantity_from_fields() expressed in shares (lots x 1000 for ap_code 1/2)."""
+    qty = esun_quantity_from_fields(raw, base, ap_code)
+    if qty is None:
+        return None
+    return qty if ap_code in _SHARE_UNIT_AP_CODES else qty * SHARES_PER_LOT
+
+
+def mat_report_shares(mat: dict, ap_code: str) -> int | None:
+    """Deal quantity of one MAT in shares, read like src/lib/esun/report-adapter.ts reads deals."""
+    fields = {
+        "mat_qty": _first_present(mat, "mat_qty", "deal_qty", "qty"),
+        "mat_qty_share": _first_present(mat, "mat_qty_share", "deal_qty_share"),
+    }
+    return esun_quantity_shares(fields, "mat", ap_code)
+
+
 class OrderBookCache:
     """
     Thread-safe in-memory cache of day orders dual-indexed by ord_no and pre_ord_no.
@@ -1096,6 +1177,10 @@ class OrderBookCache:
     - Only dicts carrying ord_no or pre_ord_no become rows (modify/cancel responses never do).
     - Per-row metadata records whether quantities come from an untouched snapshot
       ("snapshot") or were touched by events/mutations since ("event"/"local").
+    - Per-row metadata also keeps event_mat_shares (deduplicated MAT total) and event_cel_shares
+      (largest cumulative ACK cancel) across snapshots; every read reports
+      max(snapshot, event) for the filled / cancelled quantities, so a snapshot that started
+      before a report never rolls the row back.
     """
 
     # ACK fields that describe the report itself rather than the order state.
@@ -1181,11 +1266,49 @@ class OrderBookCache:
         now = time.monotonic()
         meta = self._meta.get(internal_id)
         if meta is None:
-            meta = {"created": now, "seen_mat": set()}
+            meta = self._new_meta(now)
             self._meta[internal_id] = meta
         meta["source"] = source
         meta["updated"] = now
         return internal_id
+
+    @staticmethod
+    def _new_meta(now: float) -> dict:
+        return {"created": now, "seen_mat": set(), "event_mat_shares": 0, "event_cel_shares": 0}
+
+    @staticmethod
+    def _carry_event_meta(target: dict, old: dict) -> None:
+        """Report-derived state outlives snapshots (same lifetime as seen_mat)."""
+        target["seen_mat"] |= set(old.get("seen_mat") or ())
+        for key in ("event_mat_shares", "event_cel_shares"):
+            target[key] = max(target.get(key) or 0, old.get(key) or 0)
+
+    def _effective_row_locked(self, internal_id: str) -> dict:
+        """
+        Copy of a row whose filled / cancelled quantities are max(row, reports received): written
+        back as mat_qty / cel_qty (lots; fractional lots for odd-lot classes) and *_qty_share
+        (shares). Lot rows get their bridge-only status re-derived from the effective quantities.
+        """
+        row = dict(self._orders[internal_id])
+        meta = self._meta.get(internal_id) or {}
+        ap_code = _row_ap_code(row)
+        changed = False
+        for base in ("mat", "cel"):
+            event_shares = meta.get(f"event_{base}_shares") or 0
+            current = esun_quantity_shares(row, base, ap_code) or 0
+            if event_shares > current:
+                row[f"{base}_qty"] = _num_out(event_shares / SHARES_PER_LOT)
+                row[f"{base}_qty_share"] = _num_out(event_shares)
+                changed = True
+        if (changed or "status" in row) and ap_code not in _SHARE_UNIT_AP_CODES:
+            org = esun_quantity_from_fields(row, "org", ap_code)
+            mat = esun_quantity_from_fields(row, "mat", ap_code) or 0
+            cel = esun_quantity_from_fields(row, "cel", ap_code) or 0
+            if org and mat + cel >= org:
+                row["status"] = "Cancelled" if cel > 0 else "Filled"
+            elif mat > 0:
+                row["status"] = "PartFilled"
+        return row
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -1227,14 +1350,14 @@ class OrderBookCache:
                 ord_no, pre_ord_no = _order_keys(old_order)
                 new_id = self._find_locked(ord_no, pre_ord_no)
                 if new_id is not None:
-                    self._meta[new_id]["seen_mat"] |= set(meta.get("seen_mat") or ())
+                    self._carry_event_meta(self._meta[new_id], meta)
                     continue
                 if now - float(meta.get("created") or 0.0) <= ORDER_SNAPSHOT_KEEP_RECENT_SECONDS:
                     # Placed/reported moments ago and not yet visible in the broker snapshot.
                     kept_id = self._upsert_locked(dict(old_order), str(meta.get("source") or "event"))
                     if kept_id is not None:
                         self._meta[kept_id]["created"] = float(meta.get("created") or now)
-                        self._meta[kept_id]["seen_mat"] |= set(meta.get("seen_mat") or ())
+                        self._carry_event_meta(self._meta[kept_id], meta)
             return True
 
     def update_from_ack(self, ack_data: dict, generation: int | None = None) -> tuple[bool, dict | None]:
@@ -1249,14 +1372,20 @@ class OrderBookCache:
             internal_id = self._find_locked(ord_no, pre_ord_no)
             previous = dict(self._orders[internal_id]) if internal_id else None
             state = {k: v for k, v in ack_data.items() if k not in self.REPORT_ONLY_KEYS}
-            self._upsert_locked(state, "event")
+            new_id = self._upsert_locked(state, "event")
+            if new_id is not None:
+                # ACK cel_qty is the cumulative cancelled quantity of the order.
+                cel_shares = esun_quantity_shares(ack_data, "cel", _row_ap_code(ack_data, previous))
+                meta = self._meta[new_id]
+                meta["event_cel_shares"] = max(meta.get("event_cel_shares") or 0, cel_shares or 0)
             return True, previous
 
     def update_from_mat(self, mat_data: dict, generation: int | None = None) -> bool:
         """
         Applies a MAT deal. Returns False when dropped (other session, or a duplicate of an
-        already-applied mkt_seq_num). Quantity fields of the row are never overwritten
-        (MAT units are not guaranteed to match the row); bridge-only deal_qty/status are kept.
+        already-applied mkt_seq_num). Quantity fields of the row are never overwritten here; the
+        deal is added to event_mat_shares (in shares, see esun_quantity_from_fields) and applied on
+        read. Bridge-only deal_qty/status are kept.
         """
         if not isinstance(mat_data, dict):
             return False
@@ -1284,6 +1413,9 @@ class OrderBookCache:
             meta["source"] = "event"
             meta["updated"] = time.monotonic()
             target = self._orders[internal_id]
+            mat_shares = mat_report_shares(mat_data, _row_ap_code(mat_data, target))
+            if mat_shares:
+                meta["event_mat_shares"] = (meta.get("event_mat_shares") or 0) + mat_shares
             qty = _to_number(
                 mat_data.get("mat_qty") or mat_data.get("matQty") or mat_data.get("deal_qty")
                 or mat_data.get("dealQty") or mat_data.get("qty")
@@ -1311,7 +1443,7 @@ class OrderBookCache:
                 return
             if updates:
                 self._orders[internal_id].update(updates)
-            meta = self._meta.setdefault(internal_id, {"created": time.monotonic(), "seen_mat": set()})
+            meta = self._meta.setdefault(internal_id, self._new_meta(time.monotonic()))
             meta["source"] = "event"
             meta["updated"] = time.monotonic()
 
@@ -1319,7 +1451,7 @@ class OrderBookCache:
         with self.lock:
             self._roll_day_locked()
             internal_id = self._lookup_locked(order_id)
-            return dict(self._orders[internal_id]) if internal_id else None
+            return self._effective_row_locked(internal_id) if internal_id else None
 
     def get_with_meta(self, order_id: str) -> tuple[dict | None, dict | None]:
         with self.lock:
@@ -1328,12 +1460,12 @@ class OrderBookCache:
             if internal_id is None:
                 return None, None
             meta = self._meta.get(internal_id) or {}
-            return dict(self._orders[internal_id]), {"source": meta.get("source"), "created": meta.get("created")}
+            return self._effective_row_locked(internal_id), {"source": meta.get("source"), "created": meta.get("created")}
 
     def get_all(self) -> list[dict]:
         with self.lock:
             self._roll_day_locked()
-            return [dict(order) for order in self._orders.values()]
+            return [self._effective_row_locked(internal_id) for internal_id in self._orders]
 
     @staticmethod
     def is_reservation(order: dict | None) -> bool:
@@ -1413,6 +1545,8 @@ class SSEFanoutManager:
     ):
         self.boot_id = secrets.token_hex(6)
         self._seq = 0
+        # report_seq counters per (report scope = session generation, report stream)
+        self._report_seqs: collections.OrderedDict = collections.OrderedDict()
         self._ring: collections.deque = collections.deque(maxlen=ring_size)
         self.subscribers: set[SSESubscriber] = set()
         self.max_subscribers = max_subscribers
@@ -1434,13 +1568,31 @@ class SSEFanoutManager:
         parts.append(f"data: {payload_str}\n\n")
         return "".join(parts).encode("utf-8")
 
-    def publish(self, event_type: str, data: dict, include_ids: bool = False) -> str:
-        """Assigns the next id, stores the event in the replay ring and fans it out (in seq order)."""
+    def publish(
+        self,
+        event_type: str,
+        data: dict,
+        include_ids: bool = False,
+        report_stream: str | None = None,
+        report_scope: any = None,
+    ) -> str:
+        """
+        Assigns the next id, stores the event in the replay ring and fans it out (in seq order).
+        With report_stream, the payload also gets report_stream + report_seq: 1, 2, ... per
+        (report_scope, report_stream), counting only the reports actually published.
+        """
         with self.lock:
             self._seq += 1
             seq = self._seq
             event_id = f"{self.boot_id}-{seq}"
             payload = {**data, "event_id": event_id, "seq": seq} if include_ids else data
+            if report_stream is not None:
+                key = (report_scope, report_stream)
+                report_seq = self._report_seqs.pop(key, 0) + 1
+                self._report_seqs[key] = report_seq
+                while len(self._report_seqs) > 8:  # a few recent sessions x {order, deal}
+                    self._report_seqs.popitem(last=False)
+                payload = {**payload, "report_stream": report_stream, "report_seq": report_seq}
             raw = self.format_event(event_type, payload, event_id)
             self._ring.append((seq, raw))
             for sub in list(self.subscribers):
@@ -1543,6 +1695,8 @@ RECONNECT_MIN_INTERVAL_SECONDS = 6.0
 LOGIN_DAILY_MAX = 300
 ORDERS_DAILY_MAX = 2000
 ORDERS_REFRESH_MIN_INTERVAL_SECONDS = 5.0
+ORDERS_REFRESH_MAX_WAIT_SECONDS = 12.0  # refresh=true waits at most this long before its query starts
+SHUTDOWN_MUTATION_GRACE_SECONDS = 8.0  # SIGTERM: in-flight order mutations may finish (< compose grace)
 CACHE_FILL_WAIT_SECONDS = 20.0
 WS_SILENCE_SECONDS = 90.0
 WS_WATCHDOG_INTERVAL_SECONDS = 5.0
@@ -1557,7 +1711,8 @@ class EsunSession:
     """
     Immutable login-session snapshot. Replaced as a whole (generation + 1) only after a
     successful login or environment switch; every request reads exactly one snapshot.
-    generation 0 is the offline snapshot describing the selected (not yet logged-in) config.
+    The offline snapshot (selected, not yet logged-in config) carries the process start base
+    (session_generation_base()); each successful login takes the next number.
     """
 
     generation: int
@@ -1925,6 +2080,17 @@ def report_timestamp(data: dict) -> str:
     return _report_datetime(date_raw, time_raw).isoformat(timespec="milliseconds")
 
 
+@dataclasses.dataclass
+class _OrdersRefreshFlight:
+    """One refresh=true get_order_results() call, shared by the requests that arrived before it started."""
+
+    started: float
+    generation: int
+    ticket: int  # ordering under the lock (monotonic() can tick coarser than a fast query)
+    done: bool = False
+    error: EsunQueryError | None = None
+
+
 class _WsRuntime:
     """Mutable WebSocket state of one session generation."""
 
@@ -1967,6 +2133,7 @@ class _WsRuntime:
     def note_closed(self) -> None:
         with self.lock:
             self.connected = False
+        self.opened_event.clear()
 
     def silence(self) -> tuple[bool, float]:
         with self.lock:
@@ -2042,11 +2209,20 @@ class EsunTradeBridge:
         self._session_change_lock = threading.Lock()  # serializes logins / switches
         self._login_guard_lock = threading.Lock()  # atomic check-and-record of login limits
         self._orders_refresh_lock = threading.Lock()
+        self._orders_refresh_cond = threading.Condition(self._orders_refresh_lock)
+        self._orders_refresh_flight: _OrdersRefreshFlight | None = None  # latest refresh=true query
+        self._orders_refresh_tickets = 0  # request arrivals and query starts, in lock order
         self._shutdown_event = threading.Event()
+        self._shutdown_lock = threading.Lock()  # first shutdown() caller does the work, others wait
+        self._shutdown_complete = False
+        self._mutations_cond = threading.Condition()  # guards _mutations_in_flight + the shutdown flag
+        self._mutations_in_flight = 0
         self._generation_seq = session_generation_base()
 
         cfg, _, env = load_config(selected_path)
-        self._session = self._offline_session(selected_path, cfg, env)
+        # Offline (not logged in / failed / locked) reports the start base: newer than any previous
+        # process, older than this process's first login (base + 1).
+        self._session = self._offline_session(selected_path, cfg, env, self._generation_seq)
         self.login_error: str | None = None
 
         # Login guard state (wall-clock timestamps; elapsed < 0 after a clock jump restarts the window)
@@ -2123,11 +2299,13 @@ class EsunTradeBridge:
         return self.login_state.credential_locked
 
     @staticmethod
-    def _offline_session(config_path: str | None, cfg: configparser.ConfigParser | None, env: str) -> EsunSession:
+    def _offline_session(
+        config_path: str | None, cfg: configparser.ConfigParser | None, env: str, generation: int
+    ) -> EsunSession:
         account = split_account(cfg["User"].get("Account")) if (cfg and cfg.has_section("User")) else None
         entry = cfg.get("Core", "Entry", fallback="").strip() if (cfg and cfg.has_section("Core")) else ""
         return EsunSession(
-            generation=0,
+            generation=generation,
             sdk=None,
             environment=env,
             config_path=config_path,
@@ -2153,17 +2331,54 @@ class EsunTradeBridge:
     def is_shutting_down(self) -> bool:
         return self._shutdown_event.is_set()
 
+    def begin_shutdown(self) -> None:
+        """Refuses every order mutation from now on (503 ESUN_SHUTTING_DOWN, not_sent)."""
+        with self._mutations_cond:
+            self._shutdown_event.set()
+            self._mutations_cond.notify_all()
+
+    def try_begin_mutation(self) -> bool:
+        """Registers an in-flight order mutation; False once shutdown has started."""
+        with self._mutations_cond:
+            if self._shutdown_event.is_set():
+                return False
+            self._mutations_in_flight += 1
+            return True
+
+    def end_mutation(self) -> None:
+        with self._mutations_cond:
+            self._mutations_in_flight -= 1
+            self._mutations_cond.notify_all()
+
+    def _wait_for_mutations(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._mutations_cond:
+            while self._mutations_in_flight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._mutations_cond.wait(remaining)
+            return True
+
     def shutdown(self) -> None:
-        """Graceful shutdown: close the WebSocket and release SSE subscribers."""
-        if self._shutdown_event.is_set():
-            return
-        self._shutdown_event.set()
-        with self._state_lock:
-            runtime = self._ws_runtime
-            session = self._session
-            self._ws_runtime = None
-        self._stop_websocket(runtime, session)
-        self.sse_fanout.close_all()
+        """
+        Graceful shutdown: refuse new mutations, give in-flight ones up to
+        SHUTDOWN_MUTATION_GRACE_SECONDS to finish and answer, then close the WebSocket and SSE.
+        Concurrent callers block until the first one has finished.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self.begin_shutdown()
+            if not self._wait_for_mutations(SHUTDOWN_MUTATION_GRACE_SECONDS):
+                logger.warning("關閉時仍有委託請求未完成（已等待 %.0f 秒），其結果需以委託查詢確認", SHUTDOWN_MUTATION_GRACE_SECONDS)
+            with self._state_lock:
+                runtime = self._ws_runtime
+                session = self._session
+                self._ws_runtime = None
+            self._stop_websocket(runtime, session)
+            self.sse_fanout.close_all()
+            self._shutdown_complete = True
 
     # ─────────────────────────────────────────────────────────────────────────
     # Login guard (shared by startup, reconnect and environment switch)
@@ -2550,6 +2765,9 @@ class EsunTradeBridge:
         backoff = self.ws_backoff_initial
         first = True
         while self._ws_should_run(session, runtime):
+            # Clears the previous connection's opened flag BEFORE the resync thread waits on it,
+            # so the resync snapshot is taken after this new connection opens.
+            runtime.note_connecting()
             if not first:
                 threading.Thread(
                     target=self._ws_resync_after_reconnect,
@@ -2557,7 +2775,6 @@ class EsunTradeBridge:
                     daemon=True,
                     name=f"EsunWSResync-g{session.generation}",
                 ).start()
-            runtime.note_connecting()
             started = time.monotonic()
             try:
                 session.sdk.connect_websocket()
@@ -2654,7 +2871,9 @@ class EsunTradeBridge:
         if not accepted:
             return None
         payload = self._report_payload(session, data, derive_ack_op_type(data, previous), normalize_report_status(data))
-        return self.sse_fanout.publish("order", payload, include_ids=True)
+        return self.sse_fanout.publish(
+            "order", payload, include_ids=True, report_stream="order", report_scope=session.generation
+        )
 
     def _handle_mat(self, data: dict, generation: int | None = None) -> str | None:
         """WebSocket MAT -> OrderBookCache (deduplicated by mkt_seq_num) + SSE `deal` event."""
@@ -2670,7 +2889,17 @@ class EsunTradeBridge:
             )
             return None
         self.positions_cache.mark_dirty()
-        return self.sse_fanout.publish("deal", self._report_payload(session, data, "Deal"), include_ids=True)
+        payload = self._report_payload(session, data, "Deal")
+        ord_no, pre_ord_no = _order_keys(data)
+        if ord_no and not pre_ord_no:
+            # A converted reservation keeps pre_ord_no as its client id; MAT only carries ord_no.
+            cached = self.order_book_cache.get(ord_no)
+            cached_pre = _order_keys(cached)[1] if cached else ""
+            if cached_pre:
+                payload["pre_ord_no"] = cached_pre
+        return self.sse_fanout.publish(
+            "deal", payload, include_ids=True, report_stream="deal", report_scope=session.generation
+        )
 
     def sse_heartbeat_bytes(self, initial: bool = False) -> bytes:
         """Per-connection heartbeat (no SSE id, so it never moves the client's Last-Event-ID)."""
@@ -2939,6 +3168,7 @@ class EsunTradeBridge:
         ("price_flag", ("priceFlag", "price_flag")),
         ("bs_flag", ("bsFlag", "bs_flag")),
         ("trade", ("trade",)),
+        ("ord_no", ("ordNo", "ord_no")),  # must equal order_no (validated in _resolve_order)
         ("pre_ord_no", ("preOrdNo", "pre_ord_no")),
         ("od_price", ("price", "od_price", "odPrice")),
         ("work_date", ("workDate", "work_date")),
@@ -2949,6 +3179,8 @@ class EsunTradeBridge:
     def _mutation_prelude(self, body: any) -> tuple[EsunSession | None, tuple[dict, int] | None]:
         if not isinstance(body, dict):
             return None, not_sent(400, "ESUN_INVALID_JSON", "請求本文必須為 JSON 物件")
+        if self.is_shutting_down():
+            return None, self._shutting_down_refusal()
         session = self._session
         if not session.logged_in:
             return None, not_sent(503, "ESUN_NOT_LOGGED_IN", self._not_logged_in_message())
@@ -2981,7 +3213,19 @@ class EsunTradeBridge:
             return not_sent(429, "AGR0001", "已達每日委託上限 2,000 次 (AGR0001)")
         return None
 
+    @staticmethod
+    def _shutting_down_refusal() -> tuple[dict, int]:
+        return not_sent(503, "ESUN_SHUTTING_DOWN", "玉山 bridge 關閉中，委託未送出")
+
     def _call_sdk_mutation(self, session: EsunSession, label: str, call: any) -> tuple[dict, int]:
+        if not self.try_begin_mutation():  # atomic with begin_shutdown(): nothing reaches the SDK after it
+            return self._shutting_down_refusal()
+        try:
+            return self._call_sdk_mutation_now(session, label, call)
+        finally:
+            self.end_mutation()
+
+    def _call_sdk_mutation_now(self, session: EsunSession, label: str, call: any) -> tuple[dict, int]:
         try:
             result = call()
         except Exception as e:
@@ -3061,6 +3305,12 @@ class EsunTradeBridge:
             elif field == "od_price":
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     continue
+            elif field == "ord_no":
+                # A reservation that became a regular order has both numbers; keeping ord_no on a
+                # cache miss stops it from being mistaken for a reservation (pre_ord_no only).
+                value = value.strip() if isinstance(value, str) else ""
+                if not _ORDER_NO_RE.fullmatch(value) or value != order_no:
+                    raise EsunValidationError("payload.ordNo 格式錯誤或與 order_no 不一致")
             else:
                 value = str(value).strip()
             order[field] = value
@@ -3330,8 +3580,12 @@ class EsunTradeBridge:
     def get_orders(self, refresh: bool = False) -> list[dict]:
         """
         If refresh is False, returns local OrderBookCache (0 API calls).
-        If refresh is True, enforces 5s min interval + 10 rpm limiter (AGR0005) and
-        replaces the cache with the broker snapshot. Raises EsunQueryError on failure.
+        If refresh is True, returns the cache right after a get_order_results() snapshot that
+        STARTED after this request arrived: a query already started after the arrival is shared
+        (result or error); an older in-flight one is waited out, then the next query starts at
+        max(arrival, last start + 5 s) within the 10 rpm limiter (AGR0005). Waiting happens
+        outside the lock; if the query cannot start within ORDERS_REFRESH_MAX_WAIT_SECONDS the
+        request fails with 429 AGR0005 + retry_after. Raises EsunQueryError on failure.
         """
         session = self._session
         if not session.logged_in:
@@ -3339,26 +3593,73 @@ class EsunTradeBridge:
         if not refresh:
             return self.order_book_cache.get_all()
 
-        with self._orders_refresh_lock:
-            now = time.monotonic()
-            wait = ORDERS_REFRESH_MIN_INTERVAL_SECONDS - (now - self.last_orders_refresh_time)
-            if wait > 0:
-                raise EsunQueryError(429, "AGR0005", "委託查詢過於頻繁（refresh 最短間隔 5 秒）", retry_after=wait)
-            if not self.orders_refresh_limiter.acquire():
-                raise EsunQueryError(
-                    429, "AGR0005", "委託查詢頻率過高 (限 10 次/分，AGR0005)",
-                    retry_after=max(1.0, self.orders_refresh_limiter.time_until_available()),
+        arrival = time.monotonic()
+        deadline = arrival + ORDERS_REFRESH_MAX_WAIT_SECONDS
+        cond = self._orders_refresh_cond
+        with cond:
+            self._orders_refresh_tickets += 1
+            arrival_ticket = self._orders_refresh_tickets
+            while True:
+                if not self._is_current(session.generation):
+                    raise EsunQueryError(503, "ESUN_SESSION_CHANGED", "等待期間玉山 session 已切換，請重新查詢")
+                flight = self._orders_refresh_flight
+                now = time.monotonic()
+                if flight is not None and flight.generation == session.generation:
+                    if flight.ticket > arrival_ticket:  # began after this request arrived: share it
+                        while not flight.done:
+                            cond.wait()
+                        if flight.error is not None:
+                            e = flight.error
+                            raise EsunQueryError(e.status, e.code, str(e), retry_after=e.retry_after)
+                        return self.order_book_cache.get_all()
+                    if not flight.done:  # older snapshot still running: wait for it to end
+                        if now >= deadline:
+                            raise EsunQueryError(
+                                429, "AGR0005", "委託查詢等待逾時（前一次查詢仍在進行）",
+                                retry_after=ORDERS_REFRESH_MIN_INTERVAL_SECONDS,
+                            )
+                        cond.wait(deadline - now)
+                        continue
+                start_at = max(
+                    arrival,
+                    self.last_orders_refresh_time + ORDERS_REFRESH_MIN_INTERVAL_SECONDS,
+                    now + self.orders_refresh_limiter.time_until_available(),
                 )
-            self.last_orders_refresh_time = now
-        try:
+                if start_at > deadline:
+                    raise EsunQueryError(
+                        429, "AGR0005",
+                        "委託查詢頻率過高（refresh 最短間隔 5 秒、限 10 次/分，AGR0005）",
+                        retry_after=max(1.0, start_at - now),
+                    )
+                if start_at > now:
+                    cond.wait(start_at - now)
+                    continue
+                if not self.orders_refresh_limiter.acquire():
+                    continue  # another caller took the slot in between: recompute
+                self._orders_refresh_tickets += 1
+                flight = _OrdersRefreshFlight(started=now, generation=session.generation,
+                                              ticket=self._orders_refresh_tickets)
+                self._orders_refresh_flight = flight
+                self.last_orders_refresh_time = now
+                break
+
+        error: EsunQueryError | None = None
+        try:  # SDK call outside the lock
             orders = session.sdk.get_order_results()
+            if not isinstance(orders, list):
+                error = EsunQueryError(502, "ORDERS_QUERY_ERROR", "玉山委託查詢回應格式錯誤")
+            elif not self.order_book_cache.update_from_order_results(orders, generation=session.generation):
+                error = EsunQueryError(503, "ESUN_SESSION_CHANGED", "查詢期間玉山 session 已切換，請重新查詢")
         except Exception as e:
             logger.warning(f"get_order_results failed: {redact(e)}")
-            raise EsunQueryError(502, "ORDERS_QUERY_ERROR", f"玉山查詢委託失敗：{redact(e)}")
-        if not isinstance(orders, list):
-            raise EsunQueryError(502, "ORDERS_QUERY_ERROR", "玉山委託查詢回應格式錯誤")
-        if not self.order_book_cache.update_from_order_results(orders, generation=session.generation):
-            raise EsunQueryError(503, "ESUN_SESSION_CHANGED", "查詢期間玉山 session 已切換，請重新查詢")
+            error = EsunQueryError(502, "ORDERS_QUERY_ERROR", f"玉山查詢委託失敗：{redact(e)}")
+        finally:
+            with cond:
+                flight.error = error  # handed to the requests sharing this query only, never cached
+                flight.done = True
+                cond.notify_all()
+        if error is not None:
+            raise error
         return self.order_book_cache.get_all()
 
     def _cached_query(
@@ -3928,7 +4229,19 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
         if body is None:
             return
+        if self._is_mutation_path():
+            # Tracked until the response is written, so a graceful shutdown waits for the answer.
+            if not self.bridge.try_begin_mutation():
+                self._send_error_json(503, "ESUN_SHUTTING_DOWN", "玉山 bridge 關閉中，委託未送出")
+                return
+            try:
+                self._dispatch_post(path, body)
+            finally:
+                self.bridge.end_mutation()
+            return
+        self._dispatch_post(path, body)
 
+    def _dispatch_post(self, path: str, body: dict) -> None:
         try:
             if path == "/esun/auth/reconnect":
                 _, res, code = self.bridge.reconnect(force=body.get("force") is True)
@@ -4095,8 +4408,10 @@ def create_server(
 
 def make_shutdown_handler(server: ThreadingHTTPServer, bridge: EsunTradeBridge) -> any:
     """
-    Builds the SIGTERM/SIGINT handler: stops the bridge (WebSocket, SSE) and calls
-    server.shutdown() from a helper thread (calling it on the serve_forever thread deadlocks).
+    Builds the SIGTERM/SIGINT handler. From a helper thread (calling server.shutdown() on the
+    serve_forever thread deadlocks): refuse new mutations -> stop accepting connections ->
+    bridge.shutdown() (in-flight mutations finish and answer, max SHUTDOWN_MUTATION_GRACE_SECONDS,
+    then WebSocket / SSE close). main() calls bridge.shutdown() too, which waits for this one.
     """
     started = threading.Event()
 
@@ -4107,10 +4422,11 @@ def make_shutdown_handler(server: ThreadingHTTPServer, bridge: EsunTradeBridge) 
         logger.info("收到停止訊號（%s），開始優雅關閉…", signum)
 
         def _stop() -> None:
+            bridge.begin_shutdown()
             try:
-                bridge.shutdown()
-            finally:
                 server.shutdown()
+            finally:
+                bridge.shutdown()
 
         threading.Thread(target=_stop, daemon=True, name="EsunShutdown").start()
 
