@@ -17,6 +17,7 @@ import type { ChainTier, Theme } from './company-data/types';
 import { useTradingState } from './trading-state';
 import type { Trade } from './types/order';
 import type { Account, AccountedPosition } from './types/portfolio';
+import { scopedFlashRows } from './flash-account';
 
 export type Grouping = 'sector' | 'chain' | 'theme';
 export const GROUPINGS = ['sector', 'chain', 'theme'] as const;
@@ -168,28 +169,15 @@ export function holdingsPhase(updatedAt: number | null | undefined, error: strin
 }
 
 /** Stock holdings across every account in view (no extra request). */
-export function useHoldings(accountFilter?: Account | null): HoldingsState {
+export function useHoldings(account?: Account | null): HoldingsState {
     const trading = useTradingState();
     const { positions, trades } = trading;
     const q = trading.queries.positions;
     return useMemo(() => {
-        const filteredPositions = accountFilter
-            ? positions.filter(p => !p.account || (
-                p.account.account_type === accountFilter.account_type &&
-                p.account.broker_id === accountFilter.broker_id &&
-                p.account.account_id === accountFilter.account_id
-            ))
-            : positions;
-        const filteredTrades = accountFilter
-            ? trades.filter(t => !t.account || (
-                t.account.account_type === accountFilter.account_type &&
-                t.account.broker_id === accountFilter.broker_id &&
-                t.account.account_id === accountFilter.account_id
-            ))
-            : trades;
-        const holdings = fromPositions(filteredPositions, filteredTrades);
+        // fork：指定帳戶時只算該帳戶的列；歸屬不明的列不算進去（不從目前選擇推測）
+        const holdings = account ? fromPositions(scopedFlashRows(positions, account), scopedFlashRows(trades, account)) : fromPositions(positions, trades);
         return { phase: holdingsPhase(q.updatedAt, q.error ?? null, holdings.length), holdings, error: q.error ?? null };
-    }, [positions, trades, q.updatedAt, q.error, accountFilter]);
+    }, [positions, trades, q.updatedAt, q.error, account]);
 }
 
 // ── company cards: industry, primary chain and tier, main theme ─────────────
