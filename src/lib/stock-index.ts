@@ -152,6 +152,18 @@ export function fuzzySubsequenceGap(
     return lastMatch - firstMatch + 1 - query.length;
 }
 
+// 每筆目錄只正規化一次：目錄物件在快取中是穩定的，逐鍵搜尋不必重算整份目錄
+const normalizedKeys = new WeakMap<StockMeta, { code: string; codeNoZero: string; name: string; rawName: string }>();
+
+function keysOf(s: StockMeta) {
+    const cached = normalizedKeys.get(s);
+    if (cached && cached.rawName === s.name) return cached;
+    const code = s.code.toUpperCase();
+    const keys = { code, codeNoZero: code.replace(/^0+/, ''), name: normalizeSearchText(s.name), rawName: s.name };
+    normalizedKeys.set(s, keys);
+    return keys;
+}
+
 // substring / fuzzy match on name and code — ranked so the actual
 // stock beats its thousands of warrants (台積電 before 台積電XX購YY)
 export function searchStocks(
@@ -168,9 +180,7 @@ export function searchStocks(
     const scored: { s: StockMeta; score: number }[] = [];
 
     for (const s of index) {
-        const code = s.code.toUpperCase();
-        const codeNoZero = code.replace(/^0+/, '');
-        const name = normalizeSearchText(s.name);
+        const { code, codeNoZero, name } = keysOf(s);
 
         const codeExact =
             code === q ||
