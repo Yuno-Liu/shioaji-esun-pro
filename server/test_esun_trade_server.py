@@ -517,6 +517,7 @@ class TestOrderBookCacheAndSSE(unittest.TestCase):
             "deal_qty": 1,
             "deal_price": 950.0,
             "mat_time": "09:05:00",
+            "mkt_seq_num": "000001",
         }
         cache.update_from_mat(mat_data)
         updated = cache.get("O001")
@@ -524,7 +525,7 @@ class TestOrderBookCacheAndSSE(unittest.TestCase):
         self.assertEqual(updated["status"], "PartFilled")
 
         # Update via second MAT (deal another 1 sheet)
-        cache.update_from_mat(mat_data)
+        cache.update_from_mat({**mat_data, "mkt_seq_num": "000002"})
         updated2 = cache.get("O001")
         self.assertEqual(updated2["deal_qty"], 2)
         self.assertEqual(updated2["status"], "Filled")
@@ -2275,6 +2276,62 @@ class TestMutationContractWithRealSdk(_BridgeCase):
             res, status = self.bridge.replace_price({**body, "order_no": ord_no})
             self.assertEqual((status, res["code"]), (400, code), ord_no)
 
+    def test_failed_cancel_ack_does_not_change_the_order(self):
+        # PA2-1: a rejected cancel ACK still carries the requested cel_qty; it must not cancel the row.
+        self._snapshot(self._lot_order(mat_qty=0))
+        events = self.bridge.sse_fanout.register()
+        failed = {"ord_no": "A0101", "stock_no": "2330", "ap_code": "1", "org_qty": 5, "cel_qty": 5,
+                  "od_price": 900.0, "ord_status": "4", "price_flag": "4", "err_code": "AG0011", "err_msg": "刪單失敗"}
+        self.assertIsNotNone(self.bridge._handle_ack(dict(failed)))
+        orders = [e for e in _drain(events, timeout=0.3) if e["event"] == "order"]
+        self.assertEqual([e["data"]["op_code"] for e in orders], ["AG0011"])  # still published
+        for rows in (self.bridge.get_orders(refresh=False), self._snapshot(self._lot_order(mat_qty=0))):
+            row = next(r for r in rows if r["ord_no"] == "A0101")
+            self.assertEqual((row["cel_qty"], row["od_price"], row["ord_status"], row["price_flag"]),
+                             (0, 950.0, "2", "0"))
+            self.assertNotEqual(row.get("status"), "Cancelled")
+        self.bridge._handle_ack({**failed, "err_code": "000000", "cel_qty": 3, "od_price": 950.0})
+        row = self.bridge.get_orders(refresh=False)[0]
+        self.assertEqual((row["cel_qty"], row["ord_status"]), (3, "4"))  # a successful ACK still merges
+        row = self._snapshot(self._lot_order(mat_qty=0))[0]
+        self.assertEqual(row["cel_qty"], 3)
+
+    def test_sdk_receives_the_raw_cached_row(self):
+        # PA2-4: modify/cancel hand the SDK the cached raw row, never the effective read view.
+        self._snapshot(self._lot_order(ord_no="F0101", mat_qty=0))
+        self.bridge._handle_ack({"ord_no": "F0101", "stock_no": "2330", "ap_code": "1", "cel_qty": 1})
+        self._snapshot(self._lot_order(ord_no="F0101", mat_qty=0))  # older snapshot: raw cel_qty 0
+        self.bridge._handle_mat({"kind": "MAT", "ord_no": "F0101", "stock_no": "2330", "ap_code": "1",
+                                 "mat_qty": 2, "mat_price": 950.0, "mkt_seq_num": "000901", "mat_time": "093000000"})
+        view = self.bridge.order_book_cache.get("F0101")
+        self.assertEqual((view["mat_qty"], view["cel_qty"], len(view["esun_fills"])), (2, 1, 1))
+        sdk = self.bridge.session.sdk
+        handed: list[dict] = []
+
+        def spy(name):
+            original = getattr(sdk, name)
+
+            def call(order_result, *args, **kwargs):
+                handed.append(dict(order_result))
+                return original(order_result, *args, **kwargs)
+            return call
+
+        bridge_only = {"esun_fills", "mat_qty_share", "cel_qty_share", "status", "deal_qty", "mat_time"}
+        with mock.patch.object(sdk, "modify_price", spy("modify_price")), \
+                mock.patch.object(sdk, "cancel_order", spy("cancel_order")):
+            res, status = self.bridge.replace_price({"order_no": "F0101", "price": 955.0, **self.env})
+            self.assertEqual(status, 200, res)
+            res, status = self.bridge.replace_qty({"order_no": "F0101", "cancel_quantity": 1, "quantity_unit": "lot",
+                                                   **self.env})
+            self.assertEqual(status, 200, res)
+            res, status = self.bridge.cancel_order({"order_no": "F0101", **self.env})
+            self.assertEqual(status, 200, res)
+        self.assertEqual(len(handed), 3)
+        core_sent = [c[1] for c in self.core.calls if c[0] in ("modify_price", "modify_volume")][-3:]
+        for sent in handed + core_sent:
+            self.assertFalse(bridge_only & set(sent), sent)
+            self.assertEqual((sent["mat_qty"], sent["cel_qty"], sent["org_qty"]), (0, 0, 5))
+
     def test_cache_miss_keeps_ord_no_and_pre_ord_no_from_payload(self):
         # R2-02: a reservation that became a regular order (ordNo + preOrdNo) is unknown to the cache.
         payload = {"stockNo": "2330", "apCode": "1", "buySell": "B", "bsFlag": "R", "priceFlag": "0", "trade": "0",
@@ -2453,6 +2510,29 @@ class TestReportEvents(_BridgeCase):
         self.assertEqual(deals[0]["data"]["pre_ord_no"], "R0700")
         self.assertEqual(deals[0]["data"]["ord_no"], "A0700")
         self.assertEqual(deals[1]["data"]["pre_ord_no"], "")
+
+    def test_mat_without_mkt_seq_num_is_published_but_not_counted(self):
+        # PA2-2: still published for the client, never added to the cached fill.
+        self.bridge.order_book_cache.update_from_ack({"ord_no": "A0710", "stock_no": "2330", "ap_code": "1", "org_qty": 2})
+        mat = {"kind": "MAT", "ord_no": "A0710", "stock_no": "2330", "ap_code": "1", "mat_qty": 1, "mat_price": 950.0}
+        with self.assertLogs("esun_trade_server", level="WARNING"):
+            self.assertIsNotNone(self.bridge._handle_mat(dict(mat)))
+            self.assertIsNotNone(self.bridge._handle_mat({**mat, "mkt_seq_num": ""}))
+        deals = [e for e in _drain(self.events, timeout=0.5) if e["event"] == "deal"]
+        self.assertEqual(len(deals), 2)
+        row = self.bridge.order_book_cache.get("A0710")
+        self.assertEqual((row.get("mat_qty", 0), row.get("deal_qty", 0), row["esun_fills"]), (0, 0, []))
+
+    def test_mat_pre_ord_no_is_looked_up_by_ord_no_only(self):
+        # PA2-6: a reservation whose pre_ord_no equals the MAT's ord_no is a different order.
+        self.bridge.order_book_cache.update_from_ack({"pre_ord_no": "A0720", "stock_no": "2330", "ap_code": "1",
+                                                      "org_qty": 1})
+        self.bridge._handle_mat({"kind": "MAT", "ord_no": "A0720", "stock_no": "2330", "ap_code": "1",
+                                 "mat_qty": 1, "mat_price": 950.0, "mkt_seq_num": "000720"})
+        deals = [e for e in _drain(self.events, timeout=0.5) if e["event"] == "deal"]
+        self.assertEqual(len(deals), 1)
+        self.assertIn(deals[0]["data"].get("pre_ord_no"), (None, ""))
+        self.assertEqual(self.bridge.order_book_cache.pre_ord_no_of("A0720"), "")
 
     def test_last_event_id_replay_over_http(self):
         server = create_server(host="127.0.0.1", port=0, bridge=self.bridge, access_policy=AccessPolicy())
@@ -2856,6 +2936,53 @@ class TestOrderBookCacheEventQuantities(unittest.TestCase):
         view = self.cache.get("A0001")
         self.assertEqual((view["mat_qty"], view["cel_qty"], view["status"]), (2, 3, "Cancelled"))
 
+    def test_mat_without_mkt_seq_num_is_not_counted(self):
+        # PA2-2: without mkt_seq_num a MAT cannot be deduplicated, so it never enters the cached counts.
+        self._snapshot(self._row())
+        with self.assertLogs("esun_trade_server", level="WARNING") as logs:
+            self.assertTrue(self._mat(None, account="88401234567"))
+            self.assertTrue(self._mat("", account="88401234567"))
+        self.assertNotIn("88401234567", "\n".join(logs.output))
+        self.assertNotIn("1234567", "\n".join(logs.output))
+        for view in self._views():
+            self.assertEqual((view["mat_qty"], view["esun_fills"]), (0, []))
+            self.assertNotIn("status", view)
+        self.assertTrue(self._mat("001"))
+        self.assertEqual(self.cache.get("A0001")["mat_qty"], 2)
+
+    def test_rows_list_applied_fills_across_snapshots(self):
+        # PA2-3: esun_fills = the MATs applied in this cache generation, in receive order.
+        self._snapshot(self._row())
+        for view in self._views():
+            self.assertEqual(view["esun_fills"], [])
+        self._mat("001", mat_qty=2, mat_price=950.0)
+        self._mat("002", mat_qty=1, mat_price="951.5")
+        self.assertFalse(self._mat("001"))  # duplicate: not listed twice
+        self._mat("003", mat_qty=1, mat_price=0)  # no usable price
+        self._snapshot(self._row(mat_qty=1))  # older snapshot
+        expected = [
+            {"mkt_seq_num": "001", "mat_qty_share": 2000, "mat_price": 950},
+            {"mkt_seq_num": "002", "mat_qty_share": 1000, "mat_price": 951.5},
+            {"mkt_seq_num": "003", "mat_qty_share": 1000, "mat_price": None},
+        ]
+        for view in self._views():
+            self.assertEqual(view["esun_fills"], expected)
+            self.assertEqual((view["mat_qty"], view["mat_qty_share"]), (4, 4000))  # max(1 lot, sum of fills)
+        self._views()[0]["esun_fills"].clear()  # reads are copies
+        self._snapshot(self._row(mat_qty=5))  # snapshot above the fills total wins
+        view = self.cache.get("A0001")
+        self.assertEqual((view["mat_qty"], view["esun_fills"]), (5, expected))
+        self.cache.reset(8)  # new cache generation
+        self.cache.update_from_order_results([self._row()], generation=8)
+        self.assertEqual(self.cache.get("A0001")["esun_fills"], [])
+
+    def test_odd_lot_fills_are_in_shares(self):
+        self._snapshot(self._row(ap_code="5", org_qty=0.1, org_qty_share=100, mat_qty=0.0, mat_qty_share=0))
+        self._mat("001", ap_code="5", mat_qty=30, mat_price=101.0)
+        self._mat("002", ap_code="5", mat_qty=0.02, mat_price=101.5)
+        fills = self.cache.get("A0001")["esun_fills"]
+        self.assertEqual([(f["mkt_seq_num"], f["mat_qty_share"]) for f in fills], [("001", 30), ("002", 20)])
+
     def test_refresh_false_serves_event_quantities(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.dict(os.environ, {"ESUN_ACCOUNT_PASSWORD": "pw", "ESUN_CERT_PASSWORD": "cpw",
@@ -3044,17 +3171,29 @@ class TestGracefulShutdownMutations(_BridgeCase):
         self.assertTrue(entered.wait(5))
 
         make_shutdown_handler(server, bridge)(15, None)  # SIGTERM
+        self.assertTrue(_wait_until(bridge.is_shutting_down))
+        try:
+            # PA2-5: during the grace period the server still accepts and answers new requests.
+            status, _, data = self._post(port, self.body)
+            self.assertEqual((status, data["code"], data["outcome"]), (503, "ESUN_SHUTTING_DOWN", "not_sent"))
+            status, _, data = _raw_request(port, "GET", "/esun/stream/orders")
+            self.assertEqual((status, data["code"]), (503, "ESUN_SHUTTING_DOWN"))
+            self.assertTrue(serve_thread.is_alive(), "accept loop runs until in-flight mutations finished")
+            self.assertEqual(sdk.ws_close_calls, 0)
+        finally:
+            release.set()
         serve_thread.join(5)
-        self.assertFalse(serve_thread.is_alive(), "accept loop stops first")
-        threading.Timer(0.3, release.set).start()
+        self.assertFalse(serve_thread.is_alive(), "accept loop stops after the grace period")
         bridge.shutdown()  # main(): returns only after the in-flight mutation answered
         timeline.append("shutdown_returned")
         client.join(5)
+        self.assertTrue(_wait_until(lambda: server.socket.fileno() == -1), "listening socket closed at once")
         server.server_close()
         self.assertEqual(timeline, ["placed(ws_close_calls=0)", "shutdown_returned"])
         status, _, data = responses[0]
         self.assertEqual((status, data["outcome"]), (200, "accepted"))
         self.assertGreaterEqual(sdk.ws_close_calls, 1)  # WebSocket closed after the mutation
+        self.assertEqual(len(sdk.placed_orders), 1)  # the request refused during the grace never reached the SDK
 
     def test_shutdown_grace_is_bounded(self):
         entered, release = threading.Event(), threading.Event()

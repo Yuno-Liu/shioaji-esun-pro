@@ -1181,6 +1181,9 @@ class OrderBookCache:
       (largest cumulative ACK cancel) across snapshots; every read reports
       max(snapshot, event) for the filled / cancelled quantities, so a snapshot that started
       before a report never rolls the row back.
+    - Only successful ACKs (op_code '' / all zeros) change a row; a MAT counts only with a
+      mkt_seq_num. Every read lists the applied MATs as `esun_fills` (receive order).
+    - Mutations hand the SDK the raw row (snapshot / successful ACK values), never the read view.
     """
 
     # ACK fields that describe the report itself rather than the order state.
@@ -1274,12 +1277,15 @@ class OrderBookCache:
 
     @staticmethod
     def _new_meta(now: float) -> dict:
-        return {"created": now, "seen_mat": set(), "event_mat_shares": 0, "event_cel_shares": 0}
+        return {"created": now, "seen_mat": set(), "fills": [], "event_mat_shares": 0, "event_cel_shares": 0}
 
     @staticmethod
     def _carry_event_meta(target: dict, old: dict) -> None:
         """Report-derived state outlives snapshots (same lifetime as seen_mat)."""
         target["seen_mat"] |= set(old.get("seen_mat") or ())
+        old_fills = list(old.get("fills") or ())
+        old_seqs = {fill["mkt_seq_num"] for fill in old_fills}
+        target["fills"] = old_fills + [f for f in target.get("fills") or () if f["mkt_seq_num"] not in old_seqs]
         for key in ("event_mat_shares", "event_cel_shares"):
             target[key] = max(target.get(key) or 0, old.get(key) or 0)
 
@@ -1288,9 +1294,11 @@ class OrderBookCache:
         Copy of a row whose filled / cancelled quantities are max(row, reports received): written
         back as mat_qty / cel_qty (lots; fractional lots for odd-lot classes) and *_qty_share
         (shares). Lot rows get their bridge-only status re-derived from the effective quantities.
+        `esun_fills` lists the MATs applied in this cache generation (receive order).
         """
         row = dict(self._orders[internal_id])
         meta = self._meta.get(internal_id) or {}
+        row["esun_fills"] = [dict(fill) for fill in meta.get("fills") or ()]
         ap_code = _row_ap_code(row)
         changed = False
         for base in ("mat", "cel"):
@@ -1371,6 +1379,10 @@ class OrderBookCache:
             ord_no, pre_ord_no = _order_keys(ack_data)
             internal_id = self._find_locked(ord_no, pre_ord_no)
             previous = dict(self._orders[internal_id]) if internal_id else None
+            if normalize_report_status(ack_data)[0] not in ("", "00"):
+                # A failed ACK (e.g. a rejected cancel still carrying the requested cel_qty) reports
+                # the request, not the order: published as is, but the row and its counts stay.
+                return True, previous
             state = {k: v for k, v in ack_data.items() if k not in self.REPORT_ONLY_KEYS}
             new_id = self._upsert_locked(state, "event")
             if new_id is not None:
@@ -1384,8 +1396,9 @@ class OrderBookCache:
         """
         Applies a MAT deal. Returns False when dropped (other session, or a duplicate of an
         already-applied mkt_seq_num). Quantity fields of the row are never overwritten here; the
-        deal is added to event_mat_shares (in shares, see esun_quantity_from_fields) and applied on
-        read. Bridge-only deal_qty/status are kept.
+        deal is added to event_mat_shares (in shares, see esun_quantity_from_fields) and to the
+        row's fills, applied on read. Bridge-only deal_qty/status are kept. A MAT without
+        mkt_seq_num cannot be deduplicated: it is published (True) but never counted.
         """
         if not isinstance(mat_data, dict):
             return False
@@ -1406,16 +1419,24 @@ class OrderBookCache:
                         self._orphan_mats.popitem(last=False)
                 return True
             meta = self._meta[internal_id]
-            if seq:
-                if seq in meta["seen_mat"]:
-                    return False
-                meta["seen_mat"].add(seq)
+            if seq and seq in meta["seen_mat"]:
+                return False
             meta["source"] = "event"
             meta["updated"] = time.monotonic()
+            if not seq:
+                logger.warning(f"[WebSocket] 成交回報缺少 mkt_seq_num，無法去重，不計入快取成交量（ord_no={ord_no}）")
+                return True
+            meta["seen_mat"].add(seq)
             target = self._orders[internal_id]
             mat_shares = mat_report_shares(mat_data, _row_ap_code(mat_data, target))
             if mat_shares:
                 meta["event_mat_shares"] = (meta.get("event_mat_shares") or 0) + mat_shares
+                price = _js_finite_number(_first_present(mat_data, "mat_price", "matPrice"))
+                meta["fills"].append({
+                    "mkt_seq_num": seq,
+                    "mat_qty_share": mat_shares,
+                    "mat_price": _num_out(price) if price is not None and price > 0 else None,
+                })
             qty = _to_number(
                 mat_data.get("mat_qty") or mat_data.get("matQty") or mat_data.get("deal_qty")
                 or mat_data.get("dealQty") or mat_data.get("qty")
@@ -1461,6 +1482,26 @@ class OrderBookCache:
                 return None, None
             meta = self._meta.get(internal_id) or {}
             return self._effective_row_locked(internal_id), {"source": meta.get("source"), "created": meta.get("created")}
+
+    def get_for_mutation(self, order_id: str) -> tuple[dict | None, dict | None, dict | None]:
+        """(raw row, read view, meta) under one lock: the SDK gets the raw row, checks use the view."""
+        with self.lock:
+            self._roll_day_locked()
+            internal_id = self._lookup_locked(order_id)
+            if internal_id is None:
+                return None, None, None
+            meta = self._meta.get(internal_id) or {}
+            return (
+                dict(self._orders[internal_id]),
+                self._effective_row_locked(internal_id),
+                {"source": meta.get("source"), "created": meta.get("created")},
+            )
+
+    def pre_ord_no_of(self, ord_no: str) -> str:
+        """pre_ord_no of the row indexed by this ord_no (never falls back to the pre_ord_no index)."""
+        with self.lock:
+            internal_id = self._ord_no_map.get(str(ord_no or "").strip())
+            return _order_keys(self._orders[internal_id])[1] if internal_id else ""
 
     def get_all(self) -> list[dict]:
         with self.lock:
@@ -2215,6 +2256,8 @@ class EsunTradeBridge:
         self._shutdown_event = threading.Event()
         self._shutdown_lock = threading.Lock()  # first shutdown() caller does the work, others wait
         self._shutdown_complete = False
+        self._drain_lock = threading.Lock()  # first drain_mutations() caller waits, others share its result
+        self._drained: bool | None = None
         self._mutations_cond = threading.Condition()  # guards _mutations_in_flight + the shutdown flag
         self._mutations_in_flight = 0
         self._generation_seq = session_generation_base()
@@ -2360,18 +2403,30 @@ class EsunTradeBridge:
                 self._mutations_cond.wait(remaining)
             return True
 
+    def drain_mutations(self) -> bool:
+        """
+        begin_shutdown(), then gives in-flight mutations up to SHUTDOWN_MUTATION_GRACE_SECONDS to
+        finish and answer (once: later callers wait for and share the first result). The HTTP
+        server keeps accepting meanwhile, so new requests get 503 ESUN_SHUTTING_DOWN (not_sent).
+        """
+        with self._drain_lock:
+            if self._drained is None:
+                self.begin_shutdown()
+                self._drained = self._wait_for_mutations(SHUTDOWN_MUTATION_GRACE_SECONDS)
+                if not self._drained:
+                    logger.warning("關閉時仍有委託請求未完成（已等待 %.0f 秒），其結果需以委託查詢確認", SHUTDOWN_MUTATION_GRACE_SECONDS)
+            return self._drained
+
     def shutdown(self) -> None:
         """
-        Graceful shutdown: refuse new mutations, give in-flight ones up to
-        SHUTDOWN_MUTATION_GRACE_SECONDS to finish and answer, then close the WebSocket and SSE.
+        Graceful shutdown: drain_mutations() (refuse new mutations, in-flight ones finish and
+        answer, max SHUTDOWN_MUTATION_GRACE_SECONDS), then close the WebSocket and SSE.
         Concurrent callers block until the first one has finished.
         """
         with self._shutdown_lock:
             if self._shutdown_complete:
                 return
-            self.begin_shutdown()
-            if not self._wait_for_mutations(SHUTDOWN_MUTATION_GRACE_SECONDS):
-                logger.warning("關閉時仍有委託請求未完成（已等待 %.0f 秒），其結果需以委託查詢確認", SHUTDOWN_MUTATION_GRACE_SECONDS)
+            self.drain_mutations()
             with self._state_lock:
                 runtime = self._ws_runtime
                 session = self._session
@@ -2893,8 +2948,7 @@ class EsunTradeBridge:
         ord_no, pre_ord_no = _order_keys(data)
         if ord_no and not pre_ord_no:
             # A converted reservation keeps pre_ord_no as its client id; MAT only carries ord_no.
-            cached = self.order_book_cache.get(ord_no)
-            cached_pre = _order_keys(cached)[1] if cached else ""
+            cached_pre = self.order_book_cache.pre_ord_no_of(ord_no)
             if cached_pre:
                 payload["pre_ord_no"] = cached_pre
         return self.sse_fanout.publish(
@@ -3174,7 +3228,7 @@ class EsunTradeBridge:
         ("work_date", ("workDate", "work_date")),
     )
     # Bridge-side bookkeeping fields that are not part of the SDK's order result.
-    _BRIDGE_ONLY_ORDER_KEYS = frozenset({"deal_qty", "status", "mat_time"})
+    _BRIDGE_ONLY_ORDER_KEYS = frozenset({"deal_qty", "status", "mat_time", "esun_fills"})
 
     def _mutation_prelude(self, body: any) -> tuple[EsunSession | None, tuple[dict, int] | None]:
         if not isinstance(body, dict):
@@ -3274,15 +3328,18 @@ class EsunTradeBridge:
             "sessionGeneration": session.generation,
         }, 200
 
-    def _resolve_order(self, order_no: str, body: dict) -> tuple[dict, dict | None, dict, bool]:
+    def _resolve_order(self, order_no: str, body: dict) -> tuple[dict, dict | None, dict, bool, dict]:
         """
         Cached order merged with payload hints. The payload only fills fields the cache lacks and
         never supplies quantities (their units differ between lots and odd-lot shares).
-        Returns (order, cache_meta, payload, known_in_cache).
+        Returns (order, cache_meta, payload, known_in_cache, sdk_order): `order` is the read view
+        (effective quantities) for the checks; `sdk_order` is the raw cached row plus the same
+        hints, the only form handed to the SDK.
         """
         payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
-        cached, meta = self.order_book_cache.get_with_meta(order_no)
+        raw, cached, meta = self.order_book_cache.get_for_mutation(order_no)
         order = dict(cached) if cached else {}
+        sdk_order = self._sdk_order_dict(raw or {})
         normalizers = {
             "buy_sell": to_action,
             "ap_code": to_ap_code,
@@ -3314,9 +3371,11 @@ class EsunTradeBridge:
             else:
                 value = str(value).strip()
             order[field] = value
+            sdk_order[field] = value
         if not order.get("ord_no") and not order.get("pre_ord_no"):
             order["ord_no"] = order_no
-        return order, meta, payload, cached is not None
+            sdk_order["ord_no"] = order_no
+        return order, meta, payload, cached is not None, sdk_order
 
     @staticmethod
     def _require_order_details(order: dict) -> None:
@@ -3447,7 +3506,7 @@ class EsunTradeBridge:
             if flag == "4":
                 raise EsunValidationError("不可將委託改為市價 (O00019)，請刪單後重新下單", "AG_INVALID_PRICE_MODIFY")
             price = parse_price(body.get("price")) if flag == "0" else None
-            order, _meta, payload, _known = self._resolve_order(order_no, body)
+            order, _meta, payload, _known, sdk_order = self._resolve_order(order_no, body)
             # Reservation Guard (AG0006)
             if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
                 raise EsunValidationError("預約單不可改單 (AG0006)，請先刪單後重新下單", "AG0006")
@@ -3469,7 +3528,6 @@ class EsunTradeBridge:
         refusal = self._consume_mutation_quota()
         if refusal:
             return refusal
-        sdk_order = self._sdk_order_dict(order)
         envelope, status = self._call_sdk_mutation(
             session, "改價", lambda: session.sdk.modify_price(sdk_order, target_price=price, price_flag=price_flag)
         )
@@ -3516,7 +3574,7 @@ class EsunTradeBridge:
         try:
             order_no = parse_order_no(body)
             cancel_quantity, unit = self._parse_cancel_quantity(body)
-            order, meta, payload, known = self._resolve_order(order_no, body)
+            order, meta, payload, known, sdk_order = self._resolve_order(order_no, body)
             # Reservation Guard (AG0006)
             if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
                 raise EsunValidationError("預約單不可改單 (AG0006)，請先刪單後重新下單", "AG0006")
@@ -3544,7 +3602,6 @@ class EsunTradeBridge:
         if refusal:
             return refusal
         kwargs = {"cel_qty": cancel_quantity} if unit == "lot" else {"cel_qty_share": cancel_quantity}
-        sdk_order = self._sdk_order_dict(order)
         envelope, status = self._call_sdk_mutation(session, "改量", lambda: session.sdk.cancel_order(sdk_order, **kwargs))
         if envelope.get("outcome") == "accepted":
             self._safe_mark_event(session, order_no)
@@ -3557,14 +3614,13 @@ class EsunTradeBridge:
             return refusal
         try:
             order_no = parse_order_no(body)
-            order, _meta, _payload, _known = self._resolve_order(order_no, body)
+            order, _meta, _payload, _known, sdk_order = self._resolve_order(order_no, body)
             self._require_order_details(order)
         except EsunValidationError as e:
             return not_sent(e.status, e.code, str(e))
         refusal = self._consume_mutation_quota()
         if refusal:
             return refusal
-        sdk_order = self._sdk_order_dict(order)
         # sdk.cancel_order without cel_qty cancels all
         envelope, status = self._call_sdk_mutation(session, "刪單", lambda: session.sdk.cancel_order(sdk_order))
         if envelope.get("outcome") == "accepted":
@@ -4409,9 +4465,11 @@ def create_server(
 def make_shutdown_handler(server: ThreadingHTTPServer, bridge: EsunTradeBridge) -> any:
     """
     Builds the SIGTERM/SIGINT handler. From a helper thread (calling server.shutdown() on the
-    serve_forever thread deadlocks): refuse new mutations -> stop accepting connections ->
-    bridge.shutdown() (in-flight mutations finish and answer, max SHUTDOWN_MUTATION_GRACE_SECONDS,
-    then WebSocket / SSE close). main() calls bridge.shutdown() too, which waits for this one.
+    serve_forever thread deadlocks): refuse new mutations / SSE (503, still accepting and answering)
+    -> in-flight mutations finish and answer (max SHUTDOWN_MUTATION_GRACE_SECONDS) -> stop
+    accepting -> close the listening socket at once (late connections fail fast instead of
+    hanging in the backlog) -> WebSocket / SSE close. main() calls bridge.shutdown() too, which
+    waits for this one.
     """
     started = threading.Event()
 
@@ -4424,7 +4482,9 @@ def make_shutdown_handler(server: ThreadingHTTPServer, bridge: EsunTradeBridge) 
         def _stop() -> None:
             bridge.begin_shutdown()
             try:
+                bridge.drain_mutations()
                 server.shutdown()
+                server.server_close()
             finally:
                 bridge.shutdown()
 
@@ -4486,8 +4546,8 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        server.server_close()  # idempotent; closes the listening socket before WebSocket / SSE
         bridge.shutdown()
-        server.server_close()
         logger.info("伺服器已正常停止")
     return 0
 
