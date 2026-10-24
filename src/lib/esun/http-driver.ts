@@ -44,6 +44,8 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 /** 委託送出後的等待上限：逾時只代表「不知道」，絕不當成未送出 */
 export const ESUN_MUTATION_TIMEOUT_MS = 15_000;
 const QUERY_TIMEOUT_MS = 15_000;
+/** 委託查詢：bridge 的 refresh=true 可能先等間隔與每分鐘額度（最多約 12 秒）再呼叫 SDK */
+export const ESUN_ORDERS_QUERY_TIMEOUT_MS = 30_000;
 
 /** 舊版 bridge（無信封）在呼叫 SDK 之前就回絕的錯誤碼 */
 const PRE_DISPATCH_CODES = new Set([
@@ -68,6 +70,8 @@ interface EsunBridgeErrorDetail {
     timedOut?: boolean;
     environment?: string;
     result?: unknown;
+    /** bridge 建議的重試等待（秒；429 的 retry_after 或 Retry-After） */
+    retryAfter?: number;
 }
 
 /**
@@ -84,11 +88,13 @@ export class EsunBridgeError extends Error {
     declare readonly httpStatus?: number;
     declare readonly environment?: string;
     declare readonly result?: unknown;
+    declare readonly retryAfter?: number;
     constructor(message: string, readonly status: number, detail: EsunBridgeErrorDetail = {}) {
         super(message);
         this.name = 'EsunBridgeError';
         const extra: Record<string, unknown> = {};
         if (detail.code) extra.code = detail.code;
+        if (detail.retryAfter !== undefined && Number.isFinite(detail.retryAfter) && detail.retryAfter >= 0) extra.retryAfter = detail.retryAfter;
         if (detail.outcome) extra.outcome = detail.outcome;
         if (detail.environment) extra.environment = detail.environment;
         if (detail.result !== undefined) extra.result = detail.result;
@@ -119,6 +125,13 @@ function messageOf(data: unknown, fallback: string): string {
 
 function codeOf(data: unknown): string | undefined {
     return isRecord(data) && typeof data.code === 'string' && data.code ? data.code : undefined;
+}
+
+/** 429／503 的建議等待秒數：body 的 retry_after 優先，其次 Retry-After 標頭（秒） */
+function retryAfterOf(res: Response, data: unknown): number | undefined {
+    const raw = isRecord(data) && data.retry_after !== undefined ? data.retry_after : res.headers?.get?.('Retry-After');
+    const n = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw) : NaN;
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
 /** 舊版 bridge（沒有 outcome 欄位）的錯誤分類 */
@@ -191,6 +204,7 @@ export class HttpEsunDriver implements IEsunTradeDriver {
             throw new EsunBridgeError(messageOf(data, `HTTP ${res.status}`), res.status, {
                 code: codeOf(data),
                 environment: isRecord(data) && typeof data.environment === 'string' ? data.environment : undefined,
+                retryAfter: retryAfterOf(res, data),
             });
         }
         return data as T;
@@ -328,7 +342,7 @@ export class HttpEsunDriver implements IEsunTradeDriver {
      * （節流、未登入、SDK 失敗時退回快取）就視為讀取失敗，不能當成券商回讀。
      */
     async getOrders(refresh = false): Promise<EsunOrderResult[]> {
-        const raw = await this.request<unknown>('GET', `/esun/orders?refresh=${refresh ? 'true' : 'false'}`);
+        const raw = await this.request<unknown>('GET', `/esun/orders?refresh=${refresh ? 'true' : 'false'}`, undefined, ESUN_ORDERS_QUERY_TIMEOUT_MS);
         if (Array.isArray(raw)) return raw as EsunOrderResult[];
         if (isRecord(raw) && Array.isArray(raw.orders)) {
             const cached = raw.source === 'cache' || raw.refreshed === false;

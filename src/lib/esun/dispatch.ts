@@ -135,10 +135,27 @@ export function esunQuickOrderProblem(
 
 // ---- 刪單（刪單確認） ----
 
+/** 確認回讀遇到 bridge 的 refresh 節流（429 AGR0005）時，依 retry_after 最多等這麼久再重讀一次 */
+export const ESUN_CONFIRM_RETRY_MAX_MS = 6_000;
+
+/** refresh 節流（429 AGR0005）時依 retry_after（上限 6 秒）重讀一次；其他錯誤照原樣丟出 */
+async function readThroughThrottle<T>(read: () => Promise<T>): Promise<T> {
+    try {
+        return await read();
+    } catch (error) {
+        const e = error as { status?: unknown; code?: unknown; retryAfter?: unknown } | null;
+        if (e?.status !== 429 || e.code !== 'AGR0005') throw error;
+        const seconds = typeof e.retryAfter === 'number' && Number.isFinite(e.retryAfter) ? e.retryAfter : Number.POSITIVE_INFINITY;
+        const waitMs = Math.min(ESUN_CONFIRM_RETRY_MAX_MS, Math.max(0, seconds * 1000));
+        await new Promise<void>(resolve => { globalThis.setTimeout(resolve, waitMs); });
+        return read();
+    }
+}
+
 /**
  * 玉山刪單：送出後以同帳戶回讀確認（CONTEXT「刪單確認」）。bridge 委託快取不是券商回讀，
- * 一律直接做一次 refresh:true；回讀不到 Cancelled 且取消量涵蓋剩餘量就丟出 CANCEL_UNCONFIRMED
- * （結果未知，不重送）。
+ * 一律直接做一次 refresh:true（遇到 refresh 節流時依 retry_after 重讀一次）；回讀不到 Cancelled
+ * 且取消量涵蓋剩餘量就丟出 CANCEL_UNCONFIRMED（結果未知，不重送）。
  */
 export async function cancelEsunOrder(
     before: Trade,
@@ -162,7 +179,8 @@ export async function cancelEsunOrder(
             assertAccountListed(account);
             if (esunTradeService.getSessionGeneration() !== generation) throw new Error('刪單後玉山 session 已變更');
         },
-        readTrades: refresh => esunTradeService.fetchTrades(account, refresh),
+        // 全部刪單／全平並取消先做過 refresh:true：確認回讀可能落在 bridge 的間隔內
+        readTrades: refresh => readThroughThrottle(() => esunTradeService.fetchTrades(account, refresh)),
         readHealth: async () => esunCacheHealth(),
         batch: opts.batch,
     });
