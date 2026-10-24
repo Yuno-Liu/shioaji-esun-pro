@@ -1,7 +1,6 @@
 // vite.config.ts
 
 import fs from 'node:fs';
-import net from 'node:net';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { buildVersionLabel } from './src/lib/build-version';
@@ -24,201 +23,6 @@ const modulesAllowDir = path.dirname(fs.realpathSync(modulesTarget));
 const pkg = JSON.parse(
     fs.readFileSync(path.resolve(__dirname, 'package.json'), 'utf8'),
 ) as { version?: string };
-
-function esunConfigDiscoveryPlugin() {
-    const SIM_CANDIDATES = ['esun-config.simulation.ini', 'esun-config.sim.ini', 'esun-config.test.ini'];
-    const PROD_CANDIDATES = ['esun-config.production.ini', 'esun-config.prod.ini'];
-    const SIM_ENTRY = 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1';
-    const PROD_ENTRY = 'https://esuntradingapi.esunsec.com.tw/api/v1';
-
-    function isPlaceholder(filepath: string): boolean {
-        try {
-            const content = fs.readFileSync(filepath, 'utf8');
-            return /YOUR_API_KEY/i.test(content) && /1234567/i.test(content);
-        } catch {
-            return false;
-        }
-    }
-
-    function scanDir(dir: string) {
-        let simPath: string | null = null;
-        let prodPath: string | null = null;
-
-        for (const f of SIM_CANDIDATES) {
-            const p = path.resolve(dir, f);
-            if (fs.existsSync(p)) {
-                simPath = p;
-                break;
-            }
-        }
-        for (const f of PROD_CANDIDATES) {
-            const p = path.resolve(dir, f);
-            if (fs.existsSync(p)) {
-                prodPath = p;
-                break;
-            }
-        }
-
-        // Only fall back to single generic config when NEITHER dedicated simPath NOR prodPath was found!
-        if (!simPath && !prodPath) {
-            const fallback = path.resolve(dir, 'esun-config.ini');
-            if (fs.existsSync(fallback) && !isPlaceholder(fallback)) {
-                try {
-                    const content = fs.readFileSync(fallback, 'utf8');
-                    const isSim = /environment\s*[:=]\s*simulation/i.test(content) || /entry\s*[:=].*simulation/i.test(content);
-                    if (isSim) simPath = fallback;
-                    else prodPath = fallback;
-                } catch {
-                    // ignore
-                }
-            }
-        }
-
-        return { simPath, prodPath };
-    }
-
-    function getDiscovery() {
-        const cwd = process.cwd();
-        let { simPath, prodPath } = scanDir(cwd);
-
-        if (!simPath && !prodPath) {
-            const parentMain = path.resolve(cwd, '../..', 'shioaji-pro-app');
-            if (fs.existsSync(parentMain)) {
-                const parentResult = scanDir(parentMain);
-                simPath = parentResult.simPath;
-                prodPath = parentResult.prodPath;
-            }
-        }
-
-        const simFile = simPath ? path.basename(simPath) : null;
-        const prodFile = prodPath ? path.basename(prodPath) : null;
-        const availableEnvironments: string[] = [];
-        if (simPath) availableEnvironments.push('SIMULATION');
-        if (prodPath) availableEnvironments.push('PRODUCTION');
-
-        const activeEnvironment = simPath ? 'SIMULATION' : (prodPath ? 'PRODUCTION' : 'SIMULATION');
-        const activeConfigFile = simPath ? simFile : prodFile;
-
-        return {
-            ok: true,
-            availableEnvironments,
-            configProfiles: {
-                SIMULATION: {
-                    available: Boolean(simPath),
-                    fileName: simFile,
-                    filePath: simPath,
-                    expectedFileName: 'esun-config.simulation.ini',
-                    aliases: SIM_CANDIDATES,
-                    entry: SIM_ENTRY,
-                },
-                PRODUCTION: {
-                    available: Boolean(prodPath),
-                    fileName: prodFile,
-                    filePath: prodPath,
-                    expectedFileName: 'esun-config.production.ini',
-                    aliases: PROD_CANDIDATES,
-                    entry: PROD_ENTRY,
-                },
-            },
-            activeEnvironment,
-            activeConfigFile,
-        };
-    }
-
-    function checkBridgeRunning(port = 8090): Promise<boolean> {
-        return new Promise((resolve) => {
-            const socket = net.createConnection({ host: '127.0.0.1', port }, () => {
-                socket.destroy();
-                resolve(true);
-            });
-            socket.setTimeout(150);
-            socket.on('timeout', () => {
-                socket.destroy();
-                resolve(false);
-            });
-            socket.on('error', () => {
-                resolve(false);
-            });
-        });
-    }
-
-    return {
-        name: 'esun-config-discovery',
-        configureServer(server: any) {
-            server.middlewares.use(async (req: any, res: any, next: any) => {
-                const pathname = req.url ? req.url.split('?')[0] : '';
-                const bridgePort = Number(process.env.BRIDGE_PORT || 8090);
-
-                if (req.method === 'GET' && pathname === '/esun/config-profiles') {
-                    const running = await checkBridgeRunning(bridgePort);
-                    if (running) {
-                        return next();
-                    }
-                    const data = getDiscovery();
-                    res.statusCode = 200;
-                    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-                    res.end(JSON.stringify(data));
-                    return;
-                }
-
-                if (req.method === 'POST' && (pathname === '/esun/auth/environment' || pathname === '/esun/environment')) {
-                    const running = await checkBridgeRunning(bridgePort);
-                    if (running) {
-                        return next();
-                    }
-
-                    let bodyStr = '';
-                    req.on('data', (chunk: any) => {
-                        bodyStr += chunk;
-                    });
-                    req.on('end', () => {
-                        try {
-                            const body = bodyStr ? JSON.parse(bodyStr) : {};
-                            let target = body.environment;
-                            if (target === undefined && 'simulation' in body) {
-                                target = body.simulation ? 'SIMULATION' : 'PRODUCTION';
-                            }
-                            target = String(target || '').toUpperCase();
-                            const discovery = getDiscovery();
-                            const profile = (discovery.configProfiles as any)[target];
-                            if (!profile || !profile.available) {
-                                const expected = profile?.expectedFileName || `esun-config.${target.toLowerCase()}.ini`;
-                                res.statusCode = 400;
-                                res.setHeader('Content-Type', 'application/json; charset=utf-8');
-                                res.end(JSON.stringify({
-                                    ok: false,
-                                    error: `未提供 ${expected} 設定檔，無法切換至 ${target}`,
-                                    environment: discovery.activeEnvironment,
-                                    availableEnvironments: discovery.availableEnvironments,
-                                }));
-                                return;
-                            }
-
-                            res.statusCode = 200;
-                            res.setHeader('Content-Type', 'application/json; charset=utf-8');
-                            res.end(JSON.stringify({
-                                ok: true,
-                                environment: target,
-                                simulation: target === 'SIMULATION',
-                                entry: profile.entry,
-                                activeConfigFile: profile.fileName,
-                                availableEnvironments: discovery.availableEnvironments,
-                                configProfiles: discovery.configProfiles,
-                            }));
-                        } catch {
-                            res.statusCode = 400;
-                            res.setHeader('Content-Type', 'application/json; charset=utf-8');
-                            res.end(JSON.stringify({ ok: false, error: 'JSON 格式錯誤' }));
-                        }
-                    });
-                    return;
-                }
-
-                next();
-            });
-        },
-    };
-}
 
 export default defineConfig(({ mode, command }) => {
     const env = loadEnv(mode, process.cwd(), '');
@@ -310,7 +114,7 @@ export default defineConfig(({ mode, command }) => {
                     .trim(),
             ),
         },
-        plugins: [vanillaExtractPlugin(), react(), esunConfigDiscoveryPlugin()],
+        plugins: [vanillaExtractPlugin(), react()],
         test: {
             // The desktop overlay is mirrored here for Tauri dev/CI, but its
             // Rust-adjacent Node tests use node:test rather than Vitest.
@@ -340,7 +144,11 @@ export default defineConfig(({ mode, command }) => {
                 // binary、port 21322）— 確保 API/UI 版本相符，不依賴使用
                 // 者自裝在 8080 的 CLI。要打別台時用 VITE_API_TARGET 蓋掉
                 '/api': env.VITE_API_TARGET ?? isolatedApi ?? 'http://127.0.0.1:21322',
-                '/esun': env.VITE_ESUN_BRIDGE_TARGET ?? 'http://127.0.0.1:8090',
+                // fork：玉山橋接（server/esun_trade_server.py）；token 只在代理端注入，瀏覽器不持有
+                '/esun': {
+                    target: env.VITE_ESUN_BRIDGE_TARGET ?? 'http://127.0.0.1:8090',
+                    headers: env.ESUN_BRIDGE_TOKEN ? { 'X-Esun-Bridge-Token': env.ESUN_BRIDGE_TOKEN } : {},
+                },
             },
         },
     };
