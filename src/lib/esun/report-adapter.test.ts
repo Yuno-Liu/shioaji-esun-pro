@@ -206,6 +206,21 @@ describe('MAT → projected fill', () => {
         expect(again[0]!.status.deal_quantity).toBe(2);
     });
 
+    it('takes mkt_seq_num like the bridge (Python `or`): numeric 0 and empty string mean no key', () => {
+        const body = (w: Record<string, unknown>) => (w.data as Record<string, Record<string, unknown>>).StockDeal!;
+        // bridge：str(mkt_seq_num or mktSeqNum or "").strip()
+        expect(body(wire('deal', mat(4, { mkt_seq_num: 0 }))).exchange_seq).toBe('M000123');
+        expect(body(wire('deal', mat(5, { mkt_seq_num: '' }))).exchange_seq).toBe('M000123');
+        expect(body(wire('deal', mat(6, { mkt_seq_num: 0, mktSeqNum: '000420' }))).exchange_seq).toBe('000420');
+        expect(body(wire('deal', mat(7, { mkt_seq_num: '', mktSeqNum: 0 }))).exchange_seq).toBe('M000123');
+        expect(body(wire('deal', mat(8, { mkt_seq_num: 417 }))).exchange_seq).toBe('417');
+        // 兩筆 mkt_seq_num 為 0 的不同成交不會被當成同一筆
+        const rows = projectOrderReport([], normalizeOrderEvent(wire('order', ack(1)))!, [account])! as AccountedTrade[];
+        const first = projectTradeDeal(rows, normalizeOrderEvent(wire('deal', mat(9, { mkt_seq_num: 0, mat_no: 'M1', mat_qty: 1, mat_qty_share: 1000 })))!)!;
+        const second = projectTradeDeal(first, normalizeOrderEvent(wire('deal', mat(10, { mkt_seq_num: 0, mat_no: 'M2', mat_qty: 1, mat_qty_share: 1000 })))!)!;
+        expect(second[0]!.status.deal_quantity).toBe(2);
+    });
+
     it('matches a fill without pre_ord_no to the local reservation order by ord_no', () => {
         // 預約單：本地 id 為 pre_ord_no（P0001），開盤後的 MAT 只帶 ord_no（C0009）
         const reserved = projectOrderReport([], normalizeOrderEvent(wire('order', ack(1, { pre_ord_no: 'P0001', ord_no: 'C0009', order_no: 'C0009' })))!, [account])! as AccountedTrade[];

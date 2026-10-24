@@ -19,7 +19,8 @@ export type EsunStreamStatus = 'idle' | 'connecting' | 'live' | 'down';
 export type EsunStreamSignal =
     | { kind: 'down'; message: string }
     | { kind: 'reconnected' }
-    | { kind: 'resync' }
+    /** bridge 的 resync：reason 為 ws_reconnected 時 cacheRefreshed 表示 bridge 是否已重讀委託快取 */
+    | { kind: 'resync'; reason?: string; cacheRefreshed?: boolean }
     /** 收到但無法轉換的回報（欄位不足、環境未知）：不能投影，需要對帳 */
     | { kind: 'untrackable'; deal: boolean };
 
@@ -232,7 +233,15 @@ export function ensureEsunOrderStream(): void {
         onStreamEvent(SESSION_EVENT, raw => {
             try { esunTradeService.applySession(JSON.parse(raw) as EsunSessionInfo); } catch { /* malformed */ }
         }),
-        onStreamEvent(RESYNC_EVENT, () => signal({ kind: 'resync' })),
+        onStreamEvent(RESYNC_EVENT, raw => {
+            let payload: { reason?: unknown; cacheRefreshed?: unknown } = {};
+            try { payload = (JSON.parse(raw) ?? {}) as typeof payload; } catch { /* malformed: still a resync */ }
+            signal({
+                kind: 'resync',
+                ...(typeof payload.reason === 'string' ? { reason: payload.reason } : {}),
+                ...(typeof payload.cacheRefreshed === 'boolean' ? { cacheRefreshed: payload.cacheRefreshed } : {}),
+            });
+        }),
         onStreamEvent(UNTRACKABLE_EVENT, raw => {
             let deal = false;
             try { deal = (JSON.parse(raw) as { deal?: unknown }).deal === true; } catch { /* malformed */ }

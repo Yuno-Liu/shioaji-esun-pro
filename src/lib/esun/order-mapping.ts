@@ -541,6 +541,46 @@ export function esunQuantityFromFields(
     return Math.round(lots * 1000);
 }
 
+/** Python 的真值判斷：bridge 以 `a or b` 取值，None、0、空字串、False 都視為沒有值 */
+const pyTruthy = (v: unknown): boolean => v !== undefined && v !== null && v !== 0 && v !== '' && v !== false;
+
+/**
+ * MAT 的成交序號，取值規則與 bridge 的去重鍵相同：
+ * `str(mkt_seq_num or mktSeqNum or "").strip()`。數值 0 與空字串視為沒有序號（回 ''）。
+ */
+export function esunMktSeqNum(raw: Record<string, unknown>): string {
+    const value = [raw.mkt_seq_num, raw.mktSeqNum].find(pyTruthy);
+    return value === undefined ? '' : String(value).trim();
+}
+
+type EsunDeal = Trade['status']['deals'][number];
+
+/**
+ * 列上的 esun_fills（bridge 本快取代次內經 MAT 套用的逐筆成交，依接收順序）→ App 單位的逐筆成交。
+ * seq 用 mkt_seq_num（與 SSE 成交的 exchange_seq 相同），所以權威讀取或快取重建時重播的 SSE 成交
+ * 會被 projectTradeDeal 當成重複。整股（ap_code 1、2）的股數必須是 1000 的倍數；缺序號、序號重複、
+ * 數量不是正整數的元素略過（由呼叫端併入彙總成交）。
+ */
+function esunFillDeals(raw: Record<string, unknown>, apCode: string, fallbackPrice: number, ts: number): EsunDeal[] {
+    const fills = Array.isArray(raw.esun_fills) ? raw.esun_fills : [];
+    const lot = esunQuantityUnitFor(apCode) === 'lot';
+    const seen = new Set<string>();
+    const deals: EsunDeal[] = [];
+    for (const fill of fills) {
+        if (!fill || typeof fill !== 'object' || Array.isArray(fill)) continue;
+        const f = fill as Record<string, unknown>;
+        const seq = esunMktSeqNum(f);
+        const shares = finiteNumber(f.mat_qty_share);
+        if (!seq || seen.has(seq) || shares === null || shares <= 0 || !Number.isInteger(shares)) continue;
+        const quantity = lot ? shares / 1000 : shares;
+        if (!Number.isInteger(quantity)) continue;
+        const matPrice = finiteNumber(f.mat_price);
+        seen.add(seq);
+        deals.push({ seq, price: matPrice !== null && matPrice > 0 ? matPrice : fallbackPrice, quantity, ts });
+    }
+    return deals;
+}
+
 /** 台北時間 YYYYMMDD + HHMMSS[mmm] → epoch 秒；缺資料回 undefined */
 export function esunTimestamp(date: unknown, time: unknown): number | undefined {
     const d = String(date ?? '').replace(/-/g, '').trim();
@@ -623,10 +663,15 @@ export function fromEsunOrderResult(
 
     const exchange: Exchange = apCode === EsunApCode.Emg ? 'OES' : (opts.exchangeOf?.(stockNo) ?? 'TSE');
     const orderTs = esunTimestamp(item.ord_date ?? item.ordDate ?? item.work_date ?? item.workDate, item.ord_time ?? item.ordTime);
-    // 委託查詢沒有逐筆成交：以一筆彙總成交（均價）表示，數量與 deal_quantity 一致
-    const deals = matQty > 0
-        ? [{ seq: `${orderId}:agg`, price: avgPrice > 0 ? avgPrice : price, quantity: matQty, ts: orderTs ?? 0 }]
-        : [];
+    // 逐筆成交來自 bridge 的 esun_fills；成交量超出逐筆總和的部分（快照已含、bridge 沒收到 MAT
+    // 的成交）以一筆彙總成交（均價）表示。逐筆總和超過成交量（不符 bridge 契約）時只用彙總。
+    const fallbackPrice = avgPrice > 0 ? avgPrice : price;
+    let fills = matQty > 0 ? esunFillDeals(raw, apCode, fallbackPrice, orderTs ?? 0) : [];
+    if (fills.reduce((sum, d) => sum + d.quantity, 0) > matQty) fills = [];
+    const rest = matQty - fills.reduce((sum, d) => sum + d.quantity, 0);
+    const deals: EsunDeal[] = rest > 0
+        ? [...fills, { seq: `${orderId}:agg`, price: fallbackPrice, quantity: rest, ts: orderTs ?? 0 }]
+        : fills;
 
     return {
         contract: {

@@ -16,6 +16,7 @@ import {
     fromEsunTradeStatusToLimits,
     fromEsunTransactionsToProfitLoss,
     fromEsunTransactionsToProfitLossSummary,
+    esunMktSeqNum,
     isEsunAccount,
     isEsunBroker,
     isReservationOrder,
@@ -641,6 +642,57 @@ describe('fromEsunOrderResponse and fromEsunOrderResult', () => {
         expect(trade.status.status).toBe('Filled');
         expect(trade.order.quantity).toBe(100);
         expect(trade.status.deal_quantity).toBe(100);
+    });
+});
+
+describe('fromEsunOrderResult per-fill deals (esun_fills)', () => {
+    const row = (over: Record<string, unknown> = {}) => ({
+        ord_no: 'C0001', pre_ord_no: '', stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R',
+        trade: '0', od_price: 25.5, org_qty: 5, org_qty_share: 5000, mat_qty: 2, mat_qty_share: 2000, cel_qty: 0, cel_qty_share: 0,
+        avg_price: 25.4, ord_date: '20261023', ord_time: '090512345', ...over,
+    });
+    const deals = (over: Record<string, unknown>) => fromEsunOrderResult(row(over) as EsunOrderResult, esunAccount)!.status.deals
+        .map(d => ({ seq: d.seq, price: d.price, quantity: d.quantity }));
+
+    it('uses mkt_seq_num and mat_price per fill, in lots for common shares', () => {
+        expect(deals({ esun_fills: [
+            { mkt_seq_num: '000417', mat_qty_share: 1000, mat_price: 25.5 },
+            { mkt_seq_num: '000418', mat_qty_share: 1000, mat_price: 25.3 },
+        ] })).toEqual([
+            { seq: '000417', price: 25.5, quantity: 1 },
+            { seq: '000418', price: 25.3, quantity: 1 },
+        ]);
+    });
+
+    it('adds only the part of the fill quantity the fills do not cover as `${id}:agg`', () => {
+        expect(deals({ mat_qty: 3, mat_qty_share: 3000, esun_fills: [{ mkt_seq_num: '000417', mat_qty_share: 1000, mat_price: null }] })).toEqual([
+            { seq: '000417', price: 25.4, quantity: 1 }, // 沒有成交價：用均價
+            { seq: 'C0001:agg', price: 25.4, quantity: 2 },
+        ]);
+    });
+
+    it('folds a fill that is not a whole lot, or has no sequence number, into the aggregate', () => {
+        expect(deals({ esun_fills: [
+            { mkt_seq_num: '000417', mat_qty_share: 1500, mat_price: 25.5 },
+            { mkt_seq_num: 0, mat_qty_share: 500, mat_price: 25.5 },
+        ] })).toEqual([{ seq: 'C0001:agg', price: 25.4, quantity: 2 }]);
+    });
+
+    it('keeps odd-lot fills in shares', () => {
+        expect(deals({ ap_code: '5', org_qty: 0.1, org_qty_share: 100, mat_qty: 0.03, mat_qty_share: 30,
+            esun_fills: [{ mkt_seq_num: '9', mat_qty_share: 30, mat_price: 25.5 }] })).toEqual([{ seq: '9', price: 25.5, quantity: 30 }]);
+    });
+
+    it('keeps the legacy aggregate when the row has no fills, or fills exceed the fill quantity', () => {
+        expect(deals({})).toEqual([{ seq: 'C0001:agg', price: 25.4, quantity: 2 }]);
+        expect(deals({ esun_fills: [{ mkt_seq_num: '1', mat_qty_share: 3000, mat_price: 25.5 }] })).toEqual([{ seq: 'C0001:agg', price: 25.4, quantity: 2 }]);
+    });
+
+    it('reads mkt_seq_num like the bridge (0 and empty string mean none)', () => {
+        expect(esunMktSeqNum({ mkt_seq_num: 0, mktSeqNum: ' 12 ' })).toBe('12');
+        expect(esunMktSeqNum({ mkt_seq_num: '' })).toBe('');
+        expect(esunMktSeqNum({ mkt_seq_num: 0 })).toBe('');
+        expect(esunMktSeqNum({ mkt_seq_num: 7 })).toBe('7');
     });
 });
 

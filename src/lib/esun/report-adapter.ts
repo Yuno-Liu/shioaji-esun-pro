@@ -13,6 +13,7 @@ import type { Exchange } from '../types/contract';
 import type { Account } from '../types/portfolio';
 import {
     esunAccountForEnvironment,
+    esunMktSeqNum,
     esunOrderId,
     esunQuantityFromFields,
     esunTimestamp,
@@ -163,8 +164,9 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
             mat_qty_share: raw.mat_qty_share ?? raw.deal_qty_share,
         }, 'mat', apCode);
         const price = num(raw.mat_price ?? raw.deal_price ?? raw.price);
-        // 成交識別與 bridge 的 MAT 去重鍵（mkt_seq_num）一致，其次才是其他 SDK 欄位與事件 id
-        const seq = str(raw.mkt_seq_num ?? raw.mktSeqNum) || str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no)
+        // 成交識別與 bridge 的 MAT 去重鍵（mkt_seq_num，Python `or` 取值：0、空字串視為沒有）一致，
+        // 其次才是其他 SDK 欄位與事件 id
+        const seq = esunMktSeqNum(raw) || str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no)
             || str(raw.event_id);
         if (quantity === null || quantity <= 0 || price === null || price <= 0) return { kind: 'skip', reason: 'malformed' };
         // 預約單的本地 id 是 pre_ord_no；只帶 ord_no 的成交回報依 ord_no 找回本地同帳戶的委託

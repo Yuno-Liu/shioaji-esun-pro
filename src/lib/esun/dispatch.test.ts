@@ -14,7 +14,9 @@ import { captureServerMode } from '../server-info-store';
 import { MOCK_ESUN_ACCOUNT_ID, MockEsunDriver } from './mock-driver';
 import { esunTradeService } from './service';
 import {
+    ESUN_STALE_CACHE_MESSAGE,
     esunAccountQuery,
+    esunCacheUpsertRow,
     esunConfirmBrokerLabel,
     esunConfirmGuard,
     esunConfirmSimulation,
@@ -118,6 +120,19 @@ describe('trading-state hooks (§5 consumer)', () => {
         emit({ kind: 'resync' });
         expect(hooks.raise).toHaveBeenCalledWith('orders', 'sequence-gap', expect.any(String));
         expect(hooks.checkHealth).toHaveBeenCalledWith('gap');
+        expect(hooks.raise).not.toHaveBeenCalledWith('orders', 'snapshot-boundary', expect.any(String));
+    });
+
+    it('a ws_reconnected resync whose bridge cache was not re-read raises a reason only an authoritative read clears', () => {
+        emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true });
+        expect(hooks.raise).not.toHaveBeenCalledWith('orders', 'snapshot-boundary', expect.any(String));
+        emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: false });
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', ESUN_STALE_CACHE_MESSAGE);
+        hooks.raise.mockClear();
+        emit({ kind: 'resync', reason: 'ws_reconnected' });
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', ESUN_STALE_CACHE_MESSAGE);
+        expect(hooks.raise).not.toHaveBeenCalledWith('positions', 'snapshot-boundary', expect.any(String));
+        expect(hooks.checkHealth).toHaveBeenCalledWith('gap');
     });
 
     it('raises untrackable-event for a report the stream could not convert (positions too for a deal)', () => {
@@ -149,5 +164,36 @@ describe('trading-state hooks (§5 consumer)', () => {
         } finally {
             signals.status = 'live';
         }
+    });
+});
+
+describe('cache rebuild row merge (esunCacheUpsertRow)', () => {
+    const esun = { account_type: 'S', broker_id: '8840', account_id: '1234567', signed: true, username: '', person_id: '' };
+    const row = (deal: number, cancel: number, over: { status?: string; broker?: string } = {}) => {
+        const account = { ...esun, broker_id: over.broker ?? esun.broker_id };
+        return {
+            contract: { code: '2884', security_type: 'STK' as const, exchange: 'TSE' as const, target_code: null },
+            order: { id: 'C0001', seqno: 'C0001', ordno: 'C0001', action: 'Buy' as const, price: 25.5, quantity: 5, order_type: 'ROD' as const, price_type: 'LMT' as const, account },
+            status: { id: 'C0001', status: (over.status ?? (deal > 0 ? 'PartFilled' : 'Submitted')) as 'Submitted', status_code: '', msg: '', order_quantity: 5,
+                deal_quantity: deal, cancel_quantity: cancel, modified_price: 0,
+                deals: deal > 0 ? [{ seq: `d${deal}`, price: 25.5, quantity: deal, ts: 1 }] : [] },
+            account,
+        };
+    };
+
+    it('keeps the larger local fill and cancel quantities and recomputes the status', () => {
+        const merged = esunCacheUpsertRow(row(3, 0), row(2, 0));
+        expect(merged.status).toMatchObject({ deal_quantity: 3, cancel_quantity: 0, status: 'PartFilled', deals: [{ seq: 'd3', quantity: 3 }] });
+        expect(esunCacheUpsertRow(row(3, 2), row(3, 0)).status).toMatchObject({ deal_quantity: 3, cancel_quantity: 2, status: 'Cancelled' });
+        expect(esunCacheUpsertRow(row(5, 0), row(2, 0)).status).toMatchObject({ deal_quantity: 5, status: 'Filled' });
+    });
+
+    it('takes the cache row when it is not behind, for other brokers, or when the two contradict', () => {
+        const cached = row(4, 0);
+        expect(esunCacheUpsertRow(row(3, 0), cached)).toBe(cached);
+        const sinopac = row(2, 0, { broker: '9A95' });
+        expect(esunCacheUpsertRow(row(3, 0, { broker: '9A95' }), sinopac)).toBe(sinopac);
+        const contradicting = row(4, 0);
+        expect(esunCacheUpsertRow(row(0, 3), contradicting)).toBe(contradicting);
     });
 });

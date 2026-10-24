@@ -137,6 +137,19 @@ describe('E.SUN order stream', () => {
         expect(seen.map(s => s.kind)).toEqual(['resync']);
     });
 
+    it('carries the resync reason and cacheRefreshed into the signal', () => {
+        ensureEsunOrderStream();
+        latest().open();
+        latest().fire('resync', { reason: 'ws_reconnected', generation: 1, cacheRefreshed: false }, 'boot1-9');
+        latest().fire('resync', { reason: 'bridge_restarted', bootId: 'boot2' }, 'boot2-1');
+        latest().fire('resync', 'not json', 'boot2-2');
+        expect(seen).toEqual([
+            { kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: false },
+            { kind: 'resync', reason: 'bridge_restarted' },
+            { kind: 'resync' },
+        ]);
+    });
+
     it('recreates a closed EventSource from the last received event id (bridge replays or sends resync)', () => {
         vi.useFakeTimers();
         ensureEsunOrderStream();

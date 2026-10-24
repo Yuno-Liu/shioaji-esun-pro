@@ -355,7 +355,7 @@ export type EsunReconcileScope = 'orders' | 'positions' | 'account';
 
 export interface EsunTradingHooks {
     /** 提出待對帳原因（trading-state 的 raise） */
-    raise(scope: EsunReconcileScope, reason: 'disconnect' | 'sequence-gap' | 'pending-report' | 'untrackable-event', message: string): void;
+    raise(scope: EsunReconcileScope, reason: 'disconnect' | 'sequence-gap' | 'pending-report' | 'untrackable-event' | 'snapshot-boundary', message: string): void;
     /** 玉山帳戶出現、被替換（環境切換）或 bridge 重新登入：清掉離開清單的帳戶資料並立即重讀
      *  （trading-state 在第一次串流連線前不讀，初次讀取本來就會包含目前的帳戶） */
     accountsChanged(): Promise<void>;
@@ -364,6 +364,28 @@ export interface EsunTradingHooks {
 }
 
 let hooks: EsunTradingHooks | null = null;
+
+export const ESUN_STALE_CACHE_MESSAGE = '玉山 bridge 重新連線後未能重讀委託，快取可能缺少斷線期間的成交／取消；請按更新確認';
+
+/**
+ * trading-state 快取重建（refresh:false 的 upsert）合併一筆本地列時的玉山規則：bridge 快取可能落後
+ * 本地投影（bridge 重啟後的快照、沒收到的 MAT），而成交量與取消量在現實中只增不減，所以各取
+ * 本地與快取列的較大值，狀態依合併後的數量重算。非玉山帳戶、快取列不低於本地、或兩者合起來
+ * 超過委託量（資料互相矛盾）時原樣回傳快取列（上游語意）。權威讀取（replace）不經過這裡。
+ */
+export function esunCacheUpsertRow<T extends Trade & { account?: Account }>(local: T, cached: T): T {
+    if (!isEsunAccount(cached.account ?? local.account)) return cached;
+    const deal = Math.max(local.status.deal_quantity, cached.status.deal_quantity);
+    const cancel = Math.max(local.status.cancel_quantity, cached.status.cancel_quantity);
+    if (deal === cached.status.deal_quantity && cancel === cached.status.cancel_quantity) return cached;
+    const quantity = cached.order.quantity;
+    if (deal + cancel > quantity) return cached;
+    let status = cached.status.status;
+    if (deal + cancel >= quantity) status = cancel > 0 ? 'Cancelled' : 'Filled';
+    else if (deal > 0 && status !== 'Failed') status = 'PartFilled';
+    const deals = deal > cached.status.deal_quantity ? local.status.deals : cached.status.deals;
+    return { ...cached, status: { ...cached.status, status, deal_quantity: deal, cancel_quantity: cancel, deals } };
+}
 
 function esunAccountKeys() {
     return esunTradeService.getAccounts().map(a => `${a.account_type}:${a.broker_id}:${a.account_id}`).sort().join('|');
@@ -400,6 +422,11 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
             const message = '玉山回報漏收超過 bridge 補送範圍；以 bridge 委託快取重建中，必要時請手動對帳';
             next.raise('orders', 'sequence-gap', message);
             next.raise('positions', 'sequence-gap', message);
+            // bridge 對券商的 WebSocket 重連後沒能重讀委託（額度用完、查詢失敗）：它的快取缺少斷線
+            // 期間的回報，快取重建不能解除。snapshot-boundary 不在 CACHE_RESYNC_RESOLVES，只有權威讀取能清除
+            if (signal.reason === 'ws_reconnected' && signal.cacheRefreshed !== true) {
+                next.raise('orders', 'snapshot-boundary', ESUN_STALE_CACHE_MESSAGE);
+            }
             void next.checkHealth('gap');
         }
     });
