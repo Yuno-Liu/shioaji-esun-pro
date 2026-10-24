@@ -52,6 +52,12 @@ ensure_bridge_token() {
         warn "找不到 .env，略過 ESUN_BRIDGE_TOKEN 產生"
         return 0
     fi
+    # 與 docker compose 相同：同名鍵重複時最後一行生效（dotenv_value 讀最後一行，這裡也改寫最後一行）
+    local token_re='^[[:space:]]*ESUN_BRIDGE_TOKEN[[:space:]]*=' count last
+    count="$(grep -Ec "$token_re" .env || true)"
+    if [ "$count" -gt 1 ]; then
+        warn "偵測到 .env 有重複的 ESUN_BRIDGE_TOKEN（${count} 行），以最後一行為準（與 docker compose 相同），請刪除多餘的行"
+    fi
     if [ -n "$(dotenv_value ESUN_BRIDGE_TOKEN)" ]; then
         return 0
     fi
@@ -63,12 +69,12 @@ ensure_bridge_token() {
         return 1
     fi
     tmp="$(mktemp "${TMPDIR:-/tmp}/shioaji-env.XXXXXX")"
-    if grep -Eq '^[[:space:]]*ESUN_BRIDGE_TOKEN[[:space:]]*=' .env; then
-        TOKEN="$token" awk -v BINMODE=3 '
-            !done && /^[[:space:]]*ESUN_BRIDGE_TOKEN[[:space:]]*=/ {
+    if [ "$count" -gt 0 ]; then
+        last="$(grep -En "$token_re" .env | tail -n 1 | cut -d: -f1)"
+        TOKEN="$token" awk -v BINMODE=3 -v last="$last" '
+            FNR == last {
                 cr = ($0 ~ /\r$/) ? "\r" : ""
                 print "ESUN_BRIDGE_TOKEN=" ENVIRON["TOKEN"] cr
-                done = 1
                 next
             }
             { print }

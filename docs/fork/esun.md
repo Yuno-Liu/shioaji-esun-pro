@@ -143,6 +143,15 @@ docker compose up -d --build
 nginx 透過 `host.docker.internal` 代理到宿主機。若容器連不到宿主機的 127.0.0.1，可設定 `ESUN_HOST_BRIDGE_BIND=0.0.0.0`
 （橋接仍要求 `ESUN_BRIDGE_TOKEN`）。
 
+- 宿主機橋接的 `ESUN_BRIDGE_TOKEN`、密碼與 `ESUN_ALLOWED_HOSTS` 每次都從 `.env` 重新讀取（同名鍵重複時與 compose 相同，
+  以最後一行為準），只在啟動子程序的當下帶入；腳本結束時會把它改動過的 PowerShell 環境變數還原，同一個視窗重跑或改用
+  全容器模式不會沿用殘留值。執行腳本前自行在 shell 設定的變數優先且會保留。
+- `ESUN_ALLOWED_HOSTS` 未設定時，以 `WEB_SERVER_NAMES`（shell > `.env` > 空）帶入，與容器模式的 compose 對應一致；
+  依[區網存取](#區網存取)設定 `WEB_SERVER_NAMES` 後，宿主機橋接也會接受這些 Host（否則 `/esun/` 會回 421）。
+- **Linux Docker Engine**（非 Docker Desktop）自行在宿主機執行橋接時（模式 B；`-HostBridge` 只支援 Windows）：nginx 以 resolver 在執行期解析
+  `ESUN_BRIDGE_UPSTREAM`，不讀 `/etc/hosts`，compose `extra_hosts` 寫入的 `host.docker.internal` 會解析失敗（`/esun/` 回 502）。
+  請把 `.env` 的 `ESUN_BRIDGE_UPSTREAM` 設為 gateway IP，例如 `http://172.17.0.1:8090`。Docker Desktop（Windows／macOS）不受影響。
+
 ## 安全模型
 
 - **只綁本機**：web 預設發佈到 `127.0.0.1`；`esun-bridge` 只 `expose` 在 compose 內網，不發佈到主機。
