@@ -2296,6 +2296,118 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         row = self._snapshot(self._lot_order(mat_qty=0))[0]
         self.assertEqual(row["cel_qty"], 3)
 
+    @staticmethod
+    def _client_status(row):
+        """Status rule of the client's fromEsunOrderResult (src/lib/esun/order-mapping.ts), lot rows."""
+        org, mat, cel = (float(row.get(k) or 0) for k in ("org_qty", "mat_qty", "cel_qty"))
+        err_code = str(row.get("err_code") or "").strip()
+        ord_status = str(row.get("ord_status") or "").strip()
+        if mat + cel >= org:
+            return "Cancelled" if cel > 0 else "Filled"
+        if (err_code and set(err_code) - {"0"}) or ord_status in ("Fail", "Failed"):
+            return "Failed"
+        if mat > 0:
+            return "PartFilled"
+        if (row.get("pre_ord_no") and not row.get("ord_no")) or ord_status == "PreSubmitted":
+            return "PreSubmitted"
+        return "Submitted"
+
+    def _row(self, ord_no):
+        return next(r for r in self.bridge.get_orders(refresh=False) if ord_no in (r.get("ord_no"), r.get("pre_ord_no")))
+
+    def test_rejected_new_order_ack_marks_the_unconfirmed_row_failed(self):
+        # PA3-1: a failed ACK of an order never confirmed (rejected new order) records the failure.
+        res, status = self._place()
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self._client_status(self._row("A0001")), "Submitted")
+        events = self.bridge.sse_fanout.register()
+        self.assertIsNotNone(self.bridge._handle_ack({
+            "ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "buy_sell": "B", "od_price": 999.0,
+            "price_flag": "4", "org_qty": 1, "before_qty": 0, "after_qty": 0,
+            "err_code": "E0123", "err_msg": "價格超過漲跌幅", "ord_status": "Fail",
+        }))
+        self.assertEqual([e["data"]["op_code"] for e in _drain(events, timeout=0.3) if e["event"] == "order"], ["E0123"])
+        row = self._row("A0001")
+        self.assertEqual((row["err_code"], row["err_msg"], row["ord_status"]), ("E0123", "價格超過漲跌幅", "Fail"))
+        self.assertEqual((row["od_price"], row["price_flag"], row["org_qty"]), (950.0, "0", 1))  # not merged
+        self.assertNotIn("before_qty", row)
+        self.assertEqual(self._client_status(row), "Failed")
+
+    def test_rejected_ack_of_an_unknown_order_builds_a_failure_row(self):
+        # PA3-1: no cached row -> identity / product / side / ap_code / raw quantities / failure fields.
+        self.bridge._handle_ack({
+            "kind": "ACK", "ord_no": "Z0001", "stock_no": "2330", "ap_code": "1", "buy_sell": "S",
+            "work_date": taipei_today_str(), "od_price": 900.0, "price_flag": "0", "bs_flag": "R",
+            "org_qty": 2, "cel_qty": 1, "err_code": "E0999", "err_msg": "暫停交易", "action": "1",
+        })
+        row = self._row("Z0001")
+        self.assertEqual({k: v for k, v in row.items() if k != "esun_fills"}, {
+            "ord_no": "Z0001", "stock_no": "2330", "ap_code": "1", "buy_sell": "S", "work_date": taipei_today_str(),
+            "org_qty": 2, "cel_qty": 1, "err_code": "E0999", "err_msg": "暫停交易",
+        })
+        self.assertEqual(self._client_status(row), "Failed")
+        # the raw cel_qty is not an event quantity: a later snapshot is not lifted by it
+        row = next(r for r in self._snapshot(self._lot_order(ord_no="Z0001", mat_qty=0)) if r["ord_no"] == "Z0001")
+        self.assertEqual(row["cel_qty"], 0)
+
+    def test_rejected_reservation_conversion_marks_the_row_failed(self):
+        # PA3-1: a reservation from the snapshot is not exchange-confirmed; a failed cancel of it is.
+        reservation = self._lot_order(ord_no="", pre_ord_no="P0001", ord_status="1", mat_qty=0)
+        self._snapshot(reservation)
+        self.bridge._handle_ack({"pre_ord_no": "P0001", "stock_no": "2330", "ap_code": "1", "org_qty": 5,
+                                 "before_qty": 5, "after_qty": 0, "err_code": "AG0011", "err_msg": "刪單失敗"})
+        self.assertEqual(self._client_status(self._row("P0001")), "PreSubmitted")  # rejected cancel: unchanged
+        self.assertNotIn("err_code", self._row("P0001"))
+        self.bridge._handle_ack({"pre_ord_no": "P0001", "stock_no": "2330", "ap_code": "1", "org_qty": 5,
+                                 "err_code": "E0123", "err_msg": "價格超過漲跌幅"})
+        row = self._row("P0001")
+        self.assertEqual((row["err_code"], row["ord_status"], row["org_qty"]), ("E0123", "1", 5))
+        self.assertEqual(self._client_status(row), "Failed")
+
+    def test_failed_ack_after_a_successful_ack_leaves_the_row(self):
+        # PA3-1: a successful ACK confirms a locally placed order; later failed ACKs are requests.
+        self._place()
+        self.bridge._handle_ack({"ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "org_qty": 1,
+                                 "ord_status": "2", "err_code": "00000000"})
+        before = self._row("A0001")
+        self.bridge._handle_ack({"ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "org_qty": 1,
+                                 "cel_qty": 1, "ord_status": "4", "err_code": "AG0011", "err_msg": "刪單失敗"})
+        self.assertEqual(self._row("A0001"), before)
+        self.assertEqual(self._client_status(before), "Submitted")
+
+    def test_rejected_price_modify_restores_the_previous_price(self):
+        # PA3-2: the accepted modify writes the new price at once; a failed ACK rolls it back.
+        self._snapshot(self._lot_order(ord_no="D0401", mat_qty=0))
+        body = {"order_no": "D0401", "price": 955.0, **self.env}
+        failed = {"ord_no": "D0401", "stock_no": "2330", "ap_code": "1", "org_qty": 5, "od_price": 955.0,
+                  "before_qty": 5, "after_qty": 5, "err_code": "E0123", "err_msg": "價格超過漲跌幅"}
+        self.assertEqual(self.bridge.replace_price(body)[1], 200)
+        self.assertEqual(self._row("D0401")["od_price"], 955.0)
+        self.bridge._handle_ack(dict(failed))
+        row = self._row("D0401")
+        self.assertEqual((row["od_price"], row["price_flag"]), (950.0, "0"))
+        self.assertNotIn("err_code", row)  # a confirmed order is not failed by its rejected modify
+        # limit-up flag (price not sent): the flag is rolled back too
+        self.assertEqual(self.bridge.replace_price({"order_no": "D0401", "price_flag": "3", **self.env})[1], 200)
+        self.assertEqual(self._row("D0401")["price_flag"], "3")
+        self.bridge._handle_ack(dict(failed))
+        self.assertEqual((self._row("D0401")["od_price"], self._row("D0401")["price_flag"]), (950.0, "0"))
+        # the restored price is modifiable again (no local O00021 against the rejected price)
+        self.assertEqual(self.bridge.replace_price(body)[1], 200)
+        self.bridge._handle_ack({**failed, "err_code": "00000000", "err_msg": ""})
+        self.assertEqual(self._row("D0401")["od_price"], 955.0)
+        self.bridge._handle_ack(dict(failed))  # pending cleared by the successful ACK
+        self.assertEqual(self._row("D0401")["od_price"], 955.0)
+
+    def test_snapshot_drops_the_pending_price(self):
+        # PA3-2: a snapshot after the accepted modify is authoritative; a later failed ACK keeps it.
+        self._snapshot(self._lot_order(ord_no="D0401", mat_qty=0))
+        self.assertEqual(self.bridge.replace_price({"order_no": "D0401", "price": 955.0, **self.env})[1], 200)
+        self._snapshot(self._lot_order(ord_no="D0401", mat_qty=0, od_price=955.0))
+        self.bridge._handle_ack({"ord_no": "D0401", "stock_no": "2330", "ap_code": "1", "org_qty": 5,
+                                 "err_code": "AG0011", "err_msg": "刪單失敗"})
+        self.assertEqual(self._row("D0401")["od_price"], 955.0)
+
     def test_sdk_receives_the_raw_cached_row(self):
         # PA2-4: modify/cancel hand the SDK the cached raw row, never the effective read view.
         self._snapshot(self._lot_order(ord_no="F0101", mat_qty=0))
@@ -2982,6 +3094,16 @@ class TestOrderBookCacheEventQuantities(unittest.TestCase):
         self._mat("002", ap_code="5", mat_qty=0.02, mat_price=101.5)
         fills = self.cache.get("A0001")["esun_fills"]
         self.assertEqual([(f["mkt_seq_num"], f["mat_qty_share"]) for f in fills], [("001", 30), ("002", 20)])
+
+    def test_stacked_price_modifies_restore_the_oldest_value_per_field(self):
+        # PA3-2: a flag-only modify then a price modify; one failed ACK restores both fields.
+        self._snapshot(self._row(od_price=950.0, price_flag="0"))
+        self.cache.mark_event("A0001", generation=7, updates={"price_flag": "3"})
+        self.cache.mark_event("A0001", generation=7, updates={"price_flag": "0", "od_price": 955.0})
+        self.cache.update_from_ack({"ord_no": "A0001", "err_code": "E0123"}, generation=7)
+        row = self.cache.get("A0001")
+        self.assertEqual((row["od_price"], row["price_flag"]), (950.0, "0"))
+        self.assertNotIn("err_code", row)
 
     def test_refresh_false_serves_event_quantities(self):
         with tempfile.TemporaryDirectory() as tmp, \

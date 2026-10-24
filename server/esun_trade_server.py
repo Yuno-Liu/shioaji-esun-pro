@@ -1181,13 +1181,32 @@ class OrderBookCache:
       (largest cumulative ACK cancel) across snapshots; every read reports
       max(snapshot, event) for the filled / cancelled quantities, so a snapshot that started
       before a report never rolls the row back.
-    - Only successful ACKs (op_code '' / all zeros) change a row; a MAT counts only with a
+    - Only successful ACKs (op_code '' / all zeros) change a row's state; a MAT counts only with a
       mkt_seq_num. Every read lists the applied MATs as `esun_fills` (receive order).
+    - meta["acked"]: the order was confirmed (a successful ACK, or a snapshot row that is not
+      failed). A failed ACK of an order not yet confirmed (a rejected new order / reservation
+      conversion) only merges its failure fields (err_code / err_msg / ord_status); a failed ACK of
+      a confirmed order (rejected cancel / modify) leaves the row as is.
+    - An accepted price modify writes the requested price at once and keeps the previous one in
+      meta["pending_price"]: a failed ACK restores it, a successful ACK or a snapshot drops it.
     - Mutations hand the SDK the raw row (snapshot / successful ACK values), never the read view.
     """
 
     # ACK fields that describe the report itself rather than the order state.
     REPORT_ONLY_KEYS = frozenset({"kind", "ret_date", "ret_time", "action", "before_qty", "after_qty", "cel_type"})
+    # Failure fields a failed ACK of an unconfirmed order merges into its row.
+    ACK_FAILURE_KEYS = frozenset({"err_code", "errCode", "err_msg", "errMsg", "ord_status", "ordStatus"})
+    # Row built from a failed ACK of an order missing from the cache: identity, product, side,
+    # ap_code and the raw quantities (never counted as event quantities) plus the failure fields.
+    ACK_FAILURE_ROW_KEYS = ACK_FAILURE_KEYS | frozenset({
+        "ord_no", "ordNo", "pre_ord_no", "preOrdNo", "work_date", "workDate", "ord_date", "ord_time",
+        "stock_no", "stockNo", "buy_sell", "buySell", "ap_code", "apCode",
+        "org_qty", "org_qty_share", "mat_qty", "mat_qty_share", "cel_qty", "cel_qty_share",
+    })
+    # ACK operations that are requests on an existing order (their failure never fails the order).
+    MUTATION_OP_TYPES = frozenset({"Cancel", "ModifyQty", "ModifyPrice"})
+    PENDING_PRICE_KEYS = ("od_price", "price_flag")
+    _ABSENT = object()
 
     def __init__(self):
         self._orders: dict[str, dict] = {}
@@ -1277,11 +1296,15 @@ class OrderBookCache:
 
     @staticmethod
     def _new_meta(now: float) -> dict:
-        return {"created": now, "seen_mat": set(), "fills": [], "event_mat_shares": 0, "event_cel_shares": 0}
+        return {
+            "created": now, "seen_mat": set(), "fills": [], "event_mat_shares": 0, "event_cel_shares": 0,
+            "acked": False, "pending_price": None,
+        }
 
     @staticmethod
     def _carry_event_meta(target: dict, old: dict) -> None:
-        """Report-derived state outlives snapshots (same lifetime as seen_mat)."""
+        """Report-derived state outlives snapshots (same lifetime as seen_mat); pending_price does not."""
+        target["acked"] = bool(target.get("acked") or old.get("acked"))
         target["seen_mat"] |= set(old.get("seen_mat") or ())
         old_fills = list(old.get("fills") or ())
         old_seqs = {fill["mkt_seq_num"] for fill in old_fills}
@@ -1352,7 +1375,9 @@ class OrderBookCache:
             self._ord_no_map, self._pre_ord_no_map = {}, {}
             for order in orders or []:
                 if isinstance(order, dict):
-                    self._upsert_locked(dict(order), "snapshot")
+                    new_id = self._upsert_locked(dict(order), "snapshot")
+                    if new_id is not None and not self._is_failed_row(order):
+                        self._meta[new_id]["acked"] = True
             for old_id, old_order in old_orders.items():
                 meta = old_meta.get(old_id) or {}
                 ord_no, pre_ord_no = _order_keys(old_order)
@@ -1380,8 +1405,7 @@ class OrderBookCache:
             internal_id = self._find_locked(ord_no, pre_ord_no)
             previous = dict(self._orders[internal_id]) if internal_id else None
             if normalize_report_status(ack_data)[0] not in ("", "00"):
-                # A failed ACK (e.g. a rejected cancel still carrying the requested cel_qty) reports
-                # the request, not the order: published as is, but the row and its counts stay.
+                self._apply_failed_ack_locked(internal_id, ack_data)
                 return True, previous
             state = {k: v for k, v in ack_data.items() if k not in self.REPORT_ONLY_KEYS}
             new_id = self._upsert_locked(state, "event")
@@ -1390,7 +1414,48 @@ class OrderBookCache:
                 cel_shares = esun_quantity_shares(ack_data, "cel", _row_ap_code(ack_data, previous))
                 meta = self._meta[new_id]
                 meta["event_cel_shares"] = max(meta.get("event_cel_shares") or 0, cel_shares or 0)
+                meta["acked"] = True
+                meta["pending_price"] = None
             return True, previous
+
+    @staticmethod
+    def _is_failed_row(row: dict) -> bool:
+        """Same rule as the client (isEsunFailureCode / ord_status Fail)."""
+        ord_status = str(row.get("ord_status", row.get("ordStatus")) or "").strip()
+        return normalize_report_status(row)[0] not in ("", "00") or ord_status in ("Fail", "Failed")
+
+    def _apply_failed_ack_locked(self, internal_id: str | None, ack_data: dict) -> None:
+        """
+        A failed ACK reports the request, not the order (e.g. a rejected cancel still carries the
+        requested cel_qty): quantities, prices and counts never change. A pending price modify is
+        rolled back. Only when the order was never confirmed (or is still a reservation) and the
+        ACK is not a cancel / modify request, the failure itself is recorded so reads show it Failed.
+        """
+        meta = self._meta.get(internal_id) if internal_id else None
+        if meta is not None and meta.get("pending_price"):
+            row = self._orders[internal_id]
+            for key, value in meta["pending_price"].items():
+                if value is self._ABSENT:
+                    row.pop(key, None)
+                else:
+                    row[key] = value
+            meta["pending_price"] = None
+            meta["updated"] = time.monotonic()
+            return  # attributed to the in-flight modify: the order itself stays as it was
+        row = self._orders.get(internal_id) if internal_id else None
+        if meta is not None and meta.get("acked") and not self.is_reservation(row):
+            return
+        if derive_ack_op_type(ack_data, row) in self.MUTATION_OP_TYPES:
+            return
+        keys = self.ACK_FAILURE_KEYS if row is not None else self.ACK_FAILURE_ROW_KEYS
+        failure = {k: v for k, v in ack_data.items() if k in keys}
+        if row is not None:
+            row.update(failure)
+            meta = self._meta.setdefault(internal_id, self._new_meta(time.monotonic()))
+            meta["source"] = "event"
+            meta["updated"] = time.monotonic()
+        else:
+            self._upsert_locked(failure, "event")
 
     def update_from_mat(self, mat_data: dict, generation: int | None = None) -> bool:
         """
@@ -1462,9 +1527,17 @@ class OrderBookCache:
             internal_id = self._lookup_locked(order_id)
             if internal_id is None:
                 return
-            if updates:
-                self._orders[internal_id].update(updates)
+            row = self._orders[internal_id]
             meta = self._meta.setdefault(internal_id, self._new_meta(time.monotonic()))
+            if updates:
+                price_keys = [k for k in self.PENDING_PRICE_KEYS if k in updates]
+                if price_keys:
+                    # The oldest unconfirmed value per field: what the row returns to if rejected.
+                    pending = dict(meta.get("pending_price") or {})
+                    for key in price_keys:
+                        pending.setdefault(key, row.get(key, self._ABSENT))
+                    meta["pending_price"] = pending
+                row.update(updates)
             meta["source"] = "event"
             meta["updated"] = time.monotonic()
 
