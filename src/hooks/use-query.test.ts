@@ -101,11 +101,12 @@ describe('session shared query', () => {
         expect(value.data).toBe('enabled');
     });
 
-    it('invalidateAllQueries forces immediate refetch on mounted useQuery without cooldown wait', async () => {
+    it('invalidateAllQueries refetches mounted account queries at once, without the cooldown', async () => {
+        api.accounts = [{ account_type: 'S', broker_id: 'fixture', account_id: 'a', signed: true, username: '', person_id: '' }];
         let count = 0;
         const fetcher = vi.fn(async () => `call-${++count}`);
         let value!: Snapshot;
-        await mount({ fetcher, scope: 'reactive-scope', receive: v => { value = v; } });
+        await mount({ fetcher, scope: 'reactive-scope', accounts: api.accounts, receive: v => { value = v; } });
         expect(fetcher).toHaveBeenCalledTimes(1);
         expect(value.data).toBe('call-1');
 
@@ -114,5 +115,26 @@ describe('session shared query', () => {
         });
         expect(fetcher).toHaveBeenCalledTimes(2);
         expect(value.data).toBe('call-2');
+    });
+
+    it('invalidateAllQueries leaves market-data queries (no accounts) alone (C-08 / D2-09)', async () => {
+        const fetcher = vi.fn(async () => 'quote');
+        await mount({ fetcher, scope: 'snapshots', receive: () => undefined });
+        await act(async () => { invalidateAllQueries(); });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops a response that was in flight when the queries were invalidated', async () => {
+        api.accounts = [{ account_type: 'S', broker_id: 'fixture', account_id: 'a', signed: true, username: '', person_id: '' }];
+        const old = deferred();
+        const fresh = deferred();
+        const fetcher = vi.fn<() => Promise<string>>().mockImplementationOnce(() => old.promise).mockImplementationOnce(() => fresh.promise);
+        let value!: Snapshot;
+        await mount({ fetcher, scope: 'race', accounts: api.accounts, receive: v => { value = v; } });
+        await act(async () => { invalidateAllQueries(); });
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        await act(async () => { fresh.resolve('new account'); await Promise.resolve(); });
+        await act(async () => { old.resolve('old account'); await Promise.resolve(); });
+        expect(value).toMatchObject({ data: 'new account', loading: false });
     });
 });
