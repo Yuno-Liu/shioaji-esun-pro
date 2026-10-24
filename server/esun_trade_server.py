@@ -1354,56 +1354,162 @@ class OrderBookCache:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. SSE Fan-out Manager
+# 6. SSE Fan-out Manager (event ids, replay ring, resync)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SSEFanoutManager:
-    """Manages active Server-Sent Events subscribers and broadcasts order events and heartbeats."""
+SSE_RING_SIZE = 500
+SSE_SUBSCRIBER_QUEUE_SIZE = 256
+MAX_SSE_SUBSCRIBERS = 32
+SSE_HEARTBEAT_SECONDS = 25.0
 
-    def __init__(self):
+
+class SSECapacityError(Exception):
+    """Too many concurrent SSE subscribers."""
+
+
+class SSESubscriber:
+    """One SSE connection: a bounded queue plus a flag set when it fell behind or must close."""
+
+    def __init__(self, maxsize: int):
+        self.queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self.closed = threading.Event()
+
+
+class SSEFanoutManager:
+    """
+    Publishes events to SSE subscribers with ids "<boot_id>-<seq>" (boot_id random per bridge
+    process, seq strictly increasing) and keeps the last SSE_RING_SIZE events, so a client that
+    reconnects with Last-Event-ID replays exactly what it missed. When the id cannot be served
+    (other boot, evicted from the ring, malformed) the client gets a `resync` event instead.
+    A subscriber whose queue overflows is closed (it reconnects and replays) rather than
+    silently losing events. Heartbeats carry no id, so they never move a client's Last-Event-ID.
+    """
+
+    def __init__(
+        self,
+        ring_size: int = SSE_RING_SIZE,
+        max_subscribers: int = MAX_SSE_SUBSCRIBERS,
+        queue_size: int = SSE_SUBSCRIBER_QUEUE_SIZE,
+    ):
         self.boot_id = secrets.token_hex(6)
-        self.subscribers: set[queue.Queue] = set()
+        self._seq = 0
+        self._ring: collections.deque = collections.deque(maxlen=ring_size)
+        self.subscribers: set[SSESubscriber] = set()
+        self.max_subscribers = max_subscribers
+        self.queue_size = queue_size
         self.lock = threading.Lock()
 
-    def register(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=200)
+    @property
+    def last_event_id(self) -> str:
         with self.lock:
-            self.subscribers.add(q)
-        return q
+            return f"{self.boot_id}-{self._seq}"
 
-    def unregister(self, q: queue.Queue) -> None:
-        with self.lock:
-            self.subscribers.discard(q)
-
-    def broadcast(self, event_type: str, data: dict, event_id: str | None = None) -> None:
-        payload_str = json.dumps(data, ensure_ascii=False)
+    @staticmethod
+    def format_event(event_type: str, data: dict, event_id: str | None = None) -> bytes:
+        payload_str = json.dumps(data, ensure_ascii=False, default=_json_default)
         parts = []
         if event_id:
             parts.append(f"id: {event_id}\n")
         parts.append(f"event: {event_type}\n")
         parts.append(f"data: {payload_str}\n\n")
-        raw_msg = "".join(parts).encode("utf-8")
+        return "".join(parts).encode("utf-8")
 
+    def publish(self, event_type: str, data: dict, include_ids: bool = False) -> str:
+        """Assigns the next id, stores the event in the replay ring and fans it out (in seq order)."""
         with self.lock:
-            active_subs = list(self.subscribers)
+            self._seq += 1
+            seq = self._seq
+            event_id = f"{self.boot_id}-{seq}"
+            payload = {**data, "event_id": event_id, "seq": seq} if include_ids else data
+            raw = self.format_event(event_type, payload, event_id)
+            self._ring.append((seq, raw))
+            for sub in list(self.subscribers):
+                try:
+                    sub.queue.put_nowait(raw)
+                except queue.Full:
+                    sub.closed.set()
+                    self.subscribers.discard(sub)
+                    logger.warning("SSE 訂閱者處理過慢（佇列已滿）：中斷連線，客戶端可帶 Last-Event-ID 重連重播")
+        return event_id
 
-        for q in active_subs:
-            try:
-                q.put_nowait(raw_msg)
-            except queue.Full:
-                pass
+    def broadcast(self, event_type: str, data: dict, event_id: str | None = None) -> str:
+        """Backward-compatible alias of publish() (ids are always assigned by the manager)."""
+        return self.publish(event_type, data)
+
+    @staticmethod
+    def _parse_event_id(value: any) -> tuple[str, int] | None:
+        boot, sep, seq = str(value or "").strip().rpartition("-")
+        if not sep or not boot or not seq.isdigit():
+            return None
+        return boot, int(seq)
+
+    def _resync_locked(self, reason: str) -> bytes:
+        data = {
+            "reason": reason,
+            "bootId": self.boot_id,
+            "ts": taipei_now().isoformat(timespec="milliseconds"),
+        }
+        return self.format_event("resync", data, f"{self.boot_id}-{self._seq}")
+
+    def subscribe(self, last_event_id: str | None = None) -> tuple[SSESubscriber, list[bytes], str | None]:
+        """
+        Registers a subscriber atomically with the backlog it must receive first:
+        replayed events after last_event_id, or a single `resync` event when that id cannot be
+        served. Returns (subscriber, backlog, resync_reason).
+        """
+        with self.lock:
+            if len(self.subscribers) >= self.max_subscribers:
+                raise SSECapacityError()
+            sub = SSESubscriber(self.queue_size)
+            backlog: list[bytes] = []
+            reason = None
+            if last_event_id:
+                parsed = self._parse_event_id(last_event_id)
+                if parsed is None:
+                    reason = "invalid_last_event_id"
+                elif parsed[0] != self.boot_id:
+                    reason = "bridge_restarted"
+                else:
+                    last_seq = parsed[1]
+                    oldest = self._ring[0][0] if self._ring else self._seq + 1
+                    if last_seq > self._seq:
+                        reason = "unknown_last_event_id"
+                    elif last_seq < self._seq and last_seq + 1 < oldest:
+                        reason = "events_evicted"
+                    else:
+                        backlog = [raw for seq, raw in self._ring if seq > last_seq]
+                if reason:
+                    backlog = [self._resync_locked(reason)]
+            self.subscribers.add(sub)
+            return sub, backlog, reason
+
+    def unsubscribe(self, sub: SSESubscriber) -> None:
+        with self.lock:
+            self.subscribers.discard(sub)
+
+    def register(self) -> queue.Queue:
+        """Live-only subscription (no replay); returns the subscriber's queue."""
+        sub, _, _ = self.subscribe(None)
+        return sub.queue
+
+    def unregister(self, q: queue.Queue) -> None:
+        with self.lock:
+            for sub in [s for s in self.subscribers if s.queue is q]:
+                self.subscribers.discard(sub)
 
     def client_count(self) -> int:
         with self.lock:
             return len(self.subscribers)
 
     def close_all(self) -> None:
-        """Wakes every SSE handler with a None sentinel so connections end on shutdown."""
+        """Ends every SSE stream (shutdown): sets the closed flag and wakes the handler."""
         with self.lock:
             active_subs = list(self.subscribers)
-        for q in active_subs:
+            self.subscribers.clear()
+        for sub in active_subs:
+            sub.closed.set()
             try:
-                q.put_nowait(None)
+                sub.queue.put_nowait(None)
             except queue.Full:
                 pass
 
@@ -1734,6 +1840,69 @@ def remaining_quantity(order: dict, unit: str) -> float | None:
 
 # esun_trade core input checks (O00001-O00021) are raised before any request is sent.
 _SDK_LOCAL_VALIDATION_RE = re.compile(r"\bO000(0[1-9]|1[0-9]|2[01])\b")
+
+
+def derive_ack_op_type(ack: dict, previous: dict | None) -> str:
+    """
+    Operation of an ACK from the SDK's before_qty / after_qty (and the price vs the cached order):
+    New (0 -> n), Cancel (n -> 0), ModifyQty (n -> m < n), ModifyPrice (same quantity, price or
+    price flag changed). "Unknown" whenever the fields do not determine it - never default to New.
+    """
+    before = _to_number(ack.get("before_qty", ack.get("beforeQty")))
+    after = _to_number(ack.get("after_qty", ack.get("afterQty")))
+    if before is None or after is None:
+        return "Unknown"
+    if before == 0 and after > 0:
+        return "New"
+    if before > 0 and after == 0:
+        return "Cancel"
+    if 0 < after < before:
+        return "ModifyQty"
+    if before == after and before > 0 and previous:
+        prev_price, new_price = _to_number(previous.get("od_price")), _to_number(ack.get("od_price"))
+        prev_flag = str(previous.get("price_flag") or "").strip()
+        new_flag = str(ack.get("price_flag") or "").strip()
+        price_changed = prev_price is not None and new_price is not None and abs(prev_price - new_price) > 1e-9
+        if price_changed or (prev_flag and new_flag and prev_flag != new_flag):
+            return "ModifyPrice"
+    return "Unknown"
+
+
+def normalize_report_status(data: dict) -> tuple[str, str]:
+    """(op_code, op_msg): '00' when err_code is empty / all zeros, the raw code otherwise, '' when absent."""
+    raw = data.get("err_code", data.get("errCode"))
+    message = str(data.get("err_msg") or data.get("errMsg") or "")
+    if raw is None:
+        return "", message
+    return ("00" if is_success_ret_code(raw) else str(raw).strip()), message
+
+
+def _report_datetime(date_raw: any, time_raw: any) -> datetime.datetime:
+    now = taipei_now()
+    t_digits = re.sub(r"[^0-9]", "", str(time_raw or ""))
+    d_digits = re.sub(r"[^0-9]", "", str(date_raw or ""))
+    if len(t_digits) >= 14 and t_digits[:2] in ("19", "20"):
+        d_digits, t_digits = t_digits[:8], t_digits[8:]
+    if len(t_digits) < 6:
+        return now
+    try:
+        frac = t_digits[6:12]
+        clock = datetime.time(
+            int(t_digits[0:2]), int(t_digits[2:4]), int(t_digits[4:6]), int(frac.ljust(6, "0")) if frac else 0
+        )
+        day = now.date()
+        if len(d_digits) == 8:
+            day = datetime.date(int(d_digits[:4]), int(d_digits[4:6]), int(d_digits[6:8]))
+        return datetime.datetime.combine(day, clock, tzinfo=TAIPEI_TZ)
+    except ValueError:
+        return now
+
+
+def report_timestamp(data: dict) -> str:
+    """ISO8601 (+08:00) report time from ret_date/ret_time (ACK) or mat_time (MAT); receive time otherwise."""
+    date_raw = data.get("ret_date") or data.get("retDate") or data.get("work_date") or data.get("workDate")
+    time_raw = data.get("ret_time") or data.get("retTime") or data.get("mat_time") or data.get("matTime")
+    return _report_datetime(date_raw, time_raw).isoformat(timespec="milliseconds")
 
 
 class _WsRuntime:
@@ -2181,7 +2350,7 @@ class EsunTradeBridge:
             "loginLocked": lock["locked"],
             "ts": taipei_now().isoformat(timespec="milliseconds"),
         }
-        self.sse_fanout.broadcast("session", payload)
+        self.sse_fanout.publish("session", payload)
 
     def attempt_initial_login(self) -> bool:
         """Attempt login at most once at startup; never retry automatically on failure."""
@@ -2409,7 +2578,7 @@ class EsunTradeBridge:
             return
         refreshed = self._bootstrap_orders(session)
         if self._is_current(session.generation):
-            self.sse_fanout.broadcast("resync", {
+            self.sse_fanout.publish("resync", {
                 "reason": "ws_reconnected",
                 "generation": session.generation,
                 "cacheRefreshed": refreshed,
@@ -2433,87 +2602,72 @@ class EsunTradeBridge:
             return self.order_book_cache.update_from_order_results(orders, generation=session.generation)
         return False
 
-    def _handle_ack(self, data: dict, generation: int | None = None) -> None:
+    @staticmethod
+    def _report_payload(session: EsunSession, data: dict, op_type: str, status: tuple[str, str] | None = None) -> dict:
+        """§5 report event: the SDK's raw fields plus normalized identity / context fields."""
+        payload = dict(data)
+        order_no = str(data.get("ord_no") or data.get("ordNo") or data.get("pre_ord_no") or data.get("preOrdNo") or "")
+        stock_no = data.get("stock_no") or data.get("stockNo") or data.get("stk_no") or data.get("stkNo")
+        if stock_no:
+            payload["stock_no"] = str(stock_no)
+        payload.update({
+            "ts": report_timestamp(data),
+            "environment": session.environment,
+            "account": dict(session.account) if session.account else None,
+            "order_no": order_no,
+            "op_type": op_type,
+            "session_generation": session.generation,
+        })
+        if status is not None:
+            payload["op_code"], payload["op_msg"] = status
+        return payload
+
+    def _handle_ack(self, data: dict, generation: int | None = None) -> str | None:
+        """WebSocket ACK -> OrderBookCache + SSE `order` event. Events of an old session are dropped."""
         session = self._session
         if generation is not None and generation != session.generation:
             logger.info(f"[WebSocket] 丟棄舊 session（g{generation}）的委託回報")
-            return
+            return None
         if not isinstance(data, dict):
-            return
-        accepted, _previous = self.order_book_cache.update_from_ack(data, generation=session.generation)
+            return None
+        accepted, previous = self.order_book_cache.update_from_ack(data, generation=session.generation)
         if not accepted:
-            return
-        event_id = self._generate_event_id("ack", data)
-        stock_order = {
-            **data,
-            "event_id": event_id,
-            "operation": {
-                "op_type": "New",
-                "op_code": str(data.get("err_code") or data.get("errCode") or "00"),
-                "op_msg": str(data.get("err_msg") or data.get("errMsg") or ""),
-            },
-            "order": {
-                "id": str(data.get("ord_no") or data.get("ordNo") or data.get("pre_ord_no") or data.get("preOrdNo") or ""),
-                "seqno": str(data.get("ord_no") or data.get("ordNo") or ""),
-                "ordno": str(data.get("ord_no") or data.get("ordNo") or ""),
-                "action": "Buy" if str(data.get("buy_sell") or data.get("buySell") or "").upper().startswith("B") else "Sell",
-                "price": float(data.get("od_price") or data.get("odPrice") or data.get("price") or 0.0),
-                "quantity": int(data.get("org_qty") or data.get("orgQty") or data.get("quantity") or 0),
-            },
-            "status": {
-                "id": str(data.get("ord_no") or data.get("ordNo") or ""),
-                "order_quantity": int(data.get("org_qty") or data.get("orgQty") or data.get("quantity") or 0),
-                "deal_quantity": int(data.get("deal_qty") or data.get("mat_qty") or data.get("matQty") or 0),
-                "cancel_quantity": int(data.get("cel_qty") or data.get("celQty") or 0),
-            },
-            "contract": {
-                "code": str(data.get("stock_no") or data.get("stockNo") or ""),
-            },
-        }
-        payload = {
-            "state": "StockOrder",
-            "data": {
-                "StockOrder": stock_order
-            },
-            "event_id": event_id,
-        }
-        self.sse_fanout.broadcast("order_event", payload, event_id=event_id)
+            return None
+        payload = self._report_payload(session, data, derive_ack_op_type(data, previous), normalize_report_status(data))
+        return self.sse_fanout.publish("order", payload, include_ids=True)
 
-    def _handle_mat(self, data: dict, generation: int | None = None) -> None:
+    def _handle_mat(self, data: dict, generation: int | None = None) -> str | None:
+        """WebSocket MAT -> OrderBookCache (deduplicated by mkt_seq_num) + SSE `deal` event."""
         session = self._session
         if generation is not None and generation != session.generation:
             logger.info(f"[WebSocket] 丟棄舊 session（g{generation}）的成交回報")
-            return
+            return None
         if not isinstance(data, dict):
-            return
+            return None
         if not self.order_book_cache.update_from_mat(data, generation=session.generation):
-            return
+            logger.info(
+                f"[WebSocket] 略過重複的成交回報（ord_no={data.get('ord_no')}, mkt_seq_num={data.get('mkt_seq_num')}）"
+            )
+            return None
         self.positions_cache.mark_dirty()
-        event_id = self._generate_event_id("mat", data)
-        stock_deal = {
-            **data,
-            "event_id": event_id,
-            "code": str(data.get("stock_no") or data.get("stockNo") or ""),
-            "action": "Buy" if str(data.get("buy_sell") or data.get("buySell") or "").upper().startswith("B") else "Sell",
-            "price": float(data.get("deal_price") or data.get("dealPrice") or data.get("price") or 0.0),
-            "quantity": int(data.get("deal_qty") or data.get("dealQty") or data.get("mat_qty") or data.get("matQty") or data.get("qty") or 0),
-            "ordno": str(data.get("ord_no") or data.get("ordNo") or ""),
-            "seqno": str(data.get("ord_no") or data.get("ordNo") or ""),
-        }
-        payload = {
-            "state": "StockDeal",
-            "data": {
-                "StockDeal": stock_deal
-            },
-            "event_id": event_id,
-        }
-        self.sse_fanout.broadcast("order_event", payload, event_id=event_id)
+        return self.sse_fanout.publish("deal", self._report_payload(session, data, "Deal"), include_ids=True)
 
-    def _generate_event_id(self, prefix: str, data: dict) -> str:
-        ord_no = data.get("ord_no") or data.get("ordNo") or data.get("pre_ord_no") or data.get("preOrdNo") or ""
-        serialized = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
-        digest = hashlib.md5(serialized.encode("utf-8")).hexdigest()[:8]
-        return f"esun-{prefix}-{ord_no}-{digest}"
+    def sse_heartbeat_bytes(self, initial: bool = False) -> bytes:
+        """Per-connection heartbeat (no SSE id, so it never moves the client's Last-Event-ID)."""
+        session = self._session
+        runtime = self._ws_runtime
+        data = {
+            "time": taipei_now().isoformat(timespec="seconds"),
+            "generation": session.generation,
+            "environment": session.environment,
+            "loggedIn": session.logged_in,
+            "wsConnected": bool(runtime is not None and runtime.is_connected()),
+        }
+        if initial:
+            data["connected"] = True
+            data["bootId"] = self.sse_fanout.boot_id
+            data["lastEventId"] = self.sse_fanout.last_event_id
+        return SSEFanoutManager.format_event("heartbeat", data)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Status & Accounts (pure reads: no SDK network call, no state change)
@@ -3788,43 +3942,57 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_internal_error()
 
     def _handle_sse(self, qs: dict) -> None:
-        """Handles /esun/stream/orders SSE connections with fan-out and 25s heartbeats."""
-        if self.bridge.is_shutting_down():
+        """
+        /esun/stream/orders: replays the events after Last-Event-ID (header, or ?last_event_id= for
+        clients that recreate their EventSource), sends `resync` when that id cannot be served, then
+        streams live events with 25s heartbeats. A subscriber that falls behind is disconnected.
+        """
+        bridge = self.bridge
+        if bridge.is_shutting_down():
             self._send_error_json(503, "ESUN_SHUTTING_DOWN", "服務關閉中")
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self._send_cors_headers()
-        self.end_headers()
-
-        q = self.bridge.sse_fanout.register()
+        last_event_id = self.headers.get("Last-Event-ID")
+        if not last_event_id:
+            for key in ("last_event_id", "lastEventId"):
+                values = qs.get(key)
+                if values and values[0]:
+                    last_event_id = values[0]
+                    break
         try:
-            # Send initial connected heartbeat
-            initial_hb = f"event: heartbeat\ndata: {json.dumps({'time': datetime.datetime.now().isoformat(), 'connected': True})}\n\n"
-            self.wfile.write(initial_hb.encode("utf-8"))
+            sub, backlog, _reason = bridge.sse_fanout.subscribe(last_event_id)
+        except SSECapacityError:
+            self._send_error_json(503, "ESUN_SSE_CAPACITY", "SSE 連線數已達上限", retry_after=5)
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self._send_cors_headers()
+            self.end_headers()
+
+            self.wfile.write(bridge.sse_heartbeat_bytes(initial=True))
+            for raw in backlog:
+                self.wfile.write(raw)
             self.wfile.flush()
 
-            while not self.bridge.is_shutting_down():
+            while not sub.closed.is_set() and not bridge.is_shutting_down():
                 try:
-                    # Wait for next event or 25-second heartbeat
-                    msg = q.get(timeout=25.0)
-                    if msg is None:
-                        break
-                    self.wfile.write(msg)
-                    self.wfile.flush()
+                    msg = sub.queue.get(timeout=SSE_HEARTBEAT_SECONDS)
                 except queue.Empty:
-                    # Send periodic 25s heartbeat
-                    hb = f"event: heartbeat\ndata: {json.dumps({'time': datetime.datetime.now().isoformat()})}\n\n"
-                    self.wfile.write(hb.encode("utf-8"))
+                    self.wfile.write(bridge.sse_heartbeat_bytes())
                     self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+                    continue
+                if msg is None:
+                    break
+                self.wfile.write(msg)
+                self.wfile.flush()
+        except (ConnectionError, TimeoutError, OSError):
             pass
         finally:
-            self.bridge.sse_fanout.unregister(q)
+            bridge.sse_fanout.unsubscribe(sub)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

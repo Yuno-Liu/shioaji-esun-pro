@@ -48,7 +48,11 @@ from server.esun_trade_server import (
     EsunTradeBridge,
     HEADLESS_PATCH_STATE,
     MAX_REQUEST_BODY_BYTES,
+    SSECapacityError,
+    SSEFanoutManager,
+    derive_ack_op_type,
     make_shutdown_handler,
+    normalize_report_status,
     redact,
     register_secret,
     OrderBookCache,
@@ -828,17 +832,24 @@ class TestFullHttpIntegration(unittest.TestCase):
             "quantity": 1,
         })
 
-        # Read order_event from stream
+        # Contract change (§5): `order` / `deal` events, ids "<boot_id>-<seq>", flat payload.
         id_line = resp.readline().decode("utf-8")
         event_line = resp.readline().decode("utf-8")
         data_line = resp.readline().decode("utf-8")
         empty_line = resp.readline().decode("utf-8")
 
-        self.assertTrue(id_line.startswith("id: esun-ack-SSE_ORD_1-"))
-        self.assertEqual(event_line.strip(), "event: order_event")
-        ack_obj = json.loads(data_line.replace("data: ", ""))
-        self.assertEqual(ack_obj["state"], "StockOrder")
-        self.assertEqual(ack_obj["data"]["StockOrder"]["ord_no"], "SSE_ORD_1")
+        boot_id = self.bridge.sse_fanout.boot_id
+        self.assertTrue(id_line.startswith(f"id: {boot_id}-"))
+        self.assertEqual(event_line.strip(), "event: order")
+        ack_obj = json.loads(data_line[len("data: "):])
+        self.assertEqual(ack_obj["ord_no"], "SSE_ORD_1")  # raw SDK fields are preserved
+        self.assertEqual(ack_obj["order_no"], "SSE_ORD_1")
+        self.assertEqual(ack_obj["event_id"], id_line[len("id: "):].strip())
+        self.assertIsInstance(ack_obj["seq"], int)
+        self.assertEqual(ack_obj["environment"], "SIMULATION")
+        self.assertEqual(ack_obj["account"], {"broker_id": "8840", "account_id": "1234567"})
+        self.assertTrue(ack_obj["ts"].endswith("+08:00"))
+        self.assertEqual(ack_obj["op_type"], "Unknown")  # no before/after quantity: never guessed as New
 
         # Simulate MAT broadcast
         self.bridge._handle_mat({
@@ -852,11 +863,12 @@ class TestFullHttpIntegration(unittest.TestCase):
         data_line = resp.readline().decode("utf-8")
         empty_line = resp.readline().decode("utf-8")
 
-        self.assertTrue(id_line.startswith("id: esun-mat-SSE_ORD_1-"))
-        self.assertEqual(event_line.strip(), "event: order_event")
-        mat_obj = json.loads(data_line.replace("data: ", ""))
-        self.assertEqual(mat_obj["state"], "StockDeal")
-        self.assertEqual(mat_obj["data"]["StockDeal"]["deal_qty"], 1)
+        self.assertEqual(id_line.strip(), f"id: {boot_id}-{ack_obj['seq'] + 1}")
+        self.assertEqual(event_line.strip(), "event: deal")
+        mat_obj = json.loads(data_line[len("data: "):])
+        self.assertEqual(mat_obj["deal_qty"], 1)
+        self.assertEqual(mat_obj["op_type"], "Deal")
+        self.assertEqual(mat_obj["seq"], ack_obj["seq"] + 1)
 
         resp.close()
 
@@ -2241,6 +2253,175 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         for ord_no, code in (("E1", "AG_INVALID_PRICE_MODIFY"), ("E2", "AG_INVALID_PRICE_MODIFY"), ("E3", "AG0006")):
             res, status = self.bridge.replace_price({**body, "order_no": ord_no})
             self.assertEqual((status, res["code"]), (400, code), ord_no)
+
+
+class TestSseEventLog(unittest.TestCase):
+    """§5: <boot_id>-<seq> ids, 500-event replay ring, Last-Event-ID replay, resync, overflow."""
+
+    def test_ids_are_monotonic_and_carry_boot_id(self):
+        fanout = SSEFanoutManager()
+        ids = [fanout.publish("order", {"n": i}, include_ids=True) for i in range(3)]
+        self.assertEqual(ids, [f"{fanout.boot_id}-{i}" for i in (1, 2, 3)])
+        self.assertEqual(fanout.last_event_id, f"{fanout.boot_id}-3")
+        self.assertNotEqual(SSEFanoutManager().boot_id, fanout.boot_id)
+
+    def test_replay_after_last_event_id(self):
+        fanout = SSEFanoutManager()
+        first = fanout.publish("order", {"n": 1}, include_ids=True)
+        fanout.publish("deal", {"n": 2}, include_ids=True)
+        fanout.publish("session", {"n": 3})
+        sub, backlog, reason = fanout.subscribe(first)
+        self.assertIsNone(reason)
+        events = [_parse_sse(raw) for raw in backlog]
+        self.assertEqual([e["event"] for e in events], ["deal", "session"])
+        self.assertEqual(events[0]["data"]["seq"], 2)
+        self.assertEqual(events[0]["id"], f"{fanout.boot_id}-2")
+        # the latest id replays nothing
+        _, backlog, reason = fanout.subscribe(fanout.last_event_id)
+        self.assertEqual((backlog, reason), ([], None))
+        # live events after subscription go to the queue, in order
+        fanout.publish("order", {"n": 4}, include_ids=True)
+        self.assertEqual(_parse_sse(sub.queue.get_nowait())["data"]["seq"], 4)
+
+    def test_resync_when_id_cannot_be_served(self):
+        fanout = SSEFanoutManager(ring_size=3)
+        for i in range(5):
+            fanout.publish("order", {"n": i}, include_ids=True)  # ring keeps seq 3..5
+        cases = {
+            "other-boot-3": "bridge_restarted",
+            f"{fanout.boot_id}-1": "events_evicted",
+            f"{fanout.boot_id}-99": "unknown_last_event_id",
+            "garbage": "invalid_last_event_id",
+        }
+        for last_id, expected in cases.items():
+            _, backlog, reason = fanout.subscribe(last_id)
+            self.assertEqual(reason, expected, last_id)
+            self.assertEqual(len(backlog), 1)
+            event = _parse_sse(backlog[0])
+            self.assertEqual(event["event"], "resync")
+            self.assertEqual(event["data"]["reason"], expected)
+            self.assertEqual(event["id"], f"{fanout.boot_id}-5")  # position marker: replay from here next time
+        _, backlog, reason = fanout.subscribe(f"{fanout.boot_id}-2")  # oldest kept is 3: no gap
+        self.assertIsNone(reason)
+        self.assertEqual([_parse_sse(r)["data"]["seq"] for r in backlog], [3, 4, 5])
+
+    def test_overflowing_subscriber_is_closed_not_silently_skipped(self):
+        fanout = SSEFanoutManager(queue_size=2)
+        sub, _, _ = fanout.subscribe(None)
+        for i in range(3):
+            fanout.publish("order", {"n": i}, include_ids=True)
+        self.assertTrue(sub.closed.is_set())
+        self.assertEqual(fanout.client_count(), 0)
+        # the dropped event is still in the ring for the reconnect
+        last_delivered = _parse_sse(sub.queue.queue[-1])["id"]
+        _, backlog, reason = fanout.subscribe(last_delivered)
+        self.assertIsNone(reason)
+        self.assertEqual([_parse_sse(r)["data"]["n"] for r in backlog], [2])
+
+    def test_subscriber_capacity(self):
+        fanout = SSEFanoutManager(max_subscribers=1)
+        fanout.subscribe(None)
+        with self.assertRaises(SSECapacityError):
+            fanout.subscribe(None)
+
+
+class TestReportEvents(_BridgeCase):
+    def setUp(self):
+        super().setUp()
+        self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
+        self.bridge = self.make_bridge(self.sim, RecordingFactory())
+        self.events = self.bridge.sse_fanout.register()
+
+    def test_op_type_derivation_and_status_normalization(self):
+        self.assertEqual(derive_ack_op_type({"before_qty": 0, "after_qty": 2}, None), "New")
+        self.assertEqual(derive_ack_op_type({"before_qty": 2, "after_qty": 0}, None), "Cancel")
+        self.assertEqual(derive_ack_op_type({"before_qty": 5, "after_qty": 3}, None), "ModifyQty")
+        self.assertEqual(derive_ack_op_type({"before_qty": 3, "after_qty": 3, "od_price": 101.0}, {"od_price": 100.0}), "ModifyPrice")
+        self.assertEqual(derive_ack_op_type({"before_qty": 3, "after_qty": 3, "od_price": 100.0}, {"od_price": 100.0}), "Unknown")
+        self.assertEqual(derive_ack_op_type({"before_qty": 3, "after_qty": 3}, None), "Unknown")
+        self.assertEqual(derive_ack_op_type({"org_qty": 3}, None), "Unknown")
+        self.assertEqual(normalize_report_status({"err_code": "00000000"}), ("00", ""))
+        self.assertEqual(normalize_report_status({"err_code": ""}), ("00", ""))
+        self.assertEqual(normalize_report_status({"err_code": "E0123", "err_msg": "價格超過漲跌幅"}), ("E0123", "價格超過漲跌幅"))
+        self.assertEqual(normalize_report_status({}), ("", ""))
+
+    def test_ack_event_payload_uses_report_time_and_derived_op(self):
+        today = taipei_today_str()
+        self.bridge.order_book_cache.update_from_order_results(
+            [{"ord_no": "A0001", "stock_no": "2884", "ap_code": "1", "od_price": 26.0, "org_qty": 1, "work_date": today}],
+            generation=self.bridge.session.generation,
+        )
+        self.bridge._handle_ack({
+            "kind": "ACK", "work_date": today, "ret_date": "20261024", "ret_time": "103010810", "ord_type": "2",
+            "ord_no": "A0001", "pre_ord_no": "", "stock_no": "2884", "buy_sell": "B", "ap_code": "1", "price_flag": "0",
+            "trade": "0", "od_price": 26.5, "org_qty": 1, "cel_qty": 0, "cel_type": "1", "err_code": "00000000",
+            "err_msg": "", "action": "3", "before_qty": 1, "after_qty": 1, "bs_flag": "R",
+        })
+        event = _drain(self.events, timeout=0.5)[-1]
+        self.assertEqual(event["event"], "order")
+        data = event["data"]
+        self.assertEqual(data["ts"], "2026-10-24T10:30:10.810+08:00")
+        self.assertEqual(data["op_type"], "ModifyPrice")
+        self.assertEqual((data["op_code"], data["op_msg"]), ("00", ""))
+        self.assertEqual(data["order_no"], "A0001")
+        self.assertEqual(data["account"], {"broker_id": "8840", "account_id": "1234567"})
+        self.assertEqual(data["environment"], "SIMULATION")
+        self.assertEqual(data["action"], "3")  # raw field kept for the client
+        self.assertEqual(self.bridge.order_book_cache.get("A0001")["od_price"], 26.5)
+        self.assertNotIn("before_qty", self.bridge.order_book_cache.get("A0001"))  # report-only field
+
+    def test_mat_events_are_deduplicated_by_mkt_seq_num(self):
+        mat = {"kind": "MAT", "ord_no": "A0002", "stock_no": "2884", "ap_code": "1", "buy_sell": "B",
+               "trade": "0", "mat_time": "103512345", "mat_price": 26.0, "mat_qty": 1, "pay_price": 26026.0,
+               "mkt_seq_num": "000123"}
+        self.bridge.order_book_cache.update_from_ack({"ord_no": "A0002", "stock_no": "2884", "ap_code": "1", "org_qty": 2})
+        first = self.bridge._handle_mat(dict(mat))
+        second = self.bridge._handle_mat(dict(mat))
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        deals = [e for e in _drain(self.events, timeout=0.5) if e["event"] == "deal"]
+        self.assertEqual(len(deals), 1)
+        self.assertEqual(deals[0]["data"]["op_type"], "Deal")
+        self.assertEqual(deals[0]["data"]["mat_price"], 26.0)
+        self.assertTrue(deals[0]["data"]["ts"].endswith("10:35:12.345+08:00"))
+        self.assertEqual(self.bridge.order_book_cache.get("A0002")["deal_qty"], 1)
+
+    def test_last_event_id_replay_over_http(self):
+        server = create_server(host="127.0.0.1", port=0, bridge=self.bridge, access_policy=AccessPolicy())
+        port = server.server_address[1]
+        _serve(server)
+        try:
+            missed_first = self.bridge._handle_ack({"ord_no": "R1", "stock_no": "2330", "ap_code": "1"})
+            self.bridge._handle_ack({"ord_no": "R2", "stock_no": "2330", "ap_code": "1"})
+
+            def read_events(headers, path="/esun/stream/orders", count=1):
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                try:
+                    conn.request("GET", path, headers={"Host": f"127.0.0.1:{port}", **headers})
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    events, block = [], b""
+                    while len(events) < count + 1:  # +1: the initial heartbeat
+                        line = resp.readline()
+                        block += line
+                        if line in (b"\n", b"\r\n"):
+                            events.append(_parse_sse(block))
+                            block = b""
+                    return events
+                finally:
+                    conn.close()
+
+            events = read_events({"Last-Event-ID": missed_first})
+            self.assertEqual(events[0]["event"], "heartbeat")
+            self.assertEqual(events[1]["data"]["order_no"], "R2")
+            events = read_events({}, path=f"/esun/stream/orders?last_event_id={missed_first}")
+            self.assertEqual(events[1]["data"]["order_no"], "R2")
+            events = read_events({"Last-Event-ID": "previous-boot-41"})
+            self.assertEqual(events[1]["event"], "resync")
+            self.assertEqual(events[1]["data"]["reason"], "bridge_restarted")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class TestGracefulShutdown(unittest.TestCase):
