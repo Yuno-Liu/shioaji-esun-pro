@@ -43,7 +43,9 @@ from server.esun_trade_server import (
     AccessPolicy,
     DailyCounter,
     EsunHTTPRequestHandler,
+    EsunQueryError,
     EsunTradeBridge,
+    HEADLESS_PATCH_STATE,
     MAX_REQUEST_BODY_BYTES,
     make_shutdown_handler,
     redact,
@@ -56,8 +58,8 @@ from server.esun_trade_server import (
     create_server,
     detect_esun_environment,
     load_config,
+    override_esun_config_environment,
     split_account,
-    update_esun_config_environment,
     validate_order_quantity,
     discover_esun_config_profiles,
     ESUN_PRODUCTION_ENTRY,
@@ -66,6 +68,22 @@ from server.esun_trade_server import (
     ESUN_PRODUCTION_CONFIG_CANDIDATES,
 )
 from esun_trade.constant import Action, APCode, BSFlag, PriceFlag, Trade
+
+
+# The persistent login circuit breaker writes to ESUN_STATE_DIR: keep tests away from server/.state.
+_MODULE_STATE_DIR: tempfile.TemporaryDirectory | None = None
+
+
+def setUpModule():
+    global _MODULE_STATE_DIR
+    _MODULE_STATE_DIR = tempfile.TemporaryDirectory()
+    os.environ["ESUN_STATE_DIR"] = _MODULE_STATE_DIR.name
+
+
+def tearDownModule():
+    os.environ.pop("ESUN_STATE_DIR", None)
+    if _MODULE_STATE_DIR is not None:
+        _MODULE_STATE_DIR.cleanup()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +104,13 @@ class MockSDK:
         self.profit_loss_calls = 0
         self.trade_status_calls = 0
         self.market_status_calls = 0
+        self.certinfo_calls = 0
+        self.machine_time_calls = 0
         self.ws_connected = False
+        self.ws_connect_calls = 0
+        self.ws_close_calls = 0
+        self._ws_lock = threading.Lock()
+        self._ws_events: list[threading.Event] = []
 
     def login(self) -> None:
         self.login_calls += 1
@@ -100,12 +124,30 @@ class MockSDK:
         return decorator
 
     def connect_websocket(self) -> None:
-        self.ws_connected = True
+        # Like the real SDK (WebSocketApp.run_forever) this blocks until the connection closes.
+        ev = threading.Event()
+        with self._ws_lock:
+            self.ws_connect_calls += 1
+            self._ws_events.append(ev)
+            self.ws_connected = True
+        ev.wait()
+        with self._ws_lock:
+            if ev in self._ws_events:
+                self._ws_events.remove(ev)
+            self.ws_connected = bool(self._ws_events)
+
+    def close_websocket(self) -> None:
+        with self._ws_lock:
+            self.ws_close_calls += 1
+            for ev in self._ws_events:
+                ev.set()
 
     def certinfo(self) -> dict:
+        self.certinfo_calls += 1
         return {"ca_expiretime": "2027/12/31", "subject": "CN=ESUN_TEST"}
 
     def get_machine_time(self) -> dict:
+        self.machine_time_calls += 1
         return {"time": "2026-10-23 08:30:00", "diff": 0.05}
 
     def place_order(self, order_obj: any) -> dict:
@@ -268,14 +310,17 @@ Account = 88401234567
         cp_legacy_prod.read_string("[Core]\nEntry = https://custom.api.com\n")
         self.assertEqual(detect_esun_environment(cp_legacy_prod), "PRODUCTION")
 
-    def test_update_esun_config_environment_roundtrip(self):
+    def test_override_esun_config_environment_roundtrip_in_memory(self):
+        # Contract change (§3): switching environments never rewrites the user's ini file;
+        # the [Core] section is overridden on the in-memory ConfigParser handed to SDK(config).
+        with open(self.config_file, "rb") as f:
+            original_bytes = f.read()
+        cp, _, _ = load_config(self.config_file)
+
         # 1. Switch to PRODUCTION
-        env, entry = update_esun_config_environment(self.config_file, "PRODUCTION")
+        env, entry = override_esun_config_environment(cp, "PRODUCTION")
         self.assertEqual(env, "PRODUCTION")
         self.assertEqual(entry, ESUN_PRODUCTION_ENTRY)
-
-        cp = configparser.ConfigParser()
-        cp.read(self.config_file, encoding="utf-8")
         self.assertFalse(cp.has_option("Core", "Environment"))
         self.assertEqual(cp.get("Core", "Entry"), ESUN_PRODUCTION_ENTRY)
         self.assertEqual(detect_esun_environment(cp), "PRODUCTION")
@@ -284,16 +329,19 @@ Account = 88401234567
         self.assertEqual(cp.get("Api", "Key"), "test_key")
 
         # 2. Switch to SIMULATION
-        env2, entry2 = update_esun_config_environment(self.config_file, "SIMULATION")
+        env2, entry2 = override_esun_config_environment(cp, "SIMULATION")
         self.assertEqual(env2, "SIMULATION")
         self.assertEqual(entry2, ESUN_SIMULATION_ENTRY)
+        self.assertTrue(cp.has_option("Core", "Environment"))
+        self.assertEqual(cp.get("Core", "Environment"), "SIMULATION")
+        self.assertEqual(cp.get("Core", "Entry"), ESUN_SIMULATION_ENTRY)
+        self.assertEqual(detect_esun_environment(cp), "SIMULATION")
 
-        cp2 = configparser.ConfigParser()
-        cp2.read(self.config_file, encoding="utf-8")
-        self.assertTrue(cp2.has_option("Core", "Environment"))
-        self.assertEqual(cp2.get("Core", "Environment"), "SIMULATION")
-        self.assertEqual(cp2.get("Core", "Entry"), ESUN_SIMULATION_ENTRY)
-        self.assertEqual(detect_esun_environment(cp2), "SIMULATION")
+        with self.assertRaises(ValueError):
+            override_esun_config_environment(cp, "STAGING")
+        # The file on disk is byte-for-byte unchanged.
+        with open(self.config_file, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
 
 
 class TestLoginCircuitBreaker(unittest.TestCase):
@@ -306,11 +354,18 @@ class TestLoginCircuitBreaker(unittest.TestCase):
             f.write("cert")
         os.environ["ESUN_ACCOUNT_PASSWORD"] = "pw"
         os.environ["ESUN_CERT_PASSWORD"] = "cpw"
+        # Each test gets its own persistent-state directory (the breaker survives restarts).
+        self._prev_state_dir = os.environ.get("ESUN_STATE_DIR")
+        os.environ["ESUN_STATE_DIR"] = os.path.join(self.temp_dir.name, "state")
 
     def tearDown(self):
         self.temp_dir.cleanup()
         os.environ.pop("ESUN_ACCOUNT_PASSWORD", None)
         os.environ.pop("ESUN_CERT_PASSWORD", None)
+        if self._prev_state_dir is None:
+            os.environ.pop("ESUN_STATE_DIR", None)
+        else:
+            os.environ["ESUN_STATE_DIR"] = self._prev_state_dir
 
     def test_single_attempt_lockout_on_failure(self):
         mock_sdk = MockSDK(login_fail_msg="AGA0000 密碼錯誤")
@@ -1307,6 +1362,592 @@ class TestAccessControlHttp(unittest.TestCase):
         self.assertNotIn("MySecretApiValue", text)
         self.assertNotIn("A123456789", text)
         self.assertIn("88401234567", text)
+
+
+class RecordingFactory:
+    """sdk_factory that creates a fresh MockSDK per login (like the real SDK) and keeps them."""
+
+    def __init__(self, login_fail_msg: str | None = None, mock_cls: type | None = None):
+        self.instances: list[MockSDK] = []
+        self.login_fail_msg = login_fail_msg
+        self.mock_cls = mock_cls or MockSDK
+
+    def __call__(self, cfg):
+        sdk = self.mock_cls(cfg, login_fail_msg=self.login_fail_msg)
+        self.instances.append(sdk)
+        return sdk
+
+    @property
+    def login_calls(self) -> int:
+        return sum(s.login_calls for s in self.instances)
+
+
+def _parse_sse(raw: bytes) -> dict:
+    fields: dict[str, str] = {}
+    for line in raw.decode("utf-8").splitlines():
+        if ":" in line:
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip()
+    return {"id": fields.get("id"), "event": fields.get("event"), "data": json.loads(fields["data"]) if "data" in fields else None}
+
+
+def _drain(q, timeout: float = 0.0) -> list[dict]:
+    events = []
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            raw = q.get(timeout=remaining) if remaining > 0 else q.get_nowait()
+        except Exception:
+            return events
+        if raw is None:
+            return events
+        events.append(_parse_sse(raw))
+
+
+def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.02) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+class _BridgeCase(unittest.TestCase):
+    """Per-test temp config dir + persistent state dir + passwords."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.dir = self.temp_dir.name
+        self.state_dir = os.path.join(self.dir, "state")
+        self._env = mock.patch.dict(os.environ, {
+            "ESUN_ACCOUNT_PASSWORD": "pw-correct-horse",
+            "ESUN_CERT_PASSWORD": "cert-pw-battery",
+        })
+        self._env.start()
+        for key in ("ESUN_CONFIG_DIR", "ESUN_SIMULATION_CONFIG_PATH", "ESUN_PRODUCTION_CONFIG_PATH", "ESUN_CONFIG_PATH"):
+            os.environ.pop(key, None)
+        self.bridges: list[EsunTradeBridge] = []
+
+    def tearDown(self):
+        for bridge in self.bridges:
+            bridge.shutdown()
+        self._env.stop()
+        self.temp_dir.cleanup()
+
+    def make_bridge(self, config_path, factory=None, auto_login=True, **kwargs) -> EsunTradeBridge:
+        kwargs.setdefault("state_dir", self.state_dir)
+        bridge = EsunTradeBridge(config_path=config_path, sdk_factory=factory or RecordingFactory(), auto_login=auto_login, **kwargs)
+        self.bridges.append(bridge)
+        return bridge
+
+    @staticmethod
+    def file_fingerprint(path):
+        with open(path, "rb") as f:
+            data = f.read()
+        return data, os.stat(path).st_mtime_ns
+
+
+class TestSessionHealthAndSwitch(_BridgeCase):
+    def test_health_is_read_only_and_reports_drift(self):
+        prod = _write_profile(self.dir, "esun-config.ini", "PRODUCTION", account="88405555555")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(prod, factory)
+        sdk = factory.instances[0]
+        before = bridge.get_health()
+        self.assertTrue(before["loggedIn"])
+        self.assertEqual(before["environment"], "PRODUCTION")
+        self.assertEqual(before["sessionGeneration"], 1)
+        self.assertFalse(before["configDrift"])
+        self.assertEqual(before["diskEnvironment"], "PRODUCTION")
+        self.assertFalse(before["loginLocked"])
+        self.assertIn("wsLastMessageAt", before)
+        self.assertEqual(before["certInfo"], {"ca_expiretime": "2027/12/31"})  # sanitized: no subject/cn
+        calls_before = (sdk.certinfo_calls, sdk.machine_time_calls, sdk.market_status_calls)
+
+        # Adding a simulation profile while logged into PRODUCTION used to flip health to SIMULATION.
+        _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
+        for _ in range(3):
+            health = bridge.get_health()
+        self.assertEqual(health["environment"], "PRODUCTION")
+        self.assertFalse(health["simulation"])
+        self.assertEqual(health["account"], {"broker_id": "8840", "account_id": "5555555"})
+        self.assertTrue(health["configDrift"])
+        self.assertEqual(health["sessionGeneration"], 1)
+        self.assertEqual(bridge.config_path, prod)
+        self.assertEqual(bridge.environment, "PRODUCTION")
+        # Health never calls SDK network methods.
+        self.assertEqual((sdk.certinfo_calls, sdk.machine_time_calls, sdk.market_status_calls), calls_before)
+
+        # Editing the active file's environment is reported, not adopted.
+        os.remove(os.path.join(self.dir, "esun-config.simulation.ini"))
+        _write_profile(self.dir, "esun-config.ini", "SIMULATION", account="88405555555")
+        health = bridge.get_health()
+        self.assertEqual(health["environment"], "PRODUCTION")
+        self.assertEqual(health["diskEnvironment"], "SIMULATION")
+        self.assertTrue(health["configDrift"])
+
+    def test_switch_never_writes_ini_and_resets_session_state(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401111111")
+        prod = _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION", account="88402222222")
+        sim_before, prod_before = self.file_fingerprint(sim), self.file_fingerprint(prod)
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        events = bridge.sse_fanout.register()
+        old_sdk = factory.instances[0]
+        self.assertTrue(_wait_until(lambda: old_sdk.ws_connect_calls == 1))
+
+        bridge.order_book_cache.update_from_ack({"ord_no": "O_SIM", "stock_no": "2330", "work_date": taipei_today_str()})
+        for cache, key in ((bridge.balance_cache, "balance"), (bridge.positions_cache, "positions"),
+                           (bridge.settlements_cache, "settlements"), (bridge.trade_status_cache, "trade_status"),
+                           (bridge.profit_loss_cache, "x_y"), (bridge.market_status_cache, "market_status")):
+            cache.set(key, {"stale": True})
+
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["environment"], "PRODUCTION")
+        self.assertEqual(res["account"]["account_id"], "2222222")
+        self.assertEqual(res["sessionGeneration"], 2)
+        # ini files untouched (byte content and mtime)
+        self.assertEqual(self.file_fingerprint(sim), sim_before)
+        self.assertEqual(self.file_fingerprint(prod), prod_before)
+        # every cache was cleared
+        self.assertEqual(bridge.order_book_cache.get_all(), [])
+        for cache, key in ((bridge.balance_cache, "balance"), (bridge.positions_cache, "positions"),
+                           (bridge.settlements_cache, "settlements"), (bridge.trade_status_cache, "trade_status"),
+                           (bridge.profit_loss_cache, "x_y"), (bridge.market_status_cache, "market_status")):
+            self.assertIsNone(cache.get(key))
+        # the old WebSocket was closed and a new one started for the new SDK client
+        new_sdk = factory.instances[1]
+        self.assertGreaterEqual(old_sdk.ws_close_calls, 1)
+        self.assertTrue(_wait_until(lambda: new_sdk.ws_connect_calls == 1))
+        # a session event was broadcast
+        session_events = [e for e in _drain(events, timeout=0.5) if e["event"] == "session"]
+        self.assertTrue(session_events)
+        self.assertEqual(session_events[-1]["data"]["environment"], "PRODUCTION")
+        self.assertEqual(session_events[-1]["data"]["generation"], 2)
+        self.assertTrue(session_events[-1]["data"]["loggedIn"])
+        self.assertEqual(session_events[-1]["data"]["reason"], "switch")
+
+    def test_switch_to_current_environment_is_a_noop(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        res, status = bridge.switch_environment_with_status("SIMULATION")
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"])
+        self.assertEqual(factory.login_calls, 1)
+        self.assertEqual(bridge.session.generation, 1)
+
+    def test_switch_failure_keeps_original_session(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        original = bridge.session
+        bridge.balance_cache.set("balance", {"acc_balance": 1})
+        events = bridge.sse_fanout.register()
+        factory.login_fail_msg = "error sending request: connection reset"
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 502)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["code"], "ESUN_LOGIN_FAILED")
+        self.assertEqual(res["environment"], "SIMULATION")
+        self.assertIs(bridge.session, original)
+        self.assertTrue(bridge.logged_in)
+        self.assertIsNotNone(bridge.balance_cache.get("balance"))
+        failed = [e for e in _drain(events, timeout=0.3) if e["event"] == "session"]
+        self.assertEqual(failed[-1]["data"]["reason"], "switch_failed")
+        self.assertFalse(failed[-1]["data"]["ok"])
+        self.assertEqual(failed[-1]["data"]["environment"], "SIMULATION")
+        # network errors do not trip the credential circuit breaker
+        self.assertFalse(bridge.login_locked)
+
+    def test_mismatched_profile_file_is_overridden_in_memory_only(self):
+        # A simulation-named profile whose [Core] says PRODUCTION: old code rewrote the file.
+        mislabeled = _write_profile(self.dir, "esun-config.simulation.ini", "PRODUCTION")
+        prod = _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        before = self.file_fingerprint(mislabeled)
+        factory = RecordingFactory()
+        bridge = self.make_bridge(prod, factory)
+        res, status = bridge.switch_environment_with_status("SIMULATION")
+        self.assertEqual(status, 200)
+        self.assertEqual(res["environment"], "SIMULATION")
+        self.assertTrue(res["configOverridden"])
+        self.assertEqual(bridge.entry, ESUN_SIMULATION_ENTRY)
+        cfg_given_to_sdk = factory.instances[-1].config
+        self.assertEqual(cfg_given_to_sdk.get("Core", "Entry"), ESUN_SIMULATION_ENTRY)
+        self.assertEqual(cfg_given_to_sdk.get("Core", "Environment"), "SIMULATION")
+        self.assertEqual(self.file_fingerprint(mislabeled), before)
+        health = bridge.get_health()
+        self.assertEqual(health["environment"], "SIMULATION")
+        self.assertFalse(health["configDrift"])  # intentional override is not drift
+
+    def test_switch_obeys_login_guard(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        bridge.reconnect_limiter.timestamps = [time.monotonic()] * 10
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 429)
+        self.assertEqual(res["code"], "AGR0000")
+        self.assertEqual(bridge.environment, "SIMULATION")
+        self.assertEqual(factory.login_calls, 1)
+        bridge.reconnect_limiter.timestamps = []
+        bridge.reconnect_daily.count = 300
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual((status, res["code"]), (429, "AGR0004"))
+        self.assertEqual(factory.login_calls, 1)
+
+    def test_concurrent_switch_is_rejected_while_busy(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        release = threading.Event()
+
+        class SlowLoginSDK(MockSDK):
+            def login(self):
+                super().login()
+                if self.config.get("Core", "Entry") == ESUN_PRODUCTION_ENTRY:
+                    release.wait(5)
+
+        factory = RecordingFactory(mock_cls=SlowLoginSDK)
+        bridge = self.make_bridge(sim, factory)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(bridge.switch_environment_with_status("PRODUCTION")))
+        worker.start()
+        self.assertTrue(_wait_until(lambda: factory.login_calls == 2))
+        res, status = bridge.switch_environment_with_status("SIMULATION")
+        self.assertEqual((status, res["code"]), (409, "ESUN_SESSION_BUSY"))
+        ok, body, code = bridge.reconnect()
+        self.assertEqual((ok, code, body["code"]), (False, 409, "ESUN_SESSION_BUSY"))
+        release.set()
+        worker.join(5)
+        self.assertEqual(results[0][1], 200)
+        self.assertEqual(bridge.environment, "PRODUCTION")
+
+    def test_accounts_mask_person_id_and_come_from_session(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88407654321")
+
+        class CnSDK(MockSDK):
+            def certinfo(self):
+                return {"cn": "A123456789-00-00", "not_after": 1893456000, "serial": "01"}
+
+        bridge = self.make_bridge(sim, RecordingFactory(mock_cls=CnSDK))
+        accounts = bridge.get_accounts()
+        self.assertEqual(accounts[0]["account_id"], "7654321")
+        self.assertEqual(accounts[0]["person_id"], "A*******89")
+        self.assertTrue(accounts[0]["ca_expiretime"].startswith("2030-01-01"))
+        self.assertNotIn("A123456789", json.dumps(bridge.get_health(), ensure_ascii=False))
+
+
+def taipei_today_str() -> str:
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y%m%d")
+
+
+class TestPersistentCircuitBreaker(_BridgeCase):
+    def _state_file(self):
+        return os.path.join(self.state_dir, "esun-login-state.json")
+
+    def test_credential_failure_is_persisted_and_blocks_auto_login_after_restart(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        first = self.make_bridge(sim, RecordingFactory(login_fail_msg="AGA0000 密碼錯誤"))
+        self.assertTrue(first.login_locked)
+        with open(self._state_file(), encoding="utf-8") as f:
+            raw = f.read()
+        state = json.loads(raw)
+        self.assertTrue(state["credentialLocked"])
+        self.assertEqual(state["lockCode"], "AGA0000")
+        self.assertNotIn("pw-correct-horse", raw)  # no secret stored, only a salted fingerprint
+        self.assertNotIn("cert-pw-battery", raw)
+        self.assertEqual(state["loginAttempts"]["count"], 1)
+
+        # "Restart": a new process with the same state dir must not auto-login.
+        factory = RecordingFactory()
+        second = self.make_bridge(sim, factory)
+        self.assertEqual(factory.login_calls, 0)
+        self.assertFalse(second.logged_in)
+        health = second.get_health()
+        self.assertTrue(health["loginLocked"])
+        self.assertIn("AGA0000", health["loginLockReason"])
+        # The daily login count survives the restart too.
+        self.assertEqual(second.reconnect_daily.get_count(), 1)
+
+        # Environment switch is blocked by the breaker like auto-login.
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        res, status = second.switch_environment_with_status("PRODUCTION")
+        self.assertEqual((status, res["code"]), (423, "ESUN_LOGIN_LOCKED"))
+
+        # Explicit reconnect with unchanged credentials is refused (would be strike #2) ...
+        ok, body, code = second.reconnect()
+        self.assertEqual((ok, code, body["code"]), (False, 423, "ESUN_CREDENTIALS_UNCHANGED"))
+        self.assertEqual(factory.login_calls, 0)
+        # ... unless forced, which logs in and clears the persisted lock.
+        ok, body, code = second.reconnect(force=True)
+        self.assertEqual((ok, code), (True, 200))
+        self.assertFalse(second.login_locked)
+        with open(self._state_file(), encoding="utf-8") as f:
+            self.assertFalse(json.load(f)["credentialLocked"])
+
+    def test_changed_password_allows_explicit_reconnect(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        self.make_bridge(sim, RecordingFactory(login_fail_msg="AGA0000 密碼錯誤"))
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        self.assertEqual(factory.login_calls, 0)
+        os.environ["ESUN_ACCOUNT_PASSWORD"] = "pw-fixed-now"
+        ok, _, code = bridge.reconnect()
+        self.assertEqual((ok, code), (True, 200))
+        self.assertEqual(factory.login_calls, 1)
+        self.assertFalse(bridge.login_locked)
+
+    def test_rate_limit_and_network_errors_do_not_lock(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        for message in ("AGR0000 登入頻率超限", "error sending request for url: operation timed out"):
+            bridge = self.make_bridge(sim, RecordingFactory(login_fail_msg=message))
+            self.assertFalse(bridge.login_locked, message)
+            self.assertFalse(bridge.get_health()["loginLocked"])
+
+    def test_unreadable_state_file_fails_safe(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        os.makedirs(self.state_dir, exist_ok=True)
+        with open(self._state_file(), "w", encoding="utf-8") as f:
+            f.write("{corrupt")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        self.assertEqual(factory.login_calls, 0)
+        self.assertTrue(bridge.login_locked)
+        ok, _, code = bridge.reconnect()  # no stored fingerprint: explicit reconnect is allowed
+        self.assertEqual((ok, code), (True, 200))
+
+
+class TestWebSocketSupervisor(_BridgeCase):
+    def test_old_generation_events_are_dropped_after_switch(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        old_sdk = factory.instances[0]
+        old_on_order, old_on_dealt = old_sdk.callbacks["order"], old_sdk.callbacks["dealt"]
+        bridge.switch_environment_with_status("PRODUCTION")
+        new_sdk = factory.instances[1]
+        events = bridge.sse_fanout.register()
+
+        old_on_order({"kind": "ACK", "ord_no": "S0001", "stock_no": "2330", "work_date": taipei_today_str()})
+        old_on_dealt({"kind": "MAT", "ord_no": "S0001", "mat_qty": 1, "mkt_seq_num": "1"})
+        self.assertEqual(_drain(events, timeout=0.2), [])
+        self.assertIsNone(bridge.order_book_cache.get("S0001"))
+        self.assertIsNone(bridge.positions_cache.get_stale("positions"))
+
+        new_sdk.callbacks["order"]({"kind": "ACK", "ord_no": "P0001", "stock_no": "2330", "work_date": taipei_today_str()})
+        received = _drain(events, timeout=0.5)
+        self.assertEqual(len(received), 1)
+        self.assertIsNotNone(bridge.order_book_cache.get("P0001"))
+
+    def test_disconnect_triggers_backoff_reconnect_and_resync(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory, auto_login=False)
+        bridge.ws_backoff_initial = 0.05
+        bridge.ws_resync_open_wait = 0.1
+        bridge.attempt_initial_login()
+        sdk = factory.instances[0]
+        events = bridge.sse_fanout.register()
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 1))
+        orders_calls = sdk.orders_calls
+        sdk.close_websocket()  # network drop: run_forever returns
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 2, timeout=3))
+        self.assertTrue(_wait_until(lambda: sdk.orders_calls > orders_calls, timeout=8))
+        resync = [e for e in _drain(events, timeout=1.0) if e["event"] == "resync"]
+        self.assertTrue(resync)
+        self.assertEqual(resync[0]["data"]["reason"], "ws_reconnected")
+        self.assertGreaterEqual(bridge.get_health()["wsReconnects"], 1)
+
+    def test_silence_detection_forces_reconnect(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory, auto_login=False)
+        bridge.ws_backoff_initial = 0.05
+        bridge.ws_silence_seconds = 0.2
+        bridge.ws_watchdog_interval = 0.05
+        bridge.attempt_initial_login()
+        sdk = factory.instances[0]
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls >= 2, timeout=5))
+        self.assertGreaterEqual(sdk.ws_close_calls, 1)
+
+    def test_shutdown_closes_websocket(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        sdk = factory.instances[0]
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 1))
+        bridge.shutdown()
+        self.assertGreaterEqual(sdk.ws_close_calls, 1)
+        self.assertTrue(_wait_until(lambda: not sdk.ws_connected))
+        time.sleep(0.2)
+        self.assertEqual(sdk.ws_connect_calls, 1)  # no reconnect after shutdown
+
+
+class TestQuerySemanticsAndCaches(_BridgeCase):
+    def test_not_logged_in_queries_return_503_instead_of_empty_data(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        bridge = self.make_bridge(sim, RecordingFactory(login_fail_msg="error sending request"))
+        with self.assertRaises(EsunQueryError) as ctx:
+            bridge.get_orders(refresh=False)
+        self.assertEqual(ctx.exception.status, 503)
+        for fn in (bridge.get_balance, bridge.get_inventories, bridge.get_settlements, bridge.get_trade_status):
+            data, status = fn()
+            self.assertEqual(status, 503, fn.__name__)
+            self.assertEqual(data["code"], "ESUN_NOT_LOGGED_IN")
+
+    def test_refresh_throttle_and_sdk_failure_are_errors(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        bridge.last_orders_refresh_time = 0.0
+        bridge.get_orders(refresh=True)
+        with self.assertRaises(EsunQueryError) as ctx:
+            bridge.get_orders(refresh=True)  # within 5 s
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (429, "AGR0005"))
+        self.assertGreater(ctx.exception.retry_after, 0)
+
+        sdk = factory.instances[0]
+        sdk.get_order_results = mock.Mock(side_effect=RuntimeError("upstream exploded"))
+        bridge.last_orders_refresh_time = 0.0
+        with self.assertRaises(EsunQueryError) as ctx:
+            bridge.get_orders(refresh=True)
+        self.assertEqual(ctx.exception.status, 502)
+
+        # SDK failure with an expired cache must not be served as fresh data.
+        bridge.balance_cache.set("balance", {"acc_balance": 1})
+        bridge.balance_cache.invalidate()
+        sdk.get_balance = mock.Mock(side_effect=RuntimeError("down"))
+        data, status = bridge.get_balance()
+        self.assertEqual(status, 502)
+        self.assertEqual(data["code"], "BALANCE_QUERY_ERROR")
+
+    def test_dirty_positions_are_not_served_when_rate_limited(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        bridge = self.make_bridge(sim, RecordingFactory())
+        data, status = bridge.get_inventories()
+        self.assertEqual(status, 200)
+        bridge._handle_mat({"ord_no": "X1", "mat_qty": 1})  # deal arrives: cache dirty
+        bridge.positions_limiter.timestamps = [time.monotonic()] * 10
+        data, status = bridge.get_inventories()
+        self.assertEqual(status, 429)
+        self.assertEqual(data["code"], "AGR0003")
+
+    def test_balance_single_flight(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+
+        class SlowBalanceSDK(MockSDK):
+            def get_balance(self):
+                time.sleep(0.2)
+                return super().get_balance()
+
+        factory = RecordingFactory(mock_cls=SlowBalanceSDK)
+        bridge = self.make_bridge(sim, factory)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(bridge.get_balance())) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(factory.instances[0].balance_calls, 1)
+        self.assertTrue(all(status == 200 for _, status in results))
+
+    def test_ttl_cache_rejects_stale_generation_and_keeps_dirty(self):
+        cache = TTLCache(ttl_seconds=60)
+        cache.reset(1)
+        token = cache.begin_fill()
+        cache.reset(2)  # environment switched while the query was in flight
+        self.assertFalse(cache.set("k", "old-session-data", fill_token=token))
+        self.assertIsNone(cache.get("k"))
+        token = cache.begin_fill()
+        cache.mark_dirty()  # MAT arrived while the query was in flight
+        cache.set("k", "pre-deal", fill_token=token)
+        self.assertIsNone(cache.get("k"))
+        cache.set("k", "fresh", fill_token=cache.begin_fill())
+        self.assertEqual(cache.get("k")[0], "fresh")
+
+    def test_daily_counter_rolls_over_on_taipei_midnight(self):
+        counter = DailyCounter(max_daily_requests=2)
+        with mock.patch("server.esun_trade_server.taipei_today", return_value=datetime.date(2026, 10, 24)):
+            counter.current_day = datetime.date(2026, 10, 24)
+            self.assertTrue(counter.increment())
+            self.assertTrue(counter.increment())
+            self.assertFalse(counter.increment())  # atomic try-consume
+            self.assertEqual(counter.get_count(), 2)
+        with mock.patch("server.esun_trade_server.taipei_today", return_value=datetime.date(2026, 10, 25)):
+            self.assertTrue(counter.can_increment())
+            self.assertEqual(counter.get_count(), 0)
+
+    def test_order_book_cache_snapshot_replaces_and_scopes_generation(self):
+        cache = OrderBookCache()
+        cache.reset(3)
+        today = taipei_today_str()
+        cache.update_from_order_results([{"ord_no": "A1", "work_date": today, "org_qty": 2}], generation=3)
+        self.assertFalse(cache.update_from_order_results([{"ord_no": "OLD"}], generation=2))
+        self.assertIsNone(cache.upsert({"ord_date": "x", "ret_code": "000000"}, generation=3))  # no phantom rows
+        cache.update_from_order_results([{"ord_no": "A2", "work_date": today}], generation=3)
+        # A1 was created moments ago, so it is kept until the broker snapshot shows it; force it old:
+        with cache.lock:
+            for meta in cache._meta.values():
+                meta["created"] -= 3600
+        cache.update_from_order_results([{"ord_no": "A2", "work_date": today}], generation=3)
+        self.assertEqual([o["ord_no"] for o in cache.get_all()], ["A2"])
+
+    def test_order_book_cache_evicts_previous_trading_day(self):
+        cache = OrderBookCache()
+        with mock.patch("server.esun_trade_server.taipei_today", return_value=datetime.date(2026, 10, 23)):
+            cache.reset(1)
+            cache.update_from_ack({"ord_no": "B0001", "work_date": "20261023"}, generation=1)
+            cache.update_from_ack({"ord_no": "R0001", "work_date": "20261024"}, generation=1)  # reservation for tomorrow
+        with mock.patch("server.esun_trade_server.taipei_today", return_value=datetime.date(2026, 10, 24)):
+            self.assertIsNone(cache.get("B0001"))
+            self.assertIsNotNone(cache.get("R0001"))
+
+
+class TestConfigHardening(_BridgeCase):
+    def test_bom_and_sanitized_problems(self):
+        path = _write_profile(self.dir, "esun-config.ini", "SIMULATION")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        with open(path, "w", encoding="utf-8-sig") as f:  # PowerShell 5.1 style BOM
+            f.write(content)
+        cfg, problems, env = load_config(path)
+        self.assertEqual(problems, [])
+        self.assertEqual(env, "SIMULATION")
+
+        broken = os.path.join(self.dir, "broken.ini")
+        with open(broken, "w", encoding="utf-8") as f:
+            f.write("[Core]\nEntry=x\n[Api]\nKey=k\nSecret=s3cr3t-line-1\n  ZZZ-SECRET-CONTINUATION-WITHOUT-EQUALS\n=orphan\n")
+        cfg, problems, env = load_config(broken)
+        joined = " ".join(problems)
+        self.assertIsNone(cfg)
+        self.assertIn("行格式錯誤", joined)
+        self.assertNotIn("orphan", joined)
+        self.assertNotIn("SECRET", joined)
+
+        cfg, problems, _ = load_config(os.path.join(self.dir, "missing", "esun-config.ini"))
+        self.assertEqual(problems, ["找不到玉山設定檔：esun-config.ini"])
+
+    def test_placeholder_credentials_block_login(self):
+        path = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", key="YOUR_SIMULATION_API_KEY_HERE")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(path, factory)
+        self.assertEqual(factory.login_calls, 0)
+        self.assertIn("範本預設值", bridge.login_error)
+        self.assertFalse(bridge.login_locked)
+
+    def test_headless_patch_is_verified(self):
+        self.assertTrue(apply_headless_keyring_patches())
+        self.assertTrue(HEADLESS_PATCH_STATE["ok"])
+        with self.assertRaises(RuntimeError):
+            esun_trade.util.getpass("Enter esun account password:")
 
 
 class TestGracefulShutdown(unittest.TestCase):

@@ -26,7 +26,9 @@ Key Protections & Features:
 
 from __future__ import annotations
 
+import collections
 import configparser
+import dataclasses
 import datetime
 import hashlib
 import hmac
@@ -37,6 +39,7 @@ import logging
 import math
 import os
 import queue
+import random
 import re
 import secrets
 import signal
@@ -111,15 +114,49 @@ def mask_identifier(value: any) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Headless Keyring Injection
+# 1. Headless Keyring Injection & WebSocket Keep-alive Patch
 # ─────────────────────────────────────────────────────────────────────────────
 
-def apply_headless_keyring_patches() -> None:
+HEADLESS_PATCH_STATE: dict[str, any] = {"ok": False, "detail": "尚未套用"}
+SUPPORTED_SDK_VERSION_PREFIXES = ("2.2.",)
+_INTERACTIVE_CREDENTIAL_NAMES = frozenset({
+    "ft_check_password", "ft_get_password", "ft_set_password", "get_password", "getpass",
+})
+
+
+def _detect_sdk_version() -> str | None:
+    try:
+        from importlib import metadata as importlib_metadata
+        return importlib_metadata.version("esun_trade")
+    except Exception:
+        return None
+
+
+ESUN_SDK_VERSION = _detect_sdk_version()
+
+
+def _headless_getpass_guard(prompt: str = "", stream: any = None) -> str:
+    raise RuntimeError(
+        "esun-bridge 已停用互動式密碼輸入；請以 ESUN_ACCOUNT_PASSWORD / ESUN_CERT_PASSWORD 環境變數提供密碼"
+    )
+
+
+def _code_names(func: any) -> set[str]:
+    code = getattr(func, "__code__", None)
+    return set(getattr(code, "co_names", ()) or ())
+
+
+def apply_headless_keyring_patches() -> bool:
     """
     Monkey-patch esun_trade.util.setup_keyring (no-op) and
     esun_trade.util.load_credentials to return passwords from environment variables,
     guaranteeing that SDK(config) and sdk.login() NEVER call getpass() or hang
     in headless environments.
+
+    The patch is verified against the SDK's code objects (SDK.__init__ must call the
+    module-level setup_keyring and SDK.login the module-level load_credentials, with no
+    interactive keyring/getpass helper); interactive getpass is replaced by a function
+    that raises. Returns True only when the headless path is guaranteed.
     """
     def _no_op_setup_keyring(user_account: str) -> None:
         pass
@@ -139,19 +176,134 @@ def apply_headless_keyring_patches() -> None:
         import esun_trade.util
         esun_trade.util.setup_keyring = _no_op_setup_keyring
         esun_trade.util.load_credentials = _headless_load_credentials
+        if hasattr(esun_trade.util, "getpass"):
+            esun_trade.util.getpass = _headless_getpass_guard
     except ImportError:
         pass
 
+    ok = False
+    detail = "esun_trade 未安裝"
     try:
         import esun_trade.sdk
         esun_trade.sdk.setup_keyring = _no_op_setup_keyring
         esun_trade.sdk.load_credentials = _headless_load_credentials
+        if hasattr(esun_trade.sdk, "getpass"):
+            esun_trade.sdk.getpass = _headless_getpass_guard
+        sdk_cls = getattr(esun_trade.sdk, "SDK", None)
+        init_names = _code_names(getattr(sdk_cls, "__init__", None))
+        login_names = _code_names(getattr(sdk_cls, "login", None))
+        uses_patched_names = "setup_keyring" in init_names and "load_credentials" in login_names
+        interactive = sorted(_INTERACTIVE_CREDENTIAL_NAMES & (init_names | login_names))
+        ok = (
+            uses_patched_names
+            and not interactive
+            and esun_trade.sdk.load_credentials is _headless_load_credentials
+            and esun_trade.sdk.setup_keyring is _no_op_setup_keyring
+        )
+        if ok:
+            detail = "ok"
+        elif interactive:
+            detail = f"esun_trade SDK 登入流程呼叫互動式函式 {interactive}，headless patch 無法保證不會卡住"
+        else:
+            detail = "esun_trade SDK 未使用模組層級 setup_keyring/load_credentials，headless patch 未生效"
     except ImportError:
         pass
+    HEADLESS_PATCH_STATE["ok"] = ok
+    HEADLESS_PATCH_STATE["detail"] = detail
+    if not ok and detail != "esun_trade 未安裝":
+        logger.error(f"[headless] {detail}（esun_trade {ESUN_SDK_VERSION}）；已停用自動登入")
+    return ok
 
 
 # Apply patches immediately upon module import
 apply_headless_keyring_patches()
+if ESUN_SDK_VERSION and not ESUN_SDK_VERSION.startswith(SUPPORTED_SDK_VERSION_PREFIXES):
+    logger.warning(f"esun_trade {ESUN_SDK_VERSION} 未經驗證（已驗證：{', '.join(SUPPORTED_SDK_VERSION_PREFIXES)}x）")
+
+WS_PING_INTERVAL_SECONDS = 30
+WS_PING_TIMEOUT_SECONDS = 10
+
+
+def apply_websocket_patches() -> bool:
+    """
+    Replaces esun_trade.websocket.WebsocketHandler.connect_websocket so the bridge can
+    (1) keep a handle on the WebSocketApp and close it on session switch, silence or shutdown,
+    (2) run websocket-client ping/pong keep-alive (detects half-open TCP connections), and
+    (3) observe open / message / ping / pong activity for silence detection.
+    Also adds SDK.close_websocket(). Returns True when the patch is active.
+    """
+    try:
+        import esun_trade.websocket as esun_ws
+        from websocket import WebSocketApp
+    except ImportError:
+        return False
+    handler_cls = getattr(esun_ws, "WebsocketHandler", None)
+    if handler_cls is None:
+        return False
+    if getattr(handler_cls, "_esun_bridge_patched", False):
+        return True
+
+    def _call_hook(handler: any, name: str) -> None:
+        hook = getattr(handler, name, None)
+        if callable(hook):
+            try:
+                hook()
+            except Exception:
+                logger.debug("WebSocket hook %s failed", name, exc_info=True)
+
+    def _bridge_connect_websocket(self: any, url_entry: str) -> None:
+        def _on_open(ws: any) -> None:
+            _call_hook(self, "bridge_open_hook")
+
+        def _on_message(ws: any, message: any) -> None:
+            _call_hook(self, "bridge_activity_hook")
+            self.ws_on_message(ws, message)
+
+        def _on_ping(ws: any, data: any) -> None:
+            _call_hook(self, "bridge_activity_hook")
+
+        def _on_pong(ws: any, data: any) -> None:
+            _call_hook(self, "bridge_activity_hook")
+
+        app = WebSocketApp(
+            url_entry,
+            on_open=_on_open,
+            on_message=_on_message,
+            on_error=self.ws_on_error,
+            on_close=self.ws_on_close,
+            on_ping=_on_ping,
+            on_pong=_on_pong,
+        )
+        self._WebsocketHandler__ws = app
+        self.bridge_ws_app = app
+        app.run_forever(ping_interval=WS_PING_INTERVAL_SECONDS, ping_timeout=WS_PING_TIMEOUT_SECONDS)
+
+    def _bridge_close_websocket(self: any) -> None:
+        app = getattr(self, "bridge_ws_app", None)
+        if app is not None:
+            app.close()
+
+    handler_cls.connect_websocket = _bridge_connect_websocket
+    handler_cls.close_websocket = _bridge_close_websocket
+    handler_cls._esun_bridge_patched = True
+
+    try:
+        import esun_trade.sdk as esun_sdk
+        sdk_cls = getattr(esun_sdk, "SDK", None)
+        if sdk_cls is not None and not hasattr(sdk_cls, "close_websocket"):
+            def _sdk_close_websocket(self: any) -> None:
+                handler = getattr(self, "_SDK__wsHandler", None)
+                closer = getattr(handler, "close_websocket", None)
+                if callable(closer):
+                    closer()
+
+            sdk_cls.close_websocket = _sdk_close_websocket
+    except ImportError:
+        pass
+    return True
+
+
+WS_PATCH_ACTIVE = apply_websocket_patches()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +323,23 @@ ESUN_PRODUCTION_CONFIG_CANDIDATES = (
     "esun-config.prod.ini",
 )
 
+# Config files are user-edited: accept a UTF-8 BOM (e.g. Windows PowerShell 5.1 Set-Content -Encoding UTF8).
+CONFIG_ENCODING = "utf-8-sig"
+
+
+def _describe_config_parse_error(exc: Exception) -> str:
+    """Describes a config parsing failure WITHOUT echoing file content (a broken line may hold the API secret)."""
+    if isinstance(exc, UnicodeDecodeError):
+        return "解析設定檔失敗：檔案編碼錯誤（請以 UTF-8 儲存）"
+    lineno = getattr(exc, "lineno", None)
+    if lineno:
+        return f"解析設定檔失敗：第 {lineno} 行格式錯誤"
+    errors = getattr(exc, "errors", None) or []
+    line_numbers = [str(item[0]) for item in errors if isinstance(item, tuple) and item]
+    if line_numbers:
+        return f"解析設定檔失敗：第 {', '.join(line_numbers[:5])} 行格式錯誤"
+    return f"解析設定檔失敗：{type(exc).__name__}"
+
 
 def _is_placeholder_config(config_path: str) -> bool:
     """
@@ -184,7 +353,7 @@ def _is_placeholder_config(config_path: str) -> bool:
         return False
     try:
         cp = configparser.ConfigParser()
-        cp.read(config_path, encoding="utf-8")
+        cp.read(config_path, encoding=CONFIG_ENCODING)
         if cp.has_section("Api") and cp.has_section("User"):
             api_key = str(cp["Api"].get("Key", "")).strip()
             account = str(cp["User"].get("Account", "")).strip()
@@ -205,6 +374,7 @@ def discover_esun_config_profiles(
     aliases (.sim.ini, .test.ini, .prod.ini), environment variables
     (ESUN_SIMULATION_CONFIG_PATH, ESUN_PRODUCTION_CONFIG_PATH),
     and single esun-config.ini fallback detection.
+    Read-only: never modifies any file.
     """
     if base_dir:
         root_dir = base_dir if os.path.isdir(base_dir) else os.path.dirname(os.path.abspath(base_dir))
@@ -263,14 +433,17 @@ def discover_esun_config_profiles(
         if found_fallback:
             try:
                 cp = configparser.ConfigParser()
-                cp.read(found_fallback, encoding="utf-8")
+                cp.read(found_fallback, encoding=CONFIG_ENCODING)
                 detected = detect_esun_environment(cp)
                 if detected == "SIMULATION":
                     sim_path = found_fallback
                 elif detected == "PRODUCTION":
                     prod_path = found_fallback
             except Exception as e:
-                logger.warning(f"Failed to parse fallback config file {found_fallback}: {e}")
+                logger.warning(
+                    f"Failed to parse fallback config file {os.path.basename(found_fallback)}: "
+                    f"{_describe_config_parse_error(e)}"
+                )
 
     sim_file = os.path.basename(sim_path) if sim_path else None
     prod_file = os.path.basename(prod_path) if prod_path else None
@@ -304,6 +477,20 @@ def discover_esun_config_profiles(
     }
 
 
+def public_config_profiles(discovery: dict) -> dict:
+    """Profile info safe to return to clients (no absolute file paths)."""
+    return {
+        k: {
+            "available": v["available"],
+            "fileName": v["fileName"],
+            "expectedFileName": v["expectedFileName"],
+            "aliases": v["aliases"],
+            "entry": v["entry"],
+        }
+        for k, v in discovery["profiles"].items()
+    }
+
+
 def detect_esun_environment(config: configparser.ConfigParser | None) -> str:
     """
     Detects whether an E.Sun configuration is SIMULATION or PRODUCTION based on [Core]:
@@ -327,6 +514,12 @@ def detect_esun_environment(config: configparser.ConfigParser | None) -> str:
     return "PRODUCTION"
 
 
+def normalize_environment(value: any) -> str | None:
+    """Strictly maps a client-supplied environment to SIMULATION / PRODUCTION (None if invalid)."""
+    s = str(value or "").strip().upper()
+    return s if s in ("SIMULATION", "PRODUCTION") else None
+
+
 def split_account(aid: str | None) -> dict[str, str]:
     """Split 11-digit or 7-digit account into broker_id and account_id."""
     id_str = str(aid or "").strip()
@@ -338,7 +531,8 @@ def split_account(aid: str | None) -> dict[str, str]:
 def load_config(config_path_override: str | None = None) -> tuple[configparser.ConfigParser | None, list[str], str]:
     """
     Loads config.ini / esun-config.ini or profile-specific config from path or environment.
-    Returns (config_parser, problems, environment).
+    Returns (config_parser, problems, environment). Read-only; problem texts never contain
+    file content or absolute paths.
     """
     if config_path_override:
         config_path = config_path_override
@@ -364,13 +558,15 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
     problems: list[str] = []
 
     if not os.path.exists(config_path) or not os.path.isfile(config_path):
-        return None, [f"找不到玉山設定檔：{config_path}"], "UNKNOWN"
+        return None, [f"找不到玉山設定檔：{os.path.basename(config_path)}"], "UNKNOWN"
 
-    parser = configparser.ConfigParser()
+    # interpolation=None: a "%" inside an API secret must not raise InterpolationSyntaxError
+    # (this parser is handed to SDK(config) as-is).
+    parser = configparser.ConfigParser(interpolation=None)
     try:
-        parser.read(config_path, encoding="utf-8")
+        parser.read(config_path, encoding=CONFIG_ENCODING)
     except Exception as e:
-        return None, [f"解析設定檔失敗：{e}"], "UNKNOWN"
+        return None, [_describe_config_parse_error(e)], "UNKNOWN"
 
     # Validate required sections
     for sec in ("Core", "Cert", "Api", "User"):
@@ -380,10 +576,17 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
     if parser.has_section("Core") and not parser["Core"].get("Entry"):
         problems.append("設定檔缺少 [Core] Entry")
     if parser.has_section("Api"):
-        if not parser["Api"].get("Key"):
+        api_key = str(parser["Api"].get("Key") or "").strip()
+        api_secret = str(parser["Api"].get("Secret") or "").strip()
+        if not api_key:
             problems.append("設定檔缺少 [Api] Key")
-        if not parser["Api"].get("Secret"):
+        elif api_key.upper().startswith("YOUR_"):
+            problems.append("設定檔 [Api] Key 仍為範本預設值，請填入玉山核發的金鑰")
+        if not api_secret:
             problems.append("設定檔缺少 [Api] Secret")
+        elif api_secret.upper().startswith("YOUR_"):
+            problems.append("設定檔 [Api] Secret 仍為範本預設值，請填入玉山核發的密鑰")
+        register_secret(api_secret)
     if parser.has_section("User") and not parser["User"].get("Account"):
         problems.append("設定檔缺少 [User] Account")
 
@@ -401,7 +604,7 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
                 resolved_cert = os.path.abspath(cert_raw)
 
         if not os.path.exists(resolved_cert):
-            problems.append(f"找不到憑證檔案：{resolved_cert}")
+            problems.append(f"找不到憑證檔案：{os.path.basename(resolved_cert)}")
         else:
             parser["Cert"]["Path"] = resolved_cert
 
@@ -418,105 +621,27 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
     return parser, problems, environment
 
 
-def update_esun_config_environment(config_path: str, target_env: str) -> tuple[str, str]:
+def override_esun_config_environment(config: configparser.ConfigParser, target_env: str) -> tuple[str, str]:
     """
-    Updates the [Core] section of config_path to match target_env ('SIMULATION' or 'PRODUCTION').
-    - When 'SIMULATION':
-      Entry = https://esuntradingapi-simulation.esunsec.com.tw/api/v1
-      Environment = SIMULATION
-    - When 'PRODUCTION':
-      Entry = https://esuntradingapi.esunsec.com.tw/api/v1
-      Removes Environment key from [Core].
-    Preserves other sections and existing comments.
-    Returns (target_env, target_entry).
+    In-memory only: rewrites [Core] of an already-loaded ConfigParser to match target_env
+    ('SIMULATION' or 'PRODUCTION'); the user's ini file on disk is never touched.
+    - SIMULATION: Entry = ESUN_SIMULATION_ENTRY, Environment = SIMULATION
+    - PRODUCTION: Entry = ESUN_PRODUCTION_ENTRY, no Environment key
+    Returns (target_env, target_entry). The parser can be passed straight to SDK(config).
     """
-    target_env_normalized = str(target_env or "").strip().upper()
-    if target_env_normalized not in ("SIMULATION", "PRODUCTION"):
+    target_env_normalized = normalize_environment(target_env)
+    if target_env_normalized is None:
         raise ValueError(f"不支援的環境設定：{target_env}，僅支援 SIMULATION 或 PRODUCTION")
-
     target_entry = (
         ESUN_SIMULATION_ENTRY if target_env_normalized == "SIMULATION" else ESUN_PRODUCTION_ENTRY
     )
-
-    if not os.path.exists(config_path):
-        dirname = os.path.dirname(os.path.abspath(config_path))
-        if dirname:
-            os.makedirs(dirname, exist_ok=True)
-        lines = ["[Core]\n", f"Entry = {target_entry}\n"]
-        if target_env_normalized == "SIMULATION":
-            lines.append("Environment = SIMULATION\n")
-        with open(config_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-        return target_env_normalized, target_entry
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        existing_lines = f.readlines()
-
-    new_lines: list[str] = []
-    in_core = False
-    core_seen = False
-    entry_updated = False
-    env_updated = False
-
-    for line in existing_lines:
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            sec_name = stripped[1:-1].strip()
-            if in_core:
-                if not entry_updated:
-                    new_lines.append(f"Entry = {target_entry}\n")
-                    entry_updated = True
-                if target_env_normalized == "SIMULATION" and not env_updated:
-                    new_lines.append("Environment = SIMULATION\n")
-                    env_updated = True
-                in_core = False
-            if sec_name.lower() == "core":
-                in_core = True
-                core_seen = True
-            new_lines.append(line)
-            continue
-
-        if in_core:
-            # Check if line sets Entry
-            if stripped.lower().startswith("entry") and ("=" in stripped or ":" in stripped):
-                sep = "=" if "=" in line else ":"
-                prefix = line.split(sep, 1)[0]
-                new_lines.append(f"{prefix}= {target_entry}\n")
-                entry_updated = True
-                continue
-
-            # Check if line sets Environment
-            if stripped.lower().startswith("environment") and ("=" in stripped or ":" in stripped):
-                if target_env_normalized == "SIMULATION":
-                    sep = "=" if "=" in line else ":"
-                    prefix = line.split(sep, 1)[0]
-                    new_lines.append(f"{prefix}= SIMULATION\n")
-                    env_updated = True
-                else:
-                    # PRODUCTION: Remove Environment key completely
-                    env_updated = True
-                continue
-
-        new_lines.append(line)
-
-    if in_core:
-        if not entry_updated:
-            new_lines.append(f"Entry = {target_entry}\n")
-            entry_updated = True
-        if target_env_normalized == "SIMULATION" and not env_updated:
-            new_lines.append("Environment = SIMULATION\n")
-            env_updated = True
-
-    if not core_seen:
-        core_block = ["[Core]\n", f"Entry = {target_entry}\n"]
-        if target_env_normalized == "SIMULATION":
-            core_block.append("Environment = SIMULATION\n")
-        core_block.append("\n")
-        new_lines = core_block + new_lines
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
-
+    if not config.has_section("Core"):
+        config.add_section("Core")
+    config.set("Core", "Entry", target_entry)
+    if target_env_normalized == "SIMULATION":
+        config.set("Core", "Environment", "SIMULATION")
+    else:
+        config.remove_option("Core", "Environment")
     return target_env_normalized, target_entry
 
 
@@ -524,8 +649,21 @@ def update_esun_config_environment(config_path: str, target_env: str) -> tuple[s
 # 3. Rate Limiters & Caches
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Taiwan has no DST: a fixed UTC+8 offset is exact and needs no tzdata in slim images.
+TAIPEI_TZ = datetime.timezone(datetime.timedelta(hours=8), "Asia/Taipei")
+
+
+def taipei_now() -> datetime.datetime:
+    """Current time in Asia/Taipei regardless of the container TZ (Docker defaults to UTC)."""
+    return datetime.datetime.now(TAIPEI_TZ)
+
+
+def taipei_today() -> datetime.date:
+    return taipei_now().date()
+
+
 class SlidingWindowRateLimiter:
-    """Thread-safe sliding window rate limiter."""
+    """Thread-safe sliding window rate limiter (monotonic clock: immune to wall-clock jumps)."""
 
     def __init__(self, max_requests: int, window_seconds: float):
         self.max_requests = max_requests
@@ -540,15 +678,15 @@ class SlidingWindowRateLimiter:
 
     def can_acquire(self) -> bool:
         with self.lock:
-            now = time.time()
+            now = time.monotonic()
             self._cleanup(now)
             return len(self.timestamps) < self.max_requests
 
     def acquire(self, timeout: float = 0.0) -> bool:
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
             with self.lock:
-                now = time.time()
+                now = time.monotonic()
                 self._cleanup(now)
                 if len(self.timestamps) < self.max_requests:
                     self.timestamps.append(now)
@@ -557,13 +695,13 @@ class SlidingWindowRateLimiter:
 
             if wait_time <= 0:
                 continue
-            if timeout <= 0 or (time.time() + wait_time) > deadline:
+            if timeout <= 0 or (time.monotonic() + wait_time) > deadline:
                 return False
             time.sleep(min(wait_time, 0.05))
 
     def time_until_available(self) -> float:
         with self.lock:
-            now = time.time()
+            now = time.monotonic()
             self._cleanup(now)
             if len(self.timestamps) < self.max_requests:
                 return 0.0
@@ -571,16 +709,16 @@ class SlidingWindowRateLimiter:
 
 
 class DailyCounter:
-    """Thread-safe counter tracking daily requests with automatic midnight rollover."""
+    """Thread-safe counter tracking daily requests with automatic Asia/Taipei midnight rollover."""
 
     def __init__(self, max_daily_requests: int):
         self.max_daily_requests = max_daily_requests
-        self.current_day = datetime.date.today()
+        self.current_day = taipei_today()
         self.count = 0
         self.lock = threading.Lock()
 
     def _rollover_if_needed(self) -> None:
-        today = datetime.date.today()
+        today = taipei_today()
         if today != self.current_day:
             self.current_day = today
             self.count = 0
@@ -591,6 +729,7 @@ class DailyCounter:
             return self.count < self.max_daily_requests
 
     def increment(self) -> bool:
+        """Atomic try-consume: returns False (and does not count) when the daily cap is reached."""
         with self.lock:
             self._rollover_if_needed()
             if self.count >= self.max_daily_requests:
@@ -603,15 +742,32 @@ class DailyCounter:
             self._rollover_if_needed()
             return self.count
 
+    def restore(self, day: datetime.date, count: int) -> None:
+        """Restores a persisted count for `day` (ignored when `day` is not today)."""
+        with self.lock:
+            self._rollover_if_needed()
+            if day == self.current_day:
+                self.count = max(self.count, int(count or 0))
+
 
 class TTLCache:
-    """Thread-safe TTL cache with support for dirty marking."""
+    """
+    Thread-safe TTL cache with dirty marking, session scoping and a single-flight fill lock.
+    - reset(generation) clears the cache for a new login session; writes tagged with an
+      older generation (a query that started before an environment switch) are dropped.
+    - A fill token from begin_fill() taken before the SDK call keeps the cache dirty when a
+      MAT deal marked it dirty while that call was in flight (pre-deal data is never "fresh").
+    - fill_lock lets concurrent misses share one upstream call (official per-endpoint limits).
+    """
 
     def __init__(self, ttl_seconds: float):
         self.ttl_seconds = ttl_seconds
         self._cache: dict[str, tuple[any, float]] = {}
         self._dirty = False
+        self._dirty_version = 0
+        self._generation = 0
         self.lock = threading.Lock()
+        self.fill_lock = threading.Lock()
 
     def get(self, key: str = "default") -> tuple[any, float] | None:
         """Returns (data, cache_age_sec) if fresh and not dirty, else None."""
@@ -622,28 +778,51 @@ class TTLCache:
             if not entry:
                 return None
             data, timestamp = entry
-            age = time.time() - timestamp
+            age = time.monotonic() - timestamp
             if age <= self.ttl_seconds:
                 return data, age
             return None
 
     def get_stale(self, key: str = "default") -> tuple[any, float] | None:
-        """Returns (data, cache_age_sec) even if expired, for rate limit fallback."""
+        """Returns (data, cache_age_sec) even if expired."""
         with self.lock:
             entry = self._cache.get(key)
             if not entry:
                 return None
             data, timestamp = entry
-            return data, time.time() - timestamp
+            return data, time.monotonic() - timestamp
 
-    def set(self, key: str = "default", data: any = None) -> None:
+    def begin_fill(self) -> tuple[int, int]:
+        """Token to pass to set() for data fetched after this call."""
         with self.lock:
-            self._cache[key] = (data, time.time())
+            return self._generation, self._dirty_version
+
+    def set(
+        self,
+        key: str = "default",
+        data: any = None,
+        generation: int | None = None,
+        fill_token: tuple[int, int] | None = None,
+    ) -> bool:
+        with self.lock:
+            if generation is not None and generation != self._generation:
+                return False
+            if fill_token is not None:
+                token_generation, token_version = fill_token
+                if token_generation != self._generation:
+                    return False
+                if token_version != self._dirty_version:
+                    # Fetched before the latest dirty mark: keep it, but stay dirty so the next read refetches.
+                    self._cache[key] = (data, time.monotonic())
+                    return False
+            self._cache[key] = (data, time.monotonic())
             self._dirty = False
+            return True
 
     def mark_dirty(self) -> None:
         with self.lock:
             self._dirty = True
+            self._dirty_version += 1
 
     def invalidate(self, key: str | None = None) -> None:
         with self.lock:
@@ -656,6 +835,15 @@ class TTLCache:
         with self.lock:
             self._cache.clear()
             self._dirty = True
+            self._dirty_version += 1
+
+    def reset(self, generation: int) -> None:
+        """Drops everything and scopes the cache to a new login session."""
+        with self.lock:
+            self._cache.clear()
+            self._dirty = False
+            self._dirty_version += 1
+            self._generation = int(generation)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -789,97 +977,286 @@ def to_trade(val: any) -> any:
 # 5. Thread-safe OrderBookCache
 # ─────────────────────────────────────────────────────────────────────────────
 
+ORDER_SNAPSHOT_KEEP_RECENT_SECONDS = 15.0
+_ORPHAN_MAT_MEMORY = 2000
+
+
+def _to_number(value: any) -> float | None:
+    """Parses SDK numeric fields (int / float / numeric string); None when absent or invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    return number if math.isfinite(number) else None
+
+
+def _num_out(value: float) -> int | float:
+    return int(value) if float(value).is_integer() else value
+
+
+def _order_keys(data: dict) -> tuple[str, str]:
+    ord_no = str(data.get("ord_no") or data.get("ordNo") or "").strip()
+    pre_ord_no = str(data.get("pre_ord_no") or data.get("preOrdNo") or "").strip()
+    return ord_no, pre_ord_no
+
+
 class OrderBookCache:
     """
     Thread-safe in-memory cache of day orders dual-indexed by ord_no and pre_ord_no.
-    Updated from get_order_results(), WebSocket ACK events, and MAT deal events.
+    - get_order_results() snapshots are authoritative and REPLACE the cache (orders seen in
+      the last few seconds but not yet in the snapshot are kept).
+    - WebSocket ACK/MAT events and accepted mutations update existing rows.
+    - Scoped to one login session: writes tagged with another generation are dropped.
+    - Scoped to one Asia/Taipei trading day: rows whose work_date is before today are evicted.
+    - Only dicts carrying ord_no or pre_ord_no become rows (modify/cancel responses never do).
+    - Per-row metadata records whether quantities come from an untouched snapshot
+      ("snapshot") or were touched by events/mutations since ("event"/"local").
     """
+
+    # ACK fields that describe the report itself rather than the order state.
+    REPORT_ONLY_KEYS = frozenset({"kind", "ret_date", "ret_time", "action", "before_qty", "after_qty", "cel_type"})
 
     def __init__(self):
         self._orders: dict[str, dict] = {}
         self._ord_no_map: dict[str, str] = {}
         self._pre_ord_no_map: dict[str, str] = {}
+        self._meta: dict[str, dict] = {}
+        self._orphan_mats: collections.OrderedDict = collections.OrderedDict()
+        self._generation = 0
+        self._day = taipei_today()
         self.lock = threading.RLock()
 
-    def update_from_order_results(self, orders: list) -> None:
+    @property
+    def generation(self) -> int:
         with self.lock:
-            for o in orders:
-                if isinstance(o, dict):
-                    self._upsert(o)
+            return self._generation
 
-    def update_from_ack(self, ack_data: dict) -> None:
-        with self.lock:
-            self._upsert(ack_data)
+    # ── internal helpers (lock held) ──────────────────────────────────────────
 
-    def update_from_mat(self, mat_data: dict) -> None:
-        with self.lock:
-            ord_no = mat_data.get("ord_no") or mat_data.get("ordNo")
-            target = None
-            if ord_no and ord_no in self._ord_no_map:
-                target = self._orders[self._ord_no_map[ord_no]]
-            if target is not None:
-                mat_qty = mat_data.get("deal_qty") or mat_data.get("mat_qty") or mat_data.get("qty") or 0
-                try:
-                    target["deal_qty"] = int(target.get("deal_qty", 0)) + int(mat_qty)
-                except (ValueError, TypeError):
-                    pass
-                if "mat_time" in mat_data:
-                    target["mat_time"] = mat_data["mat_time"]
-                try:
-                    org_qty = int(target.get("org_qty") or target.get("quantity") or 0)
-                    if int(target.get("deal_qty", 0)) >= org_qty:
-                        target["status"] = "Filled"
-                    else:
-                        target["status"] = "PartFilled"
-                except (ValueError, TypeError):
-                    pass
+    def _accepts(self, generation: int | None) -> bool:
+        return generation is None or generation == self._generation
 
-    def _upsert(self, data: dict) -> str:
-        ord_no = str(data.get("ord_no") or data.get("ordNo") or "").strip()
-        pre_ord_no = str(data.get("pre_ord_no") or data.get("preOrdNo") or "").strip()
+    def _clear_locked(self) -> None:
+        self._orders.clear()
+        self._ord_no_map.clear()
+        self._pre_ord_no_map.clear()
+        self._meta.clear()
+        self._orphan_mats.clear()
 
-        internal_id = None
+    def _roll_day_locked(self) -> None:
+        today = taipei_today()
+        if today == self._day:
+            return
+        self._day = today
+        today_key = today.strftime("%Y%m%d")
+        for internal_id in list(self._orders):
+            order = self._orders[internal_id]
+            work_date = re.sub(r"[^0-9]", "", str(order.get("work_date") or order.get("workDate") or ""))
+            if not work_date or work_date < today_key:
+                self._remove_locked(internal_id)
+        self._orphan_mats.clear()
+
+    def _remove_locked(self, internal_id: str) -> None:
+        self._orders.pop(internal_id, None)
+        self._meta.pop(internal_id, None)
+        for mapping in (self._ord_no_map, self._pre_ord_no_map):
+            for key in [k for k, v in mapping.items() if v == internal_id]:
+                del mapping[key]
+
+    def _find_locked(self, ord_no: str, pre_ord_no: str) -> str | None:
         if ord_no and ord_no in self._ord_no_map:
-            internal_id = self._ord_no_map[ord_no]
-        elif pre_ord_no and pre_ord_no in self._pre_ord_no_map:
-            internal_id = self._pre_ord_no_map[pre_ord_no]
+            return self._ord_no_map[ord_no]
+        if pre_ord_no and pre_ord_no in self._pre_ord_no_map:
+            return self._pre_ord_no_map[pre_ord_no]
+        return None
 
-        if not internal_id:
-            internal_id = ord_no or pre_ord_no or f"order_{len(self._orders) + 1}"
+    def _lookup_locked(self, order_id: any) -> str | None:
+        key = str(order_id or "").strip()
+        if not key:
+            return None
+        if key in self._ord_no_map:
+            return self._ord_no_map[key]
+        if key in self._pre_ord_no_map:
+            return self._pre_ord_no_map[key]
+        if key in self._orders:
+            return key
+        return None
 
+    def _upsert_locked(self, data: dict, source: str) -> str | None:
+        ord_no, pre_ord_no = _order_keys(data)
+        if not ord_no and not pre_ord_no:
+            return None
+        internal_id = self._find_locked(ord_no, pre_ord_no) or (ord_no or f"pre:{pre_ord_no}")
         existing = self._orders.get(internal_id, {})
-        merged = {**existing, **data}
-        self._orders[internal_id] = merged
-
+        self._orders[internal_id] = {**existing, **data}
         if ord_no:
             self._ord_no_map[ord_no] = internal_id
         if pre_ord_no:
             self._pre_ord_no_map[pre_ord_no] = internal_id
-
+        now = time.monotonic()
+        meta = self._meta.get(internal_id)
+        if meta is None:
+            meta = {"created": now, "seen_mat": set()}
+            self._meta[internal_id] = meta
+        meta["source"] = source
+        meta["updated"] = now
         return internal_id
 
-    def get(self, order_id: str) -> dict | None:
-        with self.lock:
-            if not order_id:
-                return None
-            key = str(order_id).strip()
-            if key in self._ord_no_map:
-                return self._orders.get(self._ord_no_map[key])
-            if key in self._pre_ord_no_map:
-                return self._orders.get(self._pre_ord_no_map[key])
-            if key in self._orders:
-                return self._orders.get(key)
-            return None
+    # ── public API ────────────────────────────────────────────────────────────
 
-    def get_all(self) -> list[dict]:
+    def reset(self, generation: int) -> None:
+        """Drops every row and scopes the cache to a new login session."""
         with self.lock:
-            return list(self._orders.values())
+            self._clear_locked()
+            self._generation = int(generation)
+            self._day = taipei_today()
 
     def clear(self) -> None:
         with self.lock:
-            self._orders.clear()
-            self._ord_no_map.clear()
-            self._pre_ord_no_map.clear()
+            self._clear_locked()
+
+    def upsert(self, data: dict, generation: int | None = None, source: str = "event") -> str | None:
+        if not isinstance(data, dict):
+            return None
+        with self.lock:
+            if not self._accepts(generation):
+                return None
+            self._roll_day_locked()
+            return self._upsert_locked(dict(data), source)
+
+    def update_from_order_results(self, orders: list, generation: int | None = None) -> bool:
+        """Replaces the cache with an authoritative get_order_results() snapshot."""
+        with self.lock:
+            if not self._accepts(generation):
+                return False
+            self._day = taipei_today()
+            now = time.monotonic()
+            old_orders, old_meta = self._orders, self._meta
+            self._orders, self._meta = {}, {}
+            self._ord_no_map, self._pre_ord_no_map = {}, {}
+            for order in orders or []:
+                if isinstance(order, dict):
+                    self._upsert_locked(dict(order), "snapshot")
+            for old_id, old_order in old_orders.items():
+                meta = old_meta.get(old_id) or {}
+                ord_no, pre_ord_no = _order_keys(old_order)
+                new_id = self._find_locked(ord_no, pre_ord_no)
+                if new_id is not None:
+                    self._meta[new_id]["seen_mat"] |= set(meta.get("seen_mat") or ())
+                    continue
+                if now - float(meta.get("created") or 0.0) <= ORDER_SNAPSHOT_KEEP_RECENT_SECONDS:
+                    # Placed/reported moments ago and not yet visible in the broker snapshot.
+                    kept_id = self._upsert_locked(dict(old_order), str(meta.get("source") or "event"))
+                    if kept_id is not None:
+                        self._meta[kept_id]["created"] = float(meta.get("created") or now)
+                        self._meta[kept_id]["seen_mat"] |= set(meta.get("seen_mat") or ())
+            return True
+
+    def update_from_ack(self, ack_data: dict, generation: int | None = None) -> tuple[bool, dict | None]:
+        """Merges an ACK into its row. Returns (accepted, previous_row_copy)."""
+        if not isinstance(ack_data, dict):
+            return False, None
+        with self.lock:
+            if not self._accepts(generation):
+                return False, None
+            self._roll_day_locked()
+            ord_no, pre_ord_no = _order_keys(ack_data)
+            internal_id = self._find_locked(ord_no, pre_ord_no)
+            previous = dict(self._orders[internal_id]) if internal_id else None
+            state = {k: v for k, v in ack_data.items() if k not in self.REPORT_ONLY_KEYS}
+            self._upsert_locked(state, "event")
+            return True, previous
+
+    def update_from_mat(self, mat_data: dict, generation: int | None = None) -> bool:
+        """
+        Applies a MAT deal. Returns False when dropped (other session, or a duplicate of an
+        already-applied mkt_seq_num). Quantity fields of the row are never overwritten
+        (MAT units are not guaranteed to match the row); bridge-only deal_qty/status are kept.
+        """
+        if not isinstance(mat_data, dict):
+            return False
+        with self.lock:
+            if not self._accepts(generation):
+                return False
+            self._roll_day_locked()
+            ord_no = str(mat_data.get("ord_no") or mat_data.get("ordNo") or "").strip()
+            seq = str(mat_data.get("mkt_seq_num") or mat_data.get("mktSeqNum") or "").strip()
+            internal_id = self._ord_no_map.get(ord_no) if ord_no else None
+            if internal_id is None:
+                if seq:
+                    key = (ord_no, seq)
+                    if key in self._orphan_mats:
+                        return False
+                    self._orphan_mats[key] = True
+                    while len(self._orphan_mats) > _ORPHAN_MAT_MEMORY:
+                        self._orphan_mats.popitem(last=False)
+                return True
+            meta = self._meta[internal_id]
+            if seq:
+                if seq in meta["seen_mat"]:
+                    return False
+                meta["seen_mat"].add(seq)
+            meta["source"] = "event"
+            meta["updated"] = time.monotonic()
+            target = self._orders[internal_id]
+            qty = _to_number(
+                mat_data.get("mat_qty") or mat_data.get("matQty") or mat_data.get("deal_qty")
+                or mat_data.get("dealQty") or mat_data.get("qty")
+            )
+            if qty is not None:
+                deal = _to_number(target.get("deal_qty")) or 0.0
+                target["deal_qty"] = _num_out(deal + qty)
+            if "mat_time" in mat_data:
+                target["mat_time"] = mat_data["mat_time"]
+            ap_code = str(target.get("ap_code") or target.get("apCode") or "").strip()
+            if ap_code in ("", "1", "2"):  # lot-denominated rows only (odd-lot qty units differ)
+                org_qty = _to_number(target.get("org_qty") or target.get("quantity"))
+                deal_qty = _to_number(target.get("deal_qty"))
+                if org_qty and deal_qty is not None:
+                    target["status"] = "Filled" if deal_qty >= org_qty else "PartFilled"
+            return True
+
+    def mark_event(self, order_id: any, generation: int | None = None, updates: dict | None = None) -> None:
+        """Marks a row as touched by an accepted mutation (its snapshot quantities are no longer known)."""
+        with self.lock:
+            if not self._accepts(generation):
+                return
+            internal_id = self._lookup_locked(order_id)
+            if internal_id is None:
+                return
+            if updates:
+                self._orders[internal_id].update(updates)
+            meta = self._meta.setdefault(internal_id, {"created": time.monotonic(), "seen_mat": set()})
+            meta["source"] = "event"
+            meta["updated"] = time.monotonic()
+
+    def get(self, order_id: str) -> dict | None:
+        with self.lock:
+            self._roll_day_locked()
+            internal_id = self._lookup_locked(order_id)
+            return dict(self._orders[internal_id]) if internal_id else None
+
+    def get_with_meta(self, order_id: str) -> tuple[dict | None, dict | None]:
+        with self.lock:
+            self._roll_day_locked()
+            internal_id = self._lookup_locked(order_id)
+            if internal_id is None:
+                return None, None
+            meta = self._meta.get(internal_id) or {}
+            return dict(self._orders[internal_id]), {"source": meta.get("source"), "created": meta.get("created")}
+
+    def get_all(self) -> list[dict]:
+        with self.lock:
+            self._roll_day_locked()
+            return [dict(order) for order in self._orders.values()]
 
     @staticmethod
     def is_reservation(order: dict | None) -> bool:
@@ -927,6 +1304,7 @@ class SSEFanoutManager:
     """Manages active Server-Sent Events subscribers and broadcasts order events and heartbeats."""
 
     def __init__(self):
+        self.boot_id = secrets.token_hex(6)
         self.subscribers: set[queue.Queue] = set()
         self.lock = threading.Lock()
 
@@ -974,13 +1352,367 @@ class SSEFanoutManager:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Bridge Core Engine
+# 7. Session Snapshot, Login Guard & Persistent Circuit Breaker
+# ─────────────────────────────────────────────────────────────────────────────
+
+LOGIN_AGR0000_COOLDOWN_SECONDS = 60.0
+RECONNECT_MIN_INTERVAL_SECONDS = 6.0
+LOGIN_DAILY_MAX = 300
+ORDERS_DAILY_MAX = 2000
+ORDERS_REFRESH_MIN_INTERVAL_SECONDS = 5.0
+CACHE_FILL_WAIT_SECONDS = 20.0
+WS_SILENCE_SECONDS = 90.0
+WS_WATCHDOG_INTERVAL_SECONDS = 5.0
+WS_BACKOFF_INITIAL_SECONDS = 1.0
+WS_BACKOFF_MAX_SECONDS = 60.0
+WS_STABLE_SECONDS = 60.0
+WS_RESYNC_OPEN_WAIT_SECONDS = 5.0
+
+
+@dataclasses.dataclass(frozen=True)
+class EsunSession:
+    """
+    Immutable login-session snapshot. Replaced as a whole (generation + 1) only after a
+    successful login or environment switch; every request reads exactly one snapshot.
+    generation 0 is the offline snapshot describing the selected (not yet logged-in) config.
+    """
+
+    generation: int
+    sdk: any
+    environment: str
+    config_path: str | None
+    config_file_name: str | None
+    entry: str
+    account: dict | None
+    source_environment: str = "UNKNOWN"  # environment written in the config file at login time
+    config_overridden: bool = False  # [Core] rewritten in memory to match the requested environment
+    cert_info: dict | None = None
+    logged_in_at: str | None = None
+
+    @property
+    def logged_in(self) -> bool:
+        return self.sdk is not None
+
+
+@dataclasses.dataclass
+class _PreparedLogin:
+    config: configparser.ConfigParser
+    config_path: str
+    environment: str
+    source_environment: str
+    overridden: bool
+    entry: str
+    account: dict | None
+    material: bytes
+
+
+def resolve_state_dir(explicit: str | None = None) -> str:
+    """ESUN_STATE_DIR, else <server dir>/.state (Docker sets ESUN_STATE_DIR=/app/state)."""
+    if explicit:
+        return os.path.abspath(explicit)
+    env_dir = (os.environ.get("ESUN_STATE_DIR") or "").strip()
+    if env_dir:
+        return os.path.abspath(env_dir)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".state")
+
+
+def _pbkdf2_hex(material: bytes, salt: bytes) -> str:
+    return hashlib.pbkdf2_hmac("sha256", material, salt, 120_000).hex()
+
+
+class LoginStateStore:
+    """
+    Persists the login circuit breaker (credential failures such as AGA0000 or certificate
+    password errors) and the daily login-attempt count as JSON in ESUN_STATE_DIR, so a restart
+    or redeploy never retries a known-bad password. No secret is stored: only a salted PBKDF2
+    fingerprint of the credentials used by the failed attempt.
+    """
+
+    FILE_NAME = "esun-login-state.json"
+    VERSION = 1
+
+    def __init__(self, state_dir: str):
+        self.state_dir = state_dir
+        self.path = os.path.join(state_dir, self.FILE_NAME)
+        self.lock = threading.Lock()
+        self.persist_ok = True
+        self._state = self._load()
+
+    @classmethod
+    def _default_state(cls) -> dict:
+        return {
+            "version": cls.VERSION,
+            "credentialLocked": False,
+            "lockCode": None,
+            "lockReason": None,
+            "lockedAt": None,
+            "fingerprint": None,
+            "loginAttempts": {"day": None, "count": 0},
+        }
+
+    def _unreadable_state(self, reason: str) -> dict:
+        logger.warning(f"登入狀態檔無法讀取（{reason}）；為避免以錯誤密碼重複登入，已停用自動登入")
+        state = self._default_state()
+        state.update(
+            credentialLocked=True,
+            lockCode="STATE_UNREADABLE",
+            lockReason="登入狀態檔無法讀取，請確認設定後手動重新連線",
+            lockedAt=taipei_now().isoformat(timespec="seconds"),
+        )
+        return state
+
+    def _load(self) -> dict:
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return self._default_state()
+        except (OSError, ValueError) as e:
+            return self._unreadable_state(type(e).__name__)
+        if not isinstance(data, dict):
+            return self._unreadable_state("format")
+        state = self._default_state()
+        state["credentialLocked"] = bool(data.get("credentialLocked"))
+        for key in ("lockCode", "lockReason", "lockedAt"):
+            value = data.get(key)
+            state[key] = str(value) if value is not None else None
+        fingerprint = data.get("fingerprint")
+        if isinstance(fingerprint, dict) and isinstance(fingerprint.get("salt"), str) and isinstance(fingerprint.get("hash"), str):
+            state["fingerprint"] = {"salt": fingerprint["salt"], "hash": fingerprint["hash"]}
+        attempts = data.get("loginAttempts")
+        if isinstance(attempts, dict):
+            try:
+                state["loginAttempts"] = {
+                    "day": str(attempts.get("day") or "") or None,
+                    "count": max(0, int(attempts.get("count") or 0)),
+                }
+            except (TypeError, ValueError):
+                pass
+        return state
+
+    def _save_locked(self) -> bool:
+        tmp = f"{self.path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            os.makedirs(self.state_dir, mode=0o700, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._state, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, self.path)
+            self.persist_ok = True
+            return True
+        except OSError as e:
+            self.persist_ok = False
+            logger.warning(f"無法寫入登入狀態檔 {self.path}（{type(e).__name__}）；熔斷狀態僅保存在記憶體中")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+
+    @property
+    def credential_locked(self) -> bool:
+        with self.lock:
+            return bool(self._state["credentialLocked"])
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "locked": bool(self._state["credentialLocked"]),
+                "code": self._state.get("lockCode"),
+                "reason": self._state.get("lockReason"),
+                "lockedAt": self._state.get("lockedAt"),
+                "persisted": self.persist_ok,
+            }
+
+    def fingerprint_matches(self, material: bytes | None) -> bool:
+        with self.lock:
+            fingerprint = self._state.get("fingerprint")
+        if not fingerprint or material is None:
+            return False
+        try:
+            salt = bytes.fromhex(fingerprint["salt"])
+        except (ValueError, KeyError):
+            return False
+        return hmac.compare_digest(_pbkdf2_hex(material, salt), str(fingerprint.get("hash") or ""))
+
+    def record_credential_failure(self, code: str, reason: str, material: bytes | None) -> None:
+        fingerprint = None
+        if material is not None:
+            salt = secrets.token_bytes(16)
+            fingerprint = {"salt": salt.hex(), "hash": _pbkdf2_hex(material, salt)}
+        with self.lock:
+            self._state.update(
+                credentialLocked=True,
+                lockCode=code,
+                lockReason=str(reason or "")[:300],
+                lockedAt=taipei_now().isoformat(timespec="seconds"),
+                fingerprint=fingerprint,
+            )
+            self._save_locked()
+
+    def clear_credential_lock(self) -> None:
+        with self.lock:
+            if not self._state.get("credentialLocked") and not self._state.get("fingerprint"):
+                return
+            self._state.update(credentialLocked=False, lockCode=None, lockReason=None, lockedAt=None, fingerprint=None)
+            self._save_locked()
+
+    def login_attempts_for(self, day: datetime.date) -> int:
+        with self.lock:
+            attempts = self._state.get("loginAttempts") or {}
+            if attempts.get("day") == day.isoformat():
+                return int(attempts.get("count") or 0)
+            return 0
+
+    def record_login_attempts(self, day: datetime.date, count: int) -> None:
+        with self.lock:
+            self._state["loginAttempts"] = {"day": day.isoformat(), "count": int(count)}
+            self._save_locked()
+
+
+_LOGIN_CREDENTIAL_PATTERNS = (
+    "aga0000", "passworderror", "password", "密碼", "a00003",
+    "certnotfound", "certopenerror", "certexpirederror", "certpermission", "certkeyerror",
+    "certerror", "keyloaderror", "憑證",
+)
+_LOGIN_NETWORK_PATTERNS = (
+    "error sending request", "timed out", "timeout", "connection", "connect", "dns", "network",
+    "unreachable", "broken pipe", "temporarily unavailable", "reqwest", "eof", "502", "503", "504",
+)
+
+
+def classify_login_error(message: str) -> str:
+    """
+    Returns 'daily_limit' | 'rate_limited' | 'network' | 'credential'.
+    Anything that is not clearly a rate limit or a network problem counts as a credential
+    failure: E.SUN locks the account after 3 wrong passwords (AGA0000), so fail safe.
+    """
+    low = str(message or "").lower()
+    if "agr0004" in low:
+        return "daily_limit"
+    if re.search(r"agr000[0-9]", low):
+        return "rate_limited"
+    if any(p in low for p in _LOGIN_CREDENTIAL_PATTERNS):
+        return "credential"
+    if any(p in low for p in _LOGIN_NETWORK_PATTERNS):
+        return "network"
+    return "credential"
+
+
+def _extract_error_code(message: str, default: str = "LOGIN_FAILED") -> str:
+    match = re.search(r"\b([A-Z]{1,4}[0-9]{4,6})\b", str(message or ""))
+    return match.group(1) if match else default
+
+
+def _credential_material(cfg: configparser.ConfigParser) -> bytes:
+    """Bytes identifying the credentials of a login attempt (only ever stored as a salted PBKDF2 hash)."""
+    def _get(section: str, key: str) -> str:
+        return str(cfg[section].get(key, "")) if cfg.has_section(section) else ""
+
+    cert_path = _get("Cert", "Path")
+    try:
+        st = os.stat(cert_path)
+        cert_sig = f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        cert_sig = "missing"
+    account_pw = os.environ.get("ESUN_ACCOUNT_PASSWORD") or os.environ.get("ESUN_PASSWORD", "")
+    cert_pw = os.environ.get("ESUN_CERT_PASSWORD", "")
+    parts = [_get("User", "Account"), _get("Api", "Key"), cert_path, cert_sig, account_pw, cert_pw]
+    return "\x1f".join(parts).encode("utf-8")
+
+
+class EsunQueryError(Exception):
+    """A query that must surface as an HTTP error instead of stale or empty data."""
+
+    def __init__(self, status: int, code: str, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.retry_after = retry_after
+
+    def to_body(self) -> dict:
+        body: dict[str, any] = {"ok": False, "code": self.code, "error": str(self)}
+        if self.retry_after:
+            body["retry_after"] = int(math.ceil(self.retry_after))
+        return body
+
+
+class _WsRuntime:
+    """Mutable WebSocket state of one session generation."""
+
+    def __init__(self, generation: int):
+        self.generation = generation
+        self.stop_event = threading.Event()
+        self.opened_event = threading.Event()
+        self.lock = threading.Lock()
+        self.connected = False
+        self.last_activity = time.monotonic()
+        self.last_message_at: str | None = None
+        self.reconnects = 0
+        self.connect_attempts = 0
+        self.thread: threading.Thread | None = None
+        self.watchdog: threading.Thread | None = None
+
+    def touch(self) -> None:
+        with self.lock:
+            self.last_activity = time.monotonic()
+
+    def note_message(self) -> None:
+        with self.lock:
+            self.last_activity = time.monotonic()
+            self.last_message_at = taipei_now().isoformat(timespec="seconds")
+            self.connected = True
+
+    def note_open(self) -> None:
+        with self.lock:
+            self.connected = True
+            self.last_activity = time.monotonic()
+        self.opened_event.set()
+
+    def note_connecting(self) -> None:
+        with self.lock:
+            self.connected = True  # optimistic until connect_websocket() returns
+            self.last_activity = time.monotonic()
+            self.connect_attempts += 1
+        self.opened_event.clear()
+
+    def note_closed(self) -> None:
+        with self.lock:
+            self.connected = False
+
+    def silence(self) -> tuple[bool, float]:
+        with self.lock:
+            return self.connected, time.monotonic() - self.last_activity
+
+    def is_connected(self) -> bool:
+        with self.lock:
+            return self.connected and not self.stop_event.is_set()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "connected": self.connected and not self.stop_event.is_set(),
+                "lastMessageAt": self.last_message_at,
+                "reconnects": self.reconnects,
+                "generation": self.generation,
+            }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7b. Bridge Core Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EsunTradeBridge:
     """
     Coordinates E.Sun Trading SDK lifecycle, official rate limiters,
     caches, OrderBookCache, and WebSocket fan-out.
+    All session-bound state (sdk, environment, config, account) lives in one immutable
+    EsunSession snapshot that is swapped atomically after a successful login/switch.
     """
 
     def __init__(
@@ -988,51 +1720,64 @@ class EsunTradeBridge:
         config_path: str | None = None,
         sdk_factory: any = None,
         auto_login: bool = True,
+        state_dir: str | None = None,
+        websocket_enabled: bool = True,
     ):
         self.base_dir = (
             os.environ.get("ESUN_CONFIG_DIR")
             or (os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd())
         )
         if config_path is not None:
-            self.config_path = config_path
+            selected_path = config_path
         else:
             discovery = discover_esun_config_profiles(self.base_dir)
             if discovery["profiles"]["SIMULATION"]["available"]:
-                self.config_path = discovery["profiles"]["SIMULATION"]["filePath"]
+                selected_path = discovery["profiles"]["SIMULATION"]["filePath"]
             elif discovery["profiles"]["PRODUCTION"]["available"]:
-                self.config_path = discovery["profiles"]["PRODUCTION"]["filePath"]
+                selected_path = discovery["profiles"]["PRODUCTION"]["filePath"]
             elif os.environ.get("ESUN_CONFIG_PATH"):
-                self.config_path = os.environ.get("ESUN_CONFIG_PATH")
+                selected_path = os.environ.get("ESUN_CONFIG_PATH")
             else:
                 default_ini = os.path.join(self.base_dir, "esun-config.ini")
                 config_ini = os.path.join(self.base_dir, "config.ini")
                 if os.path.exists(default_ini):
-                    self.config_path = default_ini
+                    selected_path = default_ini
                 elif os.path.exists(config_ini):
-                    self.config_path = config_ini
+                    selected_path = config_ini
                 else:
-                    self.config_path = default_ini
+                    selected_path = default_ini
+        self._uses_real_sdk = sdk_factory is None
         self.sdk_factory = sdk_factory or (lambda cfg: SDK(cfg))
-        self.sdk: any = None
+        self.websocket_enabled = websocket_enabled
+        self.ws_backoff_initial = WS_BACKOFF_INITIAL_SECONDS
+        self.ws_backoff_max = WS_BACKOFF_MAX_SECONDS
+        self.ws_silence_seconds = WS_SILENCE_SECONDS
+        self.ws_watchdog_interval = WS_WATCHDOG_INTERVAL_SECONDS
+        self.ws_resync_open_wait = WS_RESYNC_OPEN_WAIT_SECONDS
 
-        cfg, _, env = load_config(self.config_path)
-        self.environment = env
-        self.entry = cfg.get("Core", "Entry", fallback="").strip() if cfg and cfg.has_section("Core") else ""
+        self._state_lock = threading.RLock()  # guards the session pointer + cache resets
+        self._session_change_lock = threading.Lock()  # serializes logins / switches
+        self._login_guard_lock = threading.Lock()  # atomic check-and-record of login limits
+        self._orders_refresh_lock = threading.Lock()
+        self._shutdown_event = threading.Event()
+        self._generation_seq = 0
 
-        # Lockout & connection states
-        self.logged_in = False
-        self.login_locked = False
+        cfg, _, env = load_config(selected_path)
+        self._session = self._offline_session(selected_path, cfg, env)
         self.login_error: str | None = None
+
+        # Login guard state (wall-clock timestamps; elapsed < 0 after a clock jump restarts the window)
         self.last_agr0000_time: float = 0.0
         self.hit_agr0004 = False
+        self._agr0004_day: datetime.date | None = None
         self.last_reconnect_time: float = 0.0
         self.last_orders_refresh_time: float = 0.0
 
         # Rate Limiters
         self.order_mutation_limiter = SlidingWindowRateLimiter(max_requests=18, window_seconds=1.0)
-        self.order_mutation_daily = DailyCounter(max_daily_requests=2000)
+        self.order_mutation_daily = DailyCounter(max_daily_requests=ORDERS_DAILY_MAX)
         self.reconnect_limiter = SlidingWindowRateLimiter(max_requests=10, window_seconds=60.0)
-        self.reconnect_daily = DailyCounter(max_daily_requests=300)
+        self.reconnect_daily = DailyCounter(max_daily_requests=LOGIN_DAILY_MAX)
         self.settlements_limiter = SlidingWindowRateLimiter(max_requests=3, window_seconds=60.0)
         self.orders_refresh_limiter = SlidingWindowRateLimiter(max_requests=10, window_seconds=60.0)
         self.positions_limiter = SlidingWindowRateLimiter(max_requests=10, window_seconds=60.0)
@@ -1049,211 +1794,561 @@ class EsunTradeBridge:
         # Order & Stream managers
         self.order_book_cache = OrderBookCache()
         self.sse_fanout = SSEFanoutManager()
-        self.ws_thread: threading.Thread | None = None
-        self._shutdown_event = threading.Event()
+        self._ws_runtime: _WsRuntime | None = None
+
+        # Persistent login circuit breaker
+        self.state_dir = resolve_state_dir(state_dir)
+        self.login_state = LoginStateStore(self.state_dir)
+        today = taipei_today()
+        self.reconnect_daily.restore(today, self.login_state.login_attempts_for(today))
 
         # Startup login attempt (at most once)
         if auto_login:
-            self._attempt_initial_login()
+            self.attempt_initial_login()
 
-    def attempt_initial_login(self) -> None:
-        """Public entry point used by main() after the HTTP port is bound."""
-        self._attempt_initial_login()
+    # ─────────────────────────────────────────────────────────────────────────
+    # Session snapshot accessors (read-only views kept for compatibility)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @property
+    def session(self) -> EsunSession:
+        return self._session
+
+    @property
+    def sdk(self) -> any:
+        return self._session.sdk
+
+    @property
+    def environment(self) -> str:
+        return self._session.environment
+
+    @property
+    def config_path(self) -> str | None:
+        return self._session.config_path
+
+    @property
+    def entry(self) -> str:
+        return self._session.entry
+
+    @property
+    def logged_in(self) -> bool:
+        return self._session.logged_in
+
+    @property
+    def login_locked(self) -> bool:
+        """True while the persistent credential circuit breaker blocks automatic logins."""
+        return self.login_state.credential_locked
+
+    @staticmethod
+    def _offline_session(config_path: str | None, cfg: configparser.ConfigParser | None, env: str) -> EsunSession:
+        account = split_account(cfg["User"].get("Account")) if (cfg and cfg.has_section("User")) else None
+        entry = cfg.get("Core", "Entry", fallback="").strip() if (cfg and cfg.has_section("Core")) else ""
+        return EsunSession(
+            generation=0,
+            sdk=None,
+            environment=env,
+            config_path=config_path,
+            config_file_name=os.path.basename(config_path) if config_path else None,
+            entry=entry,
+            account=account,
+            source_environment=env,
+        )
+
+    def _ttl_caches(self) -> tuple[TTLCache, ...]:
+        return (
+            self.balance_cache,
+            self.settlements_cache,
+            self.positions_cache,
+            self.profit_loss_cache,
+            self.trade_status_cache,
+            self.market_status_cache,
+        )
+
+    def _is_current(self, generation: int) -> bool:
+        return self._session.generation == generation
 
     def is_shutting_down(self) -> bool:
         return self._shutdown_event.is_set()
 
     def shutdown(self) -> None:
-        """Graceful shutdown: stop accepting SSE work and release subscribers."""
+        """Graceful shutdown: close the WebSocket and release SSE subscribers."""
         if self._shutdown_event.is_set():
             return
         self._shutdown_event.set()
+        with self._state_lock:
+            runtime = self._ws_runtime
+            session = self._session
+            self._ws_runtime = None
+        self._stop_websocket(runtime, session)
         self.sse_fanout.close_all()
 
-    def get_config_profiles(self) -> dict:
-        discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
-        return {
-            "ok": True,
-            "availableEnvironments": discovery["availableEnvironments"],
-            "configProfiles": {
-                k: {
-                    "available": v["available"],
-                    "fileName": v["fileName"],
-                    "expectedFileName": v["expectedFileName"],
-                    "aliases": v["aliases"],
-                    "entry": v["entry"],
+    # ─────────────────────────────────────────────────────────────────────────
+    # Login guard (shared by startup, reconnect and environment switch)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _prepare_login_config(self, config_path: str | None, target_env: str | None) -> tuple[_PreparedLogin | None, str | None]:
+        """Loads a config read-only; when target_env differs, rewrites [Core] in memory (never on disk)."""
+        if self._uses_real_sdk and not HEADLESS_PATCH_STATE.get("ok"):
+            return None, f"已停用登入：{HEADLESS_PATCH_STATE.get('detail')}"
+        if not config_path:
+            return None, "找不到玉山設定檔"
+        cfg, problems, env = load_config(config_path)
+        if problems or cfg is None:
+            return None, "；".join(problems) or "無法讀取玉山設定檔"
+        source_env = env
+        overridden = False
+        if target_env and target_env != env:
+            env, _ = override_esun_config_environment(cfg, target_env)
+            overridden = True
+        entry = cfg.get("Core", "Entry", fallback="").strip()
+        account = split_account(cfg["User"].get("Account")) if cfg.has_section("User") else None
+        return _PreparedLogin(
+            config=cfg,
+            config_path=config_path,
+            environment=env,
+            source_environment=source_env,
+            overridden=overridden,
+            entry=entry,
+            account=account,
+            material=_credential_material(cfg),
+        ), None
+
+    def _acquire_login_permit(self, *, explicit: bool, force: bool, material: bytes | None) -> tuple[int, dict] | None:
+        """
+        Atomically checks and records one login attempt. Returns (status, error_body) when refused.
+        explicit=True only for a user-triggered /esun/auth/reconnect: the only path that may
+        lift the credential circuit breaker (and only if credentials changed, or force=True).
+        """
+        with self._login_guard_lock:
+            now = time.time()
+            today = taipei_today()
+            if self._agr0004_day is not None and self._agr0004_day != today:
+                self.hit_agr0004 = False
+                self._agr0004_day = None
+
+            lock = self.login_state.snapshot()
+            if lock["locked"]:
+                if not explicit:
+                    return 423, {
+                        "ok": False,
+                        "error": (
+                            f"登入熔斷鎖定中（{lock['code'] or 'LOGIN_FAILED'}）：已停用自動登入與環境切換登入；"
+                            "請修正密碼或憑證後以「重新連線」解除"
+                        ),
+                        "code": "ESUN_LOGIN_LOCKED",
+                        "login_locked": True,
+                    }
+                if not force and self.login_state.fingerprint_matches(material):
+                    return 423, {
+                        "ok": False,
+                        "error": (
+                            "帳號、密碼與憑證與上次失敗時相同，重試可能觸發玉山「密碼錯誤 3 次鎖帳」(AGA0000)；"
+                            "請更新 .env 後重啟服務，或確認無誤後以 force=true 強制重試"
+                        ),
+                        "code": "ESUN_CREDENTIALS_UNCHANGED",
+                        "login_locked": True,
+                    }
+
+            elapsed = now - self.last_agr0000_time
+            if elapsed < 0:
+                self.last_agr0000_time = now
+                elapsed = 0.0
+            if self.last_agr0000_time and elapsed < LOGIN_AGR0000_COOLDOWN_SECONDS:
+                remaining = int(math.ceil(LOGIN_AGR0000_COOLDOWN_SECONDS - elapsed))
+                return 429, {
+                    "ok": False,
+                    "error": f"登入頻率超限冷卻中 (AGR0000)，請於 {remaining} 秒後再試",
+                    "code": "AGR0000",
+                    "cooldown_remaining_sec": remaining,
                 }
-                for k, v in discovery["profiles"].items()
-            },
-            "activeConfigFile": os.path.basename(self.config_path) if self.config_path and os.path.exists(self.config_path) else None,
-            "activeEnvironment": self.environment,
+
+            if self.hit_agr0004 or not self.reconnect_daily.can_increment():
+                return 429, {"ok": False, "error": "已達每日登入上限 300 次 (AGR0004)", "code": "AGR0004"}
+
+            if explicit:
+                since = now - self.last_reconnect_time
+                if since < 0:
+                    self.last_reconnect_time = now
+                    since = 0.0
+                if since < RECONNECT_MIN_INTERVAL_SECONDS:
+                    return 429, {
+                        "ok": False,
+                        "error": "重連操作過於頻繁，請於 6 秒後重試",
+                        "code": "TOO_FREQUENT",
+                        "retry_after": int(math.ceil(RECONNECT_MIN_INTERVAL_SECONDS - since)),
+                    }
+
+            if not self.reconnect_limiter.acquire():
+                return 429, {
+                    "ok": False,
+                    "error": "登入頻率過高 (限 10 次/分，AGR0000)",
+                    "code": "AGR0000",
+                    "retry_after": int(math.ceil(self.reconnect_limiter.time_until_available())) or 1,
+                }
+
+            self.last_reconnect_time = now
+            self.reconnect_daily.increment()
+            self.login_state.record_login_attempts(today, self.reconnect_daily.get_count())
+            return None
+
+    def _record_login_failure(self, message: str, material: bytes | None) -> str:
+        self.login_error = message
+        kind = classify_login_error(message)
+        if "AGR0000" in message.upper():
+            self.last_agr0000_time = time.time()
+        if kind == "daily_limit":
+            self.hit_agr0004 = True
+            self._agr0004_day = taipei_today()
+        if kind == "credential":
+            self.login_state.record_credential_failure(_extract_error_code(message), message, material)
+            logger.error(f"玉山證券登入失敗（憑證類，已啟動持久化熔斷鎖，禁止自動重試）：{message}")
+        else:
+            logger.error(f"玉山證券登入失敗（{kind}）：{message}")
+        return kind
+
+    def _perform_login(self, prepared: _PreparedLogin, reason: str) -> tuple[bool, str | None]:
+        """Network login with a fresh SDK client; on success installs a new session snapshot."""
+        try:
+            apply_headless_keyring_patches()
+            client = self.sdk_factory(prepared.config)
+        except Exception as e:
+            # SDK(config) validation happens locally, before any login request.
+            self.login_error = f"SDK 初始化失敗：{redact(e)}"
+            logger.error(self.login_error)
+            return False, self.login_error
+        try:
+            client.login()
+        except Exception as e:
+            message = redact(e)
+            self._record_login_failure(message, prepared.material)
+            return False, message
+
+        cert_info = None
+        try:
+            info = client.certinfo() if hasattr(client, "certinfo") else None
+            cert_info = info if isinstance(info, dict) else None
+        except Exception:
+            cert_info = None
+
+        with self._state_lock:
+            self._generation_seq += 1
+            generation = self._generation_seq
+        session = EsunSession(
+            generation=generation,
+            sdk=client,
+            environment=prepared.environment,
+            config_path=prepared.config_path,
+            config_file_name=os.path.basename(prepared.config_path),
+            entry=prepared.entry,
+            account=prepared.account,
+            source_environment=prepared.source_environment,
+            config_overridden=prepared.overridden,
+            cert_info=cert_info,
+            logged_in_at=taipei_now().isoformat(timespec="seconds"),
+        )
+        self.login_error = None
+        self.login_state.clear_credential_lock()
+        self._install_session(session, reason)
+        logger.info(f"玉山證券登入成功（{session.environment}，{reason}，generation {generation}）")
+        return True, None
+
+    def _install_session(self, session: EsunSession, reason: str) -> None:
+        """Atomically publishes a new session: caches are reset, the old WebSocket is stopped."""
+        with self._state_lock:
+            old_session = self._session
+            old_runtime = self._ws_runtime
+            self._session = session
+            self._ws_runtime = None
+            for cache in self._ttl_caches():
+                cache.reset(session.generation)
+            self.order_book_cache.reset(session.generation)
+            self.last_orders_refresh_time = 0.0
+        self._stop_websocket(old_runtime, old_session)
+        self._start_websocket(session)
+        threading.Thread(
+            target=self._bootstrap_orders,
+            args=(session,),
+            daemon=True,
+            name=f"EsunOrdersBootstrap-g{session.generation}",
+        ).start()
+        self._publish_session_event(reason)
+
+    def _publish_session_event(self, reason: str, ok: bool = True, error: str | None = None) -> None:
+        session = self._session
+        lock = self.login_state.snapshot()
+        payload = {
+            "generation": session.generation,
+            "environment": session.environment,
+            "account": dict(session.account) if session.account else None,
+            "loggedIn": session.logged_in,
+            "reason": reason,
+            "ok": ok,
+            "error": error,
+            "loginLocked": lock["locked"],
+            "ts": taipei_now().isoformat(timespec="milliseconds"),
         }
+        self.sse_fanout.broadcast("session", payload)
+
+    def attempt_initial_login(self) -> bool:
+        """Attempt login at most once at startup; never retry automatically on failure."""
+        with self._session_change_lock:
+            session = self._session
+            if session.logged_in or self._shutdown_event.is_set():
+                return session.logged_in
+            lock = self.login_state.snapshot()
+            if lock["locked"]:
+                self.login_error = (
+                    f"登入熔斷鎖定中（{lock['code'] or 'LOGIN_FAILED'}）：啟動時不自動登入；"
+                    "請修正密碼或憑證後以「重新連線」解除"
+                )
+                logger.warning(self.login_error)
+                return False
+            target = session.environment if session.environment in ("SIMULATION", "PRODUCTION") else None
+            prepared, err = self._prepare_login_config(session.config_path, target)
+            if err:
+                self.login_error = err
+                logger.warning(f"Initial setup incomplete: {err}")
+                return False
+            refusal = self._acquire_login_permit(explicit=False, force=False, material=prepared.material)
+            if refusal:
+                self.login_error = refusal[1]["error"]
+                logger.warning(self.login_error)
+                return False
+            ok, _ = self._perform_login(prepared, reason="startup")
+            if not ok:
+                self._publish_session_event("startup_failed", ok=False, error=self.login_error)
+            return ok
 
     def _attempt_initial_login(self) -> None:
-        """Attempt login at most once at startup; never retry automatically on failure."""
-        cfg, problems, env = load_config(self.config_path)
-        self.environment = env
-        if cfg and cfg.has_section("Core"):
-            self.entry = cfg.get("Core", "Entry", fallback="").strip()
-        if problems or not cfg:
-            self.login_locked = True
-            self.login_error = "；".join(problems)
-            logger.warning(f"Initial setup incomplete: {self.login_error}")
-            return
+        self.attempt_initial_login()
 
-        try:
-            apply_headless_keyring_patches()
-            client = self.sdk_factory(cfg)
-            client.login()
-            self.sdk = client
-            self.logged_in = True
-            self.login_locked = False
-            self.login_error = None
-            logger.info("玉山證券登入成功")
-            self._start_websocket_thread()
-            # Bootstrap OrderBookCache in background thread
-            threading.Thread(target=self._bootstrap_orders, daemon=True, name="EsunOrdersBootstrap").start()
-        except Exception as e:
-            err_msg = str(e)
-            self.logged_in = False
-            self.login_locked = True
-            self.login_error = err_msg
-            if "AGR0000" in err_msg:
-                self.last_agr0000_time = time.time()
-            if "AGR0004" in err_msg:
-                self.hit_agr0004 = True
-            logger.error(f"玉山證券初始登入失敗 (防鎖帳已啟動，禁止自動重試)：{err_msg}")
-
-    def reconnect(self) -> tuple[bool, dict, int]:
+    def reconnect(self, force: bool = False) -> tuple[bool, dict, int]:
         """
-        Manual reconnect with 60s cooldown on AGR0000, 10 req/min sliding window,
-        and 300 req/day counter (AGR0004).
+        Manual (explicit) reconnect: same guard as every login path plus the 6s minimum interval.
+        The only way to lift the persistent credential lock (credentials must have changed, or force).
+        A failed reconnect keeps the current session untouched.
         """
-        now = time.time()
-
-        # Cooldown guard on AGR0000
-        if now - self.last_agr0000_time < 60.0:
-            remaining = int(60.0 - (now - self.last_agr0000_time))
-            return False, {
-                "error": f"登入頻率超限冷卻中 (AGR0000)，請於 {remaining} 秒後再試",
-                "code": "AGR0000",
-                "cooldown_remaining_sec": remaining,
-            }, 429
-
-        # AGR0004 Daily limit
-        if self.hit_agr0004 or not self.reconnect_daily.can_increment():
-            return False, {
-                "error": "已達每日登入上限 300 次 (AGR0004)",
-                "code": "AGR0004",
-            }, 429
-
-        # 6s Minimum interval
-        if now - self.last_reconnect_time < 6.0:
-            return False, {
-                "error": "重連操作過於頻繁，請於 6 秒後重試",
-                "code": "TOO_FREQUENT",
-            }, 429
-
-        # 10 req/min sliding window
-        if not self.reconnect_limiter.acquire():
-            return False, {
-                "error": "登入頻率過高 (限 10 次/分，AGR0000)",
-                "code": "AGR0000",
-            }, 429
-
-        self.last_reconnect_time = now
-        self.reconnect_daily.increment()
-
-        # Reload config and try login
-        cfg, problems, env = load_config(self.config_path)
-        self.environment = env
-        if cfg and cfg.has_section("Core"):
-            self.entry = cfg.get("Core", "Entry", fallback="").strip()
-        if problems or not cfg:
-            self.login_locked = True
-            self.login_error = "；".join(problems)
-            return False, {"error": f"玉山設定不完整：{self.login_error}", "code": "CONFIG_ERROR"}, 503
-
+        if not self._session_change_lock.acquire(blocking=False):
+            return False, {"ok": False, "error": "另一個登入或環境切換作業進行中", "code": "ESUN_SESSION_BUSY"}, 409
         try:
-            apply_headless_keyring_patches()
-            client = self.sdk_factory(cfg)
-            client.login()
-            self.sdk = client
-            self.logged_in = True
-            self.login_locked = False
-            self.login_error = None
-            self._start_websocket_thread()
-            aid = cfg["User"]["Account"]
+            session = self._session
+            target = session.environment if session.environment in ("SIMULATION", "PRODUCTION") else None
+            path = session.config_path
+            if (not path or not os.path.isfile(path)) and target:
+                profile = discover_esun_config_profiles(self.base_dir, path)["profiles"].get(target) or {}
+                path = profile.get("filePath") or path
+            prepared, err = self._prepare_login_config(path, target)
+            if err:
+                self.login_error = err
+                return False, {"ok": False, "error": f"玉山設定不完整：{err}", "code": "CONFIG_ERROR"}, 503
+            refusal = self._acquire_login_permit(explicit=True, force=bool(force), material=prepared.material)
+            if refusal:
+                status, body = refusal
+                return False, body, status
+            ok, message = self._perform_login(prepared, reason="reconnect")
+            if not ok:
+                self._publish_session_event("reconnect_failed", ok=False, error=message)
+                return False, {
+                    "ok": False,
+                    "error": f"玉山登入失敗：{message}",
+                    "code": "LOGIN_FAILED",
+                    "login_locked": self.login_locked,
+                }, 502
+            session = self._session
             return True, {
                 "ok": True,
                 "message": "玉山證券登入成功",
-                "account": split_account(aid),
+                "account": dict(session.account) if session.account else None,
+                "environment": session.environment,
+                "sessionGeneration": session.generation,
             }, 200
-        except Exception as e:
-            err_msg = str(e)
-            self.logged_in = False
-            self.login_locked = True
-            self.login_error = err_msg
-            if "AGR0000" in err_msg:
-                self.last_agr0000_time = time.time()
-            if "AGR0004" in err_msg:
-                self.hit_agr0004 = True
-            return False, {
-                "error": f"玉山登入失敗：{err_msg}",
-                "code": "LOGIN_FAILED",
-                "login_locked": True,
-            }, 502
+        finally:
+            self._session_change_lock.release()
 
-    def _start_websocket_thread(self) -> None:
-        """Register singleton WebSocket callbacks and launch connection thread."""
-        if not self.sdk or not hasattr(self.sdk, "on"):
-            return
+    # ─────────────────────────────────────────────────────────────────────────
+    # WebSocket supervisor (generation scoped)
+    # ─────────────────────────────────────────────────────────────────────────
 
-        @self.sdk.on("order")
-        def _on_order(data: dict):
-            self._handle_ack(data)
+    def _ws_should_run(self, session: EsunSession, runtime: _WsRuntime) -> bool:
+        return (
+            not runtime.stop_event.is_set()
+            and not self._shutdown_event.is_set()
+            and self._is_current(session.generation)
+        )
 
-        @self.sdk.on("dealt")
-        def _on_dealt(data: dict):
-            self._handle_mat(data)
-
-        @self.sdk.on("error")
-        def _on_error(err: any):
-            logger.error(f"[WebSocket] Error: {err}")
-
-        @self.sdk.on("close")
-        def _on_close(ws: any, code: any, msg: any):
-            logger.info(f"[WebSocket] Closed: code={code} msg={msg}")
-
-        def _ws_worker():
+    @staticmethod
+    def _close_sdk_websocket(sdk: any) -> None:
+        closer = getattr(sdk, "close_websocket", None)
+        if callable(closer):
             try:
-                self.sdk.connect_websocket()
+                closer()
             except Exception as e:
-                logger.error(f"[WebSocket] Worker terminated: {e}")
+                logger.debug(f"[WebSocket] close failed: {redact(e)}")
 
-        if self.ws_thread is None or not self.ws_thread.is_alive():
-            self.ws_thread = threading.Thread(target=_ws_worker, daemon=True, name="EsunWSWorker")
-            self.ws_thread.start()
-
-    def _bootstrap_orders(self) -> None:
-        """Bootstrap OrderBookCache with initial get_order_results() call."""
-        if not self.sdk or not self.logged_in:
+    def _stop_websocket(self, runtime: _WsRuntime | None, session: EsunSession | None) -> None:
+        if runtime is None:
             return
+        runtime.stop_event.set()
+        runtime.note_closed()
+        if session is not None and session.sdk is not None:
+            self._close_sdk_websocket(session.sdk)
+
+    def _register_ws_callbacks(self, session: EsunSession, runtime: _WsRuntime) -> None:
+        sdk = session.sdk
+        if not hasattr(sdk, "on"):
+            return
+        generation = session.generation
+
+        def _on_order(data: dict) -> None:
+            runtime.note_message()
+            try:
+                self._handle_ack(data, generation=generation)
+            except Exception:
+                logger.error(f"[WebSocket] ACK handling failed:\n{redact(traceback.format_exc())}")
+
+        def _on_dealt(data: dict) -> None:
+            runtime.note_message()
+            try:
+                self._handle_mat(data, generation=generation)
+            except Exception:
+                logger.error(f"[WebSocket] MAT handling failed:\n{redact(traceback.format_exc())}")
+
+        def _on_error(err: any) -> None:
+            logger.error(f"[WebSocket] Error (g{generation}): {redact(err)}")
+
+        def _on_close(*args: any) -> None:
+            runtime.note_closed()
+            logger.info(f"[WebSocket] Closed (g{generation})")
+
+        sdk.on("order")(_on_order)
+        sdk.on("dealt")(_on_dealt)
+        sdk.on("error")(_on_error)
+        sdk.on("close")(_on_close)
+
+        handler = getattr(sdk, "_SDK__wsHandler", None)
+        if handler is not None:
+            def _open_hook() -> None:
+                if runtime.stop_event.is_set():
+                    self._close_sdk_websocket(sdk)
+                    return
+                runtime.note_open()
+
+            try:
+                handler.bridge_open_hook = _open_hook
+                handler.bridge_activity_hook = runtime.touch
+            except Exception:
+                pass
+
+    def _start_websocket(self, session: EsunSession) -> None:
+        if (
+            not self.websocket_enabled
+            or session.sdk is None
+            or not hasattr(session.sdk, "connect_websocket")
+            or self._shutdown_event.is_set()
+        ):
+            return
+        runtime = _WsRuntime(session.generation)
+        self._register_ws_callbacks(session, runtime)
+        with self._state_lock:
+            if not self._is_current(session.generation):
+                return
+            self._ws_runtime = runtime
+        runtime.thread = threading.Thread(
+            target=self._ws_supervisor, args=(session, runtime), daemon=True, name=f"EsunWS-g{session.generation}"
+        )
+        runtime.watchdog = threading.Thread(
+            target=self._ws_watchdog, args=(session, runtime), daemon=True, name=f"EsunWSWatchdog-g{session.generation}"
+        )
+        runtime.thread.start()
+        runtime.watchdog.start()
+
+    def _ws_supervisor(self, session: EsunSession, runtime: _WsRuntime) -> None:
+        """Keeps the session's WebSocket connected: exponential backoff (capped) with jitter."""
+        backoff = self.ws_backoff_initial
+        first = True
+        while self._ws_should_run(session, runtime):
+            if not first:
+                threading.Thread(
+                    target=self._ws_resync_after_reconnect,
+                    args=(session, runtime),
+                    daemon=True,
+                    name=f"EsunWSResync-g{session.generation}",
+                ).start()
+            runtime.note_connecting()
+            started = time.monotonic()
+            try:
+                session.sdk.connect_websocket()
+            except Exception as e:
+                logger.warning(f"[WebSocket] 連線失敗或中斷（g{session.generation}）：{redact(e)}")
+            runtime.note_closed()
+            first = False
+            if not self._ws_should_run(session, runtime):
+                break
+            if time.monotonic() - started >= WS_STABLE_SECONDS:
+                backoff = self.ws_backoff_initial
+            delay = min(backoff, self.ws_backoff_max)
+            delay += delay * 0.2 * random.random()
+            with runtime.lock:
+                runtime.reconnects += 1
+                attempt = runtime.reconnects
+            logger.warning(f"[WebSocket] 已斷線，{delay:.1f} 秒後重連（g{session.generation}，第 {attempt} 次）")
+            if runtime.stop_event.wait(delay):
+                break
+            backoff = min(backoff * 2, self.ws_backoff_max)
+
+    def _ws_watchdog(self, session: EsunSession, runtime: _WsRuntime) -> None:
+        """Silence detection: no message/ping/pong for ws_silence_seconds counts as a dead connection."""
+        while not runtime.stop_event.wait(self.ws_watchdog_interval):
+            if not self._ws_should_run(session, runtime):
+                break
+            connected, silent_for = runtime.silence()
+            if connected and silent_for > self.ws_silence_seconds:
+                logger.warning(f"[WebSocket] 已 {silent_for:.0f} 秒無任何訊息，視為斷線並重連（g{session.generation}）")
+                runtime.touch()
+                runtime.note_closed()
+                self._close_sdk_websocket(session.sdk)
+
+    def _ws_resync_after_reconnect(self, session: EsunSession, runtime: _WsRuntime) -> None:
+        """After a reconnect, re-read orders (events may have been missed) and ask clients to resync."""
+        runtime.opened_event.wait(timeout=self.ws_resync_open_wait)
+        if not self._ws_should_run(session, runtime):
+            return
+        refreshed = self._bootstrap_orders(session)
+        if self._is_current(session.generation):
+            self.sse_fanout.broadcast("resync", {
+                "reason": "ws_reconnected",
+                "generation": session.generation,
+                "cacheRefreshed": refreshed,
+                "ts": taipei_now().isoformat(timespec="milliseconds"),
+            })
+
+    def _bootstrap_orders(self, session: EsunSession | None = None) -> bool:
+        """Re-reads the day's orders into OrderBookCache (counts against the order-query limiter)."""
+        session = session or self._session
+        if session.sdk is None or not self._is_current(session.generation):
+            return False
+        if not self.orders_refresh_limiter.acquire():
+            logger.warning("Bootstrap orders query skipped: order query rate limit reached")
+            return False
         try:
-            orders = self.sdk.get_order_results()
-            if isinstance(orders, list):
-                self.order_book_cache.update_from_order_results(orders)
+            orders = session.sdk.get_order_results()
         except Exception as e:
-            logger.warning(f"Bootstrap orders query failed: {e}")
+            logger.warning(f"Bootstrap orders query failed: {redact(e)}")
+            return False
+        if isinstance(orders, list):
+            return self.order_book_cache.update_from_order_results(orders, generation=session.generation)
+        return False
 
-    def _generate_event_id(self, prefix: str, data: dict) -> str:
-        ord_no = data.get("ord_no") or data.get("ordNo") or data.get("pre_ord_no") or data.get("preOrdNo") or ""
-        serialized = json.dumps(data, sort_keys=True, ensure_ascii=False)
-        digest = hashlib.md5(serialized.encode("utf-8")).hexdigest()[:8]
-        return f"esun-{prefix}-{ord_no}-{digest}"
-
-    def _handle_ack(self, data: dict) -> None:
-        self.order_book_cache.update_from_ack(data)
+    def _handle_ack(self, data: dict, generation: int | None = None) -> None:
+        session = self._session
+        if generation is not None and generation != session.generation:
+            logger.info(f"[WebSocket] 丟棄舊 session（g{generation}）的委託回報")
+            return
+        if not isinstance(data, dict):
+            return
+        accepted, _previous = self.order_book_cache.update_from_ack(data, generation=session.generation)
+        if not accepted:
+            return
         event_id = self._generate_event_id("ack", data)
         stock_order = {
             **data,
@@ -1290,8 +2385,15 @@ class EsunTradeBridge:
         }
         self.sse_fanout.broadcast("order_event", payload, event_id=event_id)
 
-    def _handle_mat(self, data: dict) -> None:
-        self.order_book_cache.update_from_mat(data)
+    def _handle_mat(self, data: dict, generation: int | None = None) -> None:
+        session = self._session
+        if generation is not None and generation != session.generation:
+            logger.info(f"[WebSocket] 丟棄舊 session（g{generation}）的成交回報")
+            return
+        if not isinstance(data, dict):
+            return
+        if not self.order_book_cache.update_from_mat(data, generation=session.generation):
+            return
         self.positions_cache.mark_dirty()
         event_id = self._generate_event_id("mat", data)
         stock_deal = {
@@ -1313,216 +2415,200 @@ class EsunTradeBridge:
         }
         self.sse_fanout.broadcast("order_event", payload, event_id=event_id)
 
+    def _generate_event_id(self, prefix: str, data: dict) -> str:
+        ord_no = data.get("ord_no") or data.get("ordNo") or data.get("pre_ord_no") or data.get("preOrdNo") or ""
+        serialized = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+        digest = hashlib.md5(serialized.encode("utf-8")).hexdigest()[:8]
+        return f"esun-{prefix}-{ord_no}-{digest}"
+
     # ─────────────────────────────────────────────────────────────────────────
-    # Status & Accounts
+    # Status & Accounts (pure reads: no SDK network call, no state change)
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _inspect_disk_state(self, session: EsunSession) -> dict:
+        """Read-only comparison of the config files on disk with the session snapshot."""
+        discovery = discover_esun_config_profiles(self.base_dir, session.config_path)
+        path = session.config_path
+        exists = bool(path) and os.path.isfile(path)
+        if exists:
+            cfg, problems, disk_env = load_config(path)
+        else:
+            cfg, disk_env = None, "UNKNOWN"
+            problems = [f"找不到玉山設定檔：{os.path.basename(path) if path else 'esun-config.ini'}"]
+        disk_environment = disk_env if (exists and disk_env in ("SIMULATION", "PRODUCTION")) else None
+        drift = False
+        if session.logged_in:
+            if not exists or disk_env != session.source_environment:
+                drift = True
+            else:
+                disk_account = split_account(cfg["User"].get("Account")) if (cfg and cfg.has_section("User")) else None
+                if disk_account != session.account:
+                    drift = True
+            profile = discovery["profiles"].get(session.environment) or {}
+            profile_path = profile.get("filePath")
+            if not profile.get("available") or not profile_path or os.path.abspath(profile_path) != os.path.abspath(path or ""):
+                drift = True
+        return {
+            "discovery": discovery,
+            "exists": exists,
+            "problems": problems,
+            "disk_environment": disk_environment,
+            "drift": drift,
+        }
 
     def get_health(self) -> dict:
-        discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
-
-        # Re-sync active config_path if files changed or environment became available
-        sim_profile = discovery["profiles"].get("SIMULATION", {})
-        prod_profile = discovery["profiles"].get("PRODUCTION", {})
-
-        current_env = self.environment
-        if current_env in discovery["profiles"] and discovery["profiles"][current_env]["available"]:
-            matching_path = discovery["profiles"][current_env]["filePath"]
-            if matching_path and matching_path != self.config_path and os.path.exists(matching_path):
-                self.config_path = matching_path
-        elif current_env == "SIMULATION" and not sim_profile.get("available") and prod_profile.get("available"):
-            if prod_profile.get("filePath") and os.path.exists(prod_profile["filePath"]):
-                self.config_path = prod_profile["filePath"]
-        elif current_env == "PRODUCTION" and not prod_profile.get("available") and sim_profile.get("available"):
-            if sim_profile.get("filePath") and os.path.exists(sim_profile["filePath"]):
-                self.config_path = sim_profile["filePath"]
-
-        cfg, problems, env = load_config(self.config_path)
-        self.environment = env
-        if cfg and cfg.has_section("Core"):
-            self.entry = cfg.get("Core", "Entry", fallback="").strip()
-        account = split_account(cfg["User"].get("Account")) if (cfg and cfg.has_section("User")) else None
-
-        cert_info = None
-        machine_time = None
-        market_status = None
-
-        if self.logged_in and self.sdk:
-            try:
-                cert_info = self.sdk.certinfo() if hasattr(self.sdk, "certinfo") else None
-            except Exception:
-                pass
-            try:
-                machine_time = self.sdk.get_machine_time() if hasattr(self.sdk, "get_machine_time") else None
-            except Exception:
-                pass
-            try:
-                market_status = self.get_market_status()
-            except Exception:
-                pass
-
-        discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
+        """Read-only status: never calls an SDK network method and never mutates bridge state."""
+        session = self._session
+        disk = self._inspect_disk_state(session)
+        discovery = disk["discovery"]
+        runtime = self._ws_runtime
+        ws = runtime.snapshot() if runtime is not None else {"connected": False, "lastMessageAt": None, "reconnects": 0}
+        lock = self.login_state.snapshot()
+        expire, _ = self._extract_cert_meta(session.cert_info)
+        cached_market = self.market_status_cache.get("market_status")
+        lock_reason = None
+        if lock["locked"]:
+            lock_reason = f"{lock['code'] or 'LOGIN_FAILED'}：{lock['reason'] or ''}".rstrip("：")
 
         return {
             "ok": True,
-            "configured": len(problems) == 0,
-            "problems": problems,
-            "environment": self.environment,
-            "simulation": self.environment == "SIMULATION",
-            "entry": self.entry,
-            "account": account,
-            "loggedIn": self.logged_in,
-            "loginLocked": self.login_locked,
+            "configured": session.logged_in or len(disk["problems"]) == 0,
+            "problems": disk["problems"],
+            "environment": session.environment,
+            "simulation": session.environment == "SIMULATION",
+            "entry": session.entry,
+            "account": dict(session.account) if session.account else None,
+            "loggedIn": session.logged_in,
+            "loginLocked": lock["locked"],
+            "loginLockReason": lock_reason,
             "loginError": self.login_error,
-            "certInfo": cert_info,
-            "machineTime": machine_time,
-            "marketStatus": market_status,
+            "certInfo": {"ca_expiretime": expire} if expire else None,
+            "machineTime": None,
+            "marketStatus": cached_market[0] if cached_market else None,
             "availableEnvironments": discovery["availableEnvironments"],
-            "configProfiles": {
-                k: {
-                    "available": v["available"],
-                    "fileName": v["fileName"],
-                    "expectedFileName": v["expectedFileName"],
-                    "aliases": v["aliases"],
-                    "entry": v["entry"],
-                }
-                for k, v in discovery["profiles"].items()
-            },
-            "activeConfigFile": os.path.basename(self.config_path) if self.config_path and os.path.exists(self.config_path) else None,
+            "configProfiles": public_config_profiles(discovery),
+            "activeConfigFile": session.config_file_name if disk["exists"] else None,
+            "sessionGeneration": session.generation,
+            "configDrift": disk["drift"],
+            "diskEnvironment": disk["disk_environment"],
+            "configOverridden": session.config_overridden,
+            "wsConnected": bool(ws["connected"]),
+            "wsLastMessageAt": ws["lastMessageAt"],
+            "wsReconnects": ws["reconnects"],
+            "sseBootId": self.sse_fanout.boot_id,
+            "sdkVersion": ESUN_SDK_VERSION,
             "rateLimits": {
                 "ordersToday": self.order_mutation_daily.get_count(),
-                "ordersDailyMax": 2000,
+                "ordersDailyMax": ORDERS_DAILY_MAX,
                 "reconnectToday": self.reconnect_daily.get_count(),
-                "reconnectDailyMax": 300,
+                "reconnectDailyMax": LOGIN_DAILY_MAX,
             },
         }
 
-    def switch_environment(self, target_env: str) -> dict[str, any]:
-        """
-        Switches between SIMULATION and PRODUCTION.
-        Validates target environment profile availability.
-        Switches activeConfigFile to corresponding profile file if available.
-        """
-        target_env_normalized = str(target_env or "").strip().upper()
-        if target_env_normalized not in ("SIMULATION", "PRODUCTION"):
-            raise ValueError(f"不支援的環境設定：{target_env}，僅支援 SIMULATION 或 PRODUCTION")
-
-        discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
-        profile_info = discovery["profiles"].get(target_env_normalized, {})
-
-        if not profile_info.get("available", False):
-            expected = profile_info.get("expectedFileName", f"esun-config.{target_env_normalized.lower()}.ini")
-            cfg, current_problems, _ = load_config(self.config_path)
-            return {
-                "ok": False,
-                "error": f"未提供 {expected} 設定檔，無法切換至 {target_env_normalized}",
-                "environment": self.environment,
-                "simulation": self.environment == "SIMULATION",
-                "entry": self.entry,
-                "activeConfigFile": os.path.basename(self.config_path) if self.config_path and os.path.exists(self.config_path) else None,
-                "availableEnvironments": discovery["availableEnvironments"],
-                "configProfiles": {
-                    k: {
-                        "available": v["available"],
-                        "fileName": v["fileName"],
-                        "expectedFileName": v["expectedFileName"],
-                        "aliases": v["aliases"],
-                        "entry": v["entry"],
-                    }
-                    for k, v in discovery["profiles"].items()
-                },
-                "loggedIn": self.logged_in,
-                "problems": current_problems,
-            }
-
-        self.order_book_cache.clear()
-        self.positions_cache.clear()
-        self.balance_cache.clear()
-        self.settlements_cache.clear()
-        self.profit_loss_cache.clear()
-        self.trade_status_cache.clear()
-        self.market_status_cache.clear()
-
-        target_path = profile_info.get("filePath")
-        if target_path and os.path.exists(target_path):
-            self.config_path = target_path
-            if not os.environ.get("ESUN_CONFIG_DIR"):
-                self.base_dir = os.path.dirname(os.path.abspath(self.config_path))
-
-        target_entry = (
-            ESUN_SIMULATION_ENTRY if target_env_normalized == "SIMULATION" else ESUN_PRODUCTION_ENTRY
-        )
-
-        needs_update = True
-        try:
-            cfg_check = configparser.ConfigParser()
-            cfg_check.read(self.config_path, encoding="utf-8")
-            if (
-                detect_esun_environment(cfg_check) == target_env_normalized
-                and cfg_check.get("Core", "Entry", fallback="").strip().rstrip("/") == target_entry.rstrip("/")
-            ):
-                needs_update = False
-        except Exception:
-            needs_update = True
-
-        if needs_update:
-            try:
-                update_esun_config_environment(self.config_path, target_env_normalized)
-            except OSError as e:
-                logger.warning(f"Could not update config file {self.config_path}: {e}")
-
-        cfg, problems, loaded_env = load_config(self.config_path)
-        self.environment = loaded_env
-        self.entry = target_entry
-        self.logged_in = False
-        self.login_locked = False
-        self.login_error = None
-        self.sdk = None
-
-        if not problems and cfg:
-            try:
-                apply_headless_keyring_patches()
-                client = self.sdk_factory(cfg)
-                client.login()
-                self.sdk = client
-                self.logged_in = True
-                self.login_locked = False
-                self.login_error = None
-                self._start_websocket_thread()
-                threading.Thread(target=self._bootstrap_orders, daemon=True, name="EsunOrdersBootstrap").start()
-            except Exception as e:
-                err_msg = str(e)
-                self.logged_in = False
-                self.login_locked = True
-                self.login_error = err_msg
-                logger.warning(f"環境切換至 {self.environment} 後登入失敗 (非阻斷性)：{err_msg}")
-        else:
-            self.login_locked = True
-            self.login_error = "；".join(problems)
-
-        new_discovery = discover_esun_config_profiles(self.base_dir, self.config_path)
-        account = split_account(cfg["User"].get("Account")) if (cfg and cfg.has_section("User")) else None
-
+    def get_config_profiles(self) -> dict:
+        session = self._session
+        discovery = discover_esun_config_profiles(self.base_dir, session.config_path)
         return {
             "ok": True,
-            "environment": self.environment,
-            "simulation": self.environment == "SIMULATION",
-            "entry": self.entry,
-            "account": account,
-            "activeConfigFile": os.path.basename(self.config_path) if self.config_path and os.path.exists(self.config_path) else None,
-            "availableEnvironments": new_discovery["availableEnvironments"],
-            "configProfiles": {
-                k: {
-                    "available": v["available"],
-                    "fileName": v["fileName"],
-                    "expectedFileName": v["expectedFileName"],
-                    "aliases": v["aliases"],
-                    "entry": v["entry"],
-                }
-                for k, v in new_discovery["profiles"].items()
-            },
-            "loggedIn": self.logged_in,
-            "problems": problems,
+            "availableEnvironments": discovery["availableEnvironments"],
+            "configProfiles": public_config_profiles(discovery),
+            "activeConfigFile": session.config_file_name if session.config_path and os.path.isfile(session.config_path) else None,
+            "activeEnvironment": session.environment,
+            "sessionGeneration": session.generation,
         }
+
+    def _switch_response(
+        self,
+        ok: bool,
+        discovery: dict | None = None,
+        *,
+        error: str | None = None,
+        code: str | None = None,
+        problems: list[str] | None = None,
+        extra: dict | None = None,
+    ) -> dict:
+        session = self._session
+        discovery = discovery or discover_esun_config_profiles(self.base_dir, session.config_path)
+        res: dict[str, any] = {
+            "ok": ok,
+            "environment": session.environment,
+            "simulation": session.environment == "SIMULATION",
+            "entry": session.entry,
+            "account": dict(session.account) if session.account else None,
+            "activeConfigFile": session.config_file_name if session.config_path and os.path.isfile(session.config_path) else None,
+            "availableEnvironments": discovery["availableEnvironments"],
+            "configProfiles": public_config_profiles(discovery),
+            "loggedIn": session.logged_in,
+            "loginLocked": self.login_locked,
+            "sessionGeneration": session.generation,
+            "configOverridden": session.config_overridden,
+            "problems": problems or [],
+        }
+        if error is not None:
+            res["error"] = error
+            res["code"] = code or "ESUN_SWITCH_FAILED"
+        if extra:
+            res.update(extra)
+        return res
+
+    def switch_environment(self, target_env: str) -> dict[str, any]:
+        """Dict-only wrapper (see switch_environment_with_status)."""
+        res, _ = self.switch_environment_with_status(target_env)
+        return res
+
+    def switch_environment_with_status(self, target_env: str) -> tuple[dict[str, any], int]:
+        """
+        Switches between SIMULATION and PRODUCTION without ever writing the user's ini files:
+        dual-file mode loads the target profile file; a profile file whose [Core] does not
+        match the target is overridden in memory and the ConfigParser goes to SDK(config).
+        Goes through the same login guard as startup (circuit breaker, rate limit, daily cap).
+        Success swaps the session (caches cleared, new WebSocket); failure keeps the current
+        session. Either way a `session` SSE event is broadcast.
+        """
+        target = normalize_environment(target_env)
+        if target is None:
+            raise ValueError(f"不支援的環境設定：{target_env}，僅支援 SIMULATION 或 PRODUCTION")
+
+        if not self._session_change_lock.acquire(blocking=False):
+            return self._switch_response(False, error="另一個登入或環境切換作業進行中", code="ESUN_SESSION_BUSY"), 409
+        try:
+            session = self._session
+            discovery = discover_esun_config_profiles(self.base_dir, session.config_path)
+            if session.logged_in and session.environment == target:
+                self._publish_session_event("switch_unchanged")
+                return self._switch_response(True, discovery, extra={"message": f"已在 {target} 環境，未重新登入"}), 200
+
+            profile_info = discovery["profiles"].get(target, {})
+            if not profile_info.get("available", False):
+                expected = profile_info.get("expectedFileName", f"esun-config.{target.lower()}.ini")
+                error = f"未提供 {expected} 設定檔，無法切換至 {target}"
+                self._publish_session_event("switch_failed", ok=False, error=error)
+                return self._switch_response(False, discovery, error=error, code="ESUN_PROFILE_UNAVAILABLE"), 400
+
+            prepared, err = self._prepare_login_config(profile_info.get("filePath"), target)
+            if err:
+                self._publish_session_event("switch_failed", ok=False, error=err)
+                return self._switch_response(
+                    False, discovery, error=f"玉山設定不完整：{err}", code="ESUN_CONFIG_INCOMPLETE", problems=err.split("；")
+                ), 503
+            refusal = self._acquire_login_permit(explicit=False, force=False, material=prepared.material)
+            if refusal:
+                status, body = refusal
+                self._publish_session_event("switch_failed", ok=False, error=body["error"])
+                extra = {k: v for k, v in body.items() if k not in ("ok", "error", "code")}
+                return self._switch_response(False, discovery, error=body["error"], code=body["code"], extra=extra), status
+            ok, message = self._perform_login(prepared, reason="switch")
+            if not ok:
+                self._publish_session_event("switch_failed", ok=False, error=message)
+                return self._switch_response(
+                    False,
+                    discovery,
+                    error=f"切換至 {target} 失敗（登入未成功，維持原環境）：{message}",
+                    code="ESUN_LOGIN_FAILED",
+                ), 502
+            return self._switch_response(True), 200
+        finally:
+            self._session_change_lock.release()
 
     @staticmethod
     def _extract_cert_meta(cert_info: any) -> tuple[str, str]:
@@ -1532,8 +2618,8 @@ class EsunTradeBridge:
         if not expire and cert_info.get("not_after"):
             try:
                 ts = int(cert_info["not_after"])
-                expire = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-            except (ValueError, TypeError, OSError):
+                expire = datetime.datetime.fromtimestamp(ts, TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError, OSError, OverflowError):
                 expire = str(cert_info["not_after"])
         person_id = str(cert_info.get("person_id") or "")
         if not person_id and cert_info.get("cn"):
@@ -1541,16 +2627,15 @@ class EsunTradeBridge:
         return expire, person_id
 
     def get_ca_expiretime(self) -> dict:
-        health = self.get_health()
-        expire, _ = self._extract_cert_meta(health.get("certInfo"))
+        expire, _ = self._extract_cert_meta(self._session.cert_info)
         return {"ca_expiretime": expire}
 
     def get_accounts(self) -> list[dict]:
-        health = self.get_health()
-        acc = health.get("account")
+        session = self._session
+        acc = session.account
         if not acc:
             return []
-        expire, person_id = self._extract_cert_meta(health.get("certInfo"))
+        expire, person_id = self._extract_cert_meta(session.cert_info)
 
         return [{
             "account_type": "S",
@@ -1558,7 +2643,7 @@ class EsunTradeBridge:
             "account_id": acc["account_id"],
             "signed": True,
             "username": "玉山證券",
-            "person_id": person_id,
+            "person_id": mask_identifier(person_id) if person_id else "",
             "ca_expiretime": expire,
         }]
 
@@ -1566,11 +2651,19 @@ class EsunTradeBridge:
     # Order Mutations (place, replace-price, replace-qty, cancel)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _ensure_active_login(self) -> None:
-        if not self.logged_in or not self.sdk:
-            if self.login_locked:
-                raise PermissionError(f"玉山尚未登入或已鎖定 (請呼叫 /esun/auth/reconnect 重連)：{self.login_error}")
-            raise PermissionError("玉山證券尚未登入")
+    def _not_logged_in_message(self) -> str:
+        lock = self.login_state.snapshot()
+        if lock["locked"]:
+            return f"玉山尚未登入（登入熔斷鎖定中：{lock['code'] or 'LOGIN_FAILED'}），請修正後呼叫 /esun/auth/reconnect"
+        if self.login_error:
+            return f"玉山尚未登入：{self.login_error}"
+        return "玉山證券尚未登入"
+
+    def _require_session(self) -> EsunSession:
+        session = self._session
+        if not session.logged_in:
+            raise PermissionError(self._not_logged_in_message())
+        return session
 
     def _build_synthetic_order_result(self, order_no: str, payload: dict) -> dict:
         return {
@@ -1587,7 +2680,7 @@ class EsunTradeBridge:
         }
 
     def place_order(self, payload: dict) -> tuple[any, int]:
-        self._ensure_active_login()
+        session = self._require_session()
 
         # Rate limits
         if not self.order_mutation_daily.can_increment():
@@ -1634,18 +2727,18 @@ class EsunTradeBridge:
                 user_def=str(user_def)[:50],
             )
         except Exception as e:
-            return {"error": f"委託參數格式錯誤：{e}", "code": "INVALID_ORDER_PARAMS"}, 400
+            return {"error": f"委託參數格式錯誤：{redact(e)}", "code": "INVALID_ORDER_PARAMS"}, 400
 
         try:
-            res = self.sdk.place_order(order_obj)
+            res = session.sdk.place_order(order_obj)
             if isinstance(res, dict):
-                self.order_book_cache._upsert(res)
+                self.order_book_cache.upsert(res, generation=session.generation, source="local")
             return res, 200
         except Exception as e:
-            return {"error": f"玉山下單失敗：{e}", "code": "PLACE_ORDER_ERROR"}, 502
+            return {"error": f"玉山下單失敗：{redact(e)}", "code": "PLACE_ORDER_ERROR"}, 502
 
     def replace_price(self, body: dict) -> tuple[any, int]:
-        self._ensure_active_login()
+        session = self._require_session()
         order_no = body.get("orderNo") or body.get("order_no")
         price = body.get("price")
         if not order_no or price is None:
@@ -1675,15 +2768,14 @@ class EsunTradeBridge:
         price_flag_enum = to_price_flag(price_flag_val)
 
         try:
-            res = self.sdk.modify_price(in_order_result, target_price=float(price), price_flag=price_flag_enum)
-            if isinstance(res, dict):
-                self.order_book_cache._upsert(res)
+            res = session.sdk.modify_price(in_order_result, target_price=float(price), price_flag=price_flag_enum)
+            self.order_book_cache.mark_event(order_no, generation=session.generation)
             return res, 200
         except Exception as e:
-            return {"error": f"玉山改價失敗：{e}", "code": "REPLACE_PRICE_ERROR"}, 502
+            return {"error": f"玉山改價失敗：{redact(e)}", "code": "REPLACE_PRICE_ERROR"}, 502
 
     def replace_qty(self, body: dict) -> tuple[any, int]:
-        self._ensure_active_login()
+        session = self._require_session()
         order_no = body.get("orderNo") or body.get("order_no")
         if not order_no:
             return {"error": "缺少委託書號 (orderNo)", "code": "INVALID_PARAMS"}, 400
@@ -1724,15 +2816,14 @@ class EsunTradeBridge:
             return {"error": "缺少改量參數 (quantity, cel_qty, 或 cel_qty_share)", "code": "INVALID_PARAMS"}, 400
 
         try:
-            res = self.sdk.cancel_order(in_order_result, **cancel_kwargs)
-            if isinstance(res, dict):
-                self.order_book_cache._upsert(res)
+            res = session.sdk.cancel_order(in_order_result, **cancel_kwargs)
+            self.order_book_cache.mark_event(order_no, generation=session.generation)
             return res, 200
         except Exception as e:
-            return {"error": f"玉山改量失敗：{e}", "code": "REPLACE_QTY_ERROR"}, 502
+            return {"error": f"玉山改量失敗：{redact(e)}", "code": "REPLACE_QTY_ERROR"}, 502
 
     def cancel_order(self, body: dict) -> tuple[any, int]:
-        self._ensure_active_login()
+        session = self._require_session()
         order_no = body.get("orderNo") or body.get("order_no")
         if not order_no:
             return {"error": "缺少委託書號 (orderNo)", "code": "INVALID_PARAMS"}, 400
@@ -1750,193 +2841,170 @@ class EsunTradeBridge:
 
         try:
             # sdk.cancel_order without cel_qty cancels all
-            res = self.sdk.cancel_order(in_order_result)
-            if isinstance(res, dict):
-                self.order_book_cache._upsert(res)
+            res = session.sdk.cancel_order(in_order_result)
+            self.order_book_cache.mark_event(order_no, generation=session.generation)
             return res, 200
         except Exception as e:
-            return {"error": f"玉山刪單失敗：{e}", "code": "CANCEL_ORDER_ERROR"}, 502
+            return {"error": f"玉山刪單失敗：{redact(e)}", "code": "CANCEL_ORDER_ERROR"}, 502
 
     # ─────────────────────────────────────────────────────────────────────────
     # Portfolio Queries with Tiered Caching & Rate Limiting
+    # (errors are explicit: 503 not logged in, 429 rate limited, 502 SDK failure;
+    #  stale data is never served as if it were fresh)
     # ─────────────────────────────────────────────────────────────────────────
 
     def get_orders(self, refresh: bool = False) -> list[dict]:
         """
         If refresh is False, returns local OrderBookCache (0 API calls).
-        If refresh is True, enforces 5s min interval + 10 rpm limiter (AGR0005).
+        If refresh is True, enforces 5s min interval + 10 rpm limiter (AGR0005) and
+        replaces the cache with the broker snapshot. Raises EsunQueryError on failure.
         """
-        now = time.time()
+        session = self._session
+        if not session.logged_in:
+            raise EsunQueryError(503, "ESUN_NOT_LOGGED_IN", self._not_logged_in_message())
         if not refresh:
             return self.order_book_cache.get_all()
 
-        # Enforce 5s min interval & 10 req/min
-        if (now - self.last_orders_refresh_time < 5.0) or not self.orders_refresh_limiter.acquire():
-            logger.info("Order results refresh rate limited; serving cached OrderBookCache")
-            return self.order_book_cache.get_all()
-
-        self.last_orders_refresh_time = now
+        with self._orders_refresh_lock:
+            now = time.monotonic()
+            wait = ORDERS_REFRESH_MIN_INTERVAL_SECONDS - (now - self.last_orders_refresh_time)
+            if wait > 0:
+                raise EsunQueryError(429, "AGR0005", "委託查詢過於頻繁（refresh 最短間隔 5 秒）", retry_after=wait)
+            if not self.orders_refresh_limiter.acquire():
+                raise EsunQueryError(
+                    429, "AGR0005", "委託查詢頻率過高 (限 10 次/分，AGR0005)",
+                    retry_after=max(1.0, self.orders_refresh_limiter.time_until_available()),
+                )
+            self.last_orders_refresh_time = now
         try:
-            self._ensure_active_login()
-            orders = self.sdk.get_order_results()
-            if isinstance(orders, list):
-                self.order_book_cache.update_from_order_results(orders)
-            return self.order_book_cache.get_all()
+            orders = session.sdk.get_order_results()
         except Exception as e:
-            logger.warning(f"get_order_results failed: {e}; serving cached orders")
-            return self.order_book_cache.get_all()
+            logger.warning(f"get_order_results failed: {redact(e)}")
+            raise EsunQueryError(502, "ORDERS_QUERY_ERROR", f"玉山查詢委託失敗：{redact(e)}")
+        if not isinstance(orders, list):
+            raise EsunQueryError(502, "ORDERS_QUERY_ERROR", "玉山委託查詢回應格式錯誤")
+        if not self.order_book_cache.update_from_order_results(orders, generation=session.generation):
+            raise EsunQueryError(503, "ESUN_SESSION_CHANGED", "查詢期間玉山 session 已切換，請重新查詢")
+        return self.order_book_cache.get_all()
+
+    def _cached_query(
+        self,
+        cache: TTLCache,
+        key: str,
+        fetch: any,
+        label: str,
+        error_code: str,
+        limiter: SlidingWindowRateLimiter | None = None,
+        limit_code: str | None = None,
+        limit_message: str | None = None,
+        decorate: any = None,
+    ) -> tuple[any, int]:
+        session = self._session
+        if not session.logged_in:
+            return {"ok": False, "error": self._not_logged_in_message(), "code": "ESUN_NOT_LOGGED_IN"}, 503
+        hit = cache.get(key)
+        if hit is not None:
+            return (decorate(hit[0], hit[1], True) if decorate else hit[0]), 200
+        if not cache.fill_lock.acquire(timeout=CACHE_FILL_WAIT_SECONDS):
+            return {"ok": False, "error": f"{label}查詢忙碌中，請稍後再試", "code": "ESUN_BUSY", "retry_after": 2}, 503
+        try:
+            hit = cache.get(key)  # filled by the request we waited for (single-flight)
+            if hit is not None:
+                return (decorate(hit[0], hit[1], True) if decorate else hit[0]), 200
+            with self._state_lock:
+                session = self._session
+                token = cache.begin_fill()
+            if not session.logged_in or token[0] != session.generation:
+                return {"ok": False, "error": self._not_logged_in_message(), "code": "ESUN_NOT_LOGGED_IN"}, 503
+            if limiter is not None and not limiter.acquire():
+                return {
+                    "ok": False,
+                    "error": limit_message,
+                    "code": limit_code,
+                    "retry_after": int(math.ceil(max(1.0, limiter.time_until_available()))),
+                }, 429
+            try:
+                data = fetch(session.sdk)
+            except Exception as e:
+                return {"ok": False, "error": f"玉山查詢{label}失敗：{redact(e)}", "code": error_code}, 502
+            cache.set(key, data, fill_token=token)
+            return (decorate(data, 0.0, False) if decorate else data), 200
+        finally:
+            cache.fill_lock.release()
 
     def get_balance(self) -> tuple[dict, int]:
         """Mandatory 180-second TTL cache for get_balance()."""
-        cached = self.balance_cache.get("balance")
-        if cached is not None:
-            data, age = cached
+        def _decorate(data: any, age: float, cached: bool) -> any:
             if isinstance(data, dict):
-                return {**data, "cached": True, "cache_age_sec": round(age, 1)}, 200
-            return data, 200
+                return {**data, "cached": cached, "cache_age_sec": round(age, 1)}
+            return data
 
-        try:
-            self._ensure_active_login()
-            data = self.sdk.get_balance()
-            self.balance_cache.set("balance", data)
-            if isinstance(data, dict):
-                return {**data, "cached": False, "cache_age_sec": 0.0}, 200
-            return data, 200
-        except Exception as e:
-            # Try serving stale cache if available
-            stale = self.balance_cache.get_stale("balance")
-            if stale is not None:
-                data, age = stale
-                if isinstance(data, dict):
-                    return {**data, "cached": True, "cache_age_sec": round(age, 1), "stale": True}, 200
-            return {"error": f"玉山查詢餘額失敗：{e}", "code": "BALANCE_QUERY_ERROR"}, 502
+        return self._cached_query(
+            self.balance_cache, "balance", lambda sdk: sdk.get_balance(), "餘額", "BALANCE_QUERY_ERROR",
+            decorate=_decorate,
+        )
 
     def get_settlements(self) -> tuple[any, int]:
         """25-second TTL cache + 3 req/min limiter (AGR0006)."""
-        cached = self.settlements_cache.get("settlements")
-        if cached is not None:
-            data, _ = cached
-            return data, 200
-
-        if not self.settlements_limiter.acquire():
-            stale = self.settlements_cache.get_stale("settlements")
-            if stale is not None:
-                data, _ = stale
-                return data, 200
-            return {"error": "交割款查詢頻率過高 (限 3 次/分，AGR0006)", "code": "AGR0006"}, 429
-
-        try:
-            self._ensure_active_login()
-            data = self.sdk.get_settlements()
-            self.settlements_cache.set("settlements", data)
-            return data, 200
-        except Exception as e:
-            stale = self.settlements_cache.get_stale("settlements")
-            if stale is not None:
-                data, _ = stale
-                return data, 200
-            return {"error": f"玉山查詢交割款失敗：{e}", "code": "SETTLEMENTS_QUERY_ERROR"}, 502
+        return self._cached_query(
+            self.settlements_cache, "settlements", lambda sdk: sdk.get_settlements(), "交割款", "SETTLEMENTS_QUERY_ERROR",
+            limiter=self.settlements_limiter, limit_code="AGR0006", limit_message="交割款查詢頻率過高 (限 3 次/分，AGR0006)",
+        )
 
     def get_inventories(self) -> tuple[any, int]:
         """6-second TTL cache + 10 req/min limiter (AGR0003), invalidated on MAT deals."""
-        cached = self.positions_cache.get("positions")
-        if cached is not None:
-            data, _ = cached
-            return data, 200
+        return self._cached_query(
+            self.positions_cache, "positions", lambda sdk: sdk.get_inventories(), "持股庫存", "INVENTORIES_QUERY_ERROR",
+            limiter=self.positions_limiter, limit_code="AGR0003", limit_message="庫存查詢頻率過高 (限 10 次/分，AGR0003)",
+        )
 
-        if not self.positions_limiter.acquire():
-            stale = self.positions_cache.get_stale("positions")
-            if stale is not None:
-                data, _ = stale
-                return data, 200
-            return {"error": "庫存查詢頻率過高 (限 10 次/分，AGR0003)", "code": "AGR0003"}, 429
-
-        try:
-            self._ensure_active_login()
-            data = self.sdk.get_inventories()
-            self.positions_cache.set("positions", data)
-            return data, 200
-        except Exception as e:
-            stale = self.positions_cache.get_stale("positions")
-            if stale is not None:
-                data, _ = stale
-                return data, 200
-            return {"error": f"玉山查詢持股庫存失敗：{e}", "code": "INVENTORIES_QUERY_ERROR"}, 502
-
-    def get_profit_loss(self, start_date: str | None, end_date: str | None) -> tuple[any, int]:
+    def get_profit_loss_with_meta(self, start_date: str | None, end_date: str | None) -> tuple[any, int, dict[str, str]]:
         """
         180-day range check/clamping (AW00002/AW00003) + 10s TTL cache + 10 req/min limiter.
+        Default dates use the Asia/Taipei calendar. Returns response headers describing a clamp.
         """
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        today_str = taipei_today().strftime("%Y-%m-%d")
         s_raw = start_date or today_str
         e_raw = end_date or today_str
 
         clamped_start, clamped_end, err = check_and_clamp_date_range(s_raw, e_raw)
         if err:
-            return {"error": err, "code": "INVALID_DATE_RANGE"}, 400
+            return {"ok": False, "error": err, "code": "INVALID_DATE_RANGE"}, 400, {}
+
+        headers: dict[str, str] = {"X-Esun-Range-Start": clamped_start, "X-Esun-Range-End": clamped_end}
+        parsed_start = None
+        for fmt in ("%Y-%m-%d", "%Y%m%d"):
+            try:
+                parsed_start = datetime.datetime.strptime(s_raw.strip(), fmt).date()
+                break
+            except ValueError:
+                pass
+        if parsed_start is not None and parsed_start.strftime("%Y-%m-%d") != clamped_start:
+            headers["X-Esun-Range-Clamped"] = "1"
 
         cache_key = f"{clamped_start}_{clamped_end}"
-        cached = self.profit_loss_cache.get(cache_key)
-        if cached is not None:
-            data, _ = cached
-            return data, 200
+        data, status = self._cached_query(
+            self.profit_loss_cache, cache_key,
+            lambda sdk: sdk.get_transactions_by_date(clamped_start, clamped_end), "損益", "PROFIT_LOSS_ERROR",
+            limiter=self.profit_loss_limiter, limit_code="AGR0003", limit_message="損益查詢頻率過高 (限 10 次/分，AGR0003)",
+        )
+        return data, status, headers
 
-        if not self.profit_loss_limiter.acquire():
-            stale = self.profit_loss_cache.get_stale(cache_key)
-            if stale is not None:
-                data, _ = stale
-                return data, 200
-            return {"error": "損益查詢頻率過高 (限 10 次/分，AGR0003)", "code": "AGR0003"}, 429
-
-        try:
-            self._ensure_active_login()
-            data = self.sdk.get_transactions_by_date(clamped_start, clamped_end)
-            self.profit_loss_cache.set(cache_key, data)
-            return data, 200
-        except Exception as e:
-            stale = self.profit_loss_cache.get_stale(cache_key)
-            if stale is not None:
-                data, _ = stale
-                return data, 200
-            return {"error": f"玉山查詢損益失敗：{e}", "code": "PROFIT_LOSS_ERROR"}, 502
+    def get_profit_loss(self, start_date: str | None, end_date: str | None) -> tuple[any, int]:
+        data, status, _ = self.get_profit_loss_with_meta(start_date, end_date)
+        return data, status
 
     def get_trade_status(self) -> tuple[any, int]:
         """60-second TTL cache for get_trade_status()."""
-        cached = self.trade_status_cache.get("trade_status")
-        if cached is not None:
-            data, _ = cached
-            return data, 200
-
-        try:
-            self._ensure_active_login()
-            data = self.sdk.get_trade_status()
-            self.trade_status_cache.set("trade_status", data)
-            return data, 200
-        except Exception as e:
-            stale = self.trade_status_cache.get_stale("trade_status")
-            if stale is not None:
-                data, _ = stale
-                return data, 200
-            return {"error": f"玉山查詢交易額度失敗：{e}", "code": "TRADE_STATUS_ERROR"}, 502
+        return self._cached_query(
+            self.trade_status_cache, "trade_status", lambda sdk: sdk.get_trade_status(), "交易額度", "TRADE_STATUS_ERROR",
+        )
 
     def get_market_status(self) -> tuple[any, int]:
         """300-second TTL cache for get_market_status()."""
-        cached = self.market_status_cache.get("market_status")
-        if cached is not None:
-            data, _ = cached
-            return data, 200
-
-        try:
-            self._ensure_active_login()
-            data = self.sdk.get_market_status()
-            self.market_status_cache.set("market_status", data)
-            return data, 200
-        except Exception as e:
-            stale = self.market_status_cache.get_stale("market_status")
-            if stale is not None:
-                data, _ = stale
-                return data, 200
-            return {"error": f"玉山查詢市場狀態失敗：{e}", "code": "MARKET_STATUS_ERROR"}, 502
+        return self._cached_query(
+            self.market_status_cache, "market_status", lambda sdk: sdk.get_market_status(), "市場狀態", "MARKET_STATUS_ERROR",
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2353,8 +3421,10 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
             elif path == "/esun/portfolio/profit-loss":
                 start = qs.get("begin_date", [None])[0] or qs.get("start", [None])[0] or qs.get("start_date", [None])[0]
                 end = qs.get("end_date", [None])[0] or qs.get("end", [None])[0]
-                data, code = self.bridge.get_profit_loss(start, end)
-                self._send_json(code, data, self._retry_headers(data))
+                data, code, range_headers = self.bridge.get_profit_loss_with_meta(start, end)
+                headers = dict(range_headers)
+                headers.update(self._retry_headers(data) or {})
+                self._send_json(code, data, headers)
             elif path == "/esun/portfolio/trading-limits":
                 data, code = self.bridge.get_trade_status()
                 self._send_json(code, data, self._retry_headers(data))
@@ -2367,6 +3437,9 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._handle_sse(qs)
             else:
                 self._send_error_json(404, "ESUN_NOT_FOUND", f"未知的端點 GET {path}")
+        except EsunQueryError as qe:
+            body = qe.to_body()
+            self._send_json(qe.status, body, self._retry_headers(body))
         except Exception:
             self._send_internal_error()
 
@@ -2384,7 +3457,7 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
 
         try:
             if path == "/esun/auth/reconnect":
-                _, res, code = self.bridge.reconnect()
+                _, res, code = self.bridge.reconnect(force=body.get("force") is True)
                 self._send_json(code, res, self._retry_headers(res))
             elif path in ("/esun/auth/environment", "/esun/environment"):
                 target = body.get("environment")
@@ -2394,9 +3467,8 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
                     self._send_error_json(400, "ESUN_INVALID_PARAMS", "缺少 environment 參數 (SIMULATION 或 PRODUCTION)")
                     return
                 try:
-                    res = self.bridge.switch_environment(str(target))
-                    status_code = 200 if res.get("ok") else 400
-                    self._send_json(status_code, res)
+                    res, status_code = self.bridge.switch_environment_with_status(str(target))
+                    self._send_json(status_code, res, self._retry_headers(res))
                 except ValueError as ve:
                     self._send_error_json(400, "ESUN_INVALID_PARAMS", str(ve))
             elif path == "/esun/orders/place":
@@ -2495,6 +3567,12 @@ class EsunThreadingHTTPServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._connection_slots.release()
+
+    def handle_error(self, request: any, client_address: any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return  # client went away or timed out: not an error worth a traceback
+        logger.error(f"處理請求時發生未預期錯誤：\n{redact(traceback.format_exc())}")
 
 
 def create_server(
