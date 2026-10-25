@@ -2081,6 +2081,10 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         # let the login bootstrap (empty snapshot) settle before tests install their own snapshot
         _wait_until(lambda: self.bridge.orders_refresh_limiter.timestamps != [], timeout=1)
         time.sleep(0.05)
+        # failed ACKs schedule a background query (TestFailedAckBackgroundRefresh): recorded only here
+        patcher = mock.patch.object(self.bridge, "_schedule_failed_ack_refresh")
+        self.scheduled = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self._core_patch.stop()
@@ -2264,7 +2268,7 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         self.assertEqual(status, 200, res)
         _, order_result, new_price, new_flag = self._core_calls("modify_price")[-1]
         self.assertEqual((new_price, new_flag, order_result["ord_no"]), (955.0, "0", "D0401"))
-        self.assertEqual(self.bridge.order_book_cache.get("D0401")["od_price"], 955.0)
+        self.assertEqual(self.bridge.order_book_cache.get("D0401")["od_price"], 950.0)  # PA4-2: until the ACK
         # limit-up flag: price is not sent
         res, status = self.bridge.replace_price({"order_no": "D0401", "price_flag": "3", **self.env})
         self.assertEqual(status, 200, res)
@@ -2312,101 +2316,102 @@ class TestMutationContractWithRealSdk(_BridgeCase):
             return "PreSubmitted"
         return "Submitted"
 
-    def _row(self, ord_no):
-        return next(r for r in self.bridge.get_orders(refresh=False) if ord_no in (r.get("ord_no"), r.get("pre_ord_no")))
+    # Failed ACK shapes whose meaning is unknown (no real payload confirms before/after semantics).
+    _REJECTED = {
+        "new": {"before_qty": 0, "after_qty": 0, "od_price": 999.0, "price_flag": "4", "ord_status": "Fail",
+                "err_code": "E0123", "err_msg": "價格超過漲跌幅"},
+        "price": {"before_qty": 5, "after_qty": 5, "od_price": 955.0, "price_flag": "0",
+                  "err_code": "E0124", "err_msg": "改價失敗"},
+        "cancel": {"cel_qty": 5, "od_price": 900.0, "price_flag": "4", "ord_status": "4",
+                   "err_code": "AG0011", "err_msg": "刪單失敗"},
+    }
 
-    def test_rejected_new_order_ack_marks_the_unconfirmed_row_failed(self):
-        # PA3-1: a failed ACK of an order never confirmed (rejected new order) records the failure.
-        res, status = self._place()
-        self.assertEqual(status, 200, res)
-        self.assertEqual(self._client_status(self._row("A0001")), "Submitted")
+    def _rejected_ack(self, ord_no, shape):
+        return {"ord_no": ord_no, "stock_no": "2330", "ap_code": "1", "buy_sell": "B", "org_qty": 5,
+                "work_date": taipei_today_str(), **self._REJECTED[shape]}
+
+    def test_failed_acks_never_fail_cancel_or_create_rows(self):
+        # PA4-1 / PA4-3 / PA4-5: hit or miss, a rejected new order (0 -> 0), price modify (5 -> 5) or
+        # cancel (no before/after, cel_qty = org) leaves the cache as it was; a hit carries the failure.
+        self._place()  # A0001: a locally placed order the exchange has not confirmed yet
+        snapshot = [self._lot_order(ord_no=f"H{i}", mat_qty=0) for i in range(3)]
+        self._snapshot(*snapshot)  # A0001 is kept: placed moments ago
+        expected_rows = {r["ord_no"]: r for r in self.bridge.get_orders(refresh=False)}
+        self.assertEqual(set(expected_rows), {"A0001", "H0", "H1", "H2"})
         events = self.bridge.sse_fanout.register()
-        self.assertIsNotNone(self.bridge._handle_ack({
-            "ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "buy_sell": "B", "od_price": 999.0,
-            "price_flag": "4", "org_qty": 1, "before_qty": 0, "after_qty": 0,
-            "err_code": "E0123", "err_msg": "價格超過漲跌幅", "ord_status": "Fail",
-        }))
-        self.assertEqual([e["data"]["op_code"] for e in _drain(events, timeout=0.3) if e["event"] == "order"], ["E0123"])
-        row = self._row("A0001")
-        self.assertEqual((row["err_code"], row["err_msg"], row["ord_status"]), ("E0123", "價格超過漲跌幅", "Fail"))
-        self.assertEqual((row["od_price"], row["price_flag"], row["org_qty"]), (950.0, "0", 1))  # not merged
-        self.assertNotIn("before_qty", row)
-        self.assertEqual(self._client_status(row), "Failed")
+        sent = [("A0001", "new"), ("H0", "new"), ("H1", "price"), ("H2", "cancel"),
+                ("M0", "new"), ("M1", "price"), ("M2", "cancel")]
+        for ord_no, shape in sent:
+            self.assertIsNotNone(self.bridge._handle_ack(self._rejected_ack(ord_no, shape)))
+        published = [e["data"] for e in _drain(events, timeout=0.3) if e["event"] == "order"]
+        self.assertEqual([(e["order_no"], e["op_code"], e["op_type"]) for e in published], [
+            ("A0001", "E0123", "Unknown"), ("H0", "E0123", "Unknown"), ("H1", "E0124", "ModifyPrice"),
+            ("H2", "AG0011", "Unknown"), ("M0", "E0123", "Unknown"), ("M1", "E0124", "Unknown"),
+            ("M2", "AG0011", "Unknown"),
+        ])
+        self.assertEqual(self.scheduled.call_count, len(sent))  # every failed ACK asks for a snapshot
+        rows = {r["ord_no"]: r for r in self.bridge.get_orders(refresh=False)}
+        self.assertEqual(set(rows), set(expected_rows))  # no row built for M0-M2
+        cache = self.bridge.order_book_cache
+        for ord_no, shape in sent[:4]:
+            failure = {"op_code": self._REJECTED[shape]["err_code"], "op_msg": self._REJECTED[shape]["err_msg"]}
+            for row in (rows[ord_no], cache.get(ord_no), cache.get_with_meta(ord_no)[0]):
+                self.assertEqual(row["esun_unresolved_failure"], failure, ord_no)
+                self.assertEqual({k: v for k, v in row.items() if k != "esun_unresolved_failure"},
+                                 expected_rows[ord_no], ord_no)
+                self.assertEqual(self._client_status(row), "Submitted", ord_no)
+        # the rejected cel_qty is no event quantity: an older snapshot is not lifted by it
+        rows = {r["ord_no"]: r for r in self._snapshot(*snapshot)}
+        self.assertEqual((rows["H2"]["cel_qty"], self._client_status(rows["H2"])), (0, "Submitted"))
+        self.assertNotIn("esun_unresolved_failure", rows["H2"])
 
-    def test_rejected_ack_of_an_unknown_order_builds_a_failure_row(self):
-        # PA3-1: no cached row -> identity / product / side / ap_code / raw quantities / failure fields.
-        self.bridge._handle_ack({
-            "kind": "ACK", "ord_no": "Z0001", "stock_no": "2330", "ap_code": "1", "buy_sell": "S",
-            "work_date": taipei_today_str(), "od_price": 900.0, "price_flag": "0", "bs_flag": "R",
-            "org_qty": 2, "cel_qty": 1, "err_code": "E0999", "err_msg": "暫停交易", "action": "1",
-        })
-        row = self._row("Z0001")
-        self.assertEqual({k: v for k, v in row.items() if k != "esun_fills"}, {
-            "ord_no": "Z0001", "stock_no": "2330", "ap_code": "1", "buy_sell": "S", "work_date": taipei_today_str(),
-            "org_qty": 2, "cel_qty": 1, "err_code": "E0999", "err_msg": "暫停交易",
-        })
-        self.assertEqual(self._client_status(row), "Failed")
-        # the raw cel_qty is not an event quantity: a later snapshot is not lifted by it
-        row = next(r for r in self._snapshot(self._lot_order(ord_no="Z0001", mat_qty=0)) if r["ord_no"] == "Z0001")
-        self.assertEqual(row["cel_qty"], 0)
+    def test_unresolved_failure_cleared_by_success_ack_or_snapshot_and_never_sent(self):
+        # PA4-3: cleared by a successful ACK of the order or a new snapshot; never handed to the SDK.
+        self._snapshot(self._lot_order(ord_no="C0101", mat_qty=0))
+        self.bridge._handle_ack(self._rejected_ack("C0101", "price"))
+        self.assertIn("esun_unresolved_failure", self.bridge.order_book_cache.get("C0101"))
+        sdk = self.bridge.session.sdk
+        handed: list[dict] = []
+        original = sdk.modify_price
 
-    def test_rejected_reservation_conversion_marks_the_row_failed(self):
-        # PA3-1: a reservation from the snapshot is not exchange-confirmed; a failed cancel of it is.
-        reservation = self._lot_order(ord_no="", pre_ord_no="P0001", ord_status="1", mat_qty=0)
-        self._snapshot(reservation)
-        self.bridge._handle_ack({"pre_ord_no": "P0001", "stock_no": "2330", "ap_code": "1", "org_qty": 5,
-                                 "before_qty": 5, "after_qty": 0, "err_code": "AG0011", "err_msg": "刪單失敗"})
-        self.assertEqual(self._client_status(self._row("P0001")), "PreSubmitted")  # rejected cancel: unchanged
-        self.assertNotIn("err_code", self._row("P0001"))
-        self.bridge._handle_ack({"pre_ord_no": "P0001", "stock_no": "2330", "ap_code": "1", "org_qty": 5,
-                                 "err_code": "E0123", "err_msg": "價格超過漲跌幅"})
-        row = self._row("P0001")
-        self.assertEqual((row["err_code"], row["ord_status"], row["org_qty"]), ("E0123", "1", 5))
-        self.assertEqual(self._client_status(row), "Failed")
+        def spy(order_result, *args, **kwargs):
+            handed.append(dict(order_result))
+            return original(order_result, *args, **kwargs)
 
-    def test_failed_ack_after_a_successful_ack_leaves_the_row(self):
-        # PA3-1: a successful ACK confirms a locally placed order; later failed ACKs are requests.
-        self._place()
-        self.bridge._handle_ack({"ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "org_qty": 1,
-                                 "ord_status": "2", "err_code": "00000000"})
-        before = self._row("A0001")
-        self.bridge._handle_ack({"ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "org_qty": 1,
-                                 "cel_qty": 1, "ord_status": "4", "err_code": "AG0011", "err_msg": "刪單失敗"})
-        self.assertEqual(self._row("A0001"), before)
-        self.assertEqual(self._client_status(before), "Submitted")
+        with mock.patch.object(sdk, "modify_price", spy):
+            res, status = self.bridge.replace_price({"order_no": "C0101", "price": 956.0, **self.env})
+        self.assertEqual(status, 200, res)
+        self.assertNotIn("esun_unresolved_failure", handed[0])
+        self.assertNotIn("esun_unresolved_failure", self._core_calls("modify_price")[-1][1])
+        self.bridge._handle_ack({"ord_no": "C0101", "stock_no": "2330", "ap_code": "1", "org_qty": 5,
+                                 "err_code": "00000000", "err_msg": ""})
+        self.assertNotIn("esun_unresolved_failure", self.bridge.order_book_cache.get("C0101"))
+        self.bridge._handle_ack(self._rejected_ack("C0101", "cancel"))
+        self.assertIn("esun_unresolved_failure", self.bridge.get_orders(refresh=False)[0])
+        row = self._snapshot(self._lot_order(ord_no="C0101", mat_qty=0))[0]
+        self.assertNotIn("esun_unresolved_failure", row)
 
-    def test_rejected_price_modify_restores_the_previous_price(self):
-        # PA3-2: the accepted modify writes the new price at once; a failed ACK rolls it back.
+    def test_accepted_price_modify_waits_for_the_ack(self):
+        # PA4-2: the accepted modify is not written into the row; the successful ACK brings the price
+        # and is published as ModifyPrice (ACK price != cached price).
         self._snapshot(self._lot_order(ord_no="D0401", mat_qty=0))
         body = {"order_no": "D0401", "price": 955.0, **self.env}
-        failed = {"ord_no": "D0401", "stock_no": "2330", "ap_code": "1", "org_qty": 5, "od_price": 955.0,
-                  "before_qty": 5, "after_qty": 5, "err_code": "E0123", "err_msg": "價格超過漲跌幅"}
         self.assertEqual(self.bridge.replace_price(body)[1], 200)
-        self.assertEqual(self._row("D0401")["od_price"], 955.0)
-        self.bridge._handle_ack(dict(failed))
-        row = self._row("D0401")
-        self.assertEqual((row["od_price"], row["price_flag"]), (950.0, "0"))
-        self.assertNotIn("err_code", row)  # a confirmed order is not failed by its rejected modify
-        # limit-up flag (price not sent): the flag is rolled back too
+        row, meta = self.bridge.order_book_cache.get_with_meta("D0401")
+        self.assertEqual((row["od_price"], row["price_flag"], meta["source"]), (950.0, "0", "event"))
         self.assertEqual(self.bridge.replace_price({"order_no": "D0401", "price_flag": "3", **self.env})[1], 200)
-        self.assertEqual(self._row("D0401")["price_flag"], "3")
-        self.bridge._handle_ack(dict(failed))
-        self.assertEqual((self._row("D0401")["od_price"], self._row("D0401")["price_flag"]), (950.0, "0"))
-        # the restored price is modifiable again (no local O00021 against the rejected price)
-        self.assertEqual(self.bridge.replace_price(body)[1], 200)
-        self.bridge._handle_ack({**failed, "err_code": "00000000", "err_msg": ""})
-        self.assertEqual(self._row("D0401")["od_price"], 955.0)
-        self.bridge._handle_ack(dict(failed))  # pending cleared by the successful ACK
-        self.assertEqual(self._row("D0401")["od_price"], 955.0)
-
-    def test_snapshot_drops_the_pending_price(self):
-        # PA3-2: a snapshot after the accepted modify is authoritative; a later failed ACK keeps it.
-        self._snapshot(self._lot_order(ord_no="D0401", mat_qty=0))
-        self.assertEqual(self.bridge.replace_price({"order_no": "D0401", "price": 955.0, **self.env})[1], 200)
-        self._snapshot(self._lot_order(ord_no="D0401", mat_qty=0, od_price=955.0))
+        self.assertEqual(self.bridge.order_book_cache.get("D0401")["price_flag"], "0")
+        res, status = self.bridge.replace_price({**body, "price": 950.0})  # O00021 against the cached row
+        self.assertEqual((status, res["code"]), (400, "AG_INVALID_PRICE_MODIFY"))
+        events = self.bridge.sse_fanout.register()
         self.bridge._handle_ack({"ord_no": "D0401", "stock_no": "2330", "ap_code": "1", "org_qty": 5,
-                                 "err_code": "AG0011", "err_msg": "刪單失敗"})
-        self.assertEqual(self._row("D0401")["od_price"], 955.0)
+                                 "before_qty": 5, "after_qty": 5, "od_price": 955.0, "price_flag": "0",
+                                 "err_code": "00000000", "err_msg": ""})
+        published = [e["data"] for e in _drain(events, timeout=0.3) if e["event"] == "order"]
+        self.assertEqual([e["op_type"] for e in published], ["ModifyPrice"])
+        self.assertEqual(self.bridge.order_book_cache.get("D0401")["od_price"], 955.0)
+        res, status = self.bridge.replace_price(body)
+        self.assertEqual((status, res["code"]), (400, "AG_INVALID_PRICE_MODIFY"))
 
     def test_sdk_receives_the_raw_cached_row(self):
         # PA2-4: modify/cancel hand the SDK the cached raw row, never the effective read view.
@@ -2974,6 +2979,121 @@ class TestOrdersRefreshCoalescing(_BridgeCase):
         self.assertEqual(self.sdk.orders_calls, calls + 2)
 
 
+class TestFailedAckBackgroundRefresh(_BridgeCase):
+    """PA4-4: a failed ACK schedules one authoritative orders query; its snapshot decides."""
+
+    def setUp(self):
+        super().setUp()
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        self.factory = RecordingFactory(mock_cls=TimedOrdersSDK)
+        self.bridge = self.make_bridge(sim, self.factory, websocket_enabled=False)
+        self.sdk = self.factory.instances[0]
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls >= 1))  # login bootstrap
+        time.sleep(0.05)
+        interval = mock.patch.object(bridge_module, "ORDERS_REFRESH_MIN_INTERVAL_SECONDS", 0.2)
+        interval.start()
+        self.addCleanup(interval.stop)
+        self.bridge.failed_ack_refresh_backoff = (0.3, 0.4, 0.5)
+        self.generation = self.bridge.session.generation
+        self.row = {"ord_no": "R1", "stock_no": "2330", "ap_code": "1", "buy_sell": "B", "org_qty": 1,
+                    "work_date": taipei_today_str()}
+        self.sdk.snapshot_rows = [dict(self.row)]
+        self.bridge.order_book_cache.update_from_order_results([dict(self.row)], generation=self.generation)
+        self.events = self.bridge.sse_fanout.register()
+        self.calls = self.sdk.orders_calls
+
+    def _fail(self):
+        return self.bridge._handle_ack({**self.row, "err_code": "AG0011", "err_msg": "刪單失敗"})
+
+    def _resyncs(self, timeout=0.3):
+        return [e["data"] for e in _drain(self.events, timeout=timeout) if e["event"] == "resync"]
+
+    def _failure(self):
+        return self.bridge.get_orders(refresh=False)[0].get("esun_unresolved_failure")
+
+    def _idle(self):
+        return _wait_until(lambda: self.bridge._failed_ack_refresh is None, timeout=5)
+
+    def test_failed_acks_share_one_query_then_resync(self):
+        self.bridge.last_orders_refresh_time = time.monotonic()  # the query waits for the 0.2 s interval
+        for _ in range(3):
+            self.assertIsNotNone(self._fail())
+        self.assertEqual(self._failure(), {"op_code": "AG0011", "op_msg": "刪單失敗"})
+        self.assertTrue(self._idle())
+        resyncs = self._resyncs()
+        self.assertEqual(self.sdk.orders_calls, self.calls + 1)
+        self.assertEqual(len(resyncs), 1, resyncs)
+        self.assertEqual({k: resyncs[0][k] for k in ("reason", "generation", "cacheRefreshed")},
+                         {"reason": "failed_ack_refreshed", "generation": self.generation, "cacheRefreshed": True})
+        self.assertIn("ts", resyncs[0])
+        self.assertIsNone(self._failure())  # the snapshot settled it
+        time.sleep(0.3)
+        self.assertEqual(self.sdk.orders_calls, self.calls + 1)
+
+    def test_failed_ack_during_the_query_runs_it_once_more(self):
+        self.sdk.gate = threading.Event()
+        self._fail()
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 1))  # in flight
+        self._fail()
+        self._fail()
+        self.sdk.gate.set()
+        self.assertTrue(self._idle())
+        self.assertEqual(self.sdk.orders_calls, self.calls + 2)  # one more for both, not two
+        self.assertEqual([r["reason"] for r in self._resyncs()], ["failed_ack_refreshed"] * 2)
+        self.assertIsNone(self._failure())
+
+    def test_background_query_merges_with_a_user_refresh(self):
+        self.bridge.last_orders_refresh_time = time.monotonic()
+        self._fail()
+        results: list = []
+        user = threading.Thread(target=lambda: results.append(self.bridge.get_orders(refresh=True)))
+        user.start()
+        user.join(5)
+        self.assertTrue(self._idle())
+        self.assertEqual(self.sdk.orders_calls, self.calls + 1)
+        self.assertEqual([o["ord_no"] for o in results[0]], ["R1"])
+        self.assertEqual([r["reason"] for r in self._resyncs()], ["failed_ack_refreshed"])
+
+    def test_failed_query_retries_with_backoff_at_most_three_times(self):
+        self.sdk.fail_with = RuntimeError("upstream exploded")
+        with self.assertLogs("esun_trade_server", level="WARNING"):
+            self._fail()
+            self.assertTrue(self._idle())
+        self.assertEqual(self.sdk.orders_calls, self.calls + 4)  # 1 + 3 retries
+        times = self.sdk.order_call_times[-4:]
+        for gap, delay in zip([b - a for a, b in zip(times, times[1:])], self.bridge.failed_ack_refresh_backoff):
+            self.assertGreaterEqual(gap, delay - 0.02)
+        time.sleep(0.6)
+        self.assertEqual(self.sdk.orders_calls, self.calls + 4)
+        self.assertEqual(self._resyncs(), [])
+        self.assertEqual(self._failure(), {"op_code": "AG0011", "op_msg": "刪單失敗"})  # still unresolved
+
+    def test_background_query_gives_up_on_shutdown(self):
+        self.sdk.fail_with = RuntimeError("upstream exploded")
+        self._fail()
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 1))
+        self.bridge.begin_shutdown()  # during the 0.3 s backoff
+        self.assertTrue(self._idle())
+        time.sleep(0.5)
+        self.assertEqual(self.sdk.orders_calls, self.calls + 1)
+        self.assertEqual(self._resyncs(), [])
+        self.assertIsNone(self.bridge._schedule_failed_ack_refresh(self.bridge.session))  # not scheduled
+        self.assertIsNone(self.bridge._failed_ack_refresh)
+
+    def test_background_query_gives_up_on_session_change(self):
+        self.sdk.gate = threading.Event()
+        self._fail()
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 1))  # in flight
+        self.bridge.last_reconnect_time = 0.0
+        ok, body, code = self.bridge.reconnect()
+        self.assertEqual((ok, code), (True, 200), body)
+        self.sdk.gate.set()  # the old session's snapshot is dropped
+        self.assertTrue(self._idle())
+        time.sleep(0.3)
+        self.assertEqual(self.sdk.orders_calls, self.calls + 1)
+        self.assertNotIn("failed_ack_refreshed", [r["reason"] for r in self._resyncs()])
+
+
 class TestOrderBookCacheEventQuantities(unittest.TestCase):
     """R3-02: cached rows never report less filled / cancelled quantity than the reports received."""
 
@@ -3048,6 +3168,30 @@ class TestOrderBookCacheEventQuantities(unittest.TestCase):
         view = self.cache.get("A0001")
         self.assertEqual((view["mat_qty"], view["cel_qty"], view["status"]), (2, 3, "Cancelled"))
 
+    def test_unresolved_failure_outlives_a_snapshot_started_before_it(self):
+        # PA4-3: only a snapshot whose query started after the failed ACK settles it; a recent row the
+        # snapshot does not list keeps it; a failed ACK of an unknown order records nothing.
+        self._snapshot(self._row())
+        self.cache.update_from_ack({"ord_no": "B0001", "stock_no": "2330", "ap_code": "1", "org_qty": 1,
+                                    "work_date": self.today}, generation=7)
+        before = self.cache.report_mark()
+        failed = {"stock_no": "2330", "ap_code": "1", "org_qty": 5, "err_code": "E0123", "err_msg": "價格超過漲跌幅"}
+        for ord_no in ("A0001", "B0001", "Z0001"):
+            self.assertEqual(self.cache.update_from_ack({**failed, "ord_no": ord_no}, generation=7)[0], True)
+        self.assertIsNone(self.cache.get("Z0001"))
+        failure = {"op_code": "E0123", "op_msg": "價格超過漲跌幅"}
+        self.assertTrue(self.cache.update_from_order_results([self._row()], generation=7, since=before))
+        for view in self._views():
+            self.assertEqual(view["esun_unresolved_failure"], failure)
+        after = self.cache.report_mark()
+        self.assertTrue(self.cache.update_from_order_results([self._row()], generation=7, since=after))
+        for view in self._views():
+            self.assertNotIn("esun_unresolved_failure", view)
+        self.assertEqual(self.cache.get("B0001")["esun_unresolved_failure"], failure)  # not in the snapshot
+        self.assertEqual(len(self.cache.get_all()), 2)
+        raw, _, _ = self.cache.get_for_mutation("B0001")
+        self.assertNotIn("esun_unresolved_failure", raw)
+
     def test_mat_without_mkt_seq_num_is_not_counted(self):
         # PA2-2: without mkt_seq_num a MAT cannot be deduplicated, so it never enters the cached counts.
         self._snapshot(self._row())
@@ -3094,16 +3238,6 @@ class TestOrderBookCacheEventQuantities(unittest.TestCase):
         self._mat("002", ap_code="5", mat_qty=0.02, mat_price=101.5)
         fills = self.cache.get("A0001")["esun_fills"]
         self.assertEqual([(f["mkt_seq_num"], f["mat_qty_share"]) for f in fills], [("001", 30), ("002", 20)])
-
-    def test_stacked_price_modifies_restore_the_oldest_value_per_field(self):
-        # PA3-2: a flag-only modify then a price modify; one failed ACK restores both fields.
-        self._snapshot(self._row(od_price=950.0, price_flag="0"))
-        self.cache.mark_event("A0001", generation=7, updates={"price_flag": "3"})
-        self.cache.mark_event("A0001", generation=7, updates={"price_flag": "0", "od_price": 955.0})
-        self.cache.update_from_ack({"ord_no": "A0001", "err_code": "E0123"}, generation=7)
-        row = self.cache.get("A0001")
-        self.assertEqual((row["od_price"], row["price_flag"]), (950.0, "0"))
-        self.assertNotIn("err_code", row)
 
     def test_refresh_false_serves_event_quantities(self):
         with tempfile.TemporaryDirectory() as tmp, \

@@ -1181,32 +1181,19 @@ class OrderBookCache:
       (largest cumulative ACK cancel) across snapshots; every read reports
       max(snapshot, event) for the filled / cancelled quantities, so a snapshot that started
       before a report never rolls the row back.
-    - Only successful ACKs (op_code '' / all zeros) change a row's state; a MAT counts only with a
+    - Only successful ACKs (op_code '' / all zeros) change a row; a MAT counts only with a
       mkt_seq_num. Every read lists the applied MATs as `esun_fills` (receive order).
-    - meta["acked"]: the order was confirmed (a successful ACK, or a snapshot row that is not
-      failed). A failed ACK of an order not yet confirmed (a rejected new order / reservation
-      conversion) only merges its failure fields (err_code / err_msg / ord_status); a failed ACK of
-      a confirmed order (rejected cancel / modify) leaves the row as is.
-    - An accepted price modify writes the requested price at once and keeps the previous one in
-      meta["pending_price"]: a failed ACK restores it, a successful ACK or a snapshot drops it.
+    - A failed ACK never changes, creates or counts a row: what it rejected (a new order, a cancel,
+      a modify) cannot be told from its fields. A failed ACK of a cached order is kept in
+      meta["unresolved_failure"] and every read adds `esun_unresolved_failure` {op_code, op_msg}
+      until a successful ACK of the order or a snapshot that started after the failure.
+    - Accepted mutations only mark the row (source "event"): prices / quantities change when the
+      broker reports them (snapshot, successful ACK, MAT), never optimistically.
     - Mutations hand the SDK the raw row (snapshot / successful ACK values), never the read view.
     """
 
     # ACK fields that describe the report itself rather than the order state.
     REPORT_ONLY_KEYS = frozenset({"kind", "ret_date", "ret_time", "action", "before_qty", "after_qty", "cel_type"})
-    # Failure fields a failed ACK of an unconfirmed order merges into its row.
-    ACK_FAILURE_KEYS = frozenset({"err_code", "errCode", "err_msg", "errMsg", "ord_status", "ordStatus"})
-    # Row built from a failed ACK of an order missing from the cache: identity, product, side,
-    # ap_code and the raw quantities (never counted as event quantities) plus the failure fields.
-    ACK_FAILURE_ROW_KEYS = ACK_FAILURE_KEYS | frozenset({
-        "ord_no", "ordNo", "pre_ord_no", "preOrdNo", "work_date", "workDate", "ord_date", "ord_time",
-        "stock_no", "stockNo", "buy_sell", "buySell", "ap_code", "apCode",
-        "org_qty", "org_qty_share", "mat_qty", "mat_qty_share", "cel_qty", "cel_qty_share",
-    })
-    # ACK operations that are requests on an existing order (their failure never fails the order).
-    MUTATION_OP_TYPES = frozenset({"Cancel", "ModifyQty", "ModifyPrice"})
-    PENDING_PRICE_KEYS = ("od_price", "price_flag")
-    _ABSENT = object()
 
     def __init__(self):
         self._orders: dict[str, dict] = {}
@@ -1214,6 +1201,7 @@ class OrderBookCache:
         self._pre_ord_no_map: dict[str, str] = {}
         self._meta: dict[str, dict] = {}
         self._orphan_mats: collections.OrderedDict = collections.OrderedDict()
+        self._failure_seq = 0  # numbers failed ACKs, ordered against snapshot starts (see report_mark)
         self._generation = 0
         self._day = taipei_today()
         self.lock = threading.RLock()
@@ -1296,15 +1284,11 @@ class OrderBookCache:
 
     @staticmethod
     def _new_meta(now: float) -> dict:
-        return {
-            "created": now, "seen_mat": set(), "fills": [], "event_mat_shares": 0, "event_cel_shares": 0,
-            "acked": False, "pending_price": None,
-        }
+        return {"created": now, "seen_mat": set(), "fills": [], "event_mat_shares": 0, "event_cel_shares": 0}
 
     @staticmethod
     def _carry_event_meta(target: dict, old: dict) -> None:
-        """Report-derived state outlives snapshots (same lifetime as seen_mat); pending_price does not."""
-        target["acked"] = bool(target.get("acked") or old.get("acked"))
+        """Report-derived state outlives snapshots (same lifetime as seen_mat)."""
         target["seen_mat"] |= set(old.get("seen_mat") or ())
         old_fills = list(old.get("fills") or ())
         old_seqs = {fill["mkt_seq_num"] for fill in old_fills}
@@ -1322,6 +1306,9 @@ class OrderBookCache:
         row = dict(self._orders[internal_id])
         meta = self._meta.get(internal_id) or {}
         row["esun_fills"] = [dict(fill) for fill in meta.get("fills") or ()]
+        failure = meta.get("unresolved_failure")
+        if failure:
+            row["esun_unresolved_failure"] = {"op_code": failure["op_code"], "op_msg": failure["op_msg"]}
         ap_code = _row_ap_code(row)
         changed = False
         for base in ("mat", "cel"):
@@ -1363,8 +1350,17 @@ class OrderBookCache:
             self._roll_day_locked()
             return self._upsert_locked(dict(data), source)
 
-    def update_from_order_results(self, orders: list, generation: int | None = None) -> bool:
-        """Replaces the cache with an authoritative get_order_results() snapshot."""
+    def report_mark(self) -> int:
+        """Taken right before a get_order_results() call; pass it as `since` when applying the result."""
+        with self.lock:
+            return self._failure_seq
+
+    def update_from_order_results(self, orders: list, generation: int | None = None, since: int | None = None) -> bool:
+        """
+        Replaces the cache with an authoritative get_order_results() snapshot. An unresolved failure
+        recorded after `since` (report_mark() taken before the query started) is kept, and so is the
+        one of a recent row the snapshot does not list; every other one is cleared.
+        """
         with self.lock:
             if not self._accepts(generation):
                 return False
@@ -1375,15 +1371,16 @@ class OrderBookCache:
             self._ord_no_map, self._pre_ord_no_map = {}, {}
             for order in orders or []:
                 if isinstance(order, dict):
-                    new_id = self._upsert_locked(dict(order), "snapshot")
-                    if new_id is not None and not self._is_failed_row(order):
-                        self._meta[new_id]["acked"] = True
+                    self._upsert_locked(dict(order), "snapshot")
             for old_id, old_order in old_orders.items():
                 meta = old_meta.get(old_id) or {}
                 ord_no, pre_ord_no = _order_keys(old_order)
                 new_id = self._find_locked(ord_no, pre_ord_no)
+                failure = meta.get("unresolved_failure")
                 if new_id is not None:
                     self._carry_event_meta(self._meta[new_id], meta)
+                    if failure and since is not None and failure["seq"] > since:
+                        self._meta[new_id]["unresolved_failure"] = failure  # newer than the snapshot
                     continue
                 if now - float(meta.get("created") or 0.0) <= ORDER_SNAPSHOT_KEEP_RECENT_SECONDS:
                     # Placed/reported moments ago and not yet visible in the broker snapshot.
@@ -1391,6 +1388,8 @@ class OrderBookCache:
                     if kept_id is not None:
                         self._meta[kept_id]["created"] = float(meta.get("created") or now)
                         self._carry_event_meta(self._meta[kept_id], meta)
+                        if failure:
+                            self._meta[kept_id]["unresolved_failure"] = failure  # the snapshot says nothing of it
             return True
 
     def update_from_ack(self, ack_data: dict, generation: int | None = None) -> tuple[bool, dict | None]:
@@ -1404,8 +1403,15 @@ class OrderBookCache:
             ord_no, pre_ord_no = _order_keys(ack_data)
             internal_id = self._find_locked(ord_no, pre_ord_no)
             previous = dict(self._orders[internal_id]) if internal_id else None
-            if normalize_report_status(ack_data)[0] not in ("", "00"):
-                self._apply_failed_ack_locked(internal_id, ack_data)
+            op_code, op_msg = normalize_report_status(ack_data)
+            if op_code not in ("", "00"):
+                # A failed ACK (a rejected new order, cancel or modify: its fields do not tell which)
+                # is published as is; no row is changed, created or counted. A cached order only
+                # gets the unresolved failure, for the client to reconcile with a snapshot.
+                self._failure_seq += 1
+                if internal_id is not None:
+                    meta = self._meta.setdefault(internal_id, self._new_meta(time.monotonic()))
+                    meta["unresolved_failure"] = {"op_code": op_code, "op_msg": op_msg, "seq": self._failure_seq}
                 return True, previous
             state = {k: v for k, v in ack_data.items() if k not in self.REPORT_ONLY_KEYS}
             new_id = self._upsert_locked(state, "event")
@@ -1414,48 +1420,8 @@ class OrderBookCache:
                 cel_shares = esun_quantity_shares(ack_data, "cel", _row_ap_code(ack_data, previous))
                 meta = self._meta[new_id]
                 meta["event_cel_shares"] = max(meta.get("event_cel_shares") or 0, cel_shares or 0)
-                meta["acked"] = True
-                meta["pending_price"] = None
+                meta.pop("unresolved_failure", None)
             return True, previous
-
-    @staticmethod
-    def _is_failed_row(row: dict) -> bool:
-        """Same rule as the client (isEsunFailureCode / ord_status Fail)."""
-        ord_status = str(row.get("ord_status", row.get("ordStatus")) or "").strip()
-        return normalize_report_status(row)[0] not in ("", "00") or ord_status in ("Fail", "Failed")
-
-    def _apply_failed_ack_locked(self, internal_id: str | None, ack_data: dict) -> None:
-        """
-        A failed ACK reports the request, not the order (e.g. a rejected cancel still carries the
-        requested cel_qty): quantities, prices and counts never change. A pending price modify is
-        rolled back. Only when the order was never confirmed (or is still a reservation) and the
-        ACK is not a cancel / modify request, the failure itself is recorded so reads show it Failed.
-        """
-        meta = self._meta.get(internal_id) if internal_id else None
-        if meta is not None and meta.get("pending_price"):
-            row = self._orders[internal_id]
-            for key, value in meta["pending_price"].items():
-                if value is self._ABSENT:
-                    row.pop(key, None)
-                else:
-                    row[key] = value
-            meta["pending_price"] = None
-            meta["updated"] = time.monotonic()
-            return  # attributed to the in-flight modify: the order itself stays as it was
-        row = self._orders.get(internal_id) if internal_id else None
-        if meta is not None and meta.get("acked") and not self.is_reservation(row):
-            return
-        if derive_ack_op_type(ack_data, row) in self.MUTATION_OP_TYPES:
-            return
-        keys = self.ACK_FAILURE_KEYS if row is not None else self.ACK_FAILURE_ROW_KEYS
-        failure = {k: v for k, v in ack_data.items() if k in keys}
-        if row is not None:
-            row.update(failure)
-            meta = self._meta.setdefault(internal_id, self._new_meta(time.monotonic()))
-            meta["source"] = "event"
-            meta["updated"] = time.monotonic()
-        else:
-            self._upsert_locked(failure, "event")
 
     def update_from_mat(self, mat_data: dict, generation: int | None = None) -> bool:
         """
@@ -1519,25 +1485,19 @@ class OrderBookCache:
                     target["status"] = "Filled" if deal_qty >= org_qty else "PartFilled"
             return True
 
-    def mark_event(self, order_id: any, generation: int | None = None, updates: dict | None = None) -> None:
-        """Marks a row as touched by an accepted mutation (its snapshot quantities are no longer known)."""
+    def mark_event(self, order_id: any, generation: int | None = None) -> None:
+        """
+        Marks a row as touched by an accepted mutation (its snapshot quantities are no longer known).
+        The row stays as the broker last reported it: an accepted request may still be rejected, so
+        a new price / quantity comes with the successful ACK or the next snapshot.
+        """
         with self.lock:
             if not self._accepts(generation):
                 return
             internal_id = self._lookup_locked(order_id)
             if internal_id is None:
                 return
-            row = self._orders[internal_id]
             meta = self._meta.setdefault(internal_id, self._new_meta(time.monotonic()))
-            if updates:
-                price_keys = [k for k in self.PENDING_PRICE_KEYS if k in updates]
-                if price_keys:
-                    # The oldest unconfirmed value per field: what the row returns to if rejected.
-                    pending = dict(meta.get("pending_price") or {})
-                    for key in price_keys:
-                        pending.setdefault(key, row.get(key, self._ABSENT))
-                    meta["pending_price"] = pending
-                row.update(updates)
             meta["source"] = "event"
             meta["updated"] = time.monotonic()
 
@@ -1810,6 +1770,7 @@ LOGIN_DAILY_MAX = 300
 ORDERS_DAILY_MAX = 2000
 ORDERS_REFRESH_MIN_INTERVAL_SECONDS = 5.0
 ORDERS_REFRESH_MAX_WAIT_SECONDS = 12.0  # refresh=true waits at most this long before its query starts
+FAILED_ACK_REFRESH_BACKOFF_SECONDS = (5.0, 10.0, 20.0)  # retries of the query a failed ACK schedules
 SHUTDOWN_MUTATION_GRACE_SECONDS = 8.0  # SIGTERM: in-flight order mutations may finish (< compose grace)
 CACHE_FILL_WAIT_SECONDS = 20.0
 WS_SILENCE_SECONDS = 90.0
@@ -2203,6 +2164,20 @@ class _OrdersRefreshFlight:
     ticket: int  # ordering under the lock (monotonic() can tick coarser than a fast query)
     done: bool = False
     error: EsunQueryError | None = None
+    since: int = 0  # OrderBookCache.report_mark() right before the SDK call
+
+
+@dataclasses.dataclass
+class _FailedAckRefresh:
+    """
+    Background orders query of one session, scheduled by failed ACKs (at most one pending).
+    Failed ACKs are numbered by OrderBookCache.report_mark(): a snapshot covers the ones recorded
+    before its query started, so the worker queries again only for later ones.
+    """
+
+    generation: int
+    wanted: int  # report_mark() after the latest failed ACK
+    covered: int = 0  # report_mark() before the latest applied snapshot query
 
 
 class _WsRuntime:
@@ -2326,6 +2301,9 @@ class EsunTradeBridge:
         self._orders_refresh_cond = threading.Condition(self._orders_refresh_lock)
         self._orders_refresh_flight: _OrdersRefreshFlight | None = None  # latest refresh=true query
         self._orders_refresh_tickets = 0  # request arrivals and query starts, in lock order
+        self._failed_ack_refresh_lock = threading.Lock()
+        self._failed_ack_refresh: _FailedAckRefresh | None = None
+        self.failed_ack_refresh_backoff = FAILED_ACK_REFRESH_BACKOFF_SECONDS
         self._shutdown_event = threading.Event()
         self._shutdown_lock = threading.Lock()  # first shutdown() caller does the work, others wait
         self._shutdown_complete = False
@@ -2452,6 +2430,8 @@ class EsunTradeBridge:
         with self._mutations_cond:
             self._shutdown_event.set()
             self._mutations_cond.notify_all()
+        with self._orders_refresh_cond:  # a waiting background query gives up
+            self._orders_refresh_cond.notify_all()
 
     def try_begin_mutation(self) -> bool:
         """Registers an in-flight order mutation; False once shutdown has started."""
@@ -2958,13 +2938,14 @@ class EsunTradeBridge:
         if not self.orders_refresh_limiter.acquire():
             logger.warning("Bootstrap orders query skipped: order query rate limit reached")
             return False
+        since = self.order_book_cache.report_mark()
         try:
             orders = session.sdk.get_order_results()
         except Exception as e:
             logger.warning(f"Bootstrap orders query failed: {redact(e)}")
             return False
         if isinstance(orders, list):
-            return self.order_book_cache.update_from_order_results(orders, generation=session.generation)
+            return self.order_book_cache.update_from_order_results(orders, generation=session.generation, since=since)
         return False
 
     @staticmethod
@@ -2998,10 +2979,90 @@ class EsunTradeBridge:
         accepted, previous = self.order_book_cache.update_from_ack(data, generation=session.generation)
         if not accepted:
             return None
-        payload = self._report_payload(session, data, derive_ack_op_type(data, previous), normalize_report_status(data))
-        return self.sse_fanout.publish(
+        status = normalize_report_status(data)
+        payload = self._report_payload(session, data, derive_ack_op_type(data, previous), status)
+        event_id = self.sse_fanout.publish(
             "order", payload, include_ids=True, report_stream="order", report_scope=session.generation
         )
+        if status[0] not in ("", "00"):
+            self._schedule_failed_ack_refresh(session)  # the snapshot decides what the failure did
+        return event_id
+
+    def _schedule_failed_ack_refresh(self, session: EsunSession) -> None:
+        """
+        A failed ACK asks for one authoritative orders query in the background (shared with the
+        refresh=true coordinator: 5 s interval, 10/min limiter, merged with user refreshes). At
+        most one is pending per session: failed ACKs arriving before it starts share it; one
+        arriving after it started gets one more query.
+        """
+        if not session.logged_in or self._shutdown_event.is_set():
+            return
+        wanted = self.order_book_cache.report_mark()
+        with self._failed_ack_refresh_lock:
+            state = self._failed_ack_refresh
+            if state is not None and state.generation == session.generation:
+                state.wanted = max(state.wanted, wanted)  # the running worker covers it
+                return
+            state = _FailedAckRefresh(generation=session.generation, wanted=wanted)
+            self._failed_ack_refresh = state
+        threading.Thread(
+            target=self._failed_ack_refresh_worker,
+            args=(session, state),
+            daemon=True,
+            name=f"EsunFailedAckRefresh-g{session.generation}",
+        ).start()
+
+    def _failed_ack_refresh_worker(self, session: EsunSession, state: _FailedAckRefresh) -> None:
+        """
+        Runs the scheduled query (again while failed ACKs keep arriving), retrying a failed one
+        after FAILED_ACK_REFRESH_BACKOFF_SECONDS (at most 3 retries). Gives up when the session
+        changes or the bridge shuts down. Each applied snapshot publishes `resync`
+        (reason failed_ack_refreshed, cacheRefreshed true) for clients to rebuild from the cache.
+        """
+        retries = 0
+        try:
+            while True:
+                with self._failed_ack_refresh_lock:
+                    if state.covered >= state.wanted:
+                        if self._failed_ack_refresh is state:  # same lock as scheduling: no ACK is lost
+                            self._failed_ack_refresh = None
+                        return
+                if self._shutdown_event.is_set() or not self._is_current(session.generation):
+                    return
+                try:
+                    since = self._refresh_orders_snapshot(session, background=True)
+                except EsunQueryError as e:
+                    if (
+                        e.code in ("ESUN_SESSION_CHANGED", "ESUN_SHUTTING_DOWN")
+                        or self._shutdown_event.is_set()
+                        or not self._is_current(session.generation)
+                    ):
+                        return
+                    if retries >= len(self.failed_ack_refresh_backoff):
+                        logger.warning(f"失敗回報後的委託查詢已重試 {retries} 次仍失敗，放棄：{redact(e)}")
+                        return
+                    delay = self.failed_ack_refresh_backoff[retries]
+                    retries += 1
+                    logger.warning(f"失敗回報後的委託查詢失敗，{delay:.0f} 秒後重試（第 {retries} 次）：{redact(e)}")
+                    if self._shutdown_event.wait(delay):
+                        return
+                    continue
+                retries = 0
+                with self._failed_ack_refresh_lock:
+                    state.covered = max(state.covered, since)
+                if self._is_current(session.generation) and not self._shutdown_event.is_set():
+                    self.sse_fanout.publish("resync", {
+                        "reason": "failed_ack_refreshed",
+                        "generation": session.generation,
+                        "cacheRefreshed": True,
+                        "ts": taipei_now().isoformat(timespec="milliseconds"),
+                    })
+        except Exception:
+            logger.error(f"失敗回報後的委託查詢發生錯誤：\n{redact(traceback.format_exc())}")
+        finally:
+            with self._failed_ack_refresh_lock:
+                if self._failed_ack_refresh is state:
+                    self._failed_ack_refresh = None
 
     def _handle_mat(self, data: dict, generation: int | None = None) -> str | None:
         """WebSocket MAT -> OrderBookCache (deduplicated by mkt_seq_num) + SSE `deal` event."""
@@ -3301,7 +3362,7 @@ class EsunTradeBridge:
         ("work_date", ("workDate", "work_date")),
     )
     # Bridge-side bookkeeping fields that are not part of the SDK's order result.
-    _BRIDGE_ONLY_ORDER_KEYS = frozenset({"deal_qty", "status", "mat_time", "esun_fills"})
+    _BRIDGE_ONLY_ORDER_KEYS = frozenset({"deal_qty", "status", "mat_time", "esun_fills", "esun_unresolved_failure"})
 
     def _mutation_prelude(self, body: any) -> tuple[EsunSession | None, tuple[dict, int] | None]:
         if not isinstance(body, dict):
@@ -3463,9 +3524,9 @@ class EsunTradeBridge:
     def _sdk_order_dict(self, order: dict) -> dict:
         return {k: v for k, v in order.items() if k not in self._BRIDGE_ONLY_ORDER_KEYS}
 
-    def _safe_mark_event(self, session: EsunSession, order_no: str, updates: dict | None = None) -> None:
+    def _safe_mark_event(self, session: EsunSession, order_no: str) -> None:
         try:
-            self.order_book_cache.mark_event(order_no, generation=session.generation, updates=updates)
+            self.order_book_cache.mark_event(order_no, generation=session.generation)
         except Exception:
             logger.error(f"更新委託快取失敗（委託已送出）：\n{redact(traceback.format_exc())}")
 
@@ -3605,10 +3666,9 @@ class EsunTradeBridge:
             session, "改價", lambda: session.sdk.modify_price(sdk_order, target_price=price, price_flag=price_flag)
         )
         if envelope.get("outcome") == "accepted":
-            updates = {"price_flag": flag}
-            if price is not None:
-                updates["od_price"] = price
-            self._safe_mark_event(session, order_no, updates)
+            # Not written into the row: the exchange may still reject it; the successful ACK
+            # (op_type ModifyPrice against the cached price) or the next snapshot brings it.
+            self._safe_mark_event(session, order_no)
         return envelope, status
 
     @staticmethod
@@ -3721,7 +3781,15 @@ class EsunTradeBridge:
             raise EsunQueryError(503, "ESUN_NOT_LOGGED_IN", self._not_logged_in_message())
         if not refresh:
             return self.order_book_cache.get_all()
+        self._refresh_orders_snapshot(session)
+        return self.order_book_cache.get_all()
 
+    def _refresh_orders_snapshot(self, session: EsunSession, background: bool = False) -> int:
+        """
+        get_orders(refresh=True) coordination (see there): returns once a snapshot that started
+        after this call is applied (its report_mark() taken before the query), raises
+        EsunQueryError otherwise. A background caller (failed ACK) also gives up on shutdown.
+        """
         arrival = time.monotonic()
         deadline = arrival + ORDERS_REFRESH_MAX_WAIT_SECONDS
         cond = self._orders_refresh_cond
@@ -3731,6 +3799,8 @@ class EsunTradeBridge:
             while True:
                 if not self._is_current(session.generation):
                     raise EsunQueryError(503, "ESUN_SESSION_CHANGED", "等待期間玉山 session 已切換，請重新查詢")
+                if background and self._shutdown_event.is_set():
+                    raise EsunQueryError(503, "ESUN_SHUTTING_DOWN", "玉山 bridge 關閉中")
                 flight = self._orders_refresh_flight
                 now = time.monotonic()
                 if flight is not None and flight.generation == session.generation:
@@ -3740,7 +3810,7 @@ class EsunTradeBridge:
                         if flight.error is not None:
                             e = flight.error
                             raise EsunQueryError(e.status, e.code, str(e), retry_after=e.retry_after)
-                        return self.order_book_cache.get_all()
+                        return flight.since
                     if not flight.done:  # older snapshot still running: wait for it to end
                         if now >= deadline:
                             raise EsunQueryError(
@@ -3773,11 +3843,12 @@ class EsunTradeBridge:
                 break
 
         error: EsunQueryError | None = None
+        since = flight.since = self.order_book_cache.report_mark()  # later failures outlive the snapshot
         try:  # SDK call outside the lock
             orders = session.sdk.get_order_results()
             if not isinstance(orders, list):
                 error = EsunQueryError(502, "ORDERS_QUERY_ERROR", "玉山委託查詢回應格式錯誤")
-            elif not self.order_book_cache.update_from_order_results(orders, generation=session.generation):
+            elif not self.order_book_cache.update_from_order_results(orders, generation=session.generation, since=since):
                 error = EsunQueryError(503, "ESUN_SESSION_CHANGED", "查詢期間玉山 session 已切換，請重新查詢")
         except Exception as e:
             logger.warning(f"get_order_results failed: {redact(e)}")
@@ -3789,7 +3860,7 @@ class EsunTradeBridge:
                 cond.notify_all()
         if error is not None:
             raise error
-        return self.order_book_cache.get_all()
+        return since
 
     def _cached_query(
         self,
