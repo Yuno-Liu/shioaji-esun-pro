@@ -78,6 +78,7 @@ import {
 import { CUSTOM_BASES } from '../lib/custom-theme';
 import { CustomThemeEditor } from './custom-theme-editor';
 import { BackgroundExecutionSetting } from './background-execution-setting';
+import { TradingCostSection } from './trading-cost-settings';
 import { ExternalLink } from './external-link';
 import { Orb } from './orb';
 import * as hud from './hud-header.css';
@@ -745,6 +746,7 @@ export function SettingsDialog({
                         {tab === 'soundPrivacy' && <SoundPrivacySection />}
                         {tab === 'accounts' && <AccountsSection />}
                         {tab === 'risk' && <RiskSection />}
+                        {tab === 'risk' && <TradingCostSection />}
                         {tab === 'agent' && <AgentSection />}
                         {tab === 'layout' && (
                             <LayoutSection {...layoutProps} onClose={onClose} />

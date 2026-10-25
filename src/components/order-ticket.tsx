@@ -1,6 +1,7 @@
 import { isEsunBroker, useEsunEnvironment } from '../lib/esun';
 import { captureDisplayedRoute, captureRouteEnv, esunStockLegProblem, HEADER_LOCK_TITLE, headerAccountLocked, ROUTE_CHANGED_MESSAGE, routeConfirmNote } from '../lib/order-route';
 import { OrderRoutingBadge } from './order-routing-badge';
+import { TradeCostSummary } from './trade-cost-summary';
 import { canTrade } from '../lib/account-tradable';
 // src/components/order-ticket.tsx — buy/sell ticket with two-step EXECUTE.
 // Stock vs futures aware; price autofills from the live quote.
@@ -1450,6 +1451,7 @@ export function OrderTicket({
                     qty={splitOpen && splitMode === 'fixed' ? splitTotal : qty}
                     odd={odd}
                     daytrade={!isFutures && daytradeShort}
+                    orderCond={isFutures ? undefined : orderCond}
                 />
 
                 {splitOpen ? (
@@ -1524,6 +1526,7 @@ function CostEstimate({
     qty,
     odd,
     daytrade,
+    orderCond,
 }: {
     contract: ContractInfo;
     action: Action;
@@ -1531,6 +1534,7 @@ function CostEstimate({
     qty: number;
     odd: boolean;
     daytrade: boolean;
+    orderCond?: StockOrderCond;
 }) {
     if (!price || !Number.isFinite(price) || price <= 0 || qty <= 0) {
         return null;
@@ -1559,6 +1563,7 @@ function CostEstimate({
             </span>
         );
     }
+    if (orderCond) return <TradeCostSummary contract={contract} action={action} price={price} qty={qty} odd={odd} daytrade={daytrade} orderCond={orderCond} />; // fork：股票成本列依交易成本設定
     const shares = odd ? qty : qty * 1000;
     const notional = price * shares;
     const cents = priceCents(price) * shares;
