@@ -2033,7 +2033,8 @@ class FakeCore:
     Stand-in for esun_trade._trade_core.CoreSDK (the Rust core). Returns JSON shaped like the
     core's structs (Payload501: 7 fields, PayloadModify: 4 fields, no ord_no) so the REAL
     esun_trade.sdk.SDK code (recover_order_result, cancel_order unit conversion, type checks) runs.
-    Like the core, modify_volume / modify_price panic (FakePanicException) on a missing order key.
+    Like the core, modify_volume / modify_price panic (FakePanicException) on a missing order key, a
+    *qty that is not a sane integer after recover_order_result(), or an od_price that is not a number.
     """
 
     instances: list["FakeCore"] = []
@@ -2054,6 +2055,18 @@ class FakeCore:
         for key in CORE_ORDER_FIELDS:
             if key not in order_result or order_result[key] is None:
                 raise FakePanicException(f"called `Result::unwrap()` on an `Err` value: PyErr {{ KeyError('{key}') }}")
+        # PA7-3: what recover_order_result() hands the core: every *qty an integer in a sane range
+        # (a string "2" of an odd-lot class became int("2" * 1000), a 1000-digit number), od_price a number.
+        for key, value in order_result.items():
+            if not key.endswith("qty"):
+                continue
+            low = 1 if key == "org_qty" else 0
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= 1_000_000:
+                raise FakePanicException(
+                    f"called `Result::unwrap()` on an `Err` value: PyErr {{ OverflowError('{key}={str(value)[:20]}') }}")
+        price = order_result["od_price"]
+        if isinstance(price, bool) or not isinstance(price, (int, float)):
+            raise FakePanicException(f"called `Result::unwrap()` on an `Err` value: PyErr {{ TypeError('od_price={price!r}') }}")
 
     @staticmethod
     def _wrap(data):
@@ -2729,6 +2742,218 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    # ── PA7: ACK units / types, SDK quantities, bounded completing query ──────────────────────
+
+    @staticmethod
+    def _observed_ack(**overrides):
+        """Shape of the successful ACK observed 2026-10-25 (string quantities, odd lots in shares)."""
+        ack = {"ord_no": "", "pre_ord_no": "P0E031V0", "ord_status": "1", "before_qty": "0", "after_qty": "0",
+               "action": "O", "err_code": "", "err_msg": "", "stock_no": "2330", "ap_code": "5", "buy_sell": "B",
+               "trade": "0", "bs_flag": "R", "price_flag": "0", "od_price": "950.00", "org_qty": "2",
+               "mat_qty": "0", "cel_qty": "0", "work_date": taipei_today_str()}
+        ack.update(overrides)
+        return ack
+
+    def _incomplete_ack_row(self, ord_no="G0101"):
+        """An ACK-only row (no work_date / org_qty): a mutation needs the completing snapshot."""
+        self.bridge._handle_ack({"ord_no": ord_no, "pre_ord_no": "", "stock_no": "2330", "ap_code": "1",
+                                 "buy_sell": "B", "trade": "0", "bs_flag": "R", "price_flag": "0", "od_price": 950.0,
+                                 "ord_status": "2", "err_code": "00000000", "err_msg": ""})
+
+    def test_observed_reservation_ack_then_cancel_sends_integer_shares(self):
+        # PA7-1 / PA7-3: place -> observed successful ACK (org_qty "2" shares) -> cancel. The ACK was merged
+        # raw, so recover_order_result computed int("2" * 1000) and the core got a 1000-digit org_qty.
+        self.core.order_response = {**RESERVATION_PLACE_RESPONSE, "work_date": taipei_today_str()}
+        self.assertEqual(self._place(apCode="5", quantity=2)[1], 200)
+        self.assertIsNotNone(self.bridge._handle_ack(self._observed_ack()))
+        row = self._raw_row("P0E031V0")
+        self.assertEqual((row["org_qty"], row["org_qty_share"], row["mat_qty"], row["mat_qty_share"],
+                          row["cel_qty"], row["cel_qty_share"], row["od_price"]), (0.002, 2, 0, 0, 0, 0, 950.0))
+        for key in ("org_qty", "org_qty_share", "od_price"):
+            self.assertNotIsInstance(row[key], str, key)
+        view = self.bridge.order_book_cache.get("P0E031V0")
+        self.assertEqual(bridge_module.esun_quantity_from_fields(view, "org", "5"), 2)  # still 2 shares
+        res, status = self.bridge.cancel_order({"order_no": "P0E031V0", **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual((sent["org_qty"], type(sent["org_qty"]), sent["pre_ord_no"], executed), (2, int, "P0E031V0", 0))
+
+    def test_ack_without_a_quantity_or_with_a_bad_number_keeps_the_row_value(self):
+        # PA7-1: an ACK lacking a quantity / with an unparsable one never overwrites the row's value.
+        self._snapshot(self._lot_order(mat_qty=0))
+        self.bridge._handle_ack({"ord_no": "A0101", "stock_no": "2330", "ap_code": "1", "od_price": "abc",
+                                 "cel_qty": "1", "err_code": ""})
+        row = self._raw_row("A0101")
+        self.assertEqual((row["org_qty"], row["mat_qty"], row["cel_qty"], row["od_price"]), (5, 0, 1, 950.0))
+
+    def test_reduce_after_string_acks_sends_integers_lot_and_odd_lot(self):
+        # PA7-3: lot reduce (cel_qty) and odd-lot reduce (cel_qty_share) after successful string ACKs.
+        self._snapshot(self._lot_order(mat_qty=0),
+                       self._lot_order(ord_no="B0201", ap_code="3", org_qty=0.05, mat_qty=0.01, cel_qty=0.0,
+                                       org_qty_share=50, mat_qty_share=10, cel_qty_share=0))
+        self.bridge._handle_ack(self._observed_ack(ord_no="A0101", pre_ord_no="", ord_status="2", ap_code="1",
+                                                   org_qty="5", cel_qty="1", before_qty="5", after_qty="4"))
+        self.bridge._handle_ack(self._observed_ack(ord_no="B0201", pre_ord_no="", ord_status="2", ap_code="3",
+                                                   org_qty="50", mat_qty="10", cel_qty="10",
+                                                   before_qty="40", after_qty="30"))
+        odd = self._raw_row("B0201")
+        self.assertEqual((odd["org_qty"], odd["org_qty_share"], odd["cel_qty"], odd["cel_qty_share"]), (0.05, 50, 0.01, 10))
+        res, status = self.bridge.replace_qty({"order_no": "A0101", "cancel_quantity": 1, "quantity_unit": "lot", **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual((sent["org_qty"], sent["mat_qty"], sent["cel_qty"], sent["od_price"], executed), (5, 0, 1, 950.0, 1))
+        res, status = self.bridge.replace_qty({"order_no": "B0201", "cel_qty_share": 5, **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual((sent["org_qty"], sent["mat_qty"], sent["cel_qty"], executed), (50, 10, 10, 5))
+
+    def test_string_ack_price_keeps_the_o00021_check_and_reaches_the_sdk_as_a_number(self):
+        # PA7-1 / PA7-3: a ModifyPrice ACK with od_price "955.00" makes the row 955.0 (a number).
+        self._snapshot(self._lot_order(ord_no="D0401", mat_qty=0))
+        events = self.bridge.sse_fanout.register()
+        self.bridge._handle_ack(self._observed_ack(ord_no="D0401", pre_ord_no="", ord_status="2", ap_code="1",
+                                                   org_qty="5", before_qty="5", after_qty="5", od_price="955.00"))
+        published = [e["data"] for e in _drain(events, timeout=0.3) if e["event"] == "order"]
+        self.assertEqual([e["op_type"] for e in published], ["ModifyPrice"])
+        self.assertEqual(self._raw_row("D0401")["od_price"], 955.0)
+        self.assertIsInstance(self._raw_row("D0401")["od_price"], float)
+        res, status = self.bridge.replace_price({"order_no": "D0401", "price": 955.0, **self.env})
+        self.assertEqual((status, res["code"], res["outcome"]), (400, "AG_INVALID_PRICE_MODIFY", "not_sent"))
+        self.assertIn("O00021", res["error"])
+        res, status = self.bridge.replace_price({"order_no": "D0401", "price": 950.0, **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, new_price, _ = self._core_calls("modify_price")[-1]
+        self.assertEqual((sent["od_price"], sent["org_qty"], new_price), (955.0, 5, 950.0))
+
+    def test_sdk_order_quantities_and_price_are_rebuilt_from_the_raw_row(self):
+        # PA7-2: second line of defence for rows that reach the cache with strings / fractional lots.
+        cache, gen = self.bridge.order_book_cache, self.bridge.session.generation
+        base = {"stock_no": "2330", "buy_sell": "B", "trade": "0", "bs_flag": "R", "price_flag": "0",
+                "ord_status": "2", "work_date": taipei_today_str(), "pre_ord_no": ""}
+        cache.upsert({**base, "ord_no": "", "pre_ord_no": "P0E031V9", "ord_status": "1", "ap_code": "5",
+                      "org_qty": "2", "mat_qty": "0", "cel_qty": "0", "od_price": "950"}, generation=gen)
+        cache.upsert({**base, "ord_no": "A0901", "ap_code": "1", "org_qty": "5", "mat_qty": "1", "cel_qty": "0",
+                      "od_price": "950.5"}, generation=gen)
+        cache.upsert({**base, "ord_no": "E0901", "ap_code": "4", "org_qty": 2.0, "org_qty_share": 2000,
+                      "mat_qty": 1.001, "mat_qty_share": 1001, "cel_qty": 0.0, "od_price": 30.0}, generation=gen)
+        cache.upsert({**base, "ord_no": "M0901", "ap_code": "1", "price_flag": "4", "org_qty": 3, "od_price": None},
+                     generation=gen)
+        res, status = self.bridge.cancel_order({"order_no": "P0E031V9", **self.env})
+        self.assertEqual(status, 200, res)
+        sent = self._core_calls("modify_volume")[-1][1]
+        self.assertEqual((sent["org_qty"], sent["mat_qty"], sent["od_price"]), (2, 0, 950.0))
+        res, status = self.bridge.replace_qty({"order_no": "A0901", "cancel_quantity": 1, "quantity_unit": "lot", **self.env})
+        self.assertEqual(status, 200, res)
+        sent = self._core_calls("modify_volume")[-1][1]
+        self.assertEqual((sent["org_qty"], sent["mat_qty"], sent["cel_qty"], sent["od_price"]), (5, 1, 0, 950.5))
+        res, status = self.bridge.cancel_order({"order_no": "E0901", **self.env})
+        self.assertEqual(status, 200, res)
+        sent = self._core_calls("modify_volume")[-1][1]
+        self.assertEqual((sent["org_qty"], sent["mat_qty"]), (2000, 1001))  # int(1.001 * 1000) would be 1000
+        res, status = self.bridge.cancel_order({"order_no": "M0901", **self.env})  # market order, no od_price
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self._core_calls("modify_volume")[-1][1]["od_price"], 0.0)
+        self.assertEqual(cache.get("A0901")["od_price"], "950.5")  # the cached row itself is untouched
+
+    def test_unparsable_org_qty_or_limit_price_is_incomplete(self):
+        # PA7-2: never handed to the SDK; one authoritative query (it keeps the recent row), then 409.
+        cache, gen = self.bridge.order_book_cache, self.bridge.session.generation
+        cache.upsert(self._lot_order(ord_no="X0901", org_qty="abc", mat_qty=0), generation=gen)
+        cache.upsert(self._lot_order(ord_no="X0902", od_price="", mat_qty=0), generation=gen)
+        cache.upsert(self._lot_order(ord_no="X0903", od_price=0, mat_qty=0), generation=gen)
+        for ord_no, field in (("X0901", "org_qty"), ("X0902", "od_price"), ("X0903", "od_price")):
+            self.bridge.last_orders_refresh_time = 0.0
+            res, status = self.bridge.cancel_order({"order_no": ord_no, **self.env})
+            self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ORDER_INCOMPLETE", "not_sent"), ord_no)
+            self.assertIn(field, res["error"])
+        self.assertEqual(self._core_calls("modify_volume"), [])
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
+
+    def test_completing_query_that_cannot_start_within_2s_is_409_with_retry_after(self):
+        # PA7-4: the completing query used to wait up to 12 s for its slot (the client gives up at 15 s).
+        self._incomplete_ack_row()
+        queries = self.core.order_results_calls
+        self.bridge.last_orders_refresh_time = time.monotonic()  # next query slot in 5 s
+        started = time.monotonic()
+        res, status = self.bridge.cancel_order({"order_no": "G0101", **self.env})
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ORDER_INCOMPLETE", "not_sent"), res)
+        self.assertGreaterEqual(res["retry_after"], 1)
+        self.assertEqual(self.core.order_results_calls, queries)  # no query started
+
+        # A slot within 2 s: waited for, and the snapshot that lists the order completes it.
+        self.core.order_results = [self._lot_order(ord_no="G0101", mat_qty=0)]
+        self.bridge.last_orders_refresh_time = time.monotonic() - 4.0  # slot in ~1 s
+        res, status = self.bridge.cancel_order({"order_no": "G0101", **self.env})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.core.order_results_calls, queries + 1)
+        self.assertEqual(bridge_module.ORDER_MUTATION_REFRESH_MAX_WAIT_SECONDS, 2.0)
+
+    def test_completing_query_shares_a_query_in_flight(self):
+        # PA7-4: a query already in flight is shared (even one that started before the mutation arrived).
+        self._incomplete_ack_row()
+        self.core.order_results = [self._lot_order(ord_no="G0101", mat_qty=0)]
+        sdk = self.bridge.session.sdk
+        original = sdk.get_order_results
+        entered = threading.Event()
+
+        def slow_query():
+            entered.set()
+            time.sleep(0.5)
+            return original()
+
+        self.bridge.last_orders_refresh_time = 0.0
+        queries = self.core.order_results_calls
+        with mock.patch.object(sdk, "get_order_results", slow_query):
+            refresher = threading.Thread(target=lambda: self.bridge.get_orders(refresh=True))
+            refresher.start()
+            self.assertTrue(entered.wait(2))
+            res, status = self.bridge.cancel_order({"order_no": "G0101", **self.env})
+            refresher.join(3)
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.core.order_results_calls, queries + 1)  # one query for both
+
+    def test_mutation_older_than_10s_is_never_sent(self):
+        # PA7-4: checked right before the quota / SDK call.
+        self.assertEqual(bridge_module.MUTATION_SEND_DEADLINE_SECONDS, 10.0)
+        self._incomplete_ack_row()
+        self.core.order_results = [self._lot_order(ord_no="G0101", mat_qty=0)]
+        sdk = self.bridge.session.sdk
+        original = sdk.get_order_results
+
+        def slow_query():
+            time.sleep(0.4)
+            return original()
+
+        self.bridge.last_orders_refresh_time = 0.0
+        with mock.patch.object(bridge_module, "MUTATION_SEND_DEADLINE_SECONDS", 0.2), \
+                mock.patch.object(sdk, "get_order_results", slow_query):
+            res, status = self.bridge.cancel_order({"order_no": "G0101", **self.env})
+        self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_MUTATION_EXPIRED", "not_sent"), res)
+        self.assertEqual(self._core_calls("modify_volume"), [])
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
+        res, status = self.bridge.cancel_order({"order_no": "G0101", **self.env})  # complete now: no wait
+        self.assertEqual(status, 200, res)
+
+    def test_completing_query_wait_stops_on_shutdown_without_querying(self):
+        # PA7-5: shutdown during the wait -> 503 not_sent at once, and the query is never sent.
+        self._incomplete_ack_row()
+        queries = self.core.order_results_calls
+        self.bridge.last_orders_refresh_time = time.monotonic() - 3.5  # slot in ~1.5 s
+        result: list = []
+        worker = threading.Thread(target=lambda: result.append(self.bridge.cancel_order({"order_no": "G0101", **self.env})))
+        worker.start()
+        time.sleep(0.3)
+        self.bridge.begin_shutdown()
+        stopped = time.monotonic()
+        worker.join(3)
+        self.assertLess(time.monotonic() - stopped, 0.5)
+        res, status = result[0]
+        self.assertEqual((status, res["code"], res["outcome"]), (503, "ESUN_SHUTTING_DOWN", "not_sent"), res)
+        time.sleep(1.5)  # past the slot it was waiting for
+        self.assertEqual(self.core.order_results_calls, queries)
+        self.assertEqual(self._core_calls("modify_volume"), [])
 
 
 class TestSseEventLog(unittest.TestCase):
