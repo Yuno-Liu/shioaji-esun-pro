@@ -1163,12 +1163,35 @@ def esun_quantity_shares(raw: dict, base: str, ap_code: str) -> int | None:
     return qty if ap_code in _SHARE_UNIT_AP_CODES else qty * SHARES_PER_LOT
 
 
+_EMERGING_AP_CODE = "4"
+
+
+def has_share_quantity(raw: dict, base: str) -> bool:
+    """True when raw carries a numeric *_qty_share (shares) for org / mat / cel."""
+    camel = {"org": "orgQty", "mat": "matQty", "cel": "celQty"}[base]
+    return _js_finite_number(_first_present(raw, f"{base}_qty_share", f"{camel}Share")) is not None
+
+
+def report_quantity_unknown(raw: dict, base: str, ap_code: str) -> bool:
+    """
+    An emerging (ap_code 4) report quantity without its *_qty_share: the unit of an ACK / MAT *_qty
+    has not been observed for emerging orders, so it is never read in a guessed unit (cache, SDK,
+    screen); the order-results snapshot's shares decide.
+    """
+    return ap_code == _EMERGING_AP_CODE and not has_share_quantity(raw, base)
+
+
 def mat_report_shares(mat: dict, ap_code: str) -> int | None:
-    """Deal quantity of one MAT in shares, read like src/lib/esun/report-adapter.ts reads deals."""
+    """
+    Deal quantity of one MAT in shares, read like src/lib/esun/report-adapter.ts reads deals; None for
+    an emerging MAT without mat_qty_share (report_quantity_unknown).
+    """
     fields = {
         "mat_qty": _first_present(mat, "mat_qty", "deal_qty", "qty"),
         "mat_qty_share": _first_present(mat, "mat_qty_share", "deal_qty_share"),
     }
+    if report_quantity_unknown(fields, "mat", ap_code):
+        return None
     return esun_quantity_shares(fields, "mat", ap_code)
 
 
@@ -1448,13 +1471,15 @@ class OrderBookCache:
         + org_qty_share 2). org / mat / cel go through esun_quantity_from_fields(): ap_code 3/4/5 ->
         numeric *_qty_share (shares) + *_qty (shares / 1000, fractional lots); 1/2 -> numeric *_qty
         (lots). A quantity or ACK_NUMERIC_KEYS value the ACK lacks or that does not parse never
-        overwrites the row.
+        overwrites the row, and neither does an emerging (ap_code 4) quantity without its *_qty_share
+        (report_quantity_unknown: its unit is not known).
         """
         out = dict(state)
         for base in ("org", "mat", "cel"):
             camel = {"org": "orgQty", "mat": "matQty", "cel": "celQty"}[base]
             keys = (f"{base}_qty", camel, f"{base}_qty_share", f"{camel}Share")
-            qty = esun_quantity_from_fields(state, base, ap_code)
+            unknown = report_quantity_unknown(state, base, ap_code)
+            qty = None if unknown else esun_quantity_from_fields(state, base, ap_code)
             for key in keys:
                 out.pop(key, None)
             if qty is None:
@@ -1498,8 +1523,10 @@ class OrderBookCache:
             )
             new_id = self._upsert_locked(state, "event")
             if new_id is not None:
-                # ACK cel_qty is the cumulative cancelled quantity of the order.
-                cel_shares = esun_quantity_shares(ack_data, "cel", ap_code)
+                # ACK cel_qty is the cumulative cancelled quantity of the order (never in a guessed unit).
+                cel_shares = None if report_quantity_unknown(ack_data, "cel", ap_code) else (
+                    esun_quantity_shares(ack_data, "cel", ap_code)
+                )
                 meta = self._meta[new_id]
                 meta["event_cel_shares"] = max(meta.get("event_cel_shares") or 0, cel_shares or 0)
                 meta.pop("unresolved_failure", None)
@@ -1511,7 +1538,8 @@ class OrderBookCache:
         already-applied mkt_seq_num). Quantity fields of the row are never overwritten here; the
         deal is added to event_mat_shares (in shares, see esun_quantity_from_fields) and to the
         row's fills, applied on read. Bridge-only deal_qty/status are kept. A MAT without
-        mkt_seq_num cannot be deduplicated: it is published (True) but never counted.
+        mkt_seq_num cannot be deduplicated: it is published (True) but never counted. Neither is an
+        emerging (ap_code 4) MAT without mat_qty_share (unit unknown; deduplicated, published, logged).
         """
         if not isinstance(mat_data, dict):
             return False
@@ -1541,7 +1569,14 @@ class OrderBookCache:
                 return True
             meta["seen_mat"].add(seq)
             target = self._orders[internal_id]
-            mat_shares = mat_report_shares(mat_data, _row_ap_code(mat_data, target))
+            mat_ap_code = _row_ap_code(mat_data, target)
+            mat_shares = mat_report_shares(mat_data, mat_ap_code)
+            if mat_shares is None and mat_ap_code == _EMERGING_AP_CODE:
+                logger.warning(
+                    f"[WebSocket] 興櫃成交回報缺少 mat_qty_share，數量單位未知，不計入快取成交量（ord_no={ord_no}, "
+                    f"mkt_seq_num={seq}）"
+                )
+                return True
             if mat_shares:
                 meta["event_mat_shares"] = (meta.get("event_mat_shares") or 0) + mat_shares
                 price = _js_finite_number(_first_present(mat_data, "mat_price", "matPrice"))
@@ -1856,6 +1891,7 @@ FAILED_ACK_REFRESH_BACKOFF_SECONDS = (5.0, 10.0, 20.0)  # retries of the query a
 FAILED_ACK_RECHECK_MARGIN_SECONDS = 0.1  # past the keep window of a row the snapshot did not list
 SHUTDOWN_MUTATION_GRACE_SECONDS = 8.0  # SIGTERM: in-flight order mutations may finish (< compose grace)
 ORDER_MUTATION_REFRESH_MAX_WAIT_SECONDS = 2.0  # a mutation's completing query must start within this
+ORDER_MUTATION_REFRESH_BUDGET_SECONDS = 8.0  # a mutation waits for a shared query until arrival + this
 MUTATION_SEND_DEADLINE_SECONDS = 10.0  # no SDK mutation call this long after arrival (client gives up at 15 s)
 CACHE_FILL_WAIT_SECONDS = 20.0
 WS_SILENCE_SECONDS = 90.0
@@ -2198,11 +2234,14 @@ def missing_sdk_order_fields(order: dict) -> list[str]:
     """
     Core fields absent (or None) from an SDK order dict, plus 'ord_no|pre_ord_no' when both are empty.
     An org_qty that is not a number, or a limit order's od_price that is not a positive number, is
-    incomplete too (sdk_quantities_and_price() has already turned the parsable ones into numbers).
+    incomplete too (sdk_quantities_and_price() has already turned the parsable ones into numbers), and
+    so is an emerging (ap_code 4) order without a numeric org_qty_share (its only accepted quantity).
     """
     missing = [key for key in SDK_ORDER_CORE_FIELDS if order.get(key) is None]
     if "org_qty" not in missing and not _is_sdk_number(order.get("org_qty")):
         missing.append("org_qty")
+    if _row_ap_code(order) == _EMERGING_AP_CODE and not has_share_quantity(order, "org"):
+        missing.append("org_qty_share")
     if "od_price" not in missing and _is_limit_order(order):
         price = order.get("od_price")
         if not _is_sdk_number(price) or price <= 0:
@@ -2231,11 +2270,16 @@ def sdk_quantities_and_price(order: dict) -> dict:
     or whole lots (1/2); od_price becomes a number. A quantity that does not parse is left as is
     (org_qty: then reported by missing_sdk_order_fields) or dropped (mat / cel, which the core does not
     require). A non-limit order without a parsable od_price gets 0.0, so a cancel is never held up.
+    Emerging orders (ap_code 4) only use the *_qty_share (snapshot shares): without it org_qty is
+    dropped (missing_sdk_order_fields() then reports the order incomplete) and so are mat / cel.
     """
     out = dict(order)
     ap_code = _row_ap_code(order)
     for base in ("org", "mat", "cel"):
         key = f"{base}_qty"
+        if ap_code == _EMERGING_AP_CODE and not has_share_quantity(order, base):
+            out.pop(key, None)  # never a guessed unit
+            continue
         qty = esun_quantity_from_fields(order, base, ap_code)
         if qty is not None:
             out[key] = _sdk_fractional_lots(qty) if ap_code in _SHARE_UNIT_AP_CODES else qty
@@ -2346,6 +2390,16 @@ class _FailedAckRefresh:
     generation: int
     wanted: int  # report_mark() after the latest failed ACK
     covered: int = 0  # report_mark() before the latest applied snapshot query
+
+
+@dataclasses.dataclass
+class _MutationSlot:
+    """
+    One order mutation's place in the in-flight count (try_begin_mutation), taken at most once: from
+    its completing query (_resolve_complete_order) through the SDK call, returned by the caller.
+    """
+
+    held: bool = False
 
 
 class _WsRuntime:
@@ -3610,7 +3664,34 @@ class EsunTradeBridge:
     def _shutting_down_refusal() -> tuple[dict, int]:
         return not_sent(503, "ESUN_SHUTTING_DOWN", "玉山 bridge 關閉中，委託未送出")
 
-    def _call_sdk_mutation(self, session: EsunSession, label: str, call: any) -> tuple[dict, int]:
+    def _hold_mutation(self, slot: _MutationSlot) -> bool:
+        """Counts the request as an in-flight mutation once (False once shutdown has started)."""
+        if not slot.held:
+            slot.held = self.try_begin_mutation()
+        return slot.held
+
+    def _release_mutation(self, slot: _MutationSlot) -> None:
+        if slot.held:
+            slot.held = False
+            self.end_mutation()
+
+    def _with_mutation_slot(self, run: any, body: dict) -> tuple[dict, int]:
+        """run(body, slot); the in-flight count it may take is returned on every path."""
+        slot = _MutationSlot()
+        try:
+            return run(body, slot)
+        finally:
+            self._release_mutation(slot)
+
+    def _call_sdk_mutation(
+        self, session: EsunSession, label: str, call: any, slot: _MutationSlot | None = None
+    ) -> tuple[dict, int]:
+        if slot is not None and slot.held:
+            # Counted since its completing query (never twice): drain waits for it; refused once
+            # shutdown has started, like try_begin_mutation() below.
+            if self.is_shutting_down():
+                return self._shutting_down_refusal()
+            return self._call_sdk_mutation_now(session, label, call)
         if not self.try_begin_mutation():  # atomic with begin_shutdown(): nothing reaches the SDK after it
             return self._shutting_down_refusal()
         try:
@@ -3736,15 +3817,19 @@ class EsunTradeBridge:
         return order, meta, payload, cached is not None, sdk_quantities_and_price(sdk_order)
 
     def _resolve_complete_order(
-        self, session: EsunSession, order_no: str, body: dict, check: any = None
+        self, session: EsunSession, order_no: str, body: dict, check: any = None,
+        arrival: float | None = None, slot: _MutationSlot | None = None,
     ) -> tuple[dict, dict | None, dict, bool, dict]:
         """
         _resolve_order() whose sdk_order carries every SDK_ORDER_CORE_FIELDS key (the core panics on a
         missing one). When it does not, one authoritative snapshot through the orders-refresh
         coordinator, then resolved again; still incomplete -> 409 ESUN_ORDER_INCOMPLETE (not sent).
-        The snapshot is a query in flight or one that starts within
-        ORDER_MUTATION_REFRESH_MAX_WAIT_SECONDS; otherwise 409 ESUN_ORDER_INCOMPLETE + retry_after at
-        once, and shutdown while waiting -> 503 ESUN_SHUTTING_DOWN (both not sent).
+        The snapshot is a query in flight (waited for until `arrival` +
+        ORDER_MUTATION_REFRESH_BUDGET_SECONDS) or one that starts within
+        ORDER_MUTATION_REFRESH_MAX_WAIT_SECONDS; otherwise 409 ESUN_ORDER_INCOMPLETE + retry_after.
+        The request counts as an in-flight mutation from before the query (`slot`, returned by the
+        caller), so a graceful shutdown waits for it: shutdown before, while waiting or by the time the
+        query is done -> 503 ESUN_SHUTTING_DOWN (all not sent).
         `check(order, payload)` runs on every resolution, before the completeness test.
         """
         resolved = self._resolve_order(order_no, body)
@@ -3762,16 +3847,23 @@ class EsunTradeBridge:
                 retry_after=retry_after,
             )
 
+        def shutting_down() -> EsunValidationError:
+            return EsunValidationError("玉山 bridge 關閉中，委託未送出", "ESUN_SHUTTING_DOWN", 503)
+
+        if slot is not None and not self._hold_mutation(slot):  # drained like any in-flight mutation
+            raise shutting_down()
         try:
-            self._refresh_orders_snapshot(session, for_mutation=True)
+            self._refresh_orders_snapshot(session, for_mutation=True, mutation_arrival=arrival)
         except EsunQueryError as e:
             if e.code == "ESUN_SESSION_CHANGED":
                 raise EsunValidationError(f"{e}（委託未送出）", e.code, 503)
             if e.code == "ESUN_SHUTTING_DOWN":
-                raise EsunValidationError("玉山 bridge 關閉中，委託未送出", e.code, 503)
-            if e.code == "AGR0005":  # no query can start soon enough: the client retries later
+                raise shutting_down()
+            if e.code == "AGR0005":  # no query can start / finish soon enough: the client retries later
                 raise incomplete(missing, e.retry_after or ORDERS_REFRESH_MIN_INTERVAL_SECONDS)
             logger.warning(f"補齊委託資料的查詢失敗：{redact(e)}")
+        if self.is_shutting_down():  # the query ended during shutdown: nothing more is sent
+            raise shutting_down()
         resolved = self._resolve_order(order_no, body)
         if check is not None:
             check(resolved[0], resolved[2])
@@ -3910,6 +4002,9 @@ class EsunTradeBridge:
 
     def replace_price(self, body: dict) -> tuple[dict, int]:
         """POST /esun/orders/replace-price: {order_no, price, price_flag?, payload?, expected_*}."""
+        return self._with_mutation_slot(self._replace_price, body)
+
+    def _replace_price(self, body: dict, slot: _MutationSlot) -> tuple[dict, int]:
         arrival = time.monotonic()  # MUTATION_SEND_DEADLINE_SECONDS counts from here
         session, refusal = self._mutation_prelude(body)
         if refusal:
@@ -3937,14 +4032,16 @@ class EsunTradeBridge:
                 if price is not None and current_price is not None and abs(current_price - price) < 1e-9:
                     raise EsunValidationError("新價格與原委託價格相同 (O00021)", "AG_INVALID_PRICE_MODIFY")
 
-            _order, _meta, _payload, _known, sdk_order = self._resolve_complete_order(session, order_no, body, check)
+            _order, _meta, _payload, _known, sdk_order = self._resolve_complete_order(
+                session, order_no, body, check, arrival=arrival, slot=slot
+            )
         except EsunValidationError as e:
             return e.to_not_sent()
         refusal = self._consume_mutation_quota(arrival)
         if refusal:
             return refusal
         envelope, status = self._call_sdk_mutation(
-            session, "改價", lambda: session.sdk.modify_price(sdk_order, target_price=price, price_flag=price_flag)
+            session, "改價", lambda: session.sdk.modify_price(sdk_order, target_price=price, price_flag=price_flag), slot
         )
         if envelope.get("outcome") == "accepted":
             # Not written into the row: the exchange may still reject it; the successful ACK
@@ -3982,6 +4079,9 @@ class EsunTradeBridge:
         upstream updateOrderQty and SDK cancel_order(cel_qty=...)).
         lot -> cel_qty for ap_code 1/2; share -> cel_qty_share for ap_code 3/4/5.
         """
+        return self._with_mutation_slot(self._replace_qty, body)
+
+    def _replace_qty(self, body: dict, slot: _MutationSlot) -> tuple[dict, int]:
         arrival = time.monotonic()  # MUTATION_SEND_DEADLINE_SECONDS counts from here
         session, refusal = self._mutation_prelude(body)
         if refusal:
@@ -3990,7 +4090,8 @@ class EsunTradeBridge:
             order_no = parse_order_no(body)
             cancel_quantity, unit = self._parse_cancel_quantity(body)
             order, meta, _payload, known, sdk_order = self._resolve_complete_order(
-                session, order_no, body, self._reject_reservation  # Reservation Guard (AG0006)
+                session, order_no, body, self._reject_reservation,  # Reservation Guard (AG0006)
+                arrival=arrival, slot=slot,
             )
             ap = str(order.get("ap_code")).strip()
             expected_unit = "lot" if ap in ("1", "2") else ("share" if ap in ("3", "4", "5") else None)
@@ -4015,27 +4116,36 @@ class EsunTradeBridge:
         if refusal:
             return refusal
         kwargs = {"cel_qty": cancel_quantity} if unit == "lot" else {"cel_qty_share": cancel_quantity}
-        envelope, status = self._call_sdk_mutation(session, "改量", lambda: session.sdk.cancel_order(sdk_order, **kwargs))
+        envelope, status = self._call_sdk_mutation(
+            session, "改量", lambda: session.sdk.cancel_order(sdk_order, **kwargs), slot
+        )
         if envelope.get("outcome") == "accepted":
             self._safe_mark_event(session, order_no)
         return envelope, status
 
     def cancel_order(self, body: dict) -> tuple[dict, int]:
         """POST /esun/orders/cancel: cancels the whole remaining quantity."""
+        return self._with_mutation_slot(self._cancel_order, body)
+
+    def _cancel_order(self, body: dict, slot: _MutationSlot) -> tuple[dict, int]:
         arrival = time.monotonic()  # MUTATION_SEND_DEADLINE_SECONDS counts from here
         session, refusal = self._mutation_prelude(body)
         if refusal:
             return refusal
         try:
             order_no = parse_order_no(body)
-            _order, _meta, _payload, _known, sdk_order = self._resolve_complete_order(session, order_no, body)
+            _order, _meta, _payload, _known, sdk_order = self._resolve_complete_order(
+                session, order_no, body, arrival=arrival, slot=slot
+            )
         except EsunValidationError as e:
             return e.to_not_sent()
         refusal = self._consume_mutation_quota(arrival)
         if refusal:
             return refusal
         # sdk.cancel_order without cel_qty cancels all
-        envelope, status = self._call_sdk_mutation(session, "刪單", lambda: session.sdk.cancel_order(sdk_order))
+        envelope, status = self._call_sdk_mutation(
+            session, "刪單", lambda: session.sdk.cancel_order(sdk_order), slot
+        )
         if envelope.get("outcome") == "accepted":
             self._safe_mark_event(session, order_no)
         return envelope, status
@@ -4065,18 +4175,23 @@ class EsunTradeBridge:
         return self.order_book_cache.get_all()
 
     def _refresh_orders_snapshot(
-        self, session: EsunSession, background: bool = False, for_mutation: bool = False
+        self, session: EsunSession, background: bool = False, for_mutation: bool = False,
+        mutation_arrival: float | None = None,
     ) -> int:
         """
         get_orders(refresh=True) coordination (see there): returns once a snapshot that started
         after this call is applied (its report_mark() taken before the query), raises
         EsunQueryError otherwise. A background caller (failed ACK) also gives up on shutdown.
-        A mutation completing its order (for_mutation) shares any query in flight, or starts one
-        within ORDER_MUTATION_REFRESH_MAX_WAIT_SECONDS (else 429 AGR0005 + retry_after), and gives
-        up on shutdown (503 ESUN_SHUTTING_DOWN) without starting a query.
+        A mutation completing its order (for_mutation) shares any query in flight until
+        mutation_arrival (monotonic, default now) + ORDER_MUTATION_REFRESH_BUDGET_SECONDS, or starts
+        one within ORDER_MUTATION_REFRESH_MAX_WAIT_SECONDS (within the budget too); otherwise 429
+        AGR0005 + retry_after. It gives up on shutdown (503 ESUN_SHUTTING_DOWN) without starting a query.
         """
         arrival = time.monotonic()
         deadline = arrival + (ORDER_MUTATION_REFRESH_MAX_WAIT_SECONDS if for_mutation else ORDERS_REFRESH_MAX_WAIT_SECONDS)
+        budget = (arrival if mutation_arrival is None else mutation_arrival) + ORDER_MUTATION_REFRESH_BUDGET_SECONDS
+        if for_mutation:
+            deadline = min(deadline, budget)
         stop_on_shutdown = background or for_mutation
         cond = self._orders_refresh_cond
 
@@ -4097,7 +4212,13 @@ class EsunTradeBridge:
                     # began after this request arrived (or any in-flight one, for a mutation): share it
                     if flight.ticket > arrival_ticket or (for_mutation and not flight.done):
                         while not flight.done:
-                            cond.wait()
+                            remaining = budget - time.monotonic()
+                            if for_mutation and remaining <= 0:  # the query keeps running for the others
+                                raise EsunQueryError(
+                                    429, "AGR0005", "委託查詢等待逾時（進行中的查詢尚未完成）",
+                                    retry_after=ORDERS_REFRESH_MIN_INTERVAL_SECONDS,
+                                )
+                            cond.wait(remaining if for_mutation else None)
                             check_shutdown()
                         if flight.error is not None:
                             e = flight.error

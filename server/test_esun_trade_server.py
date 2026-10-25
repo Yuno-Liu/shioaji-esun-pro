@@ -2736,8 +2736,8 @@ class TestMutationContractWithRealSdk(_BridgeCase):
             status, _, data = _raw_request(port, "POST", "/esun/orders/cancel",
                                            headers={"Content-Type": "application/json"}, body=body)
             self.assertEqual((status, data["outcome"], data["code"]), (502, "unknown", "ESUN_OUTCOME_UNKNOWN"))
-            status, _, _ = _raw_request(port, "GET", "/esun/livez")
-            self.assertEqual(status, 200)  # the single slot was released
+            # the single slot was released (by the handler thread right after the response: polled)
+            self.assertTrue(_wait_until(lambda: _raw_request(port, "GET", "/esun/livez")[0] == 200, timeout=2))
             self.assertEqual(self.bridge._mutations_in_flight, 0)
         finally:
             server.shutdown()
@@ -2954,6 +2954,174 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         time.sleep(1.5)  # past the slot it was waiting for
         self.assertEqual(self.core.order_results_calls, queries)
         self.assertEqual(self._core_calls("modify_volume"), [])
+
+    # ── PA8: emerging quantities only in shares, bounded shared query, completing query drained ──
+
+    def _emerging_order(self, **overrides):
+        """An emerging (ap_code 4) order-results row: fractional lots + *_qty_share (shares)."""
+        order = self._lot_order(ord_no="E0101", ap_code="4", od_price=30.0, org_qty=1.0, org_qty_share=1000,
+                                mat_qty=0.0, mat_qty_share=0, cel_qty=0.0, cel_qty_share=0)
+        order.update(overrides)
+        return order
+
+    def test_emerging_ack_without_shares_keeps_the_row_quantities(self):
+        # PA8-1: the unit of an emerging ACK *_qty is not known: without *_qty_share it never overwrites the
+        # row (org_qty "1000" became org_qty_share 1,000,000 and the core got 1,000,000 shares).
+        self._snapshot(self._emerging_order())
+        self.bridge._handle_ack(self._observed_ack(ord_no="E0101", pre_ord_no="", ord_status="2", ap_code="4",
+                                                   org_qty="1000", mat_qty="0", cel_qty="500", od_price="30.50"))
+        row = self._raw_row("E0101")
+        self.assertEqual((row["org_qty"], row["org_qty_share"], row["mat_qty"], row["mat_qty_share"],
+                          row["cel_qty"], row["cel_qty_share"]), (1.0, 1000, 0.0, 0, 0.0, 0))
+        self.assertEqual(row["od_price"], 30.5)  # every other field as before
+        view = self.bridge.order_book_cache.get("E0101")
+        self.assertEqual((view["org_qty_share"], view["cel_qty_share"]), (1000, 0))  # event_cel_shares untouched
+        res, status = self.bridge.cancel_order({"order_no": "E0101", **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual((sent["org_qty"], executed), (1000, 0))
+        # With the share fields the ACK is applied as before.
+        self.bridge._handle_ack(self._observed_ack(ord_no="E0101", pre_ord_no="", ord_status="2", ap_code="4",
+                                                   org_qty="1000", org_qty_share="1000", cel_qty="400",
+                                                   cel_qty_share="400", od_price="30.50"))
+        row = self._raw_row("E0101")
+        self.assertEqual((row["org_qty_share"], row["cel_qty_share"], row["cel_qty"]), (1000, 400, 0.4))
+        self.assertEqual(self.bridge.order_book_cache.get("E0101")["cel_qty_share"], 400)
+
+    def test_emerging_mat_without_shares_is_published_but_not_counted(self):
+        # PA8-2: like a MAT without mkt_seq_num: published, never in event_mat_shares / esun_fills.
+        self._snapshot(self._emerging_order())
+        events = self.bridge.sse_fanout.register()
+        mat = {"kind": "MAT", "ord_no": "E0101", "stock_no": "2330", "ap_code": "4", "mat_qty": "1000",
+               "mat_price": "30.00", "mkt_seq_num": "000001", "account": "88401234567"}
+        with self.assertLogs("esun_trade_server", "WARNING") as logs:
+            self.assertIsNotNone(self.bridge._handle_mat(mat))
+        output = "\n".join(logs.output)
+        self.assertIn("mat_qty_share", output)
+        self.assertNotIn("1234567", output)
+        deals = [e["data"] for e in _drain(events, timeout=0.3) if e["event"] == "deal"]
+        self.assertEqual(len(deals), 1)
+        view = self.bridge.order_book_cache.get("E0101")
+        self.assertEqual((view["mat_qty"], view["mat_qty_share"], view["esun_fills"]), (0.0, 0, []))
+        self.assertEqual(self._raw_row("E0101")["mat_qty_share"], 0)
+
+    def test_emerging_order_reaches_the_sdk_only_with_snapshot_shares(self):
+        # PA8-3: an emerging row without org_qty_share is incomplete (completing query, then 409); its
+        # mat / cel without shares are never sent in a guessed unit; with the snapshot shares it goes out.
+        cache, gen = self.bridge.order_book_cache, self.bridge.session.generation
+        partial = self._emerging_order(ord_no="E0102", mat_qty=0.5)
+        del partial["mat_qty_share"]
+        cache.upsert(partial, generation=gen)
+        res, status = self.bridge.cancel_order({"order_no": "E0102", **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, _ = self._core_calls("modify_volume")[-1]
+        self.assertEqual(sent["org_qty"], 1000)
+        self.assertNotIn("mat_qty", sent)  # 0.5 would have been read as 500 shares
+
+        shareless = {k: v for k, v in self._emerging_order(org_qty="1000").items() if not k.endswith("_share")}
+        self.assertIn("org_qty_share", bridge_module.missing_sdk_order_fields(bridge_module.sdk_quantities_and_price(shareless)))
+        cache.upsert(shareless, generation=gen)
+        self.bridge.last_orders_refresh_time = 0.0
+        queries, sent_before = self.core.order_results_calls, len(self._core_calls("modify_volume"))
+        res, status = self.bridge.cancel_order({"order_no": "E0101", **self.env})
+        self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ORDER_INCOMPLETE", "not_sent"), res)
+        self.assertIn("org_qty_share", res["error"])
+        self.assertEqual(self.core.order_results_calls, queries + 1)  # one authoritative query
+        self.assertEqual(len(self._core_calls("modify_volume")), sent_before)
+        self.assertEqual(self.bridge._mutations_in_flight, 0)
+
+        self._snapshot(self._emerging_order())
+        res, status = self.bridge.replace_qty({"order_no": "E0101", "cancel_quantity": 400, "quantity_unit": "share",
+                                               **self.env})
+        self.assertEqual(status, 200, res)
+        _, sent, executed = self._core_calls("modify_volume")[-1]
+        self.assertEqual((sent["org_qty"], sent["mat_qty"], sent["cel_qty"], executed), (1000, 0, 0, 400))
+        self.assertEqual(self.bridge._mutations_in_flight, 0)
+
+    def test_completing_query_sharing_a_slow_query_is_409_within_the_budget(self):
+        # PA8-4: sharing a query in flight used to wait for it without a limit (the client gives up at 15 s).
+        self.assertEqual(bridge_module.ORDER_MUTATION_REFRESH_BUDGET_SECONDS, 8.0)
+        self._incomplete_ack_row()
+        self.core.order_results = [self._lot_order(ord_no="G0101", mat_qty=0)]
+        sdk = self.bridge.session.sdk
+        original = sdk.get_order_results
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_query():
+            entered.set()
+            release.wait(5)
+            return original()
+
+        self.bridge.last_orders_refresh_time = 0.0
+        with mock.patch.object(bridge_module, "ORDER_MUTATION_REFRESH_BUDGET_SECONDS", 0.3), \
+                mock.patch.object(sdk, "get_order_results", slow_query):
+            refresher = threading.Thread(target=lambda: self.bridge.get_orders(refresh=True))
+            refresher.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                started = time.monotonic()
+                res, status = self.bridge.cancel_order({"order_no": "G0101", **self.env})
+                elapsed = time.monotonic() - started
+            finally:
+                release.set()
+                refresher.join(3)
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ORDER_INCOMPLETE", "not_sent"), res)
+        self.assertGreaterEqual(res["retry_after"], 1)
+        time.sleep(0.1)
+        self.assertEqual(self._core_calls("modify_volume"), [])  # never sent once the query is done
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
+        self.assertEqual(self.bridge._mutations_in_flight, 0)
+
+    def test_own_completing_query_is_drained_on_shutdown_and_not_sent(self):
+        # PA8-5: the request counts as in flight during its own completing query, so the drain waits for
+        # it; the query ends during shutdown -> 503 not_sent, nothing reaches the SDK.
+        self._incomplete_ack_row()
+        self.core.order_results = [self._lot_order(ord_no="G0101", mat_qty=0)]
+        sdk = self.bridge.session.sdk
+        original = sdk.get_order_results
+        entered = threading.Event()
+
+        def slow_query():
+            entered.set()
+            time.sleep(0.6)
+            return original()
+
+        self.bridge.last_orders_refresh_time = 0.0
+        result: list = []
+        with mock.patch.object(sdk, "get_order_results", slow_query):
+            worker = threading.Thread(target=lambda: result.append(self.bridge.cancel_order({"order_no": "G0101", **self.env})))
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(self.bridge._mutations_in_flight, 1)
+            started = time.monotonic()
+            self.assertTrue(self.bridge.drain_mutations())
+            elapsed = time.monotonic() - started
+            worker.join(3)
+        self.assertGreaterEqual(elapsed, 0.3)  # waited for the query in flight
+        res, status = result[0]
+        self.assertEqual((status, res["code"], res["outcome"]), (503, "ESUN_SHUTTING_DOWN", "not_sent"), res)
+        self.assertEqual(self._core_calls("modify_volume"), [])
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
+        self.assertEqual(self.bridge._mutations_in_flight, 0)
+
+    def test_completing_query_refused_when_shutdown_starts_before_it(self):
+        # PA8-5: shutdown between the prelude and the completing query: 503 not_sent, no query, count 0.
+        self._incomplete_ack_row()
+        queries = self.core.order_results_calls
+        prelude = self.bridge._mutation_prelude
+
+        def prelude_then_shutdown(body):
+            outcome = prelude(body)
+            self.bridge.begin_shutdown()
+            return outcome
+
+        self.bridge.last_orders_refresh_time = 0.0
+        with mock.patch.object(self.bridge, "_mutation_prelude", prelude_then_shutdown):
+            res, status = self.bridge.cancel_order({"order_no": "G0101", **self.env})
+        self.assertEqual((status, res["code"], res["outcome"]), (503, "ESUN_SHUTTING_DOWN", "not_sent"), res)
+        self.assertEqual(self.core.order_results_calls, queries)
+        self.assertEqual(self.bridge._mutations_in_flight, 0)
 
 
 class TestSseEventLog(unittest.TestCase):
@@ -3802,6 +3970,28 @@ class TestOrderBookCacheEventQuantities(unittest.TestCase):
         self.cache.reset(8)  # new cache generation
         self.cache.update_from_order_results([self._row()], generation=8)
         self.assertEqual(self.cache.get("A0001")["esun_fills"], [])
+
+    def test_emerging_reports_without_shares_change_no_quantity(self):
+        # PA8-1 / PA8-2: emerging (ap_code 4) ACK / MAT quantities count only with their *_qty_share.
+        emerging = dict(ap_code="4", org_qty=2.0, org_qty_share=2000, mat_qty=0.0, mat_qty_share=0,
+                        cel_qty=0.0, cel_qty_share=0)
+        self._snapshot(self._row(**emerging))
+        self.cache.update_from_ack({"ord_no": "A0001", "ap_code": "4", "org_qty": "2000", "cel_qty": "1000",
+                                    "err_code": ""}, generation=7)
+        with self.assertLogs("esun_trade_server", level="WARNING") as logs:
+            self.assertTrue(self._mat("001", ap_code="4", mat_qty=1000, account="88401234567"))
+        self.assertNotIn("1234567", "\n".join(logs.output))
+        self.assertFalse(self._mat("001", ap_code="4", mat_qty=1000))  # still deduplicated
+        for view in self._views():
+            self.assertEqual((view["org_qty"], view["org_qty_share"], view["mat_qty_share"], view["cel_qty_share"],
+                              view["esun_fills"]), (2.0, 2000, 0, 0, []))
+        self.assertTrue(self._mat("002", ap_code="4", mat_qty=1000, mat_qty_share=1000))
+        self.cache.update_from_ack({"ord_no": "A0001", "ap_code": "4", "cel_qty_share": "500", "err_code": ""},
+                                   generation=7)
+        self._snapshot(self._row(**emerging))  # an older snapshot never rolls them back
+        view = self.cache.get("A0001")
+        self.assertEqual((view["org_qty_share"], view["mat_qty_share"], view["cel_qty_share"]), (2000, 1000, 500))
+        self.assertEqual([(f["mkt_seq_num"], f["mat_qty_share"]) for f in view["esun_fills"]], [("002", 1000)])
 
     def test_odd_lot_fills_are_in_shares(self):
         self._snapshot(self._row(ap_code="5", org_qty=0.1, org_qty_share=100, mat_qty=0.0, mat_qty_share=0))
