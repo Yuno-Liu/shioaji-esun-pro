@@ -2391,6 +2391,30 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         row = self._snapshot(self._lot_order(ord_no="C0101", mat_qty=0))[0]
         self.assertNotIn("esun_unresolved_failure", row)
 
+    def test_refresh_responses_mark_kept_rows_and_never_send_the_mark(self):
+        # PA5-1: refresh=true / false rows the latest snapshot kept as recent (not listed) carry
+        # esun_snapshot_missing: true; listed rows do not; the SDK never receives it.
+        self.assertEqual(self._place()[1], 200)  # A0001
+        for rows in (self._snapshot(self._lot_order(mat_qty=0)), self.bridge.get_orders(refresh=False)):
+            rows = {r["ord_no"]: r for r in rows}
+            self.assertIs(rows["A0001"].get("esun_snapshot_missing"), True)
+            self.assertNotIn("esun_snapshot_missing", rows["A0101"])
+        sdk = self.bridge.session.sdk
+        handed: list[dict] = []
+        original = sdk.modify_price
+
+        def spy(order_result, *args, **kwargs):
+            handed.append(dict(order_result))
+            return original(order_result, *args, **kwargs)
+
+        with mock.patch.object(sdk, "modify_price", spy):
+            res, status = self.bridge.replace_price({"order_no": "A0001", "price": 951.0, **self.env})
+        self.assertEqual(status, 200, res)
+        self.assertNotIn("esun_snapshot_missing", handed[0])
+        self.assertNotIn("esun_snapshot_missing", self._core_calls("modify_price")[-1][1])
+        rows = {r["ord_no"]: r for r in self._snapshot(self._lot_order(mat_qty=0), self._lot_order(ord_no="A0001"))}
+        self.assertNotIn("esun_snapshot_missing", rows["A0001"])
+
     def test_accepted_price_modify_waits_for_the_ack(self):
         # PA4-2: the accepted modify is not written into the row; the successful ACK brings the price
         # and is published as ModifyPrice (ACK price != cached price).
@@ -3065,8 +3089,70 @@ class TestFailedAckBackgroundRefresh(_BridgeCase):
             self.assertGreaterEqual(gap, delay - 0.02)
         time.sleep(0.6)
         self.assertEqual(self.sdk.orders_calls, self.calls + 4)
-        self.assertEqual(self._resyncs(), [])
+        # PA5-2: giving up is signalled (the cache was not refreshed)
+        resyncs = self._resyncs()
+        self.assertEqual([{k: r[k] for k in ("reason", "generation", "cacheRefreshed")} for r in resyncs],
+                         [{"reason": "failed_ack_refresh_failed", "generation": self.generation,
+                           "cacheRefreshed": False}])
+        self.assertIn("ts", resyncs[0])
         self.assertEqual(self._failure(), {"op_code": "AG0011", "op_msg": "刪單失敗"})  # still unresolved
+
+    def test_failed_acks_during_the_retries_get_their_own_retries_once(self):
+        # PA5-2: a failed ACK arriving during the backoff does not share retries already used up: after
+        # giving up, the worker starts over once (1 + 3 attempts again), and only once.
+        self.sdk.fail_with = RuntimeError("upstream exploded")
+        with self.assertLogs("esun_trade_server", level="WARNING"):
+            self._fail()
+            self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 2))  # 1st retry ran
+            self._fail()  # during the backoff
+            self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 5, timeout=5))  # restarted
+            self._fail()  # during the second run: no third one
+            self.assertTrue(self._idle())
+        time.sleep(0.6)
+        self.assertEqual(self.sdk.orders_calls, self.calls + 8)
+        self.assertEqual([r["reason"] for r in self._resyncs()], ["failed_ack_refresh_failed"] * 2)
+
+    def test_snapshot_without_the_failed_recent_order_is_queried_again_after_the_keep_window(self):
+        # PA5-1: a snapshot that keeps the failed order only as recent (not listed) settles nothing; the
+        # query runs again once the row is past the keep window, then the failure is settled.
+        keep = mock.patch.object(bridge_module, "ORDER_SNAPSHOT_KEEP_RECENT_SECONDS", 0.8)
+        keep.start()
+        self.addCleanup(keep.stop)
+        placed = {**self.row, "ord_no": "N0001"}
+        cache = self.bridge.order_book_cache
+        cache.upsert(dict(placed), generation=self.generation, source="local")
+        created = time.monotonic()
+        self.bridge._handle_ack({**placed, "err_code": "E0123", "err_msg": "價格超過漲跌幅"})
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 1))
+        self.assertTrue(_wait_until(lambda: (cache.get("N0001") or {}).get("esun_snapshot_missing") is True))
+        rows = {r["ord_no"]: r for r in self.bridge.get_orders(refresh=False)}
+        self.assertEqual(rows["N0001"]["esun_unresolved_failure"], {"op_code": "E0123", "op_msg": "價格超過漲跌幅"})
+        self.assertNotIn("esun_snapshot_missing", rows["R1"])
+        self.assertEqual(self._resyncs(timeout=0.2), [])  # not settled yet
+        self.assertTrue(self._idle())
+        self.assertEqual(self.sdk.orders_calls, self.calls + 2)
+        self.assertGreaterEqual(self.sdk.order_call_times[-1], created + 0.8)
+        self.assertIsNone(cache.get("N0001"))  # past the keep window, still unlisted: dropped
+        self.assertEqual([r["reason"] for r in self._resyncs()], ["failed_ack_refreshed"])
+
+    def test_slow_bootstrap_does_not_overwrite_a_newer_background_snapshot(self):
+        # PA5-3: the bootstrap goes through the coordinator, so a failed ACK's query starts after it
+        # and its newer snapshot is the one left in the cache.
+        gate = self.sdk.gate = threading.Event()
+        bootstrap = threading.Thread(target=self.bridge._bootstrap_orders, args=(self.bridge.session,))
+        bootstrap.start()
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 1))  # bootstrap in flight
+        self.sdk.gate = None
+        self.sdk.snapshot_rows = [{**self.row, "cel_qty": 1, "ord_status": "4"}]  # cancelled since
+        self._fail()
+        time.sleep(0.4)
+        gate.set()
+        bootstrap.join(5)
+        self.assertTrue(self._idle())
+        self.assertEqual(self.sdk.orders_calls, self.calls + 2)
+        row = self.bridge.get_orders(refresh=False)[0]
+        self.assertEqual((row.get("cel_qty"), row.get("ord_status")), (1, "4"))  # not the bootstrap's
+        self.assertNotIn("esun_unresolved_failure", row)
 
     def test_background_query_gives_up_on_shutdown(self):
         self.sdk.fail_with = RuntimeError("upstream exploded")
@@ -3191,6 +3277,42 @@ class TestOrderBookCacheEventQuantities(unittest.TestCase):
         self.assertEqual(len(self.cache.get_all()), 2)
         raw, _, _ = self.cache.get_for_mutation("B0001")
         self.assertNotIn("esun_unresolved_failure", raw)
+
+    def test_snapshot_started_before_the_applied_one_does_not_overwrite_it(self):
+        # PA5-3: snapshots apply in query-start order; an older one is covered (True) and changes nothing.
+        self._snapshot(self._row())
+        older_since, older_start = self.cache.begin_snapshot()
+        self.cache.update_from_ack({**self._row(), "err_code": "AG0011", "err_msg": "刪單失敗"}, generation=7)
+        newer_since, newer_start = self.cache.begin_snapshot()
+        self.assertGreater(newer_start, older_start)
+        self.assertTrue(self.cache.update_from_order_results(
+            [self._row(cel_qty=5, ord_status="4")], generation=7, since=newer_since, start=newer_start))
+        self.assertTrue(self.cache.update_from_order_results(
+            [self._row(), self._row(ord_no="B0001")], generation=7, since=older_since, start=older_start))
+        for view in self._views():
+            self.assertEqual((view["cel_qty"], view["ord_status"]), (5, "4"))
+            self.assertNotIn("esun_unresolved_failure", view)
+        self.assertIsNone(self.cache.get("B0001"))
+        self.assertFalse(self.cache.update_from_order_results([self._row()], generation=6, start=newer_start + 1))
+
+    def test_kept_recent_rows_read_as_snapshot_missing_until_listed(self):
+        # PA5-1: a recent row the latest snapshot did not list reads with esun_snapshot_missing; the
+        # recheck time is reported only while such a row carries an unresolved failure.
+        self._snapshot(self._row())
+        self.cache.upsert(self._row(ord_no="B0001"), generation=7, source="local")
+        self._snapshot(self._row())
+        self.assertTrue(self.cache.get("B0001")["esun_snapshot_missing"])
+        self.assertNotIn("esun_snapshot_missing", self.cache.get("A0001"))
+        self.assertNotIn("esun_snapshot_missing", self.cache.get_for_mutation("B0001")[0])  # raw row
+        self.assertIsNone(self.cache.unlisted_failure_recheck_at())
+        self.cache.update_from_ack({**self._row(ord_no="B0001"), "err_code": "E0123", "err_msg": "x"}, generation=7)
+        self.cache.update_from_ack({**self._row(), "err_code": "E0123", "err_msg": "x"}, generation=7)
+        created = self.cache.get_with_meta("B0001")[1]["created"]
+        self.assertEqual(self.cache.unlisted_failure_recheck_at(), created + bridge_module.ORDER_SNAPSHOT_KEEP_RECENT_SECONDS)
+        self._snapshot(self._row(), self._row(ord_no="B0001"))
+        for order_id in ("A0001", "B0001"):
+            self.assertNotIn("esun_snapshot_missing", self.cache.get(order_id))
+        self.assertIsNone(self.cache.unlisted_failure_recheck_at())
 
     def test_mat_without_mkt_seq_num_is_not_counted(self):
         # PA2-2: without mkt_seq_num a MAT cannot be deduplicated, so it never enters the cached counts.
@@ -3353,6 +3475,10 @@ class TestReconnectResyncWaitsForNewOpen(_BridgeCase):
     def test_resync_snapshot_happens_after_the_new_connection_opens(self):
         # R1-02: the opened flag of the previous connection must not release the resync early.
         sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        # the resync query goes through the refresh coordinator (PA5-3): keep its interval short
+        interval = mock.patch.object(bridge_module, "ORDERS_REFRESH_MIN_INTERVAL_SECONDS", 0.2)
+        interval.start()
+        self.addCleanup(interval.stop)
         factory = RecordingFactory(mock_cls=OpenHookSDK)
         bridge = self.make_bridge(sim, factory, auto_login=False)
         bridge.ws_backoff_initial = 0.05

@@ -1187,6 +1187,10 @@ class OrderBookCache:
       a modify) cannot be told from its fields. A failed ACK of a cached order is kept in
       meta["unresolved_failure"] and every read adds `esun_unresolved_failure` {op_code, op_msg}
       until a successful ACK of the order or a snapshot that started after the failure.
+    - A recent row the latest snapshot did not list (kept, see update_from_order_results) reads
+      with `esun_snapshot_missing: true` until the next snapshot.
+    - Snapshots are applied in the order their queries started (begin_snapshot): one that started
+      before an already applied snapshot is covered by it and never overwrites it.
     - Accepted mutations only mark the row (source "event"): prices / quantities change when the
       broker reports them (snapshot, successful ACK, MAT), never optimistically.
     - Mutations hand the SDK the raw row (snapshot / successful ACK values), never the read view.
@@ -1202,6 +1206,8 @@ class OrderBookCache:
         self._meta: dict[str, dict] = {}
         self._orphan_mats: collections.OrderedDict = collections.OrderedDict()
         self._failure_seq = 0  # numbers failed ACKs, ordered against snapshot starts (see report_mark)
+        self._snapshot_seq = 0  # numbers snapshot query starts (see begin_snapshot)
+        self._applied_snapshot = 0  # begin_snapshot() number of the latest applied snapshot
         self._generation = 0
         self._day = taipei_today()
         self.lock = threading.RLock()
@@ -1309,6 +1315,8 @@ class OrderBookCache:
         failure = meta.get("unresolved_failure")
         if failure:
             row["esun_unresolved_failure"] = {"op_code": failure["op_code"], "op_msg": failure["op_msg"]}
+        if meta.get("snapshot_missing"):
+            row["esun_snapshot_missing"] = True
         ap_code = _row_ap_code(row)
         changed = False
         for base in ("mat", "cel"):
@@ -1355,15 +1363,32 @@ class OrderBookCache:
         with self.lock:
             return self._failure_seq
 
-    def update_from_order_results(self, orders: list, generation: int | None = None, since: int | None = None) -> bool:
+    def begin_snapshot(self) -> tuple[int, int]:
+        """
+        Taken right before a get_order_results() call: (report_mark(), query start number). Pass them
+        as `since` / `start` when applying the result.
+        """
+        with self.lock:
+            self._snapshot_seq += 1
+            return self._failure_seq, self._snapshot_seq
+
+    def update_from_order_results(
+        self, orders: list, generation: int | None = None, since: int | None = None, start: int | None = None
+    ) -> bool:
         """
         Replaces the cache with an authoritative get_order_results() snapshot. An unresolved failure
         recorded after `since` (report_mark() taken before the query started) is kept, and so is the
-        one of a recent row the snapshot does not list; every other one is cleared.
+        one of a recent row the snapshot does not list (that row is marked snapshot_missing); every
+        other one is cleared. A snapshot whose `start` (begin_snapshot()) is older than the applied
+        one's is covered by it: True without changing the cache.
         """
         with self.lock:
             if not self._accepts(generation):
                 return False
+            if start is not None:
+                if start < self._applied_snapshot:
+                    return True  # a snapshot that started later is already applied
+                self._applied_snapshot = start
             self._day = taipei_today()
             now = time.monotonic()
             old_orders, old_meta = self._orders, self._meta
@@ -1388,9 +1413,23 @@ class OrderBookCache:
                     if kept_id is not None:
                         self._meta[kept_id]["created"] = float(meta.get("created") or now)
                         self._carry_event_meta(self._meta[kept_id], meta)
+                        self._meta[kept_id]["snapshot_missing"] = True
                         if failure:
                             self._meta[kept_id]["unresolved_failure"] = failure  # the snapshot says nothing of it
             return True
+
+    def unlisted_failure_recheck_at(self) -> float | None:
+        """
+        monotonic() time after which a snapshot settles every unresolved failure of a row the latest
+        snapshot did not list (kept as recent: listed or dropped by then); None when there is none.
+        """
+        with self.lock:
+            times = [
+                float(meta.get("created") or 0.0) + ORDER_SNAPSHOT_KEEP_RECENT_SECONDS
+                for meta in self._meta.values()
+                if meta.get("snapshot_missing") and meta.get("unresolved_failure")
+            ]
+            return max(times) if times else None
 
     def update_from_ack(self, ack_data: dict, generation: int | None = None) -> tuple[bool, dict | None]:
         """Merges an ACK into its row. Returns (accepted, previous_row_copy)."""
@@ -1771,6 +1810,7 @@ ORDERS_DAILY_MAX = 2000
 ORDERS_REFRESH_MIN_INTERVAL_SECONDS = 5.0
 ORDERS_REFRESH_MAX_WAIT_SECONDS = 12.0  # refresh=true waits at most this long before its query starts
 FAILED_ACK_REFRESH_BACKOFF_SECONDS = (5.0, 10.0, 20.0)  # retries of the query a failed ACK schedules
+FAILED_ACK_RECHECK_MARGIN_SECONDS = 0.1  # past the keep window of a row the snapshot did not list
 SHUTDOWN_MUTATION_GRACE_SECONDS = 8.0  # SIGTERM: in-flight order mutations may finish (< compose grace)
 CACHE_FILL_WAIT_SECONDS = 20.0
 WS_SILENCE_SECONDS = 90.0
@@ -2931,22 +2971,19 @@ class EsunTradeBridge:
             })
 
     def _bootstrap_orders(self, session: EsunSession | None = None) -> bool:
-        """Re-reads the day's orders into OrderBookCache (counts against the order-query limiter)."""
+        """
+        Re-reads the day's orders into OrderBookCache through the refresh=true coordinator (5 s
+        interval, order-query limiter, snapshots applied in start order).
+        """
         session = session or self._session
         if session.sdk is None or not self._is_current(session.generation):
             return False
-        if not self.orders_refresh_limiter.acquire():
-            logger.warning("Bootstrap orders query skipped: order query rate limit reached")
-            return False
-        since = self.order_book_cache.report_mark()
         try:
-            orders = session.sdk.get_order_results()
-        except Exception as e:
+            self._refresh_orders_snapshot(session, background=True)
+        except EsunQueryError as e:
             logger.warning(f"Bootstrap orders query failed: {redact(e)}")
             return False
-        if isinstance(orders, list):
-            return self.order_book_cache.update_from_order_results(orders, generation=session.generation, since=since)
-        return False
+        return True
 
     @staticmethod
     def _report_payload(session: EsunSession, data: dict, op_type: str, status: tuple[str, str] | None = None) -> dict:
@@ -3015,20 +3052,33 @@ class EsunTradeBridge:
     def _failed_ack_refresh_worker(self, session: EsunSession, state: _FailedAckRefresh) -> None:
         """
         Runs the scheduled query (again while failed ACKs keep arriving), retrying a failed one
-        after FAILED_ACK_REFRESH_BACKOFF_SECONDS (at most 3 retries). Gives up when the session
-        changes or the bridge shuts down. Each applied snapshot publishes `resync`
-        (reason failed_ack_refreshed, cacheRefreshed true) for clients to rebuild from the cache.
+        after FAILED_ACK_REFRESH_BACKOFF_SECONDS (at most 3 retries). A snapshot that keeps a
+        recent row with an unresolved failure without listing it settles nothing: the query runs
+        again once that row is past ORDER_SNAPSHOT_KEEP_RECENT_SECONDS (listed or dropped by then).
+        Gives up when the session changes or the bridge shuts down. Each settled snapshot publishes
+        `resync` (reason failed_ack_refreshed, cacheRefreshed true) for clients to rebuild from the
+        cache; running out of retries publishes reason failed_ack_refresh_failed (cacheRefreshed
+        false), then starts over once if failed ACKs arrived after those retries began.
         """
         retries = 0
+        restarted = False
+        chain_wanted = 0  # state.wanted when the current run of retries began
+        recheck_at: float | None = None
         try:
             while True:
                 with self._failed_ack_refresh_lock:
-                    if state.covered >= state.wanted:
+                    if recheck_at is None and state.covered >= state.wanted:
                         if self._failed_ack_refresh is state:  # same lock as scheduling: no ACK is lost
                             self._failed_ack_refresh = None
                         return
+                    if retries == 0:
+                        chain_wanted = state.wanted
                 if self._shutdown_event.is_set() or not self._is_current(session.generation):
                     return
+                if recheck_at is not None:
+                    delay = recheck_at - time.monotonic()
+                    if delay > 0 and self._shutdown_event.wait(delay):
+                        return
                 try:
                     since = self._refresh_orders_snapshot(session, background=True)
                 except EsunQueryError as e:
@@ -3040,7 +3090,14 @@ class EsunTradeBridge:
                         return
                     if retries >= len(self.failed_ack_refresh_backoff):
                         logger.warning(f"失敗回報後的委託查詢已重試 {retries} 次仍失敗，放棄：{redact(e)}")
-                        return
+                        self._publish_failed_ack_resync(session, "failed_ack_refresh_failed", False)
+                        with self._failed_ack_refresh_lock:
+                            arrived_meanwhile = state.wanted > chain_wanted
+                        if restarted or not arrived_meanwhile:
+                            return
+                        restarted = True  # those failures get their own 1 + 3 attempts, once
+                        retries = 0
+                        continue
                     delay = self.failed_ack_refresh_backoff[retries]
                     retries += 1
                     logger.warning(f"失敗回報後的委託查詢失敗，{delay:.0f} 秒後重試（第 {retries} 次）：{redact(e)}")
@@ -3050,19 +3107,26 @@ class EsunTradeBridge:
                 retries = 0
                 with self._failed_ack_refresh_lock:
                     state.covered = max(state.covered, since)
-                if self._is_current(session.generation) and not self._shutdown_event.is_set():
-                    self.sse_fanout.publish("resync", {
-                        "reason": "failed_ack_refreshed",
-                        "generation": session.generation,
-                        "cacheRefreshed": True,
-                        "ts": taipei_now().isoformat(timespec="milliseconds"),
-                    })
+                recheck_at = self.order_book_cache.unlisted_failure_recheck_at()
+                if recheck_at is not None:
+                    recheck_at += FAILED_ACK_RECHECK_MARGIN_SECONDS
+                    continue  # the snapshot did not list the failed order yet
+                self._publish_failed_ack_resync(session, "failed_ack_refreshed", True)
         except Exception:
             logger.error(f"失敗回報後的委託查詢發生錯誤：\n{redact(traceback.format_exc())}")
         finally:
             with self._failed_ack_refresh_lock:
                 if self._failed_ack_refresh is state:
                     self._failed_ack_refresh = None
+
+    def _publish_failed_ack_resync(self, session: EsunSession, reason: str, cache_refreshed: bool) -> None:
+        if self._is_current(session.generation) and not self._shutdown_event.is_set():
+            self.sse_fanout.publish("resync", {
+                "reason": reason,
+                "generation": session.generation,
+                "cacheRefreshed": cache_refreshed,
+                "ts": taipei_now().isoformat(timespec="milliseconds"),
+            })
 
     def _handle_mat(self, data: dict, generation: int | None = None) -> str | None:
         """WebSocket MAT -> OrderBookCache (deduplicated by mkt_seq_num) + SSE `deal` event."""
@@ -3362,7 +3426,9 @@ class EsunTradeBridge:
         ("work_date", ("workDate", "work_date")),
     )
     # Bridge-side bookkeeping fields that are not part of the SDK's order result.
-    _BRIDGE_ONLY_ORDER_KEYS = frozenset({"deal_qty", "status", "mat_time", "esun_fills", "esun_unresolved_failure"})
+    _BRIDGE_ONLY_ORDER_KEYS = frozenset({
+        "deal_qty", "status", "mat_time", "esun_fills", "esun_unresolved_failure", "esun_snapshot_missing",
+    })
 
     def _mutation_prelude(self, body: any) -> tuple[EsunSession | None, tuple[dict, int] | None]:
         if not isinstance(body, dict):
@@ -3843,12 +3909,15 @@ class EsunTradeBridge:
                 break
 
         error: EsunQueryError | None = None
-        since = flight.since = self.order_book_cache.report_mark()  # later failures outlive the snapshot
+        since, start = self.order_book_cache.begin_snapshot()  # later failures outlive the snapshot
+        flight.since = since
         try:  # SDK call outside the lock
             orders = session.sdk.get_order_results()
             if not isinstance(orders, list):
                 error = EsunQueryError(502, "ORDERS_QUERY_ERROR", "玉山委託查詢回應格式錯誤")
-            elif not self.order_book_cache.update_from_order_results(orders, generation=session.generation, since=since):
+            elif not self.order_book_cache.update_from_order_results(
+                orders, generation=session.generation, since=since, start=start
+            ):
                 error = EsunQueryError(503, "ESUN_SESSION_CHANGED", "查詢期間玉山 session 已切換，請重新查詢")
         except Exception as e:
             logger.warning(f"get_order_results failed: {redact(e)}")
