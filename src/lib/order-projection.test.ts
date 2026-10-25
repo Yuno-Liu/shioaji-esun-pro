@@ -54,6 +54,14 @@ describe('wire order projection', () => {
         expect(projectOrderReport(rows, order(stock, 'Cancel', {}, { cancel_quantity: 2 }, {}, '99'), [stock])).toBe(rows);
         expect(projectOrderReport(rows, order(stock, 'Cancel', {}, { cancel_quantity: 2 }), [stock])![0]!.status).toMatchObject({ status: 'Cancelled', deal_quantity: 1, cancel_quantity: 2 });
     });
+    it('keeps a report-marked reservation PreSubmitted only while it is working (PB6-2)', () => {
+        // 原生回報不帶狀態名稱：沒有委託書號仍是 Submitted
+        expect(projectOrderReport([], order(stock, 'New', { ordno: '' }), [stock])![0]!.status.status).toBe('Submitted');
+        const rows = projectOrderReport([], order(stock, 'New', { ordno: '' }, { status: 'PreSubmitted' }), [stock])!;
+        expect(rows[0]!.status.status).toBe('PreSubmitted');
+        expect(projectOrderReport(rows, order(stock, 'Cancel', { ordno: '' }, { status: 'PreSubmitted', cancel_quantity: 3 }), [stock])![0]!.status.status).toBe('Cancelled');
+        expect(projectOrderReport([], order(stock, 'New', { ordno: '' }, { status: 'PreSubmitted' }, {}, '99'), [stock])![0]!.status.status).toBe('Failed');
+    });
     it('retains market IOC, grid tag and futures full_code', () => {
         const rows = projectOrderReport([], order(future, 'New', { price: 0, price_type: 'MKT', order_type: 'IOC' }), [future])!;
         expect(rows[0]!.contract.code).toBe('TXFI6');

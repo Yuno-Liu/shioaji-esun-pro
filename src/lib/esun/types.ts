@@ -312,6 +312,9 @@ export interface EsunPlaceOrderResponse {
     work_date?: string;
     ord_type?: string;
     ord_no?: string;
+    /** 新版 bridge：預約單（ord_type 1）的預約單編號，此時 ord_no 為空 */
+    pre_ord_no?: string;
+    preOrdNo?: string;
     ord_date?: string;
     ord_time?: string;
     [key: string]: unknown;

@@ -66,6 +66,11 @@ export function projectOrderReport(rows: AccountedTrade[], report: OrderEventRep
         if (cancelled + deals !== quantity) return null;
     }
     if (!quantity || deals + cancelled > quantity) return null;
+    const working = statusOf(quantity, deals, cancelled);
+    // A report may mark a working order as a reservation (E.SUN pre-order
+    // without an exchange order number); native reports carry no status name.
+    const status: OrderStatusName = report.failed ? 'Failed'
+        : working === 'Submitted' && rec(body?.status)?.status === 'PreSubmitted' ? 'PreSubmitted' : working;
     const next: AccountedTrade = {
         account,
         contract: { code, security_type: contract.security_type as 'STK' | 'FUT' | 'OPT' | 'WRT',
@@ -77,7 +82,7 @@ export function projectOrderReport(rows: AccountedTrade[], report: OrderEventRep
             ...(['ROD', 'IOC', 'FOK'].includes(report.orderType) ? { order_type: report.orderType as 'ROD' | 'IOC' | 'FOK' } : {}),
             ...(typeof order.custom_field === 'string' ? { custom_field: order.custom_field } : {}) },
         status: { ...old?.status, id: report.id, order_ts: old?.status.order_ts ?? report.ts,
-            status: report.failed ? 'Failed' : statusOf(quantity, deals, cancelled),
+            status,
             status_code: report.opCode, msg: report.opMsg, order_quantity: quantity,
             deal_quantity: deals, cancel_quantity: cancelled, modified_price: report.modifiedPrice,
             deals: old?.status.deals ?? [] },

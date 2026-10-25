@@ -8,6 +8,9 @@
 // （才能做去重與跳號偵測）。這裡只做轉換，不讀網路、不改狀態。
 //
 // 數量一律換成 App 單位：整股／盤後為張，零股／興櫃為股（零股的 *_qty 是張的小數）。
+// 興櫃（ap_code 4）回報的 *_qty 單位沒有實測資料：沒有 *_qty_share 時不推測股數，整筆不投影，
+// 回 skip unit-unknown（帶委託 id）。bridge 也不把這類數量寫進快取，所以呼叫端提出的待對帳
+// 只有權威讀取能解除（快取重建不能）。
 
 import type { Exchange } from '../types/contract';
 import type { Account } from '../types/portfolio';
@@ -59,7 +62,9 @@ export interface EsunUnresolvedFailure {
 
 export type EsunReportResult =
     | { kind: 'report'; wire: Rec; orderId: string; account: Account; unresolvedFailure?: EsunUnresolvedFailure }
-    | { kind: 'skip'; reason: 'environment' | 'malformed' };
+    | { kind: 'skip'; reason: 'environment' | 'malformed' }
+    /** 興櫃回報缺 *_qty_share：單位未知、不投影（bridge 快取也沒套用），只有權威讀取能對帳 */
+    | { kind: 'skip'; reason: 'unit-unknown'; orderId: string };
 
 const positiveInt = (v: unknown, min: number): number | null => {
     const n = num(v);
@@ -123,6 +128,18 @@ function orderLotOf(apCode: string): string {
     return 'Common';
 }
 
+/**
+ * 興櫃（ap_code 4）回報只有 *_qty、沒有 *_qty_share（且數量不為 0）：單位無從判定，不能以推測的
+ * 換算投影。缺少的數量欄位（委託量另由必要欄位檢查擋下）與 0 和單位無關，不在此列。
+ */
+function emgSharesMissing(raw: Rec, base: 'org' | 'mat' | 'cel', apCode: string): boolean {
+    if (apCode !== EsunApCode.Emg) return false;
+    const camel = { org: 'orgQty', mat: 'matQty', cel: 'celQty' }[base];
+    if (num(raw[`${base}_qty_share`] ?? raw[`${camel}Share`]) !== null) return false;
+    const lots = num(raw[`${base}_qty`] ?? raw[camel]);
+    return lots !== null && lots !== 0;
+}
+
 function condOf(trade: string): { cond: string; daytradeShort: boolean } {
     if (trade === EsunTradeType.Margin) return { cond: 'MarginTrading', daytradeShort: false };
     if (trade === EsunTradeType.Short) return { cond: 'ShortSelling', daytradeShort: false };
@@ -165,20 +182,23 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
     if (!orderId || !code || !action) return { kind: 'skip', reason: 'malformed' };
 
     if (isDeal) {
-        const quantity = esunQuantityFromFields({
+        const matFields = {
             mat_qty: raw.mat_qty ?? raw.deal_qty ?? raw.qty,
             mat_qty_share: raw.mat_qty_share ?? raw.deal_qty_share,
-        }, 'mat', apCode);
+        };
+        // 預約單的本地 id 是 pre_ord_no；只帶 ord_no 的成交回報依 ord_no 找回本地同帳戶的委託
+        const ordNo = str(raw.ord_no ?? raw.ordNo);
+        const preOrdNo = str(raw.pre_ord_no ?? raw.preOrdNo);
+        const tradeId = (!preOrdNo && ordNo ? ctx.lookup?.(ordNo, account, 'ordno')?.id : undefined) || orderId;
+        // 興櫃成交沒有股數欄位：不投影（呼叫端提出委託與持倉只有權威讀取能解除的待對帳）
+        if (emgSharesMissing(matFields, 'mat', apCode)) return { kind: 'skip', reason: 'unit-unknown', orderId: tradeId };
+        const quantity = esunQuantityFromFields(matFields, 'mat', apCode);
         const price = num(raw.mat_price ?? raw.deal_price ?? raw.price);
         // 成交識別與 bridge 的 MAT 去重鍵（mkt_seq_num，Python `or` 取值：0、空字串視為沒有）一致，
         // 其次才是其他 SDK 欄位與事件 id
         const seq = esunMktSeqNum(raw) || str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no)
             || str(raw.event_id);
         if (quantity === null || quantity <= 0 || price === null || price <= 0) return { kind: 'skip', reason: 'malformed' };
-        // 預約單的本地 id 是 pre_ord_no；只帶 ord_no 的成交回報依 ord_no 找回本地同帳戶的委託
-        const ordNo = str(raw.ord_no ?? raw.ordNo);
-        const preOrdNo = str(raw.pre_ord_no ?? raw.preOrdNo);
-        const tradeId = (!preOrdNo && ordNo ? ctx.lookup?.(ordNo, account, 'ordno')?.id : undefined) || orderId;
         const body: Rec = {
             trade_id: tradeId,
             exchange_seq: seq,
@@ -198,6 +218,11 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         return { kind: 'report', orderId: tradeId, account, wire: { state: 'StockDeal', data: { StockDeal: body } } };
     }
 
+    // 興櫃委託回報沒有股數欄位：不投影（呼叫端提出委託只有權威讀取能解除的待對帳）。失敗 ACK 同樣在此
+    // 略過，待對帳不比可投影的失敗回報（unresolvedFailure 的 snapshot-boundary）寬鬆
+    if ((['org', 'mat', 'cel'] as const).some(base => emgSharesMissing(raw, base, apCode))) {
+        return { kind: 'skip', reason: 'unit-unknown', orderId };
+    }
     const quantity = esunQuantityFromFields(raw, 'org', apCode);
     if (quantity === null || quantity <= 0) return { kind: 'skip', reason: 'malformed' };
     const dealt = esunQuantityFromFields(raw, 'mat', apCode) ?? 0;
@@ -219,6 +244,9 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
     const errCode = str(raw.err_code ?? raw.errCode ?? rec(raw.operation)?.op_code);
     const failed = isEsunFailureCode(errCode);
     const opMsg = str(raw.err_msg ?? raw.errMsg ?? rec(raw.operation)?.op_msg);
+    const ordNo = str(raw.ord_no ?? raw.ordNo);
+    // 預約單（還沒有委託書號，只有 pre_ord_no 或 ord_status 1）：投影時維持 PreSubmitted 而不是 Submitted
+    const reservation = !ordNo && (str(raw.pre_ord_no ?? raw.preOrdNo) !== '' || str(raw.ord_status ?? raw.ordStatus) === '1');
     const body: Rec = {
         operation: {
             op_type: opType,
@@ -228,7 +256,7 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         order: {
             id: orderId,
             seqno: orderId,
-            ordno: str(raw.ord_no ?? raw.ordNo),
+            ordno: ordNo,
             action,
             price,
             quantity,
@@ -242,6 +270,7 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         },
         status: {
             id: orderId,
+            ...(reservation ? { status: 'PreSubmitted' } : {}),
             ...(ts !== undefined ? { exchange_ts: ts } : {}),
             // 減量回報：order_quantity 為減量後的委託量（委託量 − 累計取消量）
             order_quantity: opType === 'UpdateQty' ? Math.max(0, quantity - cancelledTotal) : quantity,

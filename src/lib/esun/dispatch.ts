@@ -421,6 +421,14 @@ export function esunUnresolvedFailureMessage(orderId: string, opCode: string): s
     return `玉山委託 ${orderId} 收到失敗回報${code}，無法判定被拒的是新單、刪單或改單，已保留本地資料；請按更新確認`;
 }
 
+/**
+ * 興櫃回報缺股數欄位（單位未知）而略過時的待對帳訊息。bridge 也沒把這筆的數量寫進快取，所以以
+ * snapshot-boundary 提出（不在 CACHE_RESYNC_RESOLVES，只有權威讀取能解除）；cause 依委託 id 區分
+ */
+export function esunUnitUnknownMessage(orderId: string): string {
+    return `玉山興櫃委託 ${orderId} 的回報缺少股數欄位、單位未知，已略過；請按更新確認委託`;
+}
+
 /** 權威讀取的列同時帶 esun_unresolved_failure 與 esun_snapshot_missing（券商最近一次快照沒列出）時的訊息 */
 export function esunSnapshotMissingFailureMessage(orderId: string, opCode: string): string {
     const code = opCode ? `（${opCode}）` : '';
@@ -493,6 +501,12 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
             next.raise('positions', 'disconnect', lastDownMessage);
         } else if (signal.kind === 'reconnected') {
             void esunTradeService.refreshHealth().then(() => next.checkHealth('reconnect'));
+        } else if (signal.kind === 'untrackable' && signal.authoritativeOnly) {
+            // 興櫃回報缺股數欄位：bridge 快取也沒套用這筆，快取重建（含跳號、resync 觸發的）不能解除。
+            // 成交時持倉同樣只有權威讀取能解除
+            const message = esunUnitUnknownMessage(signal.authoritativeOnly.orderId);
+            next.raise('orders', 'snapshot-boundary', message);
+            if (signal.deal) next.raise('positions', 'snapshot-boundary', message);
         } else if (signal.kind === 'untrackable') {
             // 收到但無法轉換的回報：不能投影，也不能靜默丟棄
             const message = '玉山回報無法解析（欄位不足或環境未知），已略過；請手動對帳';

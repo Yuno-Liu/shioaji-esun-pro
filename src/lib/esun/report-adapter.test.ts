@@ -212,6 +212,44 @@ describe('ACK → projected order (C-05)', () => {
         expect(report).toMatchObject({ quantity: 100, orderLot: 'IntradayOdd' });
     });
 
+    describe('the reservation ACK measured in simulation (PB6-2)', () => {
+        // 2026-10-25 玉山模擬環境：盤中零股 2 股的預約單 ACK（數量為字串且為股、err_code 空字串）
+        const measuredAck = (seq: number, over: Record<string, unknown> = {}) => ({
+            event_id: `b7f3a2-${seq}`, seq, report_stream: 'order', report_seq: seq, session_generation: 1,
+            ts: '2026-10-25T15:27:10.550+08:00', environment: 'SIMULATION', account: { broker_id: '8840', account_id: '1234567' },
+            order_no: 'P0E031V0', op_type: 'New',
+            work_date: '20261027', ord_date: '20261025', ord_time: '152710550', ord_no: '', pre_ord_no: 'P0E031V0', ord_status: '1',
+            stock_no: '2884', buy_sell: 'B', ap_code: '5', price_flag: '0', bs_flag: 'R', trade: '0', od_price: '25.5',
+            org_qty: '2', before_qty: '0', after_qty: '0', mat_qty: '0', cel_qty: '0', action: 'O', err_code: '', err_msg: '', user_def: '',
+            ...over,
+        });
+        const known = { id: 'P0E031V0', quantity: 2, dealQuantity: 0, cancelQuantity: 0, price: 25.5 };
+
+        it('projects a 2-share PreSubmitted reservation, also over the local row from the order response', () => {
+            const report = normalizeOrderEvent(wire('order', measuredAck(1)))!;
+            expect(report).toMatchObject({ kind: 'order', opType: 'New', id: 'P0E031V0', ordno: '', failed: false, quantity: 2, orderLot: 'IntradayOdd' });
+            const rows = projectOrderReport([], report, [account])!;
+            expect(rows).toHaveLength(1);
+            expect(rows[0]!.order).toMatchObject({ id: 'P0E031V0', ordno: '', quantity: 2 });
+            expect(rows[0]!.status).toMatchObject({ status: 'PreSubmitted', order_quantity: 2, deal_quantity: 0, cancel_quantity: 0 });
+            // 重播同一筆 ACK（本地已有 PreSubmitted 列）：仍是 PreSubmitted
+            expect(projectOrderReport(rows, report, [account])![0]!.status.status).toBe('PreSubmitted');
+        });
+
+        it('projects the delete ACK of the reservation as Cancelled', () => {
+            const rows = projectOrderReport([], normalizeOrderEvent(wire('order', measuredAck(1)))!, [account])!;
+            const cancel = normalizeOrderEvent(wire('order', measuredAck(2, { op_type: 'Cancel', action: 'C', before_qty: '2', cel_qty: '2' }),
+                ctx({ lookup: () => known })))!;
+            expect(cancel).toMatchObject({ opType: 'Cancel', cancelQuantity: 2, failed: false });
+            expect(projectOrderReport(rows, cancel, [account])![0]!.status).toMatchObject({ status: 'Cancelled', cancel_quantity: 2 });
+        });
+
+        it('keeps Submitted once the reservation has an exchange order number', () => {
+            const opened = normalizeOrderEvent(wire('order', measuredAck(3, { ord_no: 'C0042', ord_status: '2' })))!;
+            expect(projectOrderReport([], opened, [account])![0]!.status.status).toBe('Submitted');
+        });
+    });
+
     it('accepts the legacy wrapped bridge shape', () => {
         const legacy = { state: 'StockOrder', event_id: 'esun-ack-C0001-1a2b3c4d', data: { StockOrder: { ...ack(9), event_id: undefined, seq: undefined, report_stream: undefined, report_seq: undefined, session_generation: undefined } } };
         const report = normalizeOrderEvent(wire('order_event', legacy));
@@ -276,6 +314,63 @@ describe('MAT → projected fill', () => {
         expect(projectTradeDeal(reserved, deal!)![0]!.status.deal_quantity).toBe(2);
         // 本地找不到時維持 ord_no
         expect(normalizeOrderEvent(wire('deal', mat(3, { ord_no: 'C0010', order_no: 'C0010' }), ctx({ lookup })))).toMatchObject({ tradeId: 'C0010' });
+    });
+});
+
+describe('emerging-stock (ap_code 4) reports without share fields (PB7-1 / PB8-1)', () => {
+    // 興櫃 *_qty 的單位沒有實測資料：沒有 *_qty_share 時不推測股數，整筆不投影。skip 原因與一般
+    // malformed 不同（unit-unknown，帶委託 id）：呼叫端提出只有權威讀取能解除的待對帳
+    const emgAck = (over: Record<string, unknown> = {}) => {
+        const base: Record<string, unknown> = ack(1, { ap_code: '4', stock_no: '6488', ...over });
+        for (const k of ['org_qty_share', 'mat_qty_share', 'cel_qty_share']) if (!(k in over)) delete base[k];
+        return base;
+    };
+    const emgMat = (over: Record<string, unknown> = {}) => {
+        const base: Record<string, unknown> = mat(1, { ap_code: '4', stock_no: '6488', ...over });
+        if (!('mat_qty_share' in over)) delete base.mat_qty_share;
+        return base;
+    };
+
+    it('does not project an ACK that only has org_qty', () => {
+        expect(toEsunReportWire('order', emgAck({ org_qty: '1000' }), ctx())).toEqual({ kind: 'skip', reason: 'unit-unknown', orderId: 'C0001' });
+    });
+
+    it('does not project an ACK whose cancel or dealt quantity has no share field', () => {
+        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, cel_qty: '1000' }), ctx())).toMatchObject({ kind: 'skip', reason: 'unit-unknown' });
+        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, mat_qty: '0.5' }), ctx())).toMatchObject({ kind: 'skip', reason: 'unit-unknown' });
+    });
+
+    it('skips a failed ACK without share fields with the same unit-unknown reason (not a projected failure)', () => {
+        expect(toEsunReportWire('order', emgAck({ org_qty: '1000', op_type: 'Unknown', err_code: '00000123', err_msg: '委託已失效' }), ctx()))
+            .toEqual({ kind: 'skip', reason: 'unit-unknown', orderId: 'C0001' });
+    });
+
+    it('does not project a MAT that only has mat_qty (deal_qty)', () => {
+        expect(toEsunReportWire('deal', emgMat({ mat_qty: '1000' }), ctx())).toEqual({ kind: 'skip', reason: 'unit-unknown', orderId: 'C0001' });
+        const legacy = emgMat({ deal_qty: '1000' });
+        delete legacy.mat_qty;
+        expect(toEsunReportWire('deal', legacy, ctx())).toMatchObject({ kind: 'skip', reason: 'unit-unknown' });
+        // 預約單只帶 ord_no 的成交：委託 id 依 ord_no 找回本地的 pre_ord_no
+        const lookup: EsunReportContext['lookup'] = (id, _a, by) => (by === 'ordno' && id === 'C0001'
+            ? { id: 'P0001', quantity: 1000, dealQuantity: 0, cancelQuantity: 0, price: 25.5 } : undefined);
+        expect(toEsunReportWire('deal', emgMat({ mat_qty: '1000' }), ctx({ lookup }))).toEqual({ kind: 'skip', reason: 'unit-unknown', orderId: 'P0001' });
+    });
+
+    it('keeps other missing fields as a generic malformed skip', () => {
+        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, stock_no: '' }), ctx())).toEqual({ kind: 'skip', reason: 'malformed' });
+    });
+
+    it('projects emerging-stock reports that carry the share fields', () => {
+        const report = normalizeOrderEvent(wire('order', emgAck({ org_qty: '1', org_qty_share: '1000', mat_qty: 0, cel_qty: 0 })));
+        expect(report).toMatchObject({ quantity: 1000, orderLot: 'IntradayOdd' });
+        const deal = normalizeOrderEvent(wire('deal', emgMat({ mat_qty: '0.5', mat_qty_share: '500' })));
+        expect(deal).toMatchObject({ quantity: 500, orderLot: 'IntradayOdd' });
+    });
+
+    it('keeps the current rules for the other classes (odd-lot *_qty without share fields)', () => {
+        const odd: Record<string, unknown> = ack(2, { ap_code: '5', org_qty: 0.1 });
+        delete odd.org_qty_share;
+        expect(normalizeOrderEvent(wire('order', odd))).toMatchObject({ quantity: 100 });
     });
 });
 

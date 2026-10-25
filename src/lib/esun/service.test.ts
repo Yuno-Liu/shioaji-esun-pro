@@ -371,6 +371,23 @@ describe('EsunTradeService', () => {
             await expect(service.cancelOrder('E00001', simAccount)).resolves.toMatchObject({ order: { ordno: 'E00001' } });
         });
 
+        it('cancels a legacy bridge reservation by its reservation number, without ordNo (PB6-1)', async () => {
+            // 玉山模擬環境實測的下單回應（舊版 bridge 原樣轉送）：ord_type 1 的 ord_no 是預約單編號
+            vi.spyOn(mockDriver, 'placeOrder').mockResolvedValueOnce({
+                ord_date: '20261025', ord_time: '152710550', ord_type: '1', ord_no: 'P0E031V0',
+                ret_code: '000000', ret_msg: '', work_date: '20261027',
+            });
+            const placed = await service.placeStockOrder(stockContract, limitBuy(2, { order_lot: 'IntradayOdd' }), simAccount);
+            expect(placed.order).toMatchObject({ id: 'P0E031V0', seqno: 'P0E031V0', ordno: '' });
+            expect(placed.status.status).toBe('PreSubmitted');
+            const cancel = vi.spyOn(mockDriver, 'cancelOrder');
+            await service.cancelOrder(placed, simAccount);
+            const [orderNo, payload] = cancel.mock.calls[0]!;
+            expect(orderNo).toBe('P0E031V0');
+            expect(payload).not.toHaveProperty('ordNo');
+            expect(payload).toMatchObject({ preOrdNo: 'P0E031V0', apCode: '5', quantity: 2 });
+        });
+
         it('treats a broker refusal as not sent and rejects a missing order number', async () => {
             mockDriver.simulateFailure = '委託已成交';
             await expect(service.cancelOrder(tradeOf({ id: 'E00009' }), simAccount)).rejects.toMatchObject({ mutationNotStarted: true });

@@ -5,7 +5,8 @@
 // 零股／興櫃 *_qty 是「張」的小數，*_qty_share 才是股數）；成功碼 err_code 為 8 碼 '00000000'。
 
 import { describe, expect, it } from 'vitest';
-import type { Trade } from '../types/order';
+import type { ContractBase } from '../types/contract';
+import type { StockOrderReq, Trade } from '../types/order';
 import type { Account } from '../types/portfolio';
 import {
     clampEsunDateRange180Days,
@@ -15,6 +16,7 @@ import {
     esunRetCode,
     esunWireBrokerId,
     fromEsunInventoryToPosition,
+    fromEsunOrderResponse,
     fromEsunOrderResult,
     fromEsunTransactionsToProfitLoss,
     fromEsunTransactionsToProfitLossSummary,
@@ -134,6 +136,58 @@ describe('mutation payload (B-12)', () => {
         expect(toEsunMutationPayload(trade)).toMatchObject({
             ordNo: 'C0001', stockNo: '2884', buySell: 'S', apCode: '5', priceFlag: '0', bsFlag: 'R', trade: '0', price: 25.5, quantity: 300,
         });
+    });
+});
+
+// 玉山模擬環境實測（2026-10-25，非交易日下盤中零股 2 股 → 預約單 P0E031V0）
+describe('reservation order measured in simulation (PB6)', () => {
+    const contract: ContractBase = { code: '2884', security_type: 'STK', exchange: 'TSE', target_code: null };
+    const oddLotBuy: StockOrderReq = { action: 'Buy', price: 25.5, quantity: 2, price_type: 'LMT', order_type: 'ROD', order_lot: 'IntradayOdd' };
+    // placeOrder 實測回應原樣（舊版 bridge 直接轉送）：ord_type 1 時 ord_no 是預約單編號
+    const measuredResponse = {
+        ord_date: '20261025', ord_time: '152710550', ord_type: '1', ord_no: 'P0E031V0',
+        ret_code: '000000', ret_msg: '', work_date: '20261027',
+    };
+    // 同一筆在委託查詢中的列：小數張 org_qty、股數 org_qty_share、8 碼成功碼、user_def 為空
+    const measuredRow = (over: Record<string, unknown> = {}) => ({
+        work_date: '20261027', ord_date: '20261025', ord_time: '152710550', ord_status: '1',
+        ord_no: '', pre_ord_no: 'P0E031V0', stock_no: '2884', buy_sell: 'B', ap_code: '5', price_flag: '0',
+        bs_flag: 'R', trade: '0', od_price: 25.5, org_qty: 0.002, org_qty_share: 2, mat_qty: 0, mat_qty_share: 0,
+        cel_qty: 0, cel_qty_share: 0, celable: '1', err_code: '00000000', err_msg: '', avg_price: 0, user_def: '',
+        ...over,
+    });
+
+    const expectReservation = (trade: Trade) => {
+        expect(trade.order).toMatchObject({ id: 'P0E031V0', seqno: 'P0E031V0', ordno: '', quantity: 2, order_lot: 'IntradayOdd' });
+        expect(trade.status).toMatchObject({ id: 'P0E031V0', status: 'PreSubmitted', order_quantity: 2 });
+        const payload = toEsunMutationPayload(trade);
+        expect(payload).not.toHaveProperty('ordNo');
+        expect(payload).toMatchObject({ preOrdNo: 'P0E031V0', stockNo: '2884', apCode: '5', quantity: 2 });
+    };
+
+    it('reads the ord_no of a legacy bridge reservation response as the reservation number (PB6-1)', () => {
+        expectReservation(fromEsunOrderResponse(measuredResponse, contract, oddLotBuy, account));
+        expectReservation(fromEsunOrderResponse(
+            { retCode: '000000', ordType: '1', ordNo: 'P0E031V0', workDate: '20261027' }, contract, oddLotBuy, account));
+    });
+
+    it('keeps the esunOrderId rule for a new bridge response that carries pre_ord_no (PB6-1)', () => {
+        expectReservation(fromEsunOrderResponse({ ...measuredResponse, ord_no: '', pre_ord_no: 'P0E031V0' }, contract, oddLotBuy, account));
+        // 盤中單（ord_type 2）的 ord_no 才是委託書號
+        const intraday = fromEsunOrderResponse({ ...measuredResponse, ord_type: '2', ord_no: 'C0042' }, contract, oddLotBuy, account);
+        expect(intraday.order).toMatchObject({ id: 'C0042', ordno: 'C0042' });
+        expect(intraday.status.status).toBe('Submitted');
+        expect(toEsunMutationPayload(intraday)).toMatchObject({ ordNo: 'C0042' });
+        expect(toEsunMutationPayload(intraday)).not.toHaveProperty('preOrdNo');
+    });
+
+    it('maps the measured order-query row as a 2-share reservation, and Cancelled after the delete (PB6-2)', () => {
+        const working = fromEsunOrderResult(measuredRow(), account)!;
+        expectReservation(working);
+        expect(working.status).toMatchObject({ status_code: '00000000', deal_quantity: 0, cancel_quantity: 0 });
+        const cancelled = fromEsunOrderResult(measuredRow({ cel_qty: 0.002, cel_qty_share: 2, celable: '2' }), account)!;
+        expect(cancelled.order).toMatchObject({ id: 'P0E031V0', quantity: 2 });
+        expect(cancelled.status).toMatchObject({ status: 'Cancelled', cancel_quantity: 2, deal_quantity: 0 });
     });
 });
 

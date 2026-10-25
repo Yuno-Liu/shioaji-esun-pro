@@ -467,8 +467,13 @@ export function fromEsunOrderResponse(
 ): Trade {
     const retCode = esunRetCode(res) ?? '';
     const retMsg = esunRetMessage(res);
-    const ordNo = String(res.ord_no ?? res.ordNo ?? '').trim();
-    const orderId = esunOrderId(res);
+    const rawOrdNo = String(res.ord_no ?? res.ordNo ?? '').trim();
+    // 預約單（ord_type 1）的 SDK 回應把預約單編號放在 ord_no。新版 bridge 已改為 pre_ord_no、ord_no 空白；
+    // 舊版 bridge 原樣轉送時，ord_no 是預約單編號而非委託書號（刪改單不得當成 ordNo 送出）
+    const legacyReservation = String(res.ord_type ?? res.ordType ?? '').trim() === '1'
+        && !String(res.pre_ord_no ?? res.preOrdNo ?? '').trim();
+    const ordNo = legacyReservation ? '' : rawOrdNo;
+    const orderId = legacyReservation ? rawOrdNo : esunOrderId(res);
     const failed = isEsunFailureCode(retCode);
 
     const orderResult: OrderResult = {

@@ -430,3 +430,117 @@ describe('authoritative read of a row whose failure the latest snapshot did not 
         }
     });
 });
+
+/** 興櫃委託 E0001（bridge 快取／委託查詢列：1000 股） */
+function emgRow(over: Record<string, unknown> = {}): Trade {
+    return row({ ord_no: 'E0001', stock_no: '6488', ap_code: '4', od_price: 25, org_qty: 1, org_qty_share: 1000, ...over });
+}
+
+/**
+ * bridge SSE 的一筆回報經 stream.ts 的轉換：可投影時為回報，興櫃缺股數欄位（unit-unknown）時為
+ * 只有權威讀取能解除的 untrackable 訊號
+ */
+function esunEvent(event: 'order' | 'deal', over: Record<string, unknown>): { report?: OrderEventReport; signal?: unknown } {
+    reportSeq += 1;
+    const result = toEsunReportWire(event, {
+        event_id: `boot1-${100 + reportSeq}`, report_stream: event, report_seq: reportSeq, session_generation: 1,
+        ts: '2026-10-23T09:07:00+08:00', environment: 'PRODUCTION', account: { broker_id: '8840', account_id: '1234567' },
+        ord_date: '20261023', ord_time: '090700000', ord_no: 'C0001', pre_ord_no: '', stock_no: '2884', buy_sell: 'B',
+        ap_code: '1', price_flag: '0', bs_flag: 'R', trade: '0', err_code: '00000000', err_msg: '', ...over,
+    }, { environment: 'PRODUCTION', account, lookup: id => {
+        const t = store.getTradingState().trades.find(r => r.order.id === id);
+        return t && { id: t.order.id, quantity: t.order.quantity, dealQuantity: t.status.deal_quantity, cancelQuantity: t.status.cancel_quantity, price: t.order.price };
+    } });
+    if (result.kind === 'report') return { report: normalizeOrderEvent(result.wire)! };
+    if (result.reason !== 'unit-unknown') throw new Error(result.reason);
+    return { signal: { kind: 'untrackable', deal: event === 'deal', authoritativeOnly: { orderId: result.orderId } } };
+}
+const emg = () => store.getTradingState().trades.find(t => t.order.id === 'E0001')!;
+/** 興櫃委託回報（實測形狀：只有 *_qty，沒有 *_qty_share） */
+const emgAckFields = { ord_no: 'E0001', stock_no: '6488', ap_code: '4', od_price: 25, org_qty: '1000', mat_qty: '0' };
+/** 經上游 stream.ts 的回報帳本（跳號偵測）再送進 trading-state，與 publishStreamEvent('order_event') 相同 */
+async function emitAdmitted(report: OrderEventReport) {
+    const { reportLedger } = await import('../report-ledger');
+    reportLedger.admit({ base: 'http://fixture.invalid', simulation: undefined }, report.eventId, report.kind);
+    await emit(report);
+}
+/** 整股委託 C0001 的一筆無變化 ACK（推進委託回報序號） */
+const plainAck = () => esunEvent('order', { op_type: 'New', od_price: 25.5, org_qty: 5, org_qty_share: 5000, mat_qty: 0, mat_qty_share: 0, cel_qty: 0, cel_qty_share: 0 });
+
+describe('emerging-stock reports without share fields (PB8)', () => {
+    beforeEach(async () => {
+        // 權威讀取帶一筆興櫃列
+        mocks.trades.mockReset().mockResolvedValue([row(), emgRow()]);
+        await act(async () => { vi.advanceTimersByTime(1600); await store.refreshTradingState(); });
+        expect(emg().status).toMatchObject({ status: 'Submitted', cancel_quantity: 0 });
+        expect(emg().order.quantity).toBe(1000);
+    });
+
+    it('keeps an orders reason naming the order through a gap-triggered cache rebuild; only an authoritative read clears it', async () => {
+        await emitAdmitted(plainAck().report!);
+        // 他處刪除興櫃委託：ACK 不帶股數欄位，不投影
+        const skipped = esunEvent('order', { ...emgAckFields, op_type: 'Cancel', cel_qty: '1000' });
+        expect(skipped.report).toBeUndefined();
+        await signal(skipped.signal);
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.esunUnitUnknownMessage('E0001'));
+        expect(reasons('positions')).toEqual([]);
+        // 被略過的回報讓下一筆看起來跳號 → 健康檢查全部 Healthy → 快取重建（bridge 快取同樣沒套用這筆）
+        mocks.trades.mockClear();
+        await emitAdmitted(plainAck().report!);
+        await idle();
+        expect(mocks.trades).toHaveBeenCalledWith('S', expect.anything(), { refresh: false });
+        expect(reasons('orders')).not.toContain('sequence-gap');
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(store.getTradingState().queries.orders.error).toContain('E0001');
+        expect(emg().status.status).toBe('Submitted');
+        // 權威讀取以券商快照為準並解除
+        mocks.trades.mockReset().mockResolvedValue([row(), emgRow({ cel_qty: 1, cel_qty_share: 1000 })]);
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+        expect(emg().status).toMatchObject({ status: 'Cancelled', cancel_quantity: 1000 });
+    });
+
+    it('also keeps a positions reason for a fill (MAT) through a resync cache rebuild, until an authoritative read', async () => {
+        const skipped = esunEvent('deal', { ord_no: 'E0001', stock_no: '6488', ap_code: '4', mat_price: 25, mat_qty: '1000', mkt_seq_num: '000501' });
+        expect(skipped.report).toBeUndefined();
+        await signal(skipped.signal);
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(reasons('positions')).toContain('snapshot-boundary');
+        expect(store.getTradingState().queries.positions.error).toContain('E0001');
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(mocks.trades).toHaveBeenLastCalledWith('S', expect.anything(), { refresh: false });
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        expect(reasons('positions')).toContain('snapshot-boundary');
+        expect(emg().status.deal_quantity).toBe(0);
+        mocks.trades.mockReset().mockResolvedValue([row(), emgRow({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25 })]);
+        await act(async () => { vi.advanceTimersByTime(1600); await store.refreshTradingState(); });
+        expect(reasons('orders')).toEqual([]);
+        expect(reasons('positions')).toEqual([]);
+        expect(emg().status).toMatchObject({ status: 'Filled', deal_quantity: 1000 });
+    });
+
+    it('raises the same reason for a failed ACK without share fields, which no cache rebuild clears (PB8-4)', async () => {
+        const skipped = esunEvent('order', { ...emgAckFields, op_type: 'Unknown', err_code: '00000123', err_msg: '委託已失效' });
+        expect(skipped.report).toBeUndefined();
+        await signal(skipped.signal);
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.esunUnitUnknownMessage('E0001'));
+        // bridge 的背景權威查詢完成後的快取重建不會解除
+        await signal({ kind: 'resync', reason: 'failed_ack_refreshed', cacheRefreshed: true });
+        expect(mocks.trades).toHaveBeenLastCalledWith('S', expect.anything(), { refresh: false });
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        expect(emg().status.status).toBe('Submitted');
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+    });
+
+    it('projects emerging-stock reports carrying the share fields without a reason', async () => {
+        const cancel = esunEvent('order', { ...emgAckFields, op_type: 'Cancel', org_qty: '1', org_qty_share: '1000', mat_qty_share: 0, cel_qty: '1', cel_qty_share: '1000' });
+        expect(cancel.signal).toBeUndefined();
+        await emit(cancel.report!);
+        expect(emg().status).toMatchObject({ status: 'Cancelled', cancel_quantity: 1000 });
+        expect(reasons('orders')).toEqual([]);
+        expect(reasons('positions')).toEqual([]);
+    });
+});
