@@ -204,6 +204,7 @@ Linux 主機請確認設定檔與 `certs/esun_cert.p12` 對其他使用者可讀
 | 登入鎖帳（`AGA0000`） | 連續密碼錯誤 3 次鎖帳 | 單次熔斷：登入失敗後鎖定（`loginLocked`），不自動重試；熔斷狀態寫入 `ESUN_STATE_DIR`（Docker 為具名 volume），容器重啟後不會再自動登入，須修正後手動重連 |
 | 登入頻率（`AGR0000`） | 每分鐘 10 次 | 滑動視窗限流；觸發後冷卻 60 秒 |
 | 每日登入（`AGR0004`） | 每日 300 次 | 每日累計計數 |
+| 登入 token 換日失效 | 台北換日後舊登入失效（WebSocket 1011 `Token Validation Error`、SDK `A0000x: response parse Error`） | 判定依「登入開始時間」（`client.login()` 前記錄）：早於「今日 00:00 ＋ `ESUN_AUTO_RELOGIN_NOT_BEFORE`（預設 00:05）」的 session 視為換日前 session（含 23:59:59 開始、午夜後才完成，以及 00:00–00:05 間完成的登入）。換日前 session 收到 WebSocket token 錯誤或 SDK 回應解析失敗時判定失效；之後才登入的 session 收到 token 錯誤屬「日間失效」（可能在其他地方重新登入），**不自動重新登入**，health 要求手動重連，以免踢掉其他工具的登入。失效後 health 改回 `loggedIn: false`、`sessionExpired: true`；委託在呼叫 SDK 前即以 503 `ESUN_SESSION_EXPIRED`（`not_sent`）拒絕，查詢回 503；舊 WebSocket 停止重連；已在 SDK 呼叫中的委託維持 `accepted`／`unknown`。換日型失效自動重新登入（`ESUN_AUTO_RELOGIN=0` 可停用）：第一次在 max(偵測＋2 秒, 今日 00:05) ＋ 0–60 秒隨機延遲（`ESUN_AUTO_RELOGIN_JITTER_SECONDS`）；只有明確未送出的網路失敗（DNS、connection refused、unreachable）與 AGR0000（至少等完冷卻）依 2／5／10 分鐘重試（`ESUN_AUTO_RELOGIN_RETRY_MINUTES`）；可能已送達伺服器的失敗（timeout、EOF、502／503／504）同一次失效最多 2 次嘗試。只有明確的憑證錯誤（AGA0000、密碼、憑證）才啟動持久熔斷；無法辨識的回應（含 `A0000x: response parse Error`、SDK 核心 panic）改為 `autoRelogin.state: paused`，不寫熔斷與指紋，按「重新連線」即可手動登入。手動登入路徑的分類維持 fail-safe（無法辨識一律視為憑證錯誤）。每次嘗試記錄時間與結果 |
 | 委託頻率（`AGR0002`） | 每秒 20 筆 | 限制 18 筆／秒 |
 | 每日委託（`AGR0001`） | 每日 2,000 筆 | 新單、改價、改量、刪單合計計數 |
 | 委託數量 | 整股 499 張／零股 999 股 | 前端與橋接都先檢查 |

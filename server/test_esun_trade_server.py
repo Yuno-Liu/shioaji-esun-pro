@@ -30,6 +30,7 @@ import http.client
 import io
 import json
 import os
+import random
 import tempfile
 import threading
 import time
@@ -4240,6 +4241,935 @@ class TestGracefulShutdownMutations(_BridgeCase):
         finally:
             release.set()
             worker.join(5)
+
+
+class _TaipeiClock:
+    """Replacement for bridge_module.taipei_now (taipei_today follows it): a settable, fixed Taipei time."""
+
+    def __init__(self, fixed: datetime.datetime):
+        self.fixed = fixed
+
+    def set(self, value: datetime.datetime) -> None:
+        self.fixed = value
+
+    def __call__(self) -> datetime.datetime:
+        return self.fixed
+
+
+class TestAutoReloginPolicy(unittest.TestCase):
+    """Pure policy helpers: failure classification and the ESUN_AUTO_RELOGIN_* settings."""
+
+    PARSE_ERROR = 'A00001: response parse Error, use env variable "ESUN_DEBUG=true" to see more'
+
+    def test_auto_path_classification(self):
+        classify = bridge_module.classify_auto_relogin_error
+        cases = {
+            self.PARSE_ERROR: "unknown",
+            "A00002: Response Parse Error": "unknown",
+            "something nobody has seen before": "unknown",
+            "AGA0000 密碼錯誤": "credential",
+            "PasswordError: wrong password": "credential",
+            "CertExpiredError": "credential",
+            "憑證密碼錯誤": "credential",
+            "AGR0004 已達每日登入上限": "daily_limit",
+            "AGR0000 登入頻率超限": "rate_limited",
+            "error sending request for url: operation timed out": "network_maybe_sent",
+            "unexpected EOF": "network_maybe_sent",
+            "HTTP 503 Service Unavailable": "network_maybe_sent",
+            "HTTP 502 Bad Gateway": "network_maybe_sent",
+            "error sending request: connection reset by peer": "network_maybe_sent",
+            "error sending request": "network_maybe_sent",  # generic: may have arrived
+            "error trying to connect: dns error: failed to lookup address": "network_unsent",
+            "tcp connect error: Connection refused (os error 111)": "network_unsent",
+            "Network is unreachable (os error 101)": "network_unsent",
+        }
+        for message, expected in cases.items():
+            self.assertEqual(classify(message), expected, message)
+        self.assertEqual(classify("called `Option::unwrap()` on a `None` value", panic=True), "unknown")
+        self.assertEqual(classify("PanicException: AGA0000 密碼錯誤", panic=True), "credential")
+
+    def test_manual_path_classification_stays_fail_safe(self):
+        classify = bridge_module.classify_login_error
+        self.assertEqual(classify(self.PARSE_ERROR), "credential")
+        self.assertEqual(classify("something nobody has seen before"), "credential")
+        self.assertEqual(classify("AGA0000 密碼錯誤"), "credential")
+        self.assertEqual(classify("error sending request: connection refused"), "network")
+
+    def test_settings_from_environment(self):
+        self.assertEqual(bridge_module.auto_relogin_not_before({}), datetime.timedelta(minutes=5))
+        self.assertEqual(bridge_module.auto_relogin_not_before({"ESUN_AUTO_RELOGIN_NOT_BEFORE": "00:10"}),
+                         datetime.timedelta(minutes=10))
+        self.assertEqual(bridge_module.auto_relogin_not_before({"ESUN_AUTO_RELOGIN_NOT_BEFORE": "00:01:30"}),
+                         datetime.timedelta(minutes=1, seconds=30))
+        for invalid in ("5", "0:75", "abc", "13:00", "-1:00"):
+            self.assertEqual(bridge_module.auto_relogin_not_before({"ESUN_AUTO_RELOGIN_NOT_BEFORE": invalid}),
+                             datetime.timedelta(minutes=5), invalid)
+
+        self.assertEqual(bridge_module.auto_relogin_jitter_seconds({}), 60.0)
+        self.assertEqual(bridge_module.auto_relogin_jitter_seconds({"ESUN_AUTO_RELOGIN_JITTER_SECONDS": "0"}), 0.0)
+        self.assertEqual(bridge_module.auto_relogin_jitter_seconds({"ESUN_AUTO_RELOGIN_JITTER_SECONDS": "15"}), 15.0)
+        for invalid in ("-1", "nan", "x", "100000"):
+            self.assertEqual(bridge_module.auto_relogin_jitter_seconds({"ESUN_AUTO_RELOGIN_JITTER_SECONDS": invalid}),
+                             60.0, invalid)
+
+        self.assertEqual(bridge_module.auto_relogin_retry_delays({}), (120.0, 300.0, 600.0))
+        self.assertEqual(bridge_module.auto_relogin_retry_delays({"ESUN_AUTO_RELOGIN_RETRY_MINUTES": "1, 3"}),
+                         (60.0, 180.0))
+        for invalid in ("0", "a,b", "1,-2", "1,2,3,4,5,6", "1000"):
+            self.assertEqual(bridge_module.auto_relogin_retry_delays({"ESUN_AUTO_RELOGIN_RETRY_MINUTES": invalid}),
+                             (120.0, 300.0, 600.0), invalid)
+
+
+class TestSessionExpiryAndAutoRelogin(_BridgeCase):
+    """
+    E.SUN invalidates the login token at the Taipei day change: detect, refuse, re-login once.
+    The bridge's Taipei clock (taipei_now, and with it taipei_today) is fixed per test.
+    """
+
+    TOKEN_ERROR = "Connection closed (code 1011): Token Validation Error"
+    PARSE_ERROR = 'A00001: response parse Error, use env variable "ESUN_DEBUG=true" to see more'
+
+    def setUp(self):
+        super().setUp()
+        self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
+        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1"},
+                     "expected_environment": "SIMULATION", "expected_account": "1234567"}
+        self.mutation_body = {**self.body, "order_no": "O0001", "price": 951.0,
+                              "cancel_quantity": 1, "quantity_unit": "lot"}
+        interval = mock.patch.object(bridge_module, "ORDERS_REFRESH_MIN_INTERVAL_SECONDS", 0.2)
+        interval.start()
+        self.addCleanup(interval.stop)
+        self.today = datetime.datetime.now(bridge_module.TAIPEI_TZ).date()
+        self.yesterday = self.today - datetime.timedelta(days=1)
+        self.clock = _TaipeiClock(self._at(self.today, 10, 0))
+        clock_patch = mock.patch.object(bridge_module, "taipei_now", self.clock)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
+
+    @staticmethod
+    def _at(day, hour, minute, second=0):
+        return datetime.datetime.combine(day, datetime.time(hour, minute, second), tzinfo=bridge_module.TAIPEI_TZ)
+
+    def _bridge(self, factory=None, initial_delay=0.0, retry_delays=(0.05, 0.05, 0.05), **kwargs):
+        factory = factory or RecordingFactory()
+        bridge = self.make_bridge(self.sim, factory, **kwargs)
+        bridge.auto_relogin_initial_delay = initial_delay
+        bridge.auto_relogin_retry_delays = retry_delays
+        bridge.auto_relogin_jitter = 0.0
+        if factory.instances:  # the startup bootstrap query has run (keeps SDK call counters stable)
+            self.assertTrue(_wait_until(lambda: factory.instances[-1].orders_calls >= 1))
+        return bridge, factory
+
+    def _rollover_bridge(self, **kwargs):
+        """Logged in yesterday 10:00; the clock now reads today 10:00 (the session predates the day change)."""
+        self.clock.set(self._at(self.yesterday, 10, 0))
+        bridge, factory = self._bridge(**kwargs)
+        self.clock.set(self._at(self.today, 10, 0))
+        return bridge, factory
+
+    @contextlib.contextmanager
+    def _next_day(self):
+        previous = self.clock.fixed
+        self.clock.set(previous + datetime.timedelta(days=1))
+        try:
+            yield
+        finally:
+            self.clock.set(previous)
+
+    @staticmethod
+    def _instant_sleep(bridge, waits=None):
+        """Replaces the worker's wait: records the delay, never sleeps."""
+        def fake(generation, delay):
+            if waits is not None:
+                waits.append(delay)
+            return bridge._relogin_should_stop(generation)
+        bridge._relogin_sleep = fake
+
+    def _assert_mutations_not_sent(self, bridge, sdk):
+        spies = {name: mock.patch.object(sdk, name, wraps=getattr(sdk, name))
+                 for name in ("place_order", "modify_price", "cancel_order", "get_order_results")}
+        started = {name: patcher.start() for name, patcher in spies.items()}
+        try:
+            orders_today = bridge.order_mutation_daily.get_count()
+            for call in (bridge.place_order, bridge.replace_price, bridge.replace_qty, bridge.cancel_order):
+                res, code = call(dict(self.mutation_body))
+                self.assertEqual((code, res["outcome"], res["code"]), (503, "not_sent", "ESUN_SESSION_EXPIRED"),
+                                 call.__name__)
+                self.assertFalse(res["ok"])
+                self.assertIn("委託未送出", res["error"])
+                self.assertIn("玉山登入已失效", res["error"])
+            for name, spy in started.items():
+                self.assertFalse(spy.called, name)
+            self.assertEqual(bridge.order_mutation_daily.get_count(), orders_today)
+        finally:
+            for patcher in spies.values():
+                patcher.stop()
+
+    def _session_events(self, events, timeout=0.3):
+        return [e["data"] for e in _drain(events, timeout=timeout) if e["event"] == "session"]
+
+    def test_ws_token_error_expires_session_and_schedules_one_relogin(self):
+        bridge, factory = self._rollover_bridge(initial_delay=0.4)
+        worker_calls = []
+        original_worker = bridge._auto_relogin_worker
+
+        def counting_worker(generation, delay):
+            worker_calls.append(generation)
+            return original_worker(generation, delay)
+
+        bridge._auto_relogin_worker = counting_worker
+        events = bridge.sse_fanout.register()
+        old_sdk = factory.instances[0]
+        old_generation = bridge.session.generation
+        self.assertTrue(_wait_until(lambda: old_sdk.ws_connect_calls == 1))
+
+        # The broker rejects the token: error + close(1011) repeated.
+        old_sdk.callbacks["error"](Exception(self.TOKEN_ERROR))
+        old_sdk.callbacks["close"](None, 1011, "Token Validation Error")
+        old_sdk.callbacks["error"](self.TOKEN_ERROR)
+        # A query on the expired session is answered without calling the SDK.
+        with mock.patch.object(old_sdk, "get_trade_status", side_effect=Exception(self.PARSE_ERROR)) as trade_status:
+            data, status = bridge.get_trade_status()
+        self.assertEqual((status, data["code"]), (503, "ESUN_SESSION_EXPIRED"))
+        trade_status.assert_not_called()
+
+        health = bridge.get_health()
+        self.assertFalse(health["loggedIn"])
+        self.assertTrue(health["sessionExpired"])
+        self.assertIsNotNone(health["sessionExpiredAt"])
+        self.assertEqual(health["sessionExpiredReason"], "ws_token")
+        self.assertIn("正在重新登入", health["loginError"])
+        self.assertIn(health["autoRelogin"]["state"], ("pending", "running"))
+        self.assertFalse(health["manualReconnectRequired"])
+        self.assertFalse(health["wsConnected"])
+        self.assertEqual(health["sessionGeneration"], old_generation)
+
+        self.assertTrue(_wait_until(lambda: bridge.session.generation != old_generation, timeout=5))
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["autoRelogin"]["state"] == "succeeded"))
+        time.sleep(0.3)
+        self.assertEqual(worker_calls, [old_generation])  # scheduled exactly once
+        self.assertEqual(factory.login_calls, 2)  # startup + one re-login
+        health = bridge.get_health()
+        self.assertTrue(health["loggedIn"])
+        self.assertFalse(health["sessionExpired"])
+        self.assertIsNone(health["sessionExpiredAt"])
+        self.assertIsNone(health["loginError"])
+        self.assertGreater(health["sessionGeneration"], old_generation)
+
+        # The new session took over the WebSocket; the old one never reconnected.
+        new_sdk = factory.instances[1]
+        self.assertTrue(_wait_until(lambda: new_sdk.ws_connect_calls == 1))
+        self.assertEqual(old_sdk.ws_connect_calls, 1)
+
+        session_events = self._session_events(events, timeout=0.5)
+        reasons = [e["reason"] for e in session_events]
+        self.assertEqual(reasons.count("session_expired"), 1)
+        expired_event = session_events[reasons.index("session_expired")]
+        self.assertFalse(expired_event["loggedIn"])
+        self.assertTrue(expired_event["sessionExpired"])
+        self.assertFalse(expired_event["ok"])
+        self.assertEqual(expired_event["generation"], old_generation)
+        relogin_event = session_events[reasons.index("auto_relogin")]
+        self.assertTrue(relogin_event["loggedIn"])
+        self.assertFalse(relogin_event["sessionExpired"])
+        self.assertEqual(relogin_event["generation"], bridge.session.generation)
+        self.assertLess(reasons.index("session_expired"), reasons.index("auto_relogin"))
+
+    def test_trade_status_parse_error_after_day_change_reaches_sdk_and_expires_session(self):
+        bridge, factory = self._bridge()
+        bridge.auto_relogin = False
+        sdk = factory.instances[0]
+        self.assertTrue(bridge.get_health()["loggedIn"])  # not expired beforehand: the SDK is really called
+        with self._next_day(), mock.patch.object(
+            sdk, "get_trade_status", side_effect=Exception(self.PARSE_ERROR)
+        ) as trade_status:
+            data, status = bridge.get_trade_status()
+        trade_status.assert_called_once()
+        self.assertEqual((status, data["code"]), (503, "ESUN_SESSION_EXPIRED"))
+        health = bridge.get_health()
+        self.assertTrue(health["sessionExpired"])
+        self.assertEqual(health["sessionExpiredReason"], "date_rollover")
+        self.assertIn("換日", health["loginError"])
+
+    def test_parse_error_expires_session_only_after_the_day_change(self):
+        bridge, factory = self._bridge()
+        bridge.auto_relogin = False
+        sdk = factory.instances[0]
+
+        # Same Taipei day: an ordinary SDK failure (existing handling, session stays usable).
+        with mock.patch.object(sdk, "get_trade_status", side_effect=Exception(self.PARSE_ERROR)) as trade_status:
+            data, status = bridge.get_trade_status()
+        trade_status.assert_called_once()
+        self.assertEqual((status, data["code"]), (502, "TRADE_STATUS_ERROR"))
+        with mock.patch.object(sdk, "get_order_results", side_effect=Exception(self.PARSE_ERROR)):
+            with self.assertRaises(EsunQueryError) as ctx:
+                bridge.get_orders(refresh=True)
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (502, "ORDERS_QUERY_ERROR"))
+        health = bridge.get_health()
+        self.assertTrue(health["loggedIn"])
+        self.assertFalse(health["sessionExpired"])
+
+        # Logged in on an earlier Taipei day: the parse error means the token was invalidated.
+        with self._next_day():
+            with mock.patch.object(sdk, "get_market_status", side_effect=Exception(self.PARSE_ERROR)) as market:
+                data, status = bridge.get_market_status()
+            market.assert_called_once()
+            self.assertEqual((status, data["code"]), (503, "ESUN_SESSION_EXPIRED"))
+            health = bridge.get_health()
+        self.assertFalse(health["loggedIn"])
+        self.assertTrue(health["sessionExpired"])
+        self.assertEqual(health["sessionExpiredReason"], "date_rollover")
+        self.assertIn("換日", health["loginError"])
+        self.assertEqual(health["autoRelogin"]["state"], "disabled")
+        self.assertEqual(factory.login_calls, 1)
+
+    def test_orders_query_parse_error_after_day_change_expires_session(self):
+        bridge, factory = self._bridge()
+        bridge.auto_relogin = False
+        sdk = factory.instances[0]
+        with self._next_day(), mock.patch.object(sdk, "get_order_results", side_effect=Exception(self.PARSE_ERROR)):
+            with self.assertRaises(EsunQueryError) as ctx:
+                bridge.get_orders(refresh=True)
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (503, "ESUN_SESSION_EXPIRED"))
+        self.assertTrue(bridge.get_health()["sessionExpired"])
+
+    def test_mutation_parse_error_after_day_change_stays_unknown_then_blocks(self):
+        bridge, factory = self._bridge()
+        bridge.auto_relogin = False
+        sdk = factory.instances[0]
+        with self._next_day(), mock.patch.object(sdk, "place_order", side_effect=Exception("A00002: response parse Error")):
+            res, status = bridge.place_order(dict(self.body))
+        # The request may have reached the broker: still outcome unknown, never retried blindly.
+        self.assertEqual((status, res["outcome"], res["code"]), (502, "unknown", "ESUN_OUTCOME_UNKNOWN"))
+        self.assertTrue(bridge.get_health()["sessionExpired"])
+        self._assert_mutations_not_sent(bridge, sdk)
+
+    def test_mutation_in_flight_when_session_expires_is_never_reported_not_sent(self):
+        for raise_after in (False, True):
+            with self.subTest(raise_after=raise_after):
+                bridge, factory = self._bridge()
+                bridge.auto_relogin = False
+                sdk = factory.instances[0]
+                entered, release = threading.Event(), threading.Event()
+                original = sdk.place_order
+
+                def slow_place(order_obj, _original=original):
+                    entered.set()
+                    release.wait(5)
+                    if raise_after:
+                        raise Exception("A00002: response parse Error")
+                    return _original(order_obj)
+
+                results = []
+                with mock.patch.object(sdk, "place_order", side_effect=slow_place):
+                    thread = threading.Thread(target=lambda: results.append(bridge.place_order(dict(self.body))))
+                    thread.start()
+                    self.assertTrue(entered.wait(5))
+                    # Another thread learns the token is invalid while the SDK call is in progress.
+                    self.assertTrue(bridge._mark_session_expired(bridge.session, "ws_token", self.TOKEN_ERROR))
+                    release.set()
+                    thread.join(5)
+                res, status = results[0]
+                self.assertNotEqual(res["outcome"], "not_sent")
+                if raise_after:
+                    self.assertEqual((status, res["outcome"], res["code"]), (502, "unknown", "ESUN_OUTCOME_UNKNOWN"))
+                else:
+                    self.assertEqual((status, res["outcome"]), (200, "accepted"))
+                    self.assertEqual(len(sdk.placed_orders), 1)
+                self.assertTrue(bridge.get_health()["sessionExpired"])
+                self._assert_mutations_not_sent(bridge, sdk)
+
+    def test_mutations_and_queries_are_refused_without_sdk_calls_while_expired(self):
+        bridge, factory = self._bridge()
+        bridge.auto_relogin = False
+        sdk = factory.instances[0]
+        session = bridge.session
+        sdk.callbacks["error"](self.TOKEN_ERROR)
+        self._assert_mutations_not_sent(bridge, sdk)
+
+        counters = ("orders_calls", "balance_calls", "inventories_calls", "settlements_calls",
+                    "profit_loss_calls", "trade_status_calls", "market_status_calls")
+        before = {name: getattr(sdk, name) for name in counters}
+        for refresh in (False, True):
+            with self.assertRaises(EsunQueryError) as ctx:
+                bridge.get_orders(refresh=refresh)
+            self.assertEqual((ctx.exception.status, ctx.exception.code), (503, "ESUN_SESSION_EXPIRED"))
+        for fn in (bridge.get_balance, bridge.get_inventories, bridge.get_settlements,
+                   bridge.get_trade_status, bridge.get_market_status):
+            data, status = fn()
+            self.assertEqual((status, data["code"]), (503, "ESUN_SESSION_EXPIRED"), fn.__name__)
+            self.assertFalse(data["ok"])
+        data, status = bridge.get_profit_loss(None, None)
+        self.assertEqual((status, data["code"]), (503, "ESUN_SESSION_EXPIRED"))
+        self.assertEqual({name: getattr(sdk, name) for name in counters}, before)
+
+        # A request prepared before the expiry is refused right before the SDK call.
+        call = mock.Mock(return_value={"ret_code": "000000"})
+        res, status = bridge._call_sdk_mutation(session, "下單", call)
+        self.assertEqual((status, res["outcome"], res["code"]), (503, "not_sent", "ESUN_SESSION_EXPIRED"))
+        call.assert_not_called()
+
+    def test_auto_relogin_success_restores_order_placement(self):
+        bridge, factory = self._rollover_bridge(initial_delay=0.3)
+        old_sdk = factory.instances[0]
+        old_generation = bridge.session.generation
+        old_sdk.callbacks["close"](None, 1011, b"Token Validation Error")
+        res, status = bridge.place_order(dict(self.body))
+        self.assertEqual((status, res["outcome"], res["code"]), (503, "not_sent", "ESUN_SESSION_EXPIRED"))
+        self.assertIn("正在重新登入", res["error"])
+
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["loggedIn"], timeout=5))
+        self.assertGreater(bridge.session.generation, old_generation)
+        res, status = bridge.place_order(dict(self.body))
+        self.assertEqual((status, res["outcome"]), (200, "accepted"))
+        self.assertEqual(res["sessionGeneration"], bridge.session.generation)
+        self.assertEqual(len(factory.instances[1].placed_orders), 1)
+        self.assertEqual(old_sdk.placed_orders, [])
+
+    def test_relogin_session_expiring_again_is_not_relogged_automatically(self):
+        bridge, factory = self._rollover_bridge()
+        self.clock.set(self._at(self.today, 0, 1))  # re-login inside the grace: also a "yesterday" session
+        self._instant_sleep(bridge)
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["loggedIn"], timeout=5))
+        self.assertTrue(bridge._session_predates_rollover(bridge.session))  # the loop guard is what stops it
+        factory.instances[1].callbacks["error"](self.TOKEN_ERROR)
+        time.sleep(0.3)
+        self.assertEqual(factory.login_calls, 2)
+        health = bridge.get_health()
+        self.assertFalse(health["loggedIn"])
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertEqual(health["autoRelogin"]["state"], "manual_required")
+        self.assertIn("隨即再次失效", health["autoRelogin"]["lastError"])
+
+    def test_credential_failure_trips_breaker_and_is_not_retried(self):
+        bridge, factory = self._rollover_bridge()
+        factory.login_fail_msg = "AGA0000 密碼錯誤"
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["autoRelogin"]["state"] == "manual_required", timeout=5))
+        time.sleep(0.3)  # longer than every retry delay of this bridge
+        self.assertEqual(factory.login_calls, 2)  # startup + exactly one re-login attempt
+        self.assertTrue(bridge.login_locked)
+        health = bridge.get_health()
+        self.assertFalse(health["loggedIn"])
+        self.assertTrue(health["loginLocked"])
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertEqual(health["autoRelogin"]["attempts"], 1)
+        self.assertIn("手動重新登入", health["loginError"])
+        self._assert_mutations_not_sent(bridge, factory.instances[0])
+        # The same credentials stay refused for a manual reconnect without force (breaker + fingerprint).
+        bridge.last_reconnect_time = 0.0
+        ok, body, code = bridge.reconnect()
+        self.assertEqual((ok, code, body["code"]), (False, 423, "ESUN_CREDENTIALS_UNCHANGED"))
+
+    def test_unrecognized_failure_pauses_without_breaker_and_manual_reconnect_works(self):
+        bridge, factory = self._rollover_bridge()
+        events = bridge.sse_fanout.register()
+        old_generation = bridge.session.generation
+        factory.login_fail_msg = self.PARSE_ERROR
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["autoRelogin"]["state"] == "paused", timeout=5))
+        time.sleep(0.3)  # longer than every retry delay of this bridge: never retried
+        self.assertEqual(factory.login_calls, 2)
+        self.assertFalse(bridge.login_locked)
+        with open(os.path.join(self.state_dir, "esun-login-state.json"), encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertFalse(state["credentialLocked"])
+        self.assertFalse(bridge.login_state.fingerprint_matches(_credential_material_of(self.sim)))
+        health = bridge.get_health()
+        self.assertFalse(health["loggedIn"])
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertFalse(health["loginLocked"])
+        self.assertEqual(health["autoRelogin"]["attempts"], 1)
+        self.assertIn("A00001", health["autoRelogin"]["lastError"])
+        self.assertIn("自動重新登入失敗（無法辨識的回應：", health["loginError"])
+        self.assertIn("請按「重新連線」手動登入", health["loginError"])
+        reasons = [e["reason"] for e in self._session_events(events)]
+        self.assertIn("auto_relogin_stopped", reasons)
+        self.assertTrue(_wait_until(lambda: bridge._relogin_thread is None))
+
+        # The frontend's reconnect (no force) logs in normally.
+        factory.login_fail_msg = None
+        bridge.last_reconnect_time = 0.0
+        ok, body, code = bridge.reconnect()
+        self.assertEqual((ok, code), (True, 200))
+        self.assertGreater(body["sessionGeneration"], old_generation)
+        health = bridge.get_health()
+        self.assertTrue(health["loggedIn"])
+        self.assertFalse(health["sessionExpired"])
+        self.assertFalse(health["manualReconnectRequired"])
+
+    def test_locked_breaker_blocks_auto_relogin(self):
+        bridge, factory = self._rollover_bridge()
+        bridge.login_state.record_credential_failure("AGA0000", "密碼錯誤", None)
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["autoRelogin"]["state"] == "manual_required", timeout=5))
+        self.assertEqual(factory.login_calls, 1)
+        self.assertIn("登入熔斷", bridge.get_health()["autoRelogin"]["lastError"])
+
+    def test_network_failure_retries_with_bounded_backoff(self):
+        self.assertEqual(bridge_module.AUTO_RELOGIN_RETRY_DELAYS_SECONDS, (120.0, 300.0, 600.0))
+        factory = RecordingFactory()
+        self.clock.set(self._at(self.yesterday, 10, 0))
+        bridge = self.make_bridge(self.sim, factory, websocket_enabled=False)
+        self.clock.set(self._at(self.today, 10, 0))
+        self.assertEqual(bridge.auto_relogin_retry_delays, (120.0, 300.0, 600.0))
+        self.assertEqual(bridge.auto_relogin_jitter, 60.0)
+        bridge.auto_relogin_rng = lambda: 0.5
+        factory.login_fail_msg = "error trying to connect: tcp connect error: Connection refused (os error 111)"
+        waits: list[float] = []
+        self._instant_sleep(bridge, waits)
+        bridge._mark_session_expired(bridge.session, "ws_token", self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(
+            lambda: bridge.get_health()["autoRelogin"]["state"] == "manual_required", timeout=5))
+        # First attempt: detection + 2 s (00:05 already passed) + 0.5 * 60 s jitter; then 2 / 5 / 10 minutes.
+        self.assertEqual(waits, [bridge_module.AUTO_RELOGIN_INITIAL_DELAY_SECONDS + 30.0, 120.0, 300.0, 600.0])
+        self.assertEqual(factory.login_calls, 1 + 4)  # one attempt + at most 3 retries
+        self.assertFalse(bridge.login_locked)
+        health = bridge.get_health()
+        self.assertFalse(health["loggedIn"])
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertEqual(health["autoRelogin"]["attempts"], 4)
+        self.assertEqual(health["autoRelogin"]["maxAttempts"], 4)
+        self.assertIn("Connection refused", health["autoRelogin"]["lastError"])
+        self.assertIn("手動重新登入", health["loginError"])
+
+    def test_failure_that_may_have_reached_the_server_allows_two_attempts(self):
+        for message in ("error sending request for url: operation timed out", "unexpected EOF",
+                        "HTTP 504 Gateway Timeout", "error sending request: connection reset by peer"):
+            with self.subTest(message=message):
+                bridge, factory = self._rollover_bridge(websocket_enabled=False)
+                factory.login_fail_msg = message
+                waits: list[float] = []
+                self._instant_sleep(bridge, waits)
+                bridge._mark_session_expired(bridge.session, "ws_token", self.TOKEN_ERROR)
+                self.assertTrue(_wait_until(
+                    lambda: bridge.get_health()["autoRelogin"]["state"] == "manual_required", timeout=5))
+                time.sleep(0.1)
+                self.assertEqual(factory.login_calls, 1 + 2)
+                self.assertEqual(len(waits), 2)
+                self.assertEqual(bridge.get_health()["autoRelogin"]["attempts"], 2)
+                self.assertFalse(bridge.login_locked)
+
+    def test_agr0000_retry_waits_out_the_cooldown(self):
+        # (a) the login guard refuses during the AGR0000 cooldown: wait at least the remaining cooldown.
+        bridge, factory = self._rollover_bridge(retry_delays=(5.0, 5.0, 5.0), websocket_enabled=False)
+        bridge.last_agr0000_time = time.time() - 10.0
+        waits: list[float] = []
+        self._instant_sleep(bridge, waits)
+        bridge._mark_session_expired(bridge.session, "ws_token", self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["autoRelogin"]["state"] == "manual_required", timeout=5))
+        self.assertEqual(factory.login_calls, 1)  # refused before any login request
+        self.assertEqual(len(waits), 4)
+        for wait in waits[1:]:
+            self.assertGreaterEqual(wait, 49.0)
+            self.assertLessEqual(wait, bridge_module.LOGIN_AGR0000_COOLDOWN_SECONDS)
+        self.assertIn("AGR0000", bridge.get_health()["autoRelogin"]["lastError"])
+
+        # (b) the per-minute login limiter answers retry_after.
+        bridge, factory = self._rollover_bridge(retry_delays=(5.0, 5.0, 5.0), websocket_enabled=False)
+        waits = []
+        self._instant_sleep(bridge, waits)
+        with mock.patch.object(bridge.reconnect_limiter, "acquire", return_value=False), \
+                mock.patch.object(bridge.reconnect_limiter, "time_until_available", return_value=42.0):
+            bridge._mark_session_expired(bridge.session, "ws_token", self.TOKEN_ERROR)
+            self.assertTrue(_wait_until(
+                lambda: bridge.get_health()["autoRelogin"]["state"] == "manual_required", timeout=5))
+        self.assertEqual(waits[1:], [42.0, 42.0, 42.0])
+        self.assertEqual(factory.login_calls, 1)
+
+        # (c) the broker answers AGR0000 to the login itself: wait the full cooldown.
+        bridge, factory = self._rollover_bridge(retry_delays=(5.0, 5.0, 5.0), websocket_enabled=False)
+        factory.login_fail_msg = "AGR0000 登入頻率超限"
+        waits = []
+        self._instant_sleep(bridge, waits)
+        bridge._mark_session_expired(bridge.session, "ws_token", self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["autoRelogin"]["state"] == "manual_required", timeout=5))
+        self.assertEqual(factory.login_calls, 2)  # later attempts are refused by the cooldown guard
+        self.assertEqual(waits[1], bridge_module.LOGIN_AGR0000_COOLDOWN_SECONDS)
+        for wait in waits[2:]:
+            self.assertGreaterEqual(wait, bridge_module.LOGIN_AGR0000_COOLDOWN_SECONDS - 2)
+        self.assertFalse(bridge.login_locked)
+
+    def test_first_relogin_waits_for_not_before_plus_jitter(self):
+        bridge, _ = self._bridge(auto_login=False)
+        bridge.auto_relogin_initial_delay = 2.0
+        bridge.auto_relogin_jitter = 60.0
+        just_after_midnight = self._at(self.today, 0, 0, 1)
+        for fraction, expected in ((0.0, 299.0), (1.0, 359.0), (0.5, 329.0), (7.0, 359.0), (-3.0, 299.0)):
+            bridge.auto_relogin_rng = lambda f=fraction: f
+            self.assertAlmostEqual(bridge._first_relogin_delay(just_after_midnight), expected)
+        bridge.auto_relogin_rng = lambda: 0.5
+        self.assertAlmostEqual(bridge._first_relogin_delay(self._at(self.today, 10, 0)), 32.0)
+        self.assertAlmostEqual(bridge._first_relogin_delay(self._at(self.today, 0, 4, 59)), 2.0 + 30.0)
+        bridge.auto_relogin_rng = random.random  # the production source of the jitter fraction
+        draws = [bridge._first_relogin_delay(just_after_midnight) for _ in range(200)]
+        self.assertTrue(all(299.0 <= d <= 359.0 for d in draws))
+
+        # Integration: an expiry detected at 00:00:01 is scheduled at 00:05:00 + jitter.
+        bridge, factory = self._rollover_bridge()
+        bridge.auto_relogin_jitter = 60.0
+        bridge.auto_relogin_rng = lambda: 0.25
+        self.clock.set(just_after_midnight)
+        entered, release, delays = threading.Event(), threading.Event(), []
+
+        def held_sleep(generation, delay):
+            delays.append(delay)
+            entered.set()
+            release.wait(5)
+            return True
+
+        bridge._relogin_sleep = held_sleep
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(entered.wait(5))
+        health = bridge.get_health()
+        self.assertEqual(health["autoRelogin"]["state"], "pending")
+        self.assertEqual(health["autoRelogin"]["nextAttemptAt"], self._at(self.today, 0, 5, 15).isoformat())
+        self.assertAlmostEqual(delays[0], 299.0 + 15.0)
+        release.set()
+        self.assertTrue(_wait_until(lambda: bridge._relogin_thread is None))
+        self.assertEqual(factory.login_calls, 1)
+
+    def test_settings_are_read_from_environment(self):
+        with mock.patch.dict(os.environ, {"ESUN_AUTO_RELOGIN_NOT_BEFORE": "00:10",
+                                          "ESUN_AUTO_RELOGIN_JITTER_SECONDS": "5",
+                                          "ESUN_AUTO_RELOGIN_RETRY_MINUTES": "1,3"}):
+            bridge = self.make_bridge(self.sim, RecordingFactory(), auto_login=False)
+        self.assertEqual(bridge.auto_relogin_not_before, datetime.timedelta(minutes=10))
+        self.assertEqual(bridge.auto_relogin_jitter, 5.0)
+        self.assertEqual(bridge.auto_relogin_retry_delays, (60.0, 180.0))
+        # The grace follows the same setting: a login at 00:08 still predates the day change.
+        self.clock.set(self._at(self.today, 0, 8))
+        self.assertTrue(_wait_until(lambda: bridge.attempt_initial_login()))
+        self.clock.set(self._at(self.today, 13, 0))
+        self.assertTrue(bridge._session_predates_rollover(bridge.session))
+        bridge.auto_relogin_rng = lambda: 1.0
+        self.assertAlmostEqual(bridge._first_relogin_delay(self._at(self.today, 0, 0, 1)), 599.0 + 5.0)
+        bridge = self.make_bridge(self.sim, RecordingFactory(), auto_login=False)
+        self.assertEqual(bridge.auto_relogin_not_before, datetime.timedelta(minutes=5))
+        self.assertEqual(bridge.auto_relogin_jitter, 60.0)
+        self.assertEqual(bridge.auto_relogin_retry_delays, (120.0, 300.0, 600.0))
+
+    def test_login_started_before_midnight_counts_as_previous_day_session(self):
+        factory = RecordingFactory()
+        clock = self.clock
+
+        class MidnightLoginSDK(MockSDK):
+            def login(self):
+                super().login()
+                clock.set(datetime.datetime.combine(
+                    clock.fixed.date() + datetime.timedelta(days=1), datetime.time(0, 0, 1), tzinfo=clock.fixed.tzinfo))
+
+        factory.mock_cls = MidnightLoginSDK
+        self.clock.set(self._at(self.yesterday, 23, 59, 59))
+        bridge, _ = self._bridge(factory)
+        bridge.auto_relogin_jitter = 0.0
+        session = bridge.session
+        self.assertEqual(session.login_started_at, self._at(self.yesterday, 23, 59, 59).isoformat())
+        self.assertEqual(session.logged_in_at, self._at(self.today, 0, 0, 1).isoformat())
+        self.assertEqual(self.clock.fixed, self._at(self.today, 0, 0, 1))
+        # The parse error right after midnight is a day-change expiry (the login began yesterday).
+        with mock.patch.object(factory.instances[0], "get_market_status", side_effect=Exception(self.PARSE_ERROR)) as market:
+            data, status = bridge.get_market_status()
+        market.assert_called_once()
+        self.assertEqual((status, data["code"]), (503, "ESUN_SESSION_EXPIRED"))
+        health = bridge.get_health()
+        self.assertEqual(health["sessionExpiredReason"], "date_rollover")
+        self.assertIn("換日", health["loginError"])
+        self.assertEqual(health["autoRelogin"]["state"], "pending")
+        self.assertEqual(health["autoRelogin"]["nextAttemptAt"], self._at(self.today, 0, 5).isoformat())
+        self.assertEqual(factory.login_calls, 1)
+
+    def test_login_finished_within_grace_counts_as_previous_day_session(self):
+        self.clock.set(self._at(self.today, 0, 3))
+        bridge, factory = self._bridge()
+        self.clock.set(self._at(self.today, 8, 0))
+        self._instant_sleep(bridge)
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["loggedIn"], timeout=5))
+        self.assertEqual(factory.login_calls, 2)
+
+    def test_intraday_token_error_is_not_relogged_automatically(self):
+        self.clock.set(self._at(self.today, 0, 10))
+        bridge, factory = self._bridge()
+        events = bridge.sse_fanout.register()
+        self.clock.set(self._at(self.today, 13, 0))
+        factory.instances[0].callbacks["close"](None, 1011, "Token Validation Error")
+        time.sleep(0.3)
+        self.assertEqual(factory.login_calls, 1)  # another tool's session is left alone
+        self.assertIsNone(bridge._relogin_thread)
+        health = bridge.get_health()
+        self.assertFalse(health["loggedIn"])
+        self.assertTrue(health["sessionExpired"])
+        self.assertEqual(health["sessionExpiredReason"], "ws_token")
+        self.assertEqual(health["autoRelogin"]["state"], "manual_required")
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertIn("登入 token 於日間失效（可能在其他地方重新登入），請手動重新連線", health["loginError"])
+        res, status = bridge.place_order(dict(self.body))
+        self.assertEqual((status, res["outcome"], res["code"]), (503, "not_sent", "ESUN_SESSION_EXPIRED"))
+        self.assertNotIn("正在重新登入", res["error"])
+        expired = [e for e in self._session_events(events) if e["reason"] == "session_expired"]
+        self.assertEqual(len(expired), 1)
+        self.assertIn("日間失效", expired[0]["error"])
+        # A same-day parse error is not an expiry by itself.
+        bridge2, factory2 = self._bridge()
+        with mock.patch.object(factory2.instances[0], "get_market_status", side_effect=Exception(self.PARSE_ERROR)):
+            data, status = bridge2.get_market_status()
+        self.assertEqual(status, 502)
+        self.assertFalse(bridge2.get_health()["sessionExpired"])
+        # The manual reconnect works.
+        bridge.last_reconnect_time = 0.0
+        ok, _, code = bridge.reconnect()
+        self.assertEqual((ok, code), (True, 200))
+        self.assertTrue(bridge.get_health()["loggedIn"])
+
+    def test_manual_reconnect_or_switch_while_pending_logs_in_once(self):
+        for action in ("reconnect", "switch"):
+            with self.subTest(action=action):
+                bridge, factory = self._rollover_bridge(initial_delay=0.5)
+                factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+                self.assertEqual(bridge.get_health()["autoRelogin"]["state"], "pending")
+                bridge.last_reconnect_time = 0.0
+                if action == "reconnect":
+                    ok, _, code = bridge.reconnect()
+                    self.assertEqual((ok, code), (True, 200))
+                else:
+                    res, code = bridge.switch_environment_with_status("SIMULATION")
+                    self.assertEqual(code, 200)
+                    self.assertTrue(res["loggedIn"])
+                # The waiting worker wakes up on the new session and ends without logging in.
+                self.assertTrue(_wait_until(lambda: bridge._relogin_thread is None, timeout=2))
+                time.sleep(0.7)
+                self.assertEqual(factory.login_calls, 2)  # startup + the manual login only
+                health = bridge.get_health()
+                self.assertTrue(health["loggedIn"])
+                self.assertFalse(health["sessionExpired"])
+
+    def test_manual_reconnect_or_switch_while_running_logs_in_once(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingLoginSDK(MockSDK):
+            blocking = False
+
+            def login(self):
+                super().login()
+                if BlockingLoginSDK.blocking:
+                    entered.set()
+                    release.wait(5)
+
+        bridge, factory = self._rollover_bridge(factory=RecordingFactory(mock_cls=BlockingLoginSDK))
+        BlockingLoginSDK.blocking = True
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(entered.wait(5))
+        self.assertEqual(bridge.get_health()["autoRelogin"]["state"], "running")
+        bridge.last_reconnect_time = 0.0
+        ok, body, code = bridge.reconnect()
+        self.assertEqual((ok, code, body["code"]), (False, 409, "ESUN_SESSION_BUSY"))
+        res, code = bridge.switch_environment_with_status("SIMULATION")
+        self.assertEqual((code, res["code"]), (409, "ESUN_SESSION_BUSY"))
+        self.assertFalse(res["loggedIn"])  # the expired session is not usable
+        BlockingLoginSDK.blocking = False
+        release.set()
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["autoRelogin"]["state"] == "succeeded", timeout=5))
+        self.assertEqual(factory.login_calls, 2)
+
+    def test_expiry_of_a_replaced_session_leaves_the_current_one_alone(self):
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        bridge, factory = self._rollover_bridge()
+        old_sdk = factory.instances[0]
+        old_generation = bridge.session.generation
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 200)
+        new_sdk = factory.instances[1]
+        self.assertTrue(_wait_until(lambda: new_sdk.ws_connect_calls == 1))
+        new_runtime = bridge._ws_runtime
+        events = bridge.sse_fanout.register()
+
+        old_sdk.callbacks["error"](self.TOKEN_ERROR)
+        old_sdk.callbacks["close"](None, 1011, "Token Validation Error")
+        time.sleep(0.3)
+        self.assertIn(old_generation, bridge._expired_sessions)
+        self.assertIsNone(bridge._relogin_thread)
+        self.assertEqual(bridge._relogin_snapshot()["state"], "idle")
+        self.assertEqual(factory.login_calls, 2)
+        self.assertIs(bridge._ws_runtime, new_runtime)
+        self.assertFalse(new_runtime.stop_event.is_set())
+        self.assertEqual(new_sdk.ws_close_calls, 0)
+        self.assertTrue(new_sdk.ws_connected)
+        health = bridge.get_health()
+        self.assertTrue(health["loggedIn"])
+        self.assertFalse(health["sessionExpired"])
+        self.assertEqual([e for e in self._session_events(events) if e["reason"] == "session_expired"], [])
+
+    def test_sdk_core_panic_during_relogin_pauses(self):
+        class PanicLoginSDK(MockSDK):
+            panic = False
+
+            def login(self):
+                super().login()
+                if PanicLoginSDK.panic:
+                    raise FakePanicException("called `Option::unwrap()` on a `None` value")
+
+        bridge, factory = self._rollover_bridge(factory=RecordingFactory(mock_cls=PanicLoginSDK))
+        events = bridge.sse_fanout.register()
+        PanicLoginSDK.panic = True
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(_wait_until(lambda: bridge.get_health()["autoRelogin"]["state"] == "paused", timeout=5))
+        self.assertTrue(_wait_until(lambda: bridge._relogin_thread is None))
+        self.assertEqual(factory.login_calls, 2)
+        self.assertFalse(bridge.login_locked)
+        health = bridge.get_health()
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertIn("SDK 核心錯誤", health["autoRelogin"]["lastError"])
+        self.assertIn("auto_relogin_stopped", [e["reason"] for e in self._session_events(events)])
+
+        # A manual reconnect hitting the same panic answers (never raises) and stays fail-safe.
+        bridge.last_reconnect_time = 0.0
+        ok, body, code = bridge.reconnect()
+        self.assertEqual((ok, code, body["code"]), (False, 502, "LOGIN_FAILED"))
+        self.assertTrue(bridge.login_locked)
+
+    def test_worker_internal_base_exception_never_stays_running(self):
+        bridge, factory = self._rollover_bridge()
+        events = bridge.sse_fanout.register()
+        with mock.patch.object(bridge, "_auto_relogin_once", side_effect=FakePanicException("boom")):
+            factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+            self.assertTrue(_wait_until(lambda: bridge._relogin_thread is None, timeout=5))
+        health = bridge.get_health()
+        self.assertEqual(health["autoRelogin"]["state"], "manual_required")
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertIn("內部錯誤", health["autoRelogin"]["lastError"])
+        self.assertIn("auto_relogin_stopped", [e["reason"] for e in self._session_events(events)])
+        self.assertEqual(factory.login_calls, 1)
+
+    def test_worker_start_failure_clears_the_worker_and_asks_for_manual_reconnect(self):
+        bridge, factory = self._rollover_bridge()
+        broken = mock.Mock()
+        broken.start.side_effect = RuntimeError("can't start new thread")
+        states_at_start = []
+
+        def create(generation, delay):
+            states_at_start.append(bridge._relogin["state"])  # called with _relogin_lock held
+            return broken
+
+        with mock.patch.object(bridge, "_create_relogin_worker", side_effect=create):
+            factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertEqual(states_at_start, ["pending"])
+        broken.start.assert_called_once()
+        self.assertIsNone(bridge._relogin_thread)
+        health = bridge.get_health()
+        self.assertEqual(health["autoRelogin"]["state"], "manual_required")
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertIn("無法啟動自動重新登入", health["autoRelogin"]["lastError"])
+        bridge.last_reconnect_time = 0.0
+        ok, _, code = bridge.reconnect()
+        self.assertEqual((ok, code), (True, 200))
+
+    def test_expiry_and_pending_state_are_set_together(self):
+        bridge, factory = self._rollover_bridge()
+        seen = []
+        with mock.patch.object(bridge, "_start_relogin_worker",
+                               side_effect=lambda worker, generation: seen.append(bridge.get_health())):
+            factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        self.assertEqual(len(seen), 1)
+        health = seen[0]
+        self.assertTrue(health["sessionExpired"])
+        self.assertEqual(health["autoRelogin"]["state"], "pending")
+        self.assertFalse(health["manualReconnectRequired"])
+        with bridge._relogin_lock:  # the never-started worker would otherwise block later expiries
+            bridge._relogin_thread = None
+
+    def test_shutdown_while_pending_never_logs_in(self):
+        bridge, factory = self._rollover_bridge(initial_delay=0.5)
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        worker = bridge._relogin_thread
+        self.assertIsNotNone(worker)
+        bridge.shutdown()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        time.sleep(0.7)
+        self.assertEqual(factory.login_calls, 1)
+
+    def test_on_close_with_a_single_message_argument_expires_the_session(self):
+        for message in ("Token Validation Error", b"Token Validation Error"):
+            with self.subTest(message=message):
+                bridge, factory = self._bridge()
+                bridge.auto_relogin = False
+                factory.instances[0].callbacks["close"](message)
+                self.assertTrue(bridge.get_health()["sessionExpired"])
+        bridge, factory = self._bridge()
+        factory.instances[0].callbacks["close"]()
+        factory.instances[0].callbacks["close"](None, None, None)
+        self.assertFalse(bridge.get_health()["sessionExpired"])
+
+    def test_auto_relogin_disabled_only_marks_expiry(self):
+        self.assertTrue(bridge_module.auto_relogin_enabled({}))
+        self.assertTrue(bridge_module.auto_relogin_enabled({"ESUN_AUTO_RELOGIN": "1"}))
+        self.assertFalse(bridge_module.auto_relogin_enabled({"ESUN_AUTO_RELOGIN": "false"}))
+        with mock.patch.dict(os.environ, {"ESUN_AUTO_RELOGIN": "0"}):
+            bridge, factory = self._rollover_bridge()
+        self.assertFalse(bridge.auto_relogin)
+        old_generation = bridge.session.generation
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        time.sleep(0.3)
+        self.assertEqual(factory.login_calls, 1)
+        health = bridge.get_health()
+        self.assertFalse(health["loggedIn"])
+        self.assertTrue(health["sessionExpired"])
+        self.assertTrue(health["manualReconnectRequired"])
+        self.assertEqual(health["autoRelogin"]["state"], "disabled")
+        self.assertFalse(health["autoRelogin"]["enabled"])
+        self.assertIn("ESUN_AUTO_RELOGIN", health["loginError"])
+        res, status = bridge.place_order(dict(self.body))
+        self.assertEqual((status, res["code"]), (503, "ESUN_SESSION_EXPIRED"))
+        self.assertIn("手動重新登入", res["error"])
+
+        # The manual reconnect still works and ends the expiry.
+        bridge.last_reconnect_time = 0.0
+        ok, body, code = bridge.reconnect()
+        self.assertEqual((ok, code), (True, 200))
+        self.assertGreater(body["sessionGeneration"], old_generation)
+        self.assertTrue(bridge.get_health()["loggedIn"])
+        self.assertFalse(bridge.get_health()["sessionExpired"])
+
+    def test_old_websocket_reconnect_loop_stops(self):
+        bridge, factory = self._bridge(auto_login=False)
+        bridge.auto_relogin = False
+        bridge.ws_backoff_initial = 0.05  # set before the supervisor reads it
+        bridge.attempt_initial_login()
+        sdk = factory.instances[0]
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 1))
+        runtime = bridge._ws_runtime
+        # Without the expiry the supervisor would reconnect quickly with this backoff.
+        sdk.close_websocket()
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 2, timeout=3))
+        sdk.callbacks["error"](self.TOKEN_ERROR)
+        self.assertTrue(runtime.stop_event.is_set())
+        self.assertGreaterEqual(sdk.ws_close_calls, 2)
+        self.assertTrue(_wait_until(lambda: not runtime.thread.is_alive(), timeout=3))
+        time.sleep(0.3)  # several backoff periods
+        self.assertEqual(sdk.ws_connect_calls, 2)
+        self.assertFalse(bridge.get_health()["wsConnected"])
+
+    def test_switch_to_same_environment_logs_in_again_when_expired(self):
+        bridge, factory = self._bridge()
+        bridge.auto_relogin = False
+        old_generation = bridge.session.generation
+        factory.instances[0].callbacks["error"](self.TOKEN_ERROR)
+        res, status = bridge.switch_environment_with_status("PRODUCTION")  # no production profile
+        self.assertEqual(status, 400)
+        self.assertFalse(res["loggedIn"])  # the expired session is reported as not logged in
+        res, status = bridge.switch_environment_with_status("SIMULATION")
+        self.assertEqual(status, 200)
+        self.assertTrue(res["loggedIn"])
+        self.assertGreater(bridge.session.generation, old_generation)
+        self.assertEqual(factory.login_calls, 2)
+        self.assertFalse(bridge.get_health()["sessionExpired"])
+
+
+def _credential_material_of(config_path: str) -> bytes:
+    cfg, _, _ = load_config(config_path)
+    return bridge_module._credential_material(cfg)
 
 
 if __name__ == "__main__":
