@@ -410,8 +410,9 @@ function Action-Status {
 
     Write-Host "`n─────────────────────────── [服務連線檢測] ───────────────────────────" -ForegroundColor Cyan
     $webPort = if ($script:PortBound) { "$Port" } else { Get-EffectiveSetting "WEB_PORT" "8080" }
-    $webUrl = "http://localhost:$webPort"
-    $healthUrl = "http://localhost:$webPort/esun/health"
+    # web 預設只綁 IPv4 的 127.0.0.1；Windows 會先以 IPv6 ::1 解析 localhost，連線要等退回 IPv4 才成功
+    $webUrl = "http://127.0.0.1:$webPort"
+    $healthUrl = "http://127.0.0.1:$webPort/esun/health"
 
     # 檢測 Web 終端
     try {

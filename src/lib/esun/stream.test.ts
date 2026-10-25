@@ -175,6 +175,25 @@ describe('E.SUN order stream', () => {
         expect(seen).toEqual([{ kind: 'untrackable', deal: true }, { kind: 'untrackable', deal: false }]);
     });
 
+    it('surfaces emerging-stock reports without share fields as untrackable only an authoritative read clears (PB7-1 / PB8-2)', () => {
+        ensureEsunOrderStream();
+        latest().open();
+        const common = {
+            report_seq: 1, session_generation: 1, account: { broker_id: '8840', account_id: '1234567' },
+            ord_no: 'C0001', stock_no: '6488', buy_sell: 'B', ap_code: '4',
+        };
+        latest().fire('order', { ...common, event_id: 'boot1-3', report_stream: 'order', op_type: 'New', od_price: 25, org_qty: '1000', err_code: '00000000' });
+        latest().fire('deal', { ...common, event_id: 'boot1-4', report_stream: 'deal', mat_price: 25, mat_qty: '1000', mkt_seq_num: '9' });
+        expect(published('order_event')).toHaveLength(0);
+        expect(seen).toEqual([
+            { kind: 'untrackable', deal: false, authoritativeOnly: { orderId: 'C0001' } },
+            { kind: 'untrackable', deal: true, authoritativeOnly: { orderId: 'C0001' } },
+        ]);
+        // 帶股數欄位的興櫃回報照常進管線
+        latest().fire('order', { ...common, event_id: 'boot1-5', report_stream: 'order', report_seq: 2, op_type: 'New', od_price: 25, org_qty: '1', org_qty_share: '1000', err_code: '00000000' });
+        expect(published('order_event')).toHaveLength(1);
+    });
+
     it('forwards a failed report whose operation is unknown and signals it as unresolved (PB4-1)', () => {
         ensureEsunOrderStream();
         latest().open();
