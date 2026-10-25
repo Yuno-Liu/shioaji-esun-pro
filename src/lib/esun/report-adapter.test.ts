@@ -212,6 +212,44 @@ describe('ACK → projected order (C-05)', () => {
         expect(report).toMatchObject({ quantity: 100, orderLot: 'IntradayOdd' });
     });
 
+    describe('the reservation ACK measured in simulation (PB6-2)', () => {
+        // 2026-10-25 玉山模擬環境：盤中零股 2 股的預約單 ACK（數量為字串且為股、err_code 空字串）
+        const measuredAck = (seq: number, over: Record<string, unknown> = {}) => ({
+            event_id: `b7f3a2-${seq}`, seq, report_stream: 'order', report_seq: seq, session_generation: 1,
+            ts: '2026-10-25T15:27:10.550+08:00', environment: 'SIMULATION', account: { broker_id: '8840', account_id: '1234567' },
+            order_no: 'P0E031V0', op_type: 'New',
+            work_date: '20261027', ord_date: '20261025', ord_time: '152710550', ord_no: '', pre_ord_no: 'P0E031V0', ord_status: '1',
+            stock_no: '2884', buy_sell: 'B', ap_code: '5', price_flag: '0', bs_flag: 'R', trade: '0', od_price: '25.5',
+            org_qty: '2', before_qty: '0', after_qty: '0', mat_qty: '0', cel_qty: '0', action: 'O', err_code: '', err_msg: '', user_def: '',
+            ...over,
+        });
+        const known = { id: 'P0E031V0', quantity: 2, dealQuantity: 0, cancelQuantity: 0, price: 25.5 };
+
+        it('projects a 2-share PreSubmitted reservation, also over the local row from the order response', () => {
+            const report = normalizeOrderEvent(wire('order', measuredAck(1)))!;
+            expect(report).toMatchObject({ kind: 'order', opType: 'New', id: 'P0E031V0', ordno: '', failed: false, quantity: 2, orderLot: 'IntradayOdd' });
+            const rows = projectOrderReport([], report, [account])!;
+            expect(rows).toHaveLength(1);
+            expect(rows[0]!.order).toMatchObject({ id: 'P0E031V0', ordno: '', quantity: 2 });
+            expect(rows[0]!.status).toMatchObject({ status: 'PreSubmitted', order_quantity: 2, deal_quantity: 0, cancel_quantity: 0 });
+            // 重播同一筆 ACK（本地已有 PreSubmitted 列）：仍是 PreSubmitted
+            expect(projectOrderReport(rows, report, [account])![0]!.status.status).toBe('PreSubmitted');
+        });
+
+        it('projects the delete ACK of the reservation as Cancelled', () => {
+            const rows = projectOrderReport([], normalizeOrderEvent(wire('order', measuredAck(1)))!, [account])!;
+            const cancel = normalizeOrderEvent(wire('order', measuredAck(2, { op_type: 'Cancel', action: 'C', before_qty: '2', cel_qty: '2' }),
+                ctx({ lookup: () => known })))!;
+            expect(cancel).toMatchObject({ opType: 'Cancel', cancelQuantity: 2, failed: false });
+            expect(projectOrderReport(rows, cancel, [account])![0]!.status).toMatchObject({ status: 'Cancelled', cancel_quantity: 2 });
+        });
+
+        it('keeps Submitted once the reservation has an exchange order number', () => {
+            const opened = normalizeOrderEvent(wire('order', measuredAck(3, { ord_no: 'C0042', ord_status: '2' })))!;
+            expect(projectOrderReport([], opened, [account])![0]!.status.status).toBe('Submitted');
+        });
+    });
+
     it('accepts the legacy wrapped bridge shape', () => {
         const legacy = { state: 'StockOrder', event_id: 'esun-ack-C0001-1a2b3c4d', data: { StockOrder: { ...ack(9), event_id: undefined, seq: undefined, report_stream: undefined, report_seq: undefined, session_generation: undefined } } };
         const report = normalizeOrderEvent(wire('order_event', legacy));

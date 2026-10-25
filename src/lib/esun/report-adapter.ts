@@ -219,6 +219,9 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
     const errCode = str(raw.err_code ?? raw.errCode ?? rec(raw.operation)?.op_code);
     const failed = isEsunFailureCode(errCode);
     const opMsg = str(raw.err_msg ?? raw.errMsg ?? rec(raw.operation)?.op_msg);
+    const ordNo = str(raw.ord_no ?? raw.ordNo);
+    // 預約單（還沒有委託書號，只有 pre_ord_no 或 ord_status 1）：投影時維持 PreSubmitted 而不是 Submitted
+    const reservation = !ordNo && (str(raw.pre_ord_no ?? raw.preOrdNo) !== '' || str(raw.ord_status ?? raw.ordStatus) === '1');
     const body: Rec = {
         operation: {
             op_type: opType,
@@ -228,7 +231,7 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         order: {
             id: orderId,
             seqno: orderId,
-            ordno: str(raw.ord_no ?? raw.ordNo),
+            ordno: ordNo,
             action,
             price,
             quantity,
@@ -242,6 +245,7 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         },
         status: {
             id: orderId,
+            ...(reservation ? { status: 'PreSubmitted' } : {}),
             ...(ts !== undefined ? { exchange_ts: ts } : {}),
             // 減量回報：order_quantity 為減量後的委託量（委託量 − 累計取消量）
             order_quantity: opType === 'UpdateQty' ? Math.max(0, quantity - cancelledTotal) : quantity,
