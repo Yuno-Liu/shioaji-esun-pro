@@ -48,3 +48,7 @@
 - **橋接啟動識別 (boot_id)**: 橋接每次啟動產生的隨機字串；SSE 事件 id 為 `<boot_id>-<seq>`。客戶端帶 `Last-Event-ID` 重連時，同一 boot 且仍在緩衝內就補送缺漏，否則送 `resync`。
 - **重新同步 (resync)**: 橋接要求客戶端做快取重建的 SSE 事件（例如橋接重啟、緩衝已覆蓋）。
 - **Session 事件 (session event)**: 環境切換或登入狀態改變時的 SSE 事件，攜帶 generation、環境、帳號與登入狀態。
+
+## 帳務
+
+- **交割行事曆 T+n (settlement calendar)**: 交割款固定顯示 T+0／T+1／T+2 三格。T+0＝今天起第一個交易日（今天是交易日就是今天，否則是下一個交易日）；交易日以玉山 `market_status`（`GET /esun/market_status`）為準，取不到或過期才退回只跳週末的推算（國定假日無法本地判斷，只影響金額為 0 的格的日期）。玉山 `get_settlements` 的 `c_date` 是交割日、`date` 是成交日、`price` 是淨交割金額（正＝應收、負＝應付）；已交割的列不顯示，超出 T+2 的未交割日期視為格式錯誤。

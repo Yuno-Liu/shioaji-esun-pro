@@ -80,9 +80,10 @@ describe('P&L panel routing (D2-07 / C-10)', () => {
 describe('trading-state hooks (§5 consumer)', () => {
     let hooks: { [K in keyof EsunTradingHooks]: ReturnType<typeof vi.fn> };
     let stop: () => void;
+    let driver: MockEsunDriver;
 
     beforeEach(async () => {
-        const driver = new MockEsunDriver();
+        driver = new MockEsunDriver();
         esunTradeService.setDriver(driver);
         await esunTradeService.switchEnvironment('SIMULATION');
         hooks = {
@@ -105,6 +106,36 @@ describe('trading-state hooks (§5 consumer)', () => {
         const generation = (esunTradeService.getSessionGeneration() ?? 0) + 1;
         esunTradeService.applySession({ generation, environment: 'SIMULATION', account: { broker_id: '8840', account_id: MOCK_ESUN_ACCOUNT_ID } });
         expect(hooks.accountsChanged).toHaveBeenCalledTimes(1);
+    });
+
+    // 頂欄「重新連線」不再自行呼叫 refreshTradingStateForModeChange：權威重讀只靠這個 session 代次 hook
+    // 單例 service 的 session 代次跨測試累加：bridge 回應一律用「目前代次＋1」
+    const nextSession = () => vi.spyOn(driver, 'reconnect').mockImplementation(async () => {
+        const sessionGeneration = (esunTradeService.getSessionGeneration() ?? 0) + 1;
+        vi.spyOn(driver, 'health').mockImplementation(async () => ({
+            ok: true, configured: true, problems: [], environment: 'SIMULATION', account: { broker_id: '8840', account_id: MOCK_ESUN_ACCOUNT_ID },
+            loggedIn: true, loginError: null, sessionGeneration,
+        }));
+        return { ok: true, environment: 'SIMULATION', sessionGeneration };
+    });
+
+    it('a successful manual reconnect re-reads exactly once through the session generation hook', async () => {
+        nextSession();
+        const res = await esunTradeService.reconnect();
+        expect(res.ok).toBe(true);
+        expect(res.health).toMatchObject({ loggedIn: true });
+        expect(hooks.accountsChanged).toHaveBeenCalledTimes(1);
+    });
+
+    it('still re-reads once when the health read after a successful reconnect fails', async () => {
+        const health = vi.spyOn(driver, 'health').mockRejectedValue(new Error('health 逾時'));
+        vi.spyOn(driver, 'reconnect').mockImplementation(async () =>
+            ({ ok: true, environment: 'SIMULATION', sessionGeneration: (esunTradeService.getSessionGeneration() ?? 0) + 1 }));
+        const res = await esunTradeService.reconnect();
+        expect(res.ok).toBe(true);
+        expect(res.health).toBeNull();
+        expect(hooks.accountsChanged).toHaveBeenCalledTimes(1);
+        health.mockRestore();
     });
 
     it('does not re-read on snapshot changes that keep the accounts and session', async () => {

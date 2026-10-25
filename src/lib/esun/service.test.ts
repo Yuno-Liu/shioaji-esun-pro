@@ -1,12 +1,22 @@
 // src/lib/esun/service.test.ts — Unit tests for EsunTradeService
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractBase } from '../types/contract';
 import type { OrderResult, StockOrderReq, Trade } from '../types/order';
 import type { Account } from '../types/portfolio';
 import { MOCK_ESUN_ACCOUNT_ID, MockEsunDriver } from './mock-driver';
 import { EsunBridgeError, HttpEsunDriver, UnavailableEsunDriver } from './http-driver';
 import { EsunTradeService } from './service';
+import {
+    clearEsunInventoryDetails,
+    clearEsunOrderMeta,
+    clearEsunTransactionDetails,
+    esunOrderMetaOf,
+    findEsunInventoryDetail,
+    findEsunTransactionDetail,
+    getEsunInventoryDetailsSnapshot,
+    getEsunTransactionDetailsSnapshot,
+} from './account-details';
 import {
     ESUN_BROKER_CODE,
     ESUN_PRODUCTION_ENTRY,
@@ -488,6 +498,123 @@ describe('EsunTradeService', () => {
             offline.registerAccount(simAccount);
             await expect(offline.fetchTrades(simAccount)).rejects.toThrow('未連線');
             await expect(offline.fetchAccountBalance(simAccount)).rejects.toThrow('未連線');
+        });
+
+        describe('account details data layer', () => {
+            afterEach(() => {
+                clearEsunInventoryDetails();
+                clearEsunOrderMeta();
+                clearEsunTransactionDetails();
+            });
+
+            it('fetchPositions maps one raw batch to positions and inventory details (one request)', async () => {
+                const rows = [
+                    { stk_no: '2884', cost_qty: '2500', qty_l: '1500', price_avg: '25', price_mkt: '26', make_a_sum: '2500', trade: '0', ap_code: '', s_type: 'H', stk_dats: [] },
+                    { stk_no: '2884', cost_qty: '30', qty_l: '0', price_avg: '25', price_mkt: '26', make_a_sum: '30', trade: '0', ap_code: '5', s_type: 'H', stk_dats: [] },
+                ];
+                mockDriver.setInventories(rows);
+                const spy = vi.spyOn(mockDriver, 'getInventories');
+                const positions = await service.fetchPositions(simAccount, 'Common');
+                expect(spy).toHaveBeenCalledTimes(1);
+                expect(positions.map(p => [p.id, p.quantity, p.yd_quantity])).toEqual([[1, 2.5, 1.5], [2, 0.03, 0]]);
+                const snap = getEsunInventoryDetailsSnapshot(simAccount);
+                expect(snap?.details.map(d => [d.rowId, d.apCode, d.costShares])).toEqual([[1, '', 2500], [2, '5', 30]]);
+                // 同 code＋cond 多列時要核對股數：Common 單位的張數對不上明細
+                expect(findEsunInventoryDetail(snap!.details, positions[1]!)).toBeNull();
+                const shares = await service.fetchPositions(simAccount, 'Share');
+                const fresh = getEsunInventoryDetailsSnapshot(simAccount)!;
+                expect(findEsunInventoryDetail(fresh.details, shares[1]!)?.apCode).toBe('5');
+                expect(findEsunInventoryDetail(fresh.details, shares[0]!)?.apCode).toBe('');
+                expect(getEsunInventoryDetailsSnapshot(prodAccount)).toBeNull();
+            });
+
+            it('fetchAccountOverview runs the three queries in parallel and parses them', async () => {
+                const order: string[] = [];
+                let release!: () => void;
+                const gate = new Promise<void>(r => { release = r; });
+                vi.spyOn(mockDriver, 'getBalanceRaw').mockImplementation(async () => {
+                    order.push('balance');
+                    await gate;
+                    return { available_balance: '300000', exange_balance: '0', stock_pre_save_amount: 1000, is_latest_data: true, updated_at: 1792850400, cached: false, cache_age_sec: 0 };
+                });
+                vi.spyOn(mockDriver, 'getTradeStatusRaw').mockImplementation(async () => { order.push('trade'); return { trade_limit: 900000, margin_limit: 0, short_limit: 0, day_trade_code: 'N', margin_code: '9', short_code: '9' }; });
+                vi.spyOn(mockDriver, 'getMarketStatusRaw').mockImplementation(async () => { order.push('market'); return { is_trading_day: true, last_trading_day: '20261022', next_trading_day: '20261026' }; });
+                const pending = service.fetchAccountOverview(simAccount);
+                await Promise.resolve();
+                expect(order.sort()).toEqual(['balance', 'market', 'trade']); // 餘額尚未回應時其他兩個已送出
+                release();
+                const overview = await pending;
+                expect(overview.balance).toMatchObject({ availableBalance: 300000, exchangeBalance: 0, preSaveAmount: 1000, isLatestData: true, updatedAt: '2026-10-24T14:00:00.000Z', cached: false, cacheAgeSec: 0 });
+                expect(overview.tradeStatus).toMatchObject({ tradeLimit: 900000, dayTradeLabel: '未啟用', marginLabel: '不可買賣', shortLabel: '不可買賣' });
+                expect(overview.marketStatus).toEqual({ isTradingDay: true, lastTradingDay: '2026-10-22', nextTradingDay: '2026-10-26' });
+            });
+
+            it('fetchAccountOverview uses mock defaults', async () => {
+                const overview = await service.fetchAccountOverview(simAccount);
+                expect(overview.balance.availableBalance).toBe(500000);
+                expect(overview.tradeStatus.dayTradeCode).toBe('X');
+                expect(overview.marketStatus?.isTradingDay).toBe(true);
+            });
+
+            it('fetchAccountOverview returns marketStatus null when market status fails', async () => {
+                vi.spyOn(mockDriver, 'getMarketStatusRaw').mockRejectedValue(new Error('市場狀態查詢失敗'));
+                const overview = await service.fetchAccountOverview(simAccount);
+                expect(overview.marketStatus).toBeNull();
+                expect(overview.balance.availableBalance).toBe(500000);
+                vi.spyOn(mockDriver, 'getMarketStatusRaw').mockResolvedValue([1, 2] as never);
+                expect((await service.fetchAccountOverview(simAccount)).marketStatus).toBeNull();
+            });
+
+            it('fetchAccountOverview rejects with a clear message when balance or trade status fails', async () => {
+                const balance = vi.spyOn(mockDriver, 'getBalanceRaw').mockRejectedValueOnce(new Error('HTTP 503'));
+                await expect(service.fetchAccountOverview(simAccount)).rejects.toThrow('玉山銀行餘額查詢失敗：HTTP 503');
+                balance.mockResolvedValueOnce(null as never);
+                await expect(service.fetchAccountOverview(simAccount)).rejects.toThrow('玉山銀行餘額查詢失敗：回應格式錯誤');
+                vi.spyOn(mockDriver, 'getTradeStatusRaw').mockRejectedValueOnce(new Error('逾時'));
+                await expect(service.fetchAccountOverview(simAccount)).rejects.toThrow('玉山交易額度查詢失敗：逾時');
+                await expect(service.fetchAccountOverview(otherAccount)).rejects.toThrow('非玉山證券帳戶');
+                const offline = new EsunTradeService(new UnavailableEsunDriver());
+                offline.registerAccount(simAccount);
+                await expect(offline.fetchAccountOverview(simAccount)).rejects.toThrow('未連線');
+            });
+
+            it('fetchTrades sorts rows oldest first (milliseconds, missing time first) and replaces order meta', async () => {
+                const row = (ord_no: string, ord_date: string, ord_time: string, extra: Record<string, unknown> = {}) => ({
+                    work_date: ord_date, ord_date, ord_time, ord_status: '2', ord_no, pre_ord_no: '', stock_no: '2884', buy_sell: 'B',
+                    ap_code: '1', price_flag: '0', bs_flag: 'R', trade: '0', od_price: 25, org_qty: 1, mat_qty: 0, cel_qty: 0, celable: '1', ...extra,
+                });
+                const getOrders = vi.spyOn(mockDriver, 'getOrders').mockResolvedValueOnce([
+                    row('A0003', '20261023', '090000500'),
+                    row('A0001', '20261022', '133000000'),
+                    row('A0004', '20261023', '90000501'),
+                    row('A0002', '20261023', '090000050', { celable: '2' }),
+                    row('', '20261022', '', { ord_status: '1', pre_ord_no: 'P0001', work_date: '20261023' }),
+                ]);
+                const trades = await service.fetchTrades(simAccount, true);
+                expect(trades.map(t => t.order.id)).toEqual(['P0001', 'A0001', 'A0002', 'A0003', 'A0004']);
+                expect(esunOrderMetaOf(trades[0]!)).toEqual({ reservation: true, pendingReservation: true, workDate: '2026-10-23', orderDate: '2026-10-22', orderTime: '', cancellable: true });
+                expect(esunOrderMetaOf(trades[2]!)).toMatchObject({ reservation: false, pendingReservation: false, orderTime: '09:00:00', cancellable: false });
+
+                getOrders.mockResolvedValueOnce([row('A0009', '20261023', '100000000')]);
+                await service.fetchTrades(simAccount, true);
+                expect(esunOrderMetaOf(trades[1]!)).toBeNull(); // 整批取代：舊委託不殘留
+            });
+
+            it('fetchProfitLoss stores realized transaction details aligned with the returned rows', async () => {
+                mockDriver.setTransactions([
+                    { stk_no: '2884', buy_sell: 'B', trade: '0', t_date: '20261021', qty: '1000', cost: '25000', make: '0', mat_dats: [] },
+                    { stk_no: '2884', buy_sell: 'S', trade: '0', t_date: '20261022', qty: '1000', cost: '-25000', recv: '26000', make: '1000', mat_dats: [{ order_no: 'Y1', qty: '1000', t_time: '101500' }] },
+                    { stk_no: '1342', buy_sell: 'S', trade: '0', t_date: '20261023', qty: '40', cost: '-20000', recv: '20400', make: '400', mat_dats: [] },
+                ]);
+                const spy = vi.spyOn(mockDriver, 'getTransactions');
+                const pl = await service.fetchProfitLoss(simAccount, '20261001', '20261023');
+                expect(spy).toHaveBeenCalledTimes(1);
+                expect(pl.map(r => [r.id, r.code, r.quantity])).toEqual([[1, '2884', 1], [2, '1342', 0.04]]);
+                const snap = getEsunTransactionDetailsSnapshot(simAccount, '20261001', '20261023');
+                expect(snap?.details.map(d => [d.rowId, d.code])).toEqual([[1, '2884'], [2, '1342']]);
+                expect(findEsunTransactionDetail(snap!.details, pl[0]!)?.fills[0]).toMatchObject({ orderNo: 'Y1', tradeTime: '10:15:00' });
+                expect(getEsunTransactionDetailsSnapshot(simAccount, '', '')).toBeNull();
+            });
         });
 
         it('propagates CA expiry errors instead of reporting an empty expiry', async () => {

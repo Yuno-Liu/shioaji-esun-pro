@@ -1,6 +1,11 @@
 // src/lib/esun/adapter.ts — Driver interface for E.SUN Securities trading & portfolio
 
 import type {
+    EsunBalanceRaw,
+    EsunInventoryItem,
+    EsunMarketStatusRaw,
+    EsunTradeStatusRaw,
+    EsunTransactionItem,
     EsunConfigProfilesMap,
     EsunEnvironment,
     EsunMutationGuard,
@@ -43,6 +48,27 @@ export interface EsunBridgeHealth {
     wsLastMessageAt?: string | null;
     loginLocked?: boolean;
     loginLockReason?: string | null;
+    /** 券商 token 已失效（例如台北換日 00:00）；失效期間委託回 503 ESUN_SESSION_EXPIRED（未送出） */
+    sessionExpired?: boolean;
+    /** 失效時間（ISO 字串或 epoch 秒／毫秒） */
+    sessionExpiredAt?: string | number | null;
+}
+
+/** POST /esun/auth/reconnect 的成功回應（失敗時 bridge 回非 2xx，driver 丟出 EsunBridgeError） */
+export interface EsunReconnectResponse {
+    ok: boolean;
+    message?: string;
+    error?: string;
+    code?: string;
+    account?: { broker_id: string; account_id: string } | null;
+    environment?: EsunEnvironment | null;
+    sessionGeneration?: number | null;
+}
+
+/** POST /esun/auth/reconnect 的選項 */
+export interface EsunReconnectOptions {
+    /** 熔斷鎖住且憑證未變時強制重試一次（只在使用者確認後帶） */
+    force?: boolean;
 }
 
 /** 每筆委託類請求附帶的選項 */
@@ -91,6 +117,24 @@ export interface IEsunTradeDriver {
     /** 查詢持股庫存與未實現損益 */
     getPositions?(unit?: 'Common' | 'Share'): Promise<StockPosition[]>;
 
+    /**
+     * 查詢 get_inventories 原始列（bridge 原樣回傳）。有此方法時 service 只打一次請求，
+     * 同時產生 StockPosition 與完整庫存明細。
+     */
+    getInventories?(unit?: 'Common' | 'Share'): Promise<EsunInventoryItem[]>;
+
+    /** get_transactions_by_date 原始列（區間已裁切到 180 天內） */
+    getTransactions?(beginDate: string, endDate: string): Promise<EsunTransactionItem[]>;
+
+    /** get_balance 原始回應（含 bridge 的 cached、cache_age_sec） */
+    getBalanceRaw?(): Promise<EsunBalanceRaw>;
+
+    /** get_trade_status 原始回應 */
+    getTradeStatusRaw?(): Promise<EsunTradeStatusRaw>;
+
+    /** get_market_status 原始回應 */
+    getMarketStatusRaw?(): Promise<EsunMarketStatusRaw>;
+
     /** 查詢銀行餘額與圈存 */
     getBalance?(): Promise<AccountBalance>;
 
@@ -131,6 +175,13 @@ export interface IEsunTradeDriver {
         sessionGeneration?: number | null;
         error?: string;
     }>;
+
+    /**
+     * 以目前設定檔重新登入券商（POST /esun/auth/reconnect；不是委託）。
+     * opts.force：熔斷鎖住且憑證未變時 bridge 回 423 ESUN_CREDENTIALS_UNCHANGED，需帶 force 才重試；
+     * 只能在使用者明確確認後傳入。
+     */
+    reconnect?(opts?: EsunReconnectOptions): Promise<EsunReconnectResponse>;
 
     /** 登入 / 連線（可選） */
     login?(): Promise<void>;

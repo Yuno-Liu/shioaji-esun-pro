@@ -212,7 +212,7 @@ describe('realized P&L only (B-13)', () => {
         const pl = fromEsunTransactionsToProfitLoss(rows);
         expect(pl.map(r => [r.code, r.date, r.pnl])).toEqual([['2884', '20261022', 1000], ['2330', '20261023', 20000]]);
         const sum = fromEsunTransactionsToProfitLossSummary(rows);
-        expect(sum.total.quantity).toBe(2000);
+        expect(sum.total.quantity).toBe(2); // 張（Σ股數/1000，與明細一致）
         expect(sum.total.pnl).toBe(21000);
     });
 });

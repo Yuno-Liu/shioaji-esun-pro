@@ -31,9 +31,12 @@ import {
     esunRetCode,
     esunRetMessage,
     formatEsunErrorMessage,
+    fromEsunInventoryToPosition,
     fromEsunOrderResponse,
     fromEsunOrderResult,
+    fromEsunTransactionsToProfitLoss,
     isEsunAccount,
+    sortEsunOrderResultsOldestFirst,
     isEsunBroker,
     isEsunFailureCode,
     toEsunMutationPayload,
@@ -54,6 +57,17 @@ import {
     createDefaultEsunConfigProfiles,
 } from './types';
 import { HttpEsunDriver, UnavailableEsunDriver } from './http-driver';
+import {
+    parseEsunBalanceDetail,
+    parseEsunInventoryDetails,
+    parseEsunMarketStatusDetail,
+    parseEsunRealizedTransactionDetails,
+    parseEsunTradeStatusDetail,
+    setEsunInventoryDetails,
+    setEsunOrderMetaSnapshot,
+    setEsunTransactionDetails,
+    type EsunAccountOverview,
+} from './account-details';
 
 /** esun-bridge 位址：預設同源（由 Vite proxy / Docker 轉發 /esun） */
 export function bridgeBase(): string {
@@ -136,6 +150,21 @@ export interface EsunEnvironmentSnapshot {
     bridgeConnected: boolean;
 }
 
+/** 重新連線（POST /esun/auth/reconnect）的結果 */
+export interface EsunReconnectResult {
+    ok: boolean;
+    /**
+     * 重新連線後重新讀取的 health。失敗時讀不到則為最後看到的 health；
+     * 成功但讀不到時為 null（舊的 health 仍是失效狀態，不可沿用；呼叫端應顯示「狀態確認中」並稍後重讀）
+     */
+    health: EsunBridgeHealth | null;
+    environment?: EsunEnvironment | null;
+    sessionGeneration?: number | null;
+    error?: string;
+    /** bridge 錯誤碼（例：LOGIN_FAILED、ESUN_SESSION_BUSY、CONFIG_ERROR） */
+    code?: string;
+}
+
 type DispatchOpts = { beforeDispatch?: () => void };
 
 export class EsunTradeService {
@@ -150,6 +179,7 @@ export class EsunTradeService {
     private configProfiles: EsunConfigProfilesMap = createDefaultEsunConfigProfiles(true, true);
     private activeConfigFile: string | null = null;
     private switchInFlight: Promise<EsunSwitchResult> | null = null;
+    private reconnectInFlight: Promise<EsunReconnectResult> | null = null;
     // 每次採用切換／session 結果就 +1：在那之前發出的 health 回應（沒有代次可比時）一律丟棄
     private stateVersion = 0;
     private listeners = new Set<() => void>();
@@ -443,6 +473,9 @@ export class EsunTradeService {
         if (this.switchInFlight) {
             return Promise.resolve(this.switchResult(false, { error: '玉山環境切換進行中，請稍候' }));
         }
+        if (this.reconnectInFlight) {
+            return Promise.resolve(this.switchResult(false, { error: '玉山重新連線進行中，請稍候再切換環境' }));
+        }
         const driver = this.driver;
         if (!driver.switchEnvironment) {
             return Promise.resolve(this.switchResult(false, { error: '玉山下單服務 (esun-bridge) 未連線，無法切換環境' }));
@@ -501,6 +534,65 @@ export class EsunTradeService {
             this.updateSnapshot();
             this.emit();
         });
+    }
+
+    /**
+     * 以目前設定檔重新登入券商（台北換日 token 失效後）。成功後先採用回應的 session 代次
+     * （trading-state 的 session 代次 hook 據此做委託權威重讀），再立即重新讀取 health；
+     * 帳務查詢由呼叫端 invalidateAllQueries。失敗回 ok:false 與錯誤說明，不丟出。
+     * 同一時間只有一個請求：進行中再呼叫會拿到同一個結果（不論 force）。
+     * opts.force：登入熔斷鎖住且憑證未變時，bridge 回 423 ESUN_CREDENTIALS_UNCHANGED，
+     * 只有使用者明確確認後才可帶 force:true 強制重試一次；其他情況一律不帶。
+     */
+    reconnect(opts?: { force?: boolean }): Promise<EsunReconnectResult> {
+        if (this.reconnectInFlight) return this.reconnectInFlight;
+        const driver = this.driver;
+        if (!driver.reconnect) {
+            return Promise.resolve({ ok: false, health: this.bridgeHealth, error: '玉山下單服務 (esun-bridge) 未連線，無法重新連線' });
+        }
+        if (this.switchInFlight) {
+            return Promise.resolve({ ok: false, health: this.bridgeHealth, error: '玉山環境切換進行中，請稍候再重新連線', code: 'ESUN_SESSION_BUSY' });
+        }
+        const run = (async (): Promise<EsunReconnectResult> => {
+            const failed = async (error: string, code?: string): Promise<EsunReconnectResult> => {
+                const health = await this.refreshHealth();
+                return { ok: false, health: health ?? this.bridgeHealth, error, ...(code ? { code } : {}) };
+            };
+            let res: Awaited<ReturnType<NonNullable<IEsunTradeDriver['reconnect']>>>;
+            try {
+                res = opts?.force === true ? await driver.reconnect!({ force: true }) : await driver.reconnect!();
+            } catch (e) {
+                const code = (e as { code?: unknown } | null)?.code;
+                return failed(`玉山重新連線失敗：${e instanceof Error ? e.message : String(e)}`, typeof code === 'string' ? code : undefined);
+            }
+            if (!res || res.ok === false) {
+                return failed(`玉山重新連線失敗：${res?.error || res?.message || '玉山 bridge 未回報成功'}`, res?.code);
+            }
+            // 先採用回應的 session 代次：即使接著讀 health 失敗，session 代次 hook 仍會觸發權威重讀
+            if (typeof res.sessionGeneration === 'number'
+                && this.applyBridgeState({ sessionGeneration: res.sessionGeneration }, null)) {
+                this.updateSnapshot();
+                this.emit();
+            }
+            const health = await this.refreshHealth(5_000);
+            return {
+                ok: true,
+                // 讀不到 health 時回 null：舊的 health 仍是登入失效，沿用會與成功結果矛盾
+                health,
+                environment: isEnv(res.environment) ? res.environment : health && isEnv(health.environment) ? health.environment : null,
+                sessionGeneration: typeof res.sessionGeneration === 'number' ? res.sessionGeneration : health?.sessionGeneration ?? null,
+            };
+        })();
+        const pending = run.finally(() => {
+            if (this.reconnectInFlight === pending) this.reconnectInFlight = null;
+        });
+        this.reconnectInFlight = pending;
+        return pending;
+    }
+
+    /** 重新連線請求進行中 */
+    isReconnecting(): boolean {
+        return this.reconnectInFlight !== null;
     }
 
     /**
@@ -880,23 +972,70 @@ export class EsunTradeService {
     /** 委託列中缺少識別欄位而略過的筆數（最近一次讀取） */
     lastSkippedOrderRows = 0;
 
-    /** 查詢玉山委託 */
+    /**
+     * 查詢玉山委託。回傳順序依 (ord_date, ord_time) 由舊到新（上游約定：陣列由舊到新，UI 反轉成
+     * 最新在前）；同時以這次快照整批取代該帳戶的委託中繼資料（預約單、有效交易日、委託時間、可否取消）。
+     */
     async fetchTrades(account: Account, refresh = false): Promise<Trade[]> {
         this.assertQueryAccount(account);
         if (!this.driver.getOrders) this.missing('委託');
         const results: EsunOrderResult[] = await this.driver.getOrders(refresh);
         if (!Array.isArray(results)) throw new Error('玉山委託回應格式錯誤');
+        const sorted = sortEsunOrderResultsOldestFirst(results);
         const exchangeOf = (code: string) => getCachedContract(code)?.exchange ?? undefined;
-        const trades = results.map(r => fromEsunOrderResult(r, account, { exchangeOf }));
+        const trades = sorted.map(r => fromEsunOrderResult(r, account, { exchangeOf }));
         this.lastSkippedOrderRows = trades.filter(t => t === null).length;
+        setEsunOrderMetaSnapshot(account, sorted);
         return trades.filter((t): t is Trade => t !== null);
     }
 
-    /** 查詢持股庫存與未實現損益 */
+    /**
+     * 查詢持股庫存與未實現損益。driver 提供原始列時只打一次請求，同一批列同時產生
+     * StockPosition（回傳）與完整庫存明細（寫入 account-details 的庫存明細 store）。
+     */
     async fetchPositions(account: Account, unit: 'Common' | 'Share' = 'Common'): Promise<StockPosition[]> {
         this.assertQueryAccount(account);
+        if (this.driver.getInventories) {
+            const rows = await this.driver.getInventories(unit);
+            if (!Array.isArray(rows) || rows.some(r => !r || typeof r !== 'object' || Array.isArray(r))) {
+                throw new Error('玉山庫存回應格式錯誤');
+            }
+            const positions = rows.map((item, idx) => fromEsunInventoryToPosition(item, unit, idx + 1));
+            setEsunInventoryDetails(account, parseEsunInventoryDetails(rows));
+            return positions;
+        }
         if (!this.driver.getPositions) this.missing('庫存');
         return this.driver.getPositions(unit);
+    }
+
+    /**
+     * 帳務總覽：餘額、交易額度、市場狀態三個請求並行。市場狀態失敗 → marketStatus 為 null；
+     * 餘額或交易額度失敗 → 整體 reject（訊息標明哪一項失敗）。
+     */
+    async fetchAccountOverview(account: Account): Promise<EsunAccountOverview> {
+        this.assertQueryAccount(account);
+        const driver = this.driver;
+        if (!driver.getBalanceRaw) this.missing('餘額');
+        if (!driver.getTradeStatusRaw) this.missing('交易額度');
+        const failed = (what: string) => (e: unknown): never => {
+            const reason = e instanceof Error ? e.message : String(e);
+            throw Object.assign(new Error(`玉山${what}查詢失敗：${reason}`), { cause: e });
+        };
+        const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+        const [balance, tradeStatus, marketStatus] = await Promise.all([
+            driver.getBalanceRaw().then(raw => {
+                if (!isRecord(raw)) throw new Error('回應格式錯誤');
+                return parseEsunBalanceDetail(raw);
+            }).catch(failed('銀行餘額')),
+            driver.getTradeStatusRaw().then(raw => {
+                if (!isRecord(raw)) throw new Error('回應格式錯誤');
+                return parseEsunTradeStatusDetail(raw);
+            }).catch(failed('交易額度')),
+            (driver.getMarketStatusRaw ? driver.getMarketStatusRaw() : Promise.resolve(null))
+                .then(raw => (isRecord(raw) ? parseEsunMarketStatusDetail(raw) : null))
+                .catch(() => null),
+        ]);
+        return { balance, tradeStatus, marketStatus };
     }
 
     /** 查詢銀行餘額與圈存 */
@@ -913,13 +1052,26 @@ export class EsunTradeService {
         return this.driver.getSettlements();
     }
 
-    /** 查詢歷史成交與已實現損益 */
+    /**
+     * 查詢歷史成交與已實現損益。driver 提供原始列時只打一次請求，同一批列同時產生
+     * StockProfitLoss[]（回傳）與已實現列的成交明細（以帳戶＋傳入的 beginDate／endDate 為鍵寫入 store，
+     * 順序與回傳的列一致）。
+     */
     async fetchProfitLoss(
         account: Account,
         beginDate = '',
         endDate = '',
     ): Promise<StockProfitLoss[]> {
         this.assertQueryAccount(account);
+        if (this.driver.getTransactions) {
+            const rows = await this.driver.getTransactions(beginDate, endDate);
+            if (!Array.isArray(rows) || rows.some(r => !r || typeof r !== 'object' || Array.isArray(r))) {
+                throw new Error('玉山已實現損益回應格式錯誤');
+            }
+            const list = fromEsunTransactionsToProfitLoss(rows);
+            setEsunTransactionDetails(account, beginDate, endDate, parseEsunRealizedTransactionDetails(rows));
+            return list;
+        }
         if (!this.driver.getProfitLoss) this.missing('已實現損益');
         return this.driver.getProfitLoss(beginDate, endDate);
     }
