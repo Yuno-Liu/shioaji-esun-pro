@@ -81,6 +81,8 @@ export const popover = style({
     borderRadius: vars.radius.md,
     boxShadow: '0 12px 32px rgba(0, 0, 0, 0.35)',
     padding: vars.space.sm,
+    // 開啟時聚焦對話框本身（tabIndex=-1）：容器不畫焦點框，Tab 進入按鈕後照常顯示
+    ':focus': { outline: 'none' },
     display: 'flex',
     flexDirection: 'column',
     gap: vars.space.sm,
@@ -452,3 +454,59 @@ export const footerHint = style({
     padding: '4px 2px 2px 2px',
     borderTop: `1px dashed ${vars.color.border}`,
 });
+
+// 玉山登入失效：徽章上的紅色警示標記（疊在徽章原本的環境色上）
+export const sessionLostTag = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '3px',
+    marginLeft: '6px',
+    padding: '0 5px',
+    borderRadius: vars.radius.sm,
+    background: vars.color.danger,
+    color: '#fff',
+    fontWeight: 700,
+    whiteSpace: 'nowrap',
+});
+
+// 玉山登入失效：選單最上方的警示區塊
+export const sessionAlert = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+    padding: '8px 9px',
+    borderRadius: vars.radius.sm,
+    border: `1px solid ${vars.color.danger}`,
+    background: vars.color.dangerDim,
+    color: vars.color.foreground,
+    fontSize: '0.68rem',
+    lineHeight: 1.45,
+    minWidth: 0,
+    overflowWrap: 'anywhere',
+});
+
+export const sessionAlertTitle = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: '5px',
+    fontFamily: vars.font.display,
+    fontWeight: 700,
+    color: vars.color.danger,
+});
+
+export const reconnectBtn = style([
+    actionBtnBase,
+    {
+        alignSelf: 'flex-start',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '4px',
+        borderColor: vars.color.danger,
+        background: vars.color.danger,
+        color: '#fff',
+        ':disabled': {
+            cursor: 'progress',
+            opacity: 0.75,
+        },
+    },
+]);

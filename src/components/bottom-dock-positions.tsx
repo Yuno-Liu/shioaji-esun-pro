@@ -4,7 +4,7 @@ import { canTrade } from '../lib/account-tradable';
 
 import { reconcileAfterUnknownOutcome } from '../lib/order-outcome';
 import { ChevronDown, ChevronRight } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { useTradingLive } from '../hooks/use-stream';
 import { ensureContract } from '../lib/contracts-cache';
 import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../lib/privacy';
@@ -26,6 +26,7 @@ import { Orb } from './orb';
 import { AsyncStatus } from './async-status';
 import * as panel from './panel.css';
 import * as styles from './bottom-dock.css';
+import { useEsunPositionDetails } from './esun-position-details';
 import {
     accountRefLabel,
     ArmLockButton,
@@ -55,6 +56,8 @@ function sortValue(p: AccountedPosition): number {
 }
 
 function retPctOf(p: AccountedPosition): number {
+    // 股票（quantity 為股數）以損益÷投入成本：損益含費稅時才不會和損益不同號；不含費用時與下式相等
+    if (isStockPosition(p)) return p.price > 0 && p.quantity !== 0 ? (p.pnl / (p.price * Math.abs(p.quantity))) * 100 : 0;
     const sign = p.direction === 'Buy' ? 1 : -1;
     return p.price > 0
         ? ((p.last_price - p.price) / p.price) * 100 * sign
@@ -90,6 +93,7 @@ export function PositionsPane({
     const size = sizeClassOf(width);
     const live = useTradingLive();
     const yesterdayNotice = yesterdayQuantityNotice(useServerInfo());
+    const esun = useEsunPositionDetails();
     const priv = usePrivacyMode();
     const privMoney = usePrivacyMoney();
     const [armed, setArmed] = useState(false);
@@ -329,6 +333,7 @@ export function PositionsPane({
                     const dir = p.pnl > 0 ? 'up' : p.pnl < 0 ? 'down' : 'flat';
                     const retPct = retPctOf(p);
                     return (
+                        <Fragment key={posKey(p)}>
                         <tr
                             key={posKey(p)}
                             className={styles.clickableRow}
@@ -341,7 +346,7 @@ export function PositionsPane({
                             >
                                 {selectionCell(p)}
                             </td>
-                            <td className={styles.td}>{p.code}</td>
+                            <td className={styles.td}>{p.code}{esun.toggle(p)}</td>
                             {sz === 'wide' && (
                                 <td className={styles.td}>
                                     {names[p.code] ?? ''}
@@ -367,9 +372,9 @@ export function PositionsPane({
                                 )}
                             </td>
                             {sz === 'wide' && (
-                                <td className={`${styles.td} ${styles.qtyCell}`} title={isStockPosition(p) ? yesterdayNotice : undefined}>
+                                <td className={`${styles.td} ${styles.qtyCell}`} title={isStockPosition(p) ? esun.yesterdayNotice(p, yesterdayNotice) : undefined}>
                                     {isStockPosition(p)
-                                        ? yesterdayNotice ? '待確認' : maskMoney(
+                                        ? esun.yesterdayNotice(p, yesterdayNotice) ? '待確認' : maskMoney(
                                               fmtStockLots(p.yd_quantity),
                                               privMoney,
                                           )
@@ -464,6 +469,7 @@ export function PositionsPane({
                                 </td>
                             )}
                         </tr>
+                        {esun.row(p, sz === 'wide' ? 12 : 7)}</Fragment>
                     );
                 })}
             </tbody>
@@ -487,7 +493,7 @@ export function PositionsPane({
                             <span onClick={(e) => e.stopPropagation()}>
                                 {selectionCell(p)}
                             </span>
-                            <span className={styles.cardCode}>{p.code}</span>
+                            <span className={styles.cardCode}>{p.code}{esun.toggle(p)}</span>
                             <span className={styles.cardName}>
                                 {names[p.code] ?? ''}
                             </span>
@@ -534,6 +540,7 @@ export function PositionsPane({
                                 </span>
                             </span>
                         </div>
+                        {esun.card(p)}
                     </div>
                 );
             })}

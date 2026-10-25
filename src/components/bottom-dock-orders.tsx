@@ -1,3 +1,4 @@
+import { EsunOrderEditGate, EsunOrderMetaBadge, mutationErrorNotice } from './esun-order-meta';
 import { remainingWorkingOrderQuantity } from '../lib/working-order-quantity';
 import { canUpdateOrderPrice, isOddLot, lotLabel } from '../lib/odd-lot';
 import { cancellationSummary } from '../lib/trade-mutations';
@@ -182,8 +183,7 @@ export function OrderEditor({
             }).catch((err) =>
                 notify({
                     kind: 'err',
-                    title: field === 'qty' ? '改量失敗或結果未知' : '改價失敗或結果未知',
-                    body: `${err instanceof Error ? err.message : String(err)}；請手動更新委託確認，勿自動重送`,
+                    ...mutationErrorNotice(err, field === 'qty' ? '改量' : '改價'),
                 }),
             );
         }
@@ -359,7 +359,7 @@ export function OrdersPane({
         } catch (error) {
             notify(isCancelUnconfirmed(error)
                 ? { title: '刪單未確認', kind: 'err', body: error.message }
-                : { title: '刪單失敗或結果未知', kind: 'err', body: `${error instanceof Error ? error.message : String(error)}；請手動更新委託確認，勿自動重送` });
+                : { kind: 'err', ...mutationErrorNotice(error, '刪單') });
         } finally {
             setCancelling(null);
         }
@@ -433,7 +433,7 @@ export function OrdersPane({
         return (
             <>
                 {withEditors && (
-                    <>
+                    <EsunOrderEditGate trade={t}>
                         <span onClick={(e) => e.stopPropagation()}>
                             {/* 零股只能減量／刪單，不提供改價（#204） */}
                             {canUpdateOrderPrice(t.order) && (
@@ -451,7 +451,7 @@ export function OrdersPane({
                                 onChanged={onChanged}
                             />
                         </span>{' '}
-                    </>
+                    </EsunOrderEditGate>
                 )}
                 <button
                     className={styles.cancelBtn}
@@ -533,6 +533,7 @@ export function OrdersPane({
                                 >
                                     {ACTIVE_STATUSES.has(st) && remainingWorkingOrderQuantity(t) === 0 ? '無未成交量' : orderStatusLabel(st)}
                                 </span>
+                                <EsunOrderMetaBadge trade={t} compact={size === 'mid'} />
                             </td>
                             {size === 'wide' && (
                                 <td
@@ -594,6 +595,7 @@ export function OrdersPane({
                             >
                                 {ACTIVE_STATUSES.has(st) && remainingWorkingOrderQuantity(t) === 0 ? '無未成交量' : orderStatusLabel(st)}
                             </span>
+                            <EsunOrderMetaBadge trade={t} />
                         </div>
                         <div className={styles.cardLine}>
                             {priceCell(t)}
