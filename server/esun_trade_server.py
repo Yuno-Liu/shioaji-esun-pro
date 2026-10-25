@@ -2131,6 +2131,34 @@ def remaining_quantity(order: dict, unit: str) -> float | None:
 # esun_trade core input checks (O00001-O00021) are raised before any request is sent.
 _SDK_LOCAL_VALIDATION_RE = re.compile(r"\bO000(0[1-9]|1[0-9]|2[01])\b")
 
+# Keys the SDK core reads from an order result (Node OrderResultObject): a missing one panics in
+# the Rust core (pyo3 PanicException, a BaseException) instead of raising a Python error.
+SDK_ORDER_CORE_FIELDS = (
+    "ap_code", "work_date", "ord_status", "trade", "buy_sell", "stock_no",
+    "org_qty", "price_flag", "od_price", "bs_flag", "ord_no", "pre_ord_no",
+)
+# Never swallowed by the SDK-call guards (every other BaseException, e.g. a core panic, is).
+_PROPAGATED_BASE_EXCEPTIONS = (KeyboardInterrupt, SystemExit, GeneratorExit)
+
+
+def missing_sdk_order_fields(order: dict) -> list[str]:
+    """Core fields absent (or None) from an SDK order dict, plus 'ord_no|pre_ord_no' when both are empty."""
+    missing = [key for key in SDK_ORDER_CORE_FIELDS if order.get(key) is None]
+    if not str(order.get("ord_no") or "").strip() and not str(order.get("pre_ord_no") or "").strip():
+        missing.append("ord_no|pre_ord_no")
+    return missing
+
+
+def normalize_place_result(result: any) -> any:
+    """
+    placeOrder ord_type '1' (reservation): the response's ord_no is the reservation number, so it is
+    returned as pre_ord_no with an empty ord_no (ord_type kept). ord_type '2' / missing: unchanged.
+    """
+    if not isinstance(result, dict) or str(result.get("ord_type") or "").strip() != "1":
+        return result
+    number = str(result.get("pre_ord_no") or "").strip() or str(result.get("ord_no") or "").strip()
+    return {**result, "pre_ord_no": number, "ord_no": ""}
+
 
 def derive_ack_op_type(ack: dict, previous: dict | None) -> str:
     """
@@ -3482,8 +3510,21 @@ class EsunTradeBridge:
     def _call_sdk_mutation_now(self, session: EsunSession, label: str, call: any) -> tuple[dict, int]:
         try:
             result = call()
-        except Exception as e:
+        except _PROPAGATED_BASE_EXCEPTIONS:
+            raise
+        except BaseException as e:
             message = redact(e)
+            if not isinstance(e, Exception):
+                # SDK core panic (pyo3 PanicException): the request may or may not have been sent.
+                logger.error(f"{label}結果未知（SDK 核心 panic）：\n{redact(traceback.format_exc())}")
+                return {
+                    "ok": False,
+                    "outcome": "unknown",
+                    "code": "ESUN_OUTCOME_UNKNOWN",
+                    "error": f"{label}結果未知（玉山 SDK 核心錯誤），無法確認玉山是否已收到：{message}（請以委託查詢確認，切勿直接重送）",
+                    "environment": session.environment,
+                    "sessionGeneration": session.generation,
+                }, 502
             if _SDK_LOCAL_VALIDATION_RE.search(message):
                 # O000xx are the SDK core's own input checks, raised before any request is built.
                 logger.warning(f"{label}未送出（SDK 本地驗證）：{message}")
@@ -3540,6 +3581,10 @@ class EsunTradeBridge:
         raw, cached, meta = self.order_book_cache.get_for_mutation(order_no)
         order = dict(cached) if cached else {}
         sdk_order = self._sdk_order_dict(raw or {})
+        cached_ord_no, cached_pre_ord_no = _order_keys(order)
+        cached_reservation = bool(cached) and bool(cached_pre_ord_no) and (
+            not cached_ord_no or str(order.get("ord_status") or "").strip() == "1"
+        )
         normalizers = {
             "buy_sell": to_action,
             "ap_code": to_ap_code,
@@ -3568,6 +3613,8 @@ class EsunTradeBridge:
                 value = value.strip() if isinstance(value, str) else ""
                 if not _ORDER_NO_RE.fullmatch(value) or value != order_no:
                     raise EsunValidationError("payload.ordNo 格式錯誤或與 order_no 不一致")
+                if cached_reservation and value == cached_pre_ord_no:
+                    continue  # the reservation number mislabelled as ordNo: never the SDK's ord_no
             else:
                 value = str(value).strip()
             order[field] = value
@@ -3577,15 +3624,42 @@ class EsunTradeBridge:
             sdk_order["ord_no"] = order_no
         return order, meta, payload, cached is not None, sdk_order
 
-    @staticmethod
-    def _require_order_details(order: dict) -> None:
-        """recover_order_result() needs ap_code and stock_no: refuse instead of guessing defaults."""
-        if not str(order.get("ap_code") or "").strip() or not str(order.get("stock_no") or "").strip():
+    def _resolve_complete_order(
+        self, session: EsunSession, order_no: str, body: dict, check: any = None
+    ) -> tuple[dict, dict | None, dict, bool, dict]:
+        """
+        _resolve_order() whose sdk_order carries every SDK_ORDER_CORE_FIELDS key (the core panics on a
+        missing one). When it does not, one authoritative snapshot through the orders-refresh
+        coordinator, then resolved again; still incomplete -> 409 ESUN_ORDER_INCOMPLETE (not sent).
+        `check(order, payload)` runs on every resolution, before the completeness test.
+        """
+        resolved = self._resolve_order(order_no, body)
+        if check is not None:
+            check(resolved[0], resolved[2])
+        if not missing_sdk_order_fields(resolved[4]):
+            return resolved
+        try:
+            self._refresh_orders_snapshot(session)
+        except EsunQueryError as e:
+            if e.code == "ESUN_SESSION_CHANGED":
+                raise EsunValidationError(f"{e}（委託未送出）", e.code, 503)
+            logger.warning(f"補齊委託資料的查詢失敗：{redact(e)}")
+        resolved = self._resolve_order(order_no, body)
+        if check is not None:
+            check(resolved[0], resolved[2])
+        missing = missing_sdk_order_fields(resolved[4])
+        if missing:
             raise EsunValidationError(
-                "委託資料不完整（缺 ap_code 或 stock_no）：請先更新委託（refresh=true）或於 payload 提供 apCode/stockNo",
-                "ESUN_ORDER_DETAILS_MISSING",
+                f"委託資料不完整（缺 {', '.join(missing)}），委託未送出：請更新委託（refresh=true）後重試",
+                "ESUN_ORDER_INCOMPLETE",
                 409,
             )
+        return resolved
+
+    @staticmethod
+    def _reject_reservation(order: dict, payload: dict) -> None:
+        if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
+            raise EsunValidationError("預約單不可改單 (AG0006)，請先刪單後重新下單", "AG0006")
 
     def _sdk_order_dict(self, order: dict) -> dict:
         return {k: v for k, v in order.items() if k not in self._BRIDGE_ONLY_ORDER_KEYS}
@@ -3655,15 +3729,28 @@ class EsunTradeBridge:
         return order_obj, normalized
 
     def _remember_placed_order(self, session: EsunSession, normalized: dict, result: any) -> None:
-        """Caches an accepted order as request fields + response (the response alone lacks stock/ap_code)."""
+        """
+        Caches an accepted order as request fields + the normalized response (the response alone lacks
+        stock/ap_code), shaped like an order result row so it can be handed to the SDK: ord_status from
+        ord_type, both order numbers, quantities in the order-result units, nothing filled/cancelled.
+        """
         if not isinstance(result, dict) or not (result.get("ord_no") or result.get("pre_ord_no")):
             return
         entry = {k: normalized[k] for k in ("stock_no", "buy_sell", "ap_code", "price_flag", "bs_flag", "trade", "od_price")}
-        if normalized["ap_code"] in ("1", "2"):
-            entry["org_qty"] = normalized["quantity"]  # lots, same unit as order results
+        quantity = normalized["quantity"]
+        if normalized["ap_code"] in _SHARE_UNIT_AP_CODES:
+            entry["org_qty_share"] = quantity  # shares
+            entry["org_qty"] = _num_out(quantity / SHARES_PER_LOT)  # fractional lots, as in order results
         else:
-            entry["org_qty_share"] = normalized["quantity"]  # shares (order results use fractional lots in *_qty)
+            entry["org_qty"] = quantity  # lots, same unit as order results
+        entry["mat_qty"] = 0
+        entry["cel_qty"] = 0
         entry.update(result)
+        entry.setdefault("ord_no", "")
+        entry.setdefault("pre_ord_no", "")
+        ord_type = str(result.get("ord_type") or "").strip()
+        if ord_type and entry.get("ord_status") in (None, ""):
+            entry["ord_status"] = ord_type  # 1 reservation / 2 intraday, same codes as ord_status
         try:
             self.order_book_cache.upsert(entry, generation=session.generation, source="local")
         except Exception:
@@ -3690,6 +3777,8 @@ class EsunTradeBridge:
         if refusal:
             return refusal
         envelope, status = self._call_sdk_mutation(session, "下單", lambda: session.sdk.place_order(order_obj))
+        if "result" in envelope:
+            envelope["result"] = normalize_place_result(envelope["result"])
         if envelope.get("outcome") == "accepted":
             self._remember_placed_order(session, normalized, envelope.get("result"))
         return envelope, status
@@ -3706,23 +3795,23 @@ class EsunTradeBridge:
             if flag == "4":
                 raise EsunValidationError("不可將委託改為市價 (O00019)，請刪單後重新下單", "AG_INVALID_PRICE_MODIFY")
             price = parse_price(body.get("price")) if flag == "0" else None
-            order, _meta, payload, _known, sdk_order = self._resolve_order(order_no, body)
-            # Reservation Guard (AG0006)
-            if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
-                raise EsunValidationError("預約單不可改單 (AG0006)，請先刪單後重新下單", "AG0006")
-            # Price Modify Guard (ROD Limit only), applied whenever the order type is known
-            bs = str(order.get("bs_flag") or order.get("bsFlag") or "").strip().upper()
-            current_flag = str(order.get("price_flag") or order.get("priceFlag") or "").strip().upper()
-            if (bs and bs not in ("R", "ROD")) or (current_flag and current_flag not in ("0", "LIMIT", "LMT")):
-                raise EsunValidationError(
-                    "玉山證券僅支援 ROD 限價單改價，市價單或 IOC/FOK 請先刪單再重新下單", "AG_INVALID_PRICE_MODIFY"
-                )
-            if str(order.get("ap_code") or "").strip() in ("3", "5"):
-                raise EsunValidationError("零股委託不支援改價，請刪單後重新下單", "AG_INVALID_PRICE_MODIFY")
-            current_price = _to_number(order.get("od_price"))
-            if price is not None and current_price is not None and abs(current_price - price) < 1e-9:
-                raise EsunValidationError("新價格與原委託價格相同 (O00021)", "AG_INVALID_PRICE_MODIFY")
-            self._require_order_details(order)
+
+            def check(order: dict, payload: dict) -> None:
+                self._reject_reservation(order, payload)  # Reservation Guard (AG0006)
+                # Price Modify Guard (ROD Limit only), applied whenever the order type is known
+                bs = str(order.get("bs_flag") or order.get("bsFlag") or "").strip().upper()
+                current_flag = str(order.get("price_flag") or order.get("priceFlag") or "").strip().upper()
+                if (bs and bs not in ("R", "ROD")) or (current_flag and current_flag not in ("0", "LIMIT", "LMT")):
+                    raise EsunValidationError(
+                        "玉山證券僅支援 ROD 限價單改價，市價單或 IOC/FOK 請先刪單再重新下單", "AG_INVALID_PRICE_MODIFY"
+                    )
+                if str(order.get("ap_code") or "").strip() in ("3", "5"):
+                    raise EsunValidationError("零股委託不支援改價，請刪單後重新下單", "AG_INVALID_PRICE_MODIFY")
+                current_price = _to_number(order.get("od_price"))
+                if price is not None and current_price is not None and abs(current_price - price) < 1e-9:
+                    raise EsunValidationError("新價格與原委託價格相同 (O00021)", "AG_INVALID_PRICE_MODIFY")
+
+            _order, _meta, _payload, _known, sdk_order = self._resolve_complete_order(session, order_no, body, check)
         except EsunValidationError as e:
             return not_sent(e.status, e.code, str(e))
         refusal = self._consume_mutation_quota()
@@ -3773,11 +3862,9 @@ class EsunTradeBridge:
         try:
             order_no = parse_order_no(body)
             cancel_quantity, unit = self._parse_cancel_quantity(body)
-            order, meta, payload, known, sdk_order = self._resolve_order(order_no, body)
-            # Reservation Guard (AG0006)
-            if OrderBookCache.is_reservation(order) or OrderBookCache.is_reservation(payload):
-                raise EsunValidationError("預約單不可改單 (AG0006)，請先刪單後重新下單", "AG0006")
-            self._require_order_details(order)
+            order, meta, _payload, known, sdk_order = self._resolve_complete_order(
+                session, order_no, body, self._reject_reservation  # Reservation Guard (AG0006)
+            )
             ap = str(order.get("ap_code")).strip()
             expected_unit = "lot" if ap in ("1", "2") else ("share" if ap in ("3", "4", "5") else None)
             if expected_unit is None:
@@ -3813,8 +3900,7 @@ class EsunTradeBridge:
             return refusal
         try:
             order_no = parse_order_no(body)
-            order, _meta, _payload, _known, sdk_order = self._resolve_order(order_no, body)
-            self._require_order_details(order)
+            _order, _meta, _payload, _known, sdk_order = self._resolve_complete_order(session, order_no, body)
         except EsunValidationError as e:
             return not_sent(e.status, e.code, str(e))
         refusal = self._consume_mutation_quota()
@@ -3919,8 +4005,13 @@ class EsunTradeBridge:
                 orders, generation=session.generation, since=since, start=start
             ):
                 error = EsunQueryError(503, "ESUN_SESSION_CHANGED", "查詢期間玉山 session 已切換，請重新查詢")
-        except Exception as e:
-            logger.warning(f"get_order_results failed: {redact(e)}")
+        except _PROPAGATED_BASE_EXCEPTIONS:
+            raise
+        except BaseException as e:  # also an SDK core panic (pyo3 PanicException)
+            if isinstance(e, Exception):
+                logger.warning(f"get_order_results failed: {redact(e)}")
+            else:
+                logger.error(f"get_order_results 發生 SDK 核心 panic：\n{redact(traceback.format_exc())}")
             error = EsunQueryError(502, "ORDERS_QUERY_ERROR", f"玉山查詢委託失敗：{redact(e)}")
         finally:
             with cond:
@@ -3969,7 +4060,11 @@ class EsunTradeBridge:
                 }, 429
             try:
                 data = fetch(session.sdk)
-            except Exception as e:
+            except _PROPAGATED_BASE_EXCEPTIONS:
+                raise
+            except BaseException as e:  # also an SDK core panic (pyo3 PanicException)
+                if not isinstance(e, Exception):
+                    logger.error(f"查詢{label}發生 SDK 核心 panic：\n{redact(traceback.format_exc())}")
                 return {"ok": False, "error": f"玉山查詢{label}失敗：{redact(e)}", "code": error_code}, 502
             cache.set(key, data, fill_token=token)
             return (decorate(data, 0.0, False) if decorate else data), 200
