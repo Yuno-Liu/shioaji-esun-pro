@@ -6,3 +6,4 @@ export * from './adapter';
 export * from './mock-driver';
 export * from './http-driver';
 export * from './service';
+export * from './account-details';

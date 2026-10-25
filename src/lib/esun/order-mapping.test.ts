@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest';
 import type { ContractBase } from '../types/contract';
 import type { StockOrderReq, Trade } from '../types/order';
 import type { Account } from '../types/portfolio';
+import type { StockProfitLossSummary } from '../shioaji';
+import { markPosition } from '../portfolio-projection';
 import {
     clampEsunDateRange180Days,
     formatEsunErrorMessage,
@@ -17,9 +19,15 @@ import {
     fromEsunTransactionsToProfitLoss,
     fromEsunTransactionsToProfitLossSummary,
     esunMktSeqNum,
+    esunOrderSortKey,
+    esunTransactionCondOf,
     isEsunAccount,
     isEsunBroker,
+    isEsunRealizedTransaction,
+    isEstimatedEsunSettlement,
     isReservationOrder,
+    mergeSettlementSlot,
+    sortEsunOrderResultsOldestFirst,
     toEsunOrderPayload,
     validateEsunOrderPriceMutation,
     validateEsunOrderQtyMutation,
@@ -710,7 +718,8 @@ describe('Portfolio & SSE Mapping', () => {
 
         const posCommon = fromEsunInventoryToPosition(rawItem, 'Common');
         expect(posCommon.code).toBe('2884');
-        expect(posCommon.quantity).toBe(2); // 2500 / 1000 = 2 sheets
+        expect(posCommon.quantity).toBe(2.5); // 2500 / 1000 = 2.5 張（精確換算，不取整）
+        expect(posCommon.yd_quantity).toBe(2.5);
         expect(posCommon.price).toBe(24.5);
         expect(posCommon.last_price).toBe(26.0);
         expect(posCommon.pnl).toBe(3750);
@@ -719,6 +728,33 @@ describe('Portfolio & SSE Mapping', () => {
 
         const posShare = fromEsunInventoryToPosition(rawItem, 'Share');
         expect(posShare.quantity).toBe(2500); // 2500 shares
+        expect(posShare.yd_quantity).toBe(2500);
+    });
+
+    it('converts Common quantity and yd_quantity to exact lots (shares / 1000)', () => {
+        const at = (cost_qty: number, qty_l: number) => fromEsunInventoryToPosition({ stk_no: '1342', cost_qty, qty_l, trade: '0' }, 'Common');
+        expect(at(3000, 1000)).toMatchObject({ quantity: 3, yd_quantity: 1 });
+        expect(at(1200, 1800)).toMatchObject({ quantity: 1.2, yd_quantity: 1.8 });
+        expect(at(37, 0)).toMatchObject({ quantity: 0.037, yd_quantity: 0 });
+    });
+
+    it('never maps blank or zero price fields to 0 (first finite positive wins, otherwise NaN)', () => {
+        const pos = (extra: Record<string, unknown>) =>
+            fromEsunInventoryToPosition({ stk_no: '2884', cost_qty: 1000, trade: '0', ...extra }, 'Share');
+        // 空字串的市價退到 price_now
+        expect(pos({ price_mkt: '', price_now: '25.5', price_avg: '24' })).toMatchObject({ price: 24, last_price: 25.5 });
+        // 市價、現價皆缺或為 0 → 以均價為參考價
+        expect(pos({ price_mkt: '0', price_now: ' ', price_avg: '24' })).toMatchObject({ price: 24, last_price: 24 });
+        // 均價缺值 → 退到舊欄位 price；都沒有 → NaN（不是 0）
+        expect(pos({ price_avg: '', price: '23.1', price_mkt: 26 }).price).toBe(23.1);
+        const blank = pos({ price_avg: '', price_mkt: '', price_now: '' });
+        expect(blank.price).toBeNaN();
+        expect(blank.last_price).toBeNaN();
+        // 參考價未知時第一個 tick 不會把損益加上「價格×股數」
+        const marked = markPosition({ ...blank, pnl: 1200 }, 26, 1);
+        expect(marked.pnl).toBe(1200);
+        const normal = markPosition({ ...pos({ price_mkt: '', price_now: '', price_avg: '24' }), pnl: 0 }, 26, 1);
+        expect(normal.pnl).toBe(2000);
     });
 
     it('maps balance and reserve summary', () => {
@@ -743,18 +779,193 @@ describe('Portfolio & SSE Mapping', () => {
         expect(fromEsunBalance({ available_balance: 1 }).date).toBe('');
     });
 
-    it('maps settlements correctly', () => {
-        const rawSettlements = [
-            { date: '2026-10-23', price: 100000, T: 0 },
-            { date: '2026-10-24', price: -50000, T: 1 },
-        ];
+    it('maps numeric epoch updated_at (production shape) to ISO date', () => {
+        // 正式環境 updated_at 是整數 epoch 秒
+        expect(fromEsunBalance({ available_balance: 1, updated_at: 1792850400 }).date)
+            .toBe('2026-10-24T14:00:00.000Z');
+        // ≥ 1e12 視為毫秒
+        expect(fromEsunBalance({ available_balance: 1, updated_at: 1792850400123 }).date)
+            .toBe('2026-10-24T14:00:00.123Z');
+        // 非有限數值不採用，沿用既有退回邏輯
+        expect(fromEsunBalance({ available_balance: 1, updated_at: Number.NaN }).date).toBe('');
+    });
 
-        const mapped = fromEsunSettlements(rawSettlements);
-        expect(mapped).toHaveLength(2);
-        expect(mapped[0]?.amount).toBe(100000);
-        expect(mapped[0]?.T).toBe(0);
-        expect(mapped[1]?.amount).toBe(-50000);
-        expect(mapped[1]?.T).toBe(1);
+    describe('fromEsunSettlements（交割行事曆 T+n）', () => {
+        // 台北時間 → epoch ms
+        const taipei = (iso: string, hh = 12, mm = 0) => {
+            const [y, m, d] = iso.split('-').map(Number);
+            return Date.UTC(y!, m! - 1, d!, hh - 8, mm);
+        };
+        const row = (cDate: string, price: string, date = '20261021') => ({ c_date: cDate, date, price });
+        const sundayStatus = { is_trading_day: false, last_trading_day: '20261022', next_trading_day: '20261027' };
+        const tradingStatus = { is_trading_day: true, last_trading_day: '20261022', next_trading_day: '20261028' };
+        const slots = (list: { T: number; date: string; amount: number }[]) => list.map(s => [s.T, s.date, s.amount]);
+
+        it('maps the production shape on a Sunday: c_date is the settlement day, date (trade day) is ignored', () => {
+            const raw = [row('20261027', '120000', '20261022'), row('20261028', '-35500', '20261023')];
+            expect(slots(fromEsunSettlements(raw, sundayStatus, taipei('2026-10-25')))).toEqual([
+                [0, '2026-10-27', 120000],
+                [1, '2026-10-28', -35500],
+                [2, '2026-10-29', 0],
+            ]);
+        });
+
+        it('maps each pending day to its own slot on a trading day', () => {
+            const raw = [row('20261027', '1'), row('20261028', '-2'), row('20261029', '3')];
+            expect(slots(fromEsunSettlements(raw, tradingStatus, taipei('2026-10-27')))).toEqual([
+                [0, '2026-10-27', 1],
+                [1, '2026-10-28', -2],
+                [2, '2026-10-29', 3],
+            ]);
+        });
+
+        it('keeps the T+1 slot (amount 0) when a trading day has no T+1 settlement', () => {
+            const raw = [row('20261027', '10'), row('20261029', '30')];
+            expect(slots(fromEsunSettlements(raw, tradingStatus, taipei('2026-10-27')))).toEqual([
+                [0, '2026-10-27', 10],
+                [1, '2026-10-28', 0],
+                [2, '2026-10-29', 30],
+            ]);
+        });
+
+        it('anchors T+0 on the next trading day when a non-trading day has no T+0 settlement', () => {
+            expect(slots(fromEsunSettlements([row('20261028', '5')], sundayStatus, taipei('2026-10-25')))).toEqual([
+                [0, '2026-10-27', 0],
+                [1, '2026-10-28', 5],
+                [2, '2026-10-29', 0],
+            ]);
+        });
+
+        it('falls back to weekday arithmetic without market_status', () => {
+            const raw = [row('2026-10-28', '7'), row('20261029', '8')];
+            expect(slots(fromEsunSettlements(raw, null, taipei('2026-10-28')))).toEqual([
+                [0, '2026-10-28', 7],
+                [1, '2026-10-29', 8],
+                [2, '2026-10-30', 0],
+            ]);
+            // 週末：T+0 為下一個週一、T+2 跳過週末
+            expect(slots(fromEsunSettlements([], undefined, taipei('2026-10-24')))).toEqual([
+                [0, '2026-10-26', 0],
+                [1, '2026-10-27', 0],
+                [2, '2026-10-28', 0],
+            ]);
+            expect(slots(fromEsunSettlements([], null, taipei('2026-10-29')))).toEqual([
+                [0, '2026-10-29', 0],
+                [1, '2026-10-30', 0],
+                [2, '2026-11-02', 0],
+            ]);
+        });
+
+        it('ignores an unusable market_status (non-boolean flag or invalid next day)', () => {
+            const today = taipei('2026-10-28');
+            for (const status of [
+                { is_trading_day: 'true', next_trading_day: '20261029' },
+                { is_trading_day: true, next_trading_day: '20261332' },
+                { is_trading_day: true },
+            ]) {
+                expect(slots(fromEsunSettlements([], status as never, today)).map(s => s[1]))
+                    .toEqual(['2026-10-28', '2026-10-29', '2026-10-30']);
+            }
+            // camelCase 欄位同樣可用
+            expect(fromEsunSettlements([], { isTradingDay: false, nextTradingDay: '20261027' }, taipei('2026-10-25'))[0]!.date)
+                .toBe('2026-10-27');
+        });
+
+        it('handles a stale overnight cache: next==today anchors on today, next<today falls back', () => {
+            const justAfterMidnight = taipei('2026-10-27', 0, 30);
+            expect(Date.UTC(2026, 9, 26, 16, 30)).toBe(justAfterMidnight); // 10/26 UTC 仍是台北 10/27
+            expect(slots(fromEsunSettlements([row('20261027', '9')], sundayStatus, justAfterMidnight))).toEqual([
+                [0, '2026-10-27', 9],
+                [1, '2026-10-28', 0],
+                [2, '2026-10-29', 0],
+            ]);
+            // N < today：過期，退回只跳週末的推算
+            expect(slots(fromEsunSettlements([row('20261029', '4')], sundayStatus, taipei('2026-10-28')))).toEqual([
+                [0, '2026-10-28', 0],
+                [1, '2026-10-29', 4],
+                [2, '2026-10-30', 0],
+            ]);
+            // 交易日但 N < today 同樣視為過期
+            expect(fromEsunSettlements([], tradingStatus, taipei('2026-10-29'))[0]!.date).toBe('2026-10-29');
+        });
+
+        it('drops already-settled rows, sums rows with the same settlement day, accepts numeric strings', () => {
+            const raw = [
+                row('20261022', '999999'),
+                row('20261027', '100'),
+                { c_date: '20261027', date: '20261022', price: '-40' },
+                { cDate: '20261028', amount: 12.5 },
+            ];
+            expect(slots(fromEsunSettlements(raw, sundayStatus, taipei('2026-10-25')))).toEqual([
+                [0, '2026-10-27', 60],
+                [1, '2026-10-28', 12.5],
+                [2, '2026-10-29', 0],
+            ]);
+        });
+
+        it('rejects malformed rows', () => {
+            const today = taipei('2026-10-25');
+            const bad = [
+                [{ date: '20261027', price: '1' }],
+                [{ c_date: '20261027', price: 'abc' }],
+                [{ c_date: '20261027', price: '' }],
+                [{ c_date: '20261027' }],
+                [{ c_date: '20261332', price: '1' }],
+                [{ c_date: '2026/10/27', price: '1' }],
+                [{ c_date: '20261027', price: '1', T: 0 }, { T: 1, price: '2' }],
+                [null],
+            ];
+            for (const raw of bad) {
+                expect(() => fromEsunSettlements(raw as never, sundayStatus, today)).toThrow('玉山交割款回應格式錯誤');
+            }
+            expect(() => fromEsunSettlements({} as never, sundayStatus, today)).toThrow('玉山交割款回應格式錯誤');
+        });
+
+        it('rejects pending settlement days beyond T+2', () => {
+            const raw = [row('20261027', '1'), row('20261028', '2'), row('20261029', '3'), row('20261030', '4')];
+            expect(() => fromEsunSettlements(raw, sundayStatus, taipei('2026-10-25')))
+                .toThrow('玉山交割款日期超出 T+2（2026-10-30），無法對應交割行事曆');
+        });
+
+        it('marks only slots without E.SUN amounts as estimated', () => {
+            const list = fromEsunSettlements([row('20261028', '0')], sundayStatus, taipei('2026-10-25'));
+            // 10/28 有一筆金額為 0 的真實列 → 不是推算格
+            expect(list.map(isEstimatedEsunSettlement)).toEqual([true, false, true]);
+        });
+    });
+
+    describe('mergeSettlementSlot（多帳戶交割合計）', () => {
+        const taipeiNoon = (iso: string) => {
+            const [y, m, d] = iso.split('-').map(Number);
+            return Date.UTC(y!, m! - 1, d!, 4);
+        };
+        // 合成：無 market_status，只跳週末推算 → T+1 推算為 10/29
+        const esun = () => fromEsunSettlements([{ c_date: '20261028', price: '300' }], null, taipeiNoon('2026-10-28'));
+        const real = (T: number, date: string, amount: number) => ({ T, date, amount });
+
+        it('takes the real row date when the other side is an estimated E.SUN slot (either order)', () => {
+            const est = esun()[1]!;
+            expect(isEstimatedEsunSettlement(est)).toBe(true);
+            const a = mergeSettlementSlot(mergeSettlementSlot(undefined, est), real(1, '2026-10-30', -50));
+            expect(a).toEqual({ T: 1, date: '2026-10-30', amount: -50 });
+            expect(isEstimatedEsunSettlement(a)).toBe(false);
+            const b = mergeSettlementSlot(mergeSettlementSlot(undefined, real(1, '2026-10-30', -50)), est);
+            expect(b).toEqual({ T: 1, date: '2026-10-30', amount: -50 });
+        });
+
+        it('keeps the estimated mark only when both sides are estimated', () => {
+            const merged = mergeSettlementSlot(mergeSettlementSlot(undefined, esun()[2]!), esun()[2]!);
+            expect(isEstimatedEsunSettlement(merged)).toBe(true);
+            // 之後再遇到真實列仍可讓位
+            expect(mergeSettlementSlot(merged, real(2, '2026-11-02', 20))).toEqual({ T: 2, date: '2026-11-02', amount: 20 });
+        });
+
+        it('still rejects two real rows with different dates and sums matching ones', () => {
+            const first = mergeSettlementSlot(undefined, esun()[0]!);
+            expect(isEstimatedEsunSettlement(first)).toBe(false);
+            expect(() => mergeSettlementSlot(first, real(0, '2026-10-29', 1))).toThrow('帳戶交割日期不一致，合計待確認');
+            expect(mergeSettlementSlot(first, real(0, '2026-10-28', 100))).toEqual({ T: 0, date: '2026-10-28', amount: 400 });
+        });
     });
 
     it('maps transactions to profit loss and summary', () => {
@@ -762,7 +973,8 @@ describe('Portfolio & SSE Mapping', () => {
             {
                 stk_no: '2884',
                 c_date: '2026-10-22',
-                price_qty: 1000,
+                qty: 1000,
+                price_qty: 26000,
                 cost: 24000,
                 recv: 26000,
                 make: 2000,
@@ -772,7 +984,8 @@ describe('Portfolio & SSE Mapping', () => {
             {
                 stk_no: '2884',
                 c_date: '2026-10-23',
-                price_qty: 1000,
+                qty: 1000,
+                price_qty: 27000,
                 cost: 25000,
                 recv: 27000,
                 make: 2000,
@@ -790,10 +1003,150 @@ describe('Portfolio & SSE Mapping', () => {
         const plSummary = fromEsunTransactionsToProfitLossSummary(rawTx);
         expect(plSummary.profitloss_sum).toHaveLength(1);
         expect(plSummary.profitloss_sum[0]?.code).toBe('2884');
-        expect(plSummary.profitloss_sum[0]?.quantity).toBe(2000);
+        // quantity 為張（2000 股 → 2 張），與明細一致
+        expect(plSummary.profitloss_sum[0]?.quantity).toBe(2);
         expect(plSummary.profitloss_sum[0]?.pnl).toBe(4000);
-        expect(plSummary.total.quantity).toBe(2000);
+        expect(plSummary.total.quantity).toBe(2);
         expect(plSummary.total.pnl).toBe(4000);
+    });
+
+    describe('fromEsunTransactionsToProfitLossSummary（code＋cond 分組、張、價格以股數計）', () => {
+        const rows = [
+            // 現股：兩筆賣出合併
+            { stk_no: '2884', buy_sell: 'S', trade: '0', t_date: '20261022', qty: '1000', price_qty: '30000', cost: '-28000', recv: '29900', make: '1900' },
+            { stk_no: '2884', buy_sell: 'S', trade: '0', t_date: '20261023', qty: '500', price_qty: '15600', cost: '-14000', recv: '15550', make: '1550' },
+            // 同一檔融資賣出：另成一組
+            { stk_no: '2884', buy_sell: 'S', trade: '3', t_date: '20261023', qty: '2000', price_qty: '62000', cost: '24000', recv: '25500', make: '1500' },
+            // 零股：缺 price_qty 時以 price×股數補
+            { stk_no: '1342', buy_sell: 'S', trade: '0', t_date: '20261023', qty: '40', price: '512', cost: '20000', recv: '20400', make: '400' },
+            // 建倉買進：不列入
+            { stk_no: '2884', buy_sell: 'B', trade: '0', t_date: '20261021', qty: '1000', price_qty: '28000', cost: '28000', make: '0' },
+        ];
+
+        it('groups by code + cond and reports lots, share-based prices and 玉山 cost / recv subtotals', () => {
+            const sum = fromEsunTransactionsToProfitLossSummary(rows as never);
+            const groupsOf = sum.profitloss_sum as StockProfitLossSummary[];
+            const groups = groupsOf.map(g => [g.code, g.cond, g.quantity]);
+            expect(groups).toEqual([['2884', 'Cash', 1.5], ['2884', 'MarginTrading', 2], ['1342', 'Cash', 0.04]]);
+
+            const cash = groupsOf[0]!;
+            expect(cash.entry_cost).toBe(42000); // Σ|cost|
+            expect(cash.cover_cost).toBe(45450); // Σrecv
+            expect(cash.cover_price).toBeCloseTo(45600 / 1500, 10); // Σprice_qty／Σ股數
+            expect(cash.entry_price).toBeCloseTo(42000 / 1500, 10); // entry_cost／Σ股數
+            expect(cash.pnl).toBe(3450);
+            expect(cash.buy_cost).toBe(42000);
+            expect(cash.sell_cost).toBe(45450);
+
+            const margin = groupsOf[1]!;
+            expect(margin.entry_cost).toBe(24000);
+            expect(margin.cover_price).toBe(31);
+            expect(margin.entry_price).toBe(12); // 自備款成本／股數，僅供參考
+
+            const odd = groupsOf[2]!;
+            expect(odd.cover_price).toBe(512);
+            expect(odd.entry_price).toBe(500);
+
+            expect(sum.total.quantity).toBe(3.54);
+            expect(sum.total.pnl).toBe(5350);
+            expect(sum.total.entry_amount).toBe(86000);
+            expect(sum.total.cover_amount).toBe(91350);
+        });
+
+        it('returns an empty summary when nothing is realized', () => {
+            const sum = fromEsunTransactionsToProfitLossSummary([rows[4]] as never);
+            expect(sum.profitloss_sum).toEqual([]);
+            expect(sum.total.quantity).toBe(0);
+        });
+    });
+
+    describe('trade 9（信用當沖）', () => {
+        const base = { stk_no: '2884', t_date: '20261023', qty: '1000', trade: '9' };
+
+        it('counts the S side whenever make is finite and the B side only when make ≠ 0', () => {
+            expect(isEsunRealizedTransaction({ ...base, buy_sell: 'S', make: '0' })).toBe(true);
+            expect(isEsunRealizedTransaction({ ...base, buy_sell: 'S', make: '-300' })).toBe(true);
+            expect(isEsunRealizedTransaction({ ...base, buy_sell: 'B', make: '0' })).toBe(false);
+            expect(isEsunRealizedTransaction({ ...base, buy_sell: 'B', make: '250' })).toBe(true);
+            expect(isEsunRealizedTransaction({ ...base, buy_sell: 'S', make: '' })).toBe(false);
+            expect(isEsunRealizedTransaction({ ...base, buy_sell: 'B' })).toBe(false);
+        });
+
+        it('maps trade 9 to cond MarginTrading in rows and summary', () => {
+            const rows = [
+                { ...base, buy_sell: 'B', make: '0', cost: '10000' },
+                { ...base, buy_sell: 'S', make: '800', cost: '10000', recv: '10800', price_qty: '31000' },
+            ];
+            const pl = fromEsunTransactionsToProfitLoss(rows as never);
+            expect(pl.map(r => [r.code, r.cond, r.pnl, r.quantity])).toEqual([['2884', 'MarginTrading', 800, 1]]);
+            const sum = fromEsunTransactionsToProfitLossSummary(rows as never);
+            expect((sum.profitloss_sum as StockProfitLossSummary[]).map(g => [g.code, g.cond, g.quantity])).toEqual([['2884', 'MarginTrading', 1]]);
+            expect(esunTransactionCondOf('9')).toBe('MarginTrading');
+            expect(esunTransactionCondOf('3')).toBe('MarginTrading');
+            expect(esunTransactionCondOf('4')).toBe('ShortSelling');
+            expect(esunTransactionCondOf('A')).toBe('Cash');
+            expect(esunTransactionCondOf('0')).toBe('Cash');
+        });
+
+        it('keeps the existing rules for other trade types', () => {
+            expect(isEsunRealizedTransaction({ buy_sell: 'B', trade: '0', make: '100' })).toBe(false);
+            expect(isEsunRealizedTransaction({ buy_sell: 'S', trade: '0', make: '0' })).toBe(true);
+            expect(isEsunRealizedTransaction({ buy_sell: 'B', trade: '4', make: '100' })).toBe(true);
+            expect(isEsunRealizedTransaction({ buy_sell: 'S', trade: '4', make: '0' })).toBe(false);
+        });
+    });
+
+    describe('sortEsunOrderResultsOldestFirst', () => {
+        const r = (id: string, ord_date?: string, ord_time?: string) => ({ id, ord_date, ord_time });
+        const ids = (rows: { id: string }[]) => rows.map(x => x.id);
+
+        it('sorts by (ord_date, ord_time) oldest first, by milliseconds within a second', () => {
+            const rows = [
+                r('c', '20261023', '090000500'),
+                r('a', '20261022', '133000000'),
+                r('d', '20261023', '090000501'),
+                r('b', '20261023', '090000050'),
+            ];
+            expect(ids(sortEsunOrderResultsOldestFirst(rows))).toEqual(['a', 'b', 'c', 'd']);
+        });
+
+        it('pads ord_time to 9 digits (leading zero dropped) and treats 6 digits as HHMMSS', () => {
+            const rows = [r('late', '20261023', '100000000'), r('early', '20261023', '93000123'), r('hhmmss', '20261023', '093000')];
+            expect(ids(sortEsunOrderResultsOldestFirst(rows))).toEqual(['hhmmss', 'early', 'late']);
+            expect(esunOrderSortKey({ ord_date: '2026-10-23', ord_time: '93000123' })).toBe('20261023093000123');
+            expect(esunOrderSortKey({ ord_date: '20261023', ord_time: '093000' })).toBe('20261023093000000');
+        });
+
+        it('keeps rows without date or time first, in their original relative order, and is stable', () => {
+            const rows = [
+                r('t2', '20261023', '090000000'),
+                r('noTime1', '20261023', ''),
+                r('t1', '20261022', '090000000'),
+                r('noDate', undefined, '090000000'),
+                r('same1', '20261023', '090000000'),
+                r('noTime2', '20261023'),
+            ];
+            expect(ids(sortEsunOrderResultsOldestFirst(rows))).toEqual(['noTime1', 'noDate', 'noTime2', 't1', 't2', 'same1']);
+            expect(ids(rows)).toEqual(['t2', 'noTime1', 't1', 'noDate', 'same1', 'noTime2']); // 不改動輸入
+        });
+    });
+
+    it('converts production transaction qty (shares) to lots for profit loss rows', () => {
+        // 正式環境形狀（合成數值）：qty 是股數，price_qty = 價 × 股
+        const rawTx = [
+            { stk_no: '2884', t_date: '20261023', buy_sell: 'S', trade: '0', qty: '3000', price: '30.50', price_qty: '91500', make: '1200' },
+            { stk_no: '1342', t_date: '20261023', buy_sell: 'S', trade: '0', qty: '40', price: '512', price_qty: '20480', make: '-500' },
+            { stk_no: '2885', t_date: '20261023', buy_sell: 'S', trade: '0', qty: '2500', price: '25', price_qty: '62500', make: '100' },
+        ];
+        const pl = fromEsunTransactionsToProfitLoss(rawTx as never);
+        expect(pl.map(r => [r.code, r.quantity])).toEqual([
+            ['2884', 3],
+            ['1342', 0.04],
+            ['2885', 2.5],
+        ]);
+        // 價格仍是每股價
+        expect(pl[0]?.price).toBe(30.5);
+        expect(pl[1]?.price).toBe(512);
     });
 
     it('maps trade status to trading limits', () => {

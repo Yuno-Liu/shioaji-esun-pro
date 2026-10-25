@@ -185,6 +185,129 @@ describe('HttpEsunDriver queries', () => {
         expect(await caught(new HttpEsunDriver('', header as never).getOrders(true))).toMatchObject({ retryAfter: 2 });
     });
 
+    describe('getSettlements', () => {
+        // 台北 2026-10-25（週日）12:00；只假造 Date，request 的逾時計時器照常
+        const SUNDAY = Date.UTC(2026, 9, 25, 4);
+        const settlements = [
+            { c_date: '20261027', date: '20261022', price: '120000' },
+            { c_date: '20261028', date: '20261023', price: '-35500' },
+        ];
+        const sundayStatus = { is_trading_day: false, last_trading_day: '20261022', next_trading_day: '20261027' };
+        const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+        const routed = (status: () => Promise<Response>, list: unknown = settlements) => vi.fn(async (url: string) => {
+            if (url === '/esun/market_status') return status();
+            if (url === '/esun/portfolio/settlements') return json(list);
+            throw new Error(`unexpected ${url}`);
+        });
+        const slots = (list: { T: number; date: string; amount: number }[]) => list.map(s => [s.T, s.date, s.amount]);
+
+        it('requests settlements and market_status concurrently', async () => {
+            vi.useFakeTimers({ toFake: ['Date'] });
+            vi.setSystemTime(SUNDAY);
+            let releaseSettlements!: () => void;
+            const fetchImpl = vi.fn((url: string) => {
+                if (url === '/esun/portfolio/settlements') {
+                    return new Promise<Response>(resolve => { releaseSettlements = () => resolve(json(settlements)); });
+                }
+                return Promise.resolve(json(sundayStatus));
+            });
+            const pending = new HttpEsunDriver('', fetchImpl as never).getSettlements();
+            await Promise.resolve();
+            // 交割款尚未回應時 market_status 已送出
+            expect(fetchImpl.mock.calls.map(c => (c as unknown as [string])[0]).sort())
+                .toEqual(['/esun/market_status', '/esun/portfolio/settlements']);
+            releaseSettlements();
+            expect(slots(await pending)).toEqual([
+                [0, '2026-10-27', 120000],
+                [1, '2026-10-28', -35500],
+                [2, '2026-10-29', 0],
+            ]);
+        });
+
+        it('still returns three slots when market_status fails', async () => {
+            vi.useFakeTimers({ toFake: ['Date'] });
+            vi.setSystemTime(SUNDAY);
+            for (const status of [
+                async () => json({ error: '玉山證券尚未登入', code: 'NOT_LOGGED_IN' }, 503),
+                async () => { throw new TypeError('Failed to fetch'); },
+                async () => new Response('not json', { status: 200 }),
+                async () => json([1, 2]),
+            ]) {
+                // 退回只跳週末的推算：週日的 T+0 為下一個週一
+                expect(slots(await new HttpEsunDriver('', routed(status) as never).getSettlements())).toEqual([
+                    [0, '2026-10-26', 0],
+                    [1, '2026-10-27', 120000],
+                    [2, '2026-10-28', -35500],
+                ]);
+            }
+        });
+
+        it('rejects a non-array settlements response', async () => {
+            const driver = new HttpEsunDriver('', routed(async () => json(sundayStatus), { rows: [] }) as never);
+            const e = await caught(driver.getSettlements());
+            expect(e).toBeInstanceOf(EsunBridgeError);
+            expect(e.message).toBe('玉山交割款回應格式錯誤');
+        });
+    });
+
+    describe('getProfitLoss', () => {
+        it('rejects a non-array 200 response instead of returning an empty list', async () => {
+            for (const body of [null, { rows: [] }]) {
+                const e = await caught(new HttpEsunDriver('', reply(200, body) as never).getProfitLoss('20261001', '20261023'));
+                expect(e).toBeInstanceOf(EsunBridgeError);
+                expect(e.message).toBe('玉山已實現損益回應格式錯誤');
+                expect(e.status).toBe(200);
+            }
+        });
+
+        it('maps an array response with qty in shares to lots', async () => {
+            const rows = [{ stk_no: '2884', t_date: '20261023', buy_sell: 'S', trade: '0', qty: '3000', price: '30.50', make: '1200' }];
+            const pl = await new HttpEsunDriver('', reply(200, rows) as never).getProfitLoss('20261001', '20261023');
+            expect(pl.map(r => [r.code, r.quantity])).toEqual([['2884', 3]]);
+        });
+    });
+
+    describe('raw account queries', () => {
+        const path = (fetchImpl: ReturnType<typeof reply>) => (fetchImpl.mock.calls[0] as unknown as [string])[0];
+
+        it('returns the raw rows and objects of the account endpoints', async () => {
+            const rows = [{ stk_no: '2884', cost_qty: '1000', trade: '0', stk_dats: [] }];
+            let f = reply(200, rows);
+            expect(await new HttpEsunDriver('', f as never).getInventories('Share')).toEqual(rows);
+            expect(path(f)).toBe('/esun/portfolio/positions?unit=Share');
+
+            const balance = { available_balance: 1000, exchange_balance: 0, cached: true, cache_age_sec: 3 };
+            f = reply(200, balance);
+            expect(await new HttpEsunDriver('', f as never).getBalanceRaw()).toEqual(balance);
+            expect(path(f)).toBe('/esun/portfolio/balance');
+
+            const status = { trade_limit: 1000, margin_limit: 0, short_limit: 0, day_trade_code: 'X', margin_code: '0', short_code: '0' };
+            f = reply(200, status);
+            expect(await new HttpEsunDriver('', f as never).getTradeStatusRaw()).toEqual(status);
+            expect(path(f)).toBe('/esun/portfolio/trading-limits');
+
+            const market = { is_trading_day: true, last_trading_day: '20261022', next_trading_day: '20261026' };
+            f = reply(200, market);
+            expect(await new HttpEsunDriver('', f as never).getMarketStatusRaw()).toEqual(market);
+            expect(path(f)).toBe('/esun/market_status');
+
+            const tx = [{ stk_no: '2884', qty: '1000', make: '10', buy_sell: 'S', trade: '0' }];
+            f = reply(200, tx);
+            expect(await new HttpEsunDriver('', f as never).getTransactions('20261001', '20261023')).toEqual(tx);
+            expect(path(f)).toBe('/esun/portfolio/profit-loss?begin_date=20261001&end_date=20261023');
+        });
+
+        it('rejects malformed raw responses', async () => {
+            const d = (body: unknown) => new HttpEsunDriver('', reply(200, body) as never);
+            expect((await caught(d({ rows: [] }).getInventories())).message).toBe('玉山庫存回應格式錯誤');
+            expect((await caught(d([null]).getInventories())).message).toBe('玉山庫存回應格式錯誤');
+            expect((await caught(d([1]).getBalanceRaw())).message).toBe('玉山餘額回應格式錯誤');
+            expect((await caught(d(null).getTradeStatusRaw())).message).toBe('玉山交易額度回應格式錯誤');
+            expect((await caught(d('x').getMarketStatusRaw())).message).toBe('玉山市場狀態回應格式錯誤');
+            expect((await caught(d([null]).getTransactions('20261001', '20261023'))).message).toBe('玉山已實現損益回應格式錯誤');
+        });
+    });
+
     it('encodes query parameters', async () => {
         const fetchImpl = reply(200, { ca_expiretime: '2027-12-31' });
         await new HttpEsunDriver('', fetchImpl as never).getCaExpire('A1 2&x');
@@ -203,6 +326,11 @@ describe('UnavailableEsunDriver', () => {
         await expect(driver.placeOrder()).rejects.toMatchObject({ mutationNotStarted: true });
         await expect(driver.getOrders()).rejects.toThrow('未連線');
         await expect(driver.getBalance()).rejects.toThrow('未連線');
+        await expect(driver.getInventories()).rejects.toThrow('未連線');
+        await expect(driver.getTransactions()).rejects.toThrow('未連線');
+        await expect(driver.getBalanceRaw()).rejects.toThrow('未連線');
+        await expect(driver.getTradeStatusRaw()).rejects.toThrow('未連線');
+        await expect(driver.getMarketStatusRaw()).rejects.toThrow('未連線');
         await expect(driver.switchEnvironment('PRODUCTION')).resolves.toMatchObject({ ok: false });
     });
 });

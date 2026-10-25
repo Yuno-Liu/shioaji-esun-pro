@@ -1,5 +1,6 @@
-import { isEsunBroker, useEsunEnvironment } from '../lib/esun';
+import { isEsunBroker, mergeSettlementSlot, useEsunEnvironment } from '../lib/esun';
 import { esunEnvKey } from '../lib/order-route';
+import { EsunAccountOverview, EsunPnlCostTotal, EsunPnlRowDetail, useEsunAccountPane } from './esun-account-overview';
 import { canTrade } from '../lib/account-tradable';
 // src/components/bottom-dock-account.tsx — 帳務/交割 tab。
 // 報表風卡片牆＋donut 改成交易工具：資金狀態緊湊數字列（含風險指標色條）、
@@ -92,6 +93,7 @@ function FundsSection({
     showStock,
     showFut,
     sim,
+    stockSim = sim,
     privMoney,
 }: {
     balance?: AccountBalance;
@@ -100,6 +102,7 @@ function FundsSection({
     showStock: boolean;
     showFut: boolean;
     sim: boolean;
+    stockSim?: boolean;
     privMoney: boolean;
     incomplete?: boolean;
 }) {
@@ -120,7 +123,7 @@ function FundsSection({
     const futEquity = margin?.equity ?? 0;
     // 模擬環境 balance/margin 全 0 屬上游行為（server 不打真 API）—
     // 顯示「模擬模式無法查詢」小字而不是一排 $0
-    const simBalanceBlank = sim && !!balance && cash === 0;
+    const simBalanceBlank = stockSim && !!balance && cash === 0;
     const marginAllZero =
         !!margin &&
         margin.equity === 0 &&
@@ -252,9 +255,11 @@ function FundsSection({
 function SettleSection({
     settlements,
     privMoney,
+    error,
 }: {
     settlements: Settlement[] | undefined;
     privMoney: boolean;
+    error?: string | null;
 }) {
     const byT = new Map((settlements ?? []).map((s) => [s.T, s]));
     // 全 0 也顯示三列（手機版預收頁日曆概念）
@@ -272,7 +277,9 @@ function SettleSection({
                 交割行事曆 Settlements
                 <span className={styles.acctTitleNote}>正=應收 負=應付</span>
             </div>
-            {settlements === undefined ? (
+            {settlements === undefined && error ? (
+                <span className={styles.acctHint} role='status'>交割資訊查詢失敗：{error}</span>
+            ) : settlements === undefined ? (
                 <Loading text='載入交割資訊' />
             ) : (
                 rows.map((r) => (
@@ -376,6 +383,7 @@ function PnlSection({
                             {pnl.rows.length} 筆
                         </span>
                     </button>
+                    <EsunPnlCostTotal rows={pnl.rows} />
                     {open &&
                         pnl.rows.map((r) => (
                             <div
@@ -400,6 +408,7 @@ function PnlSection({
                                 >
                                     {maskMoney(fmtSigned(r.pnl, 0), privMoney)}
                                 </span>
+                                <EsunPnlRowDetail row={r} />
                             </div>
                         ))}
                 </>
@@ -669,7 +678,6 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
             alive = false;
         };
     }, []);
-    const sim = simulation === true;
 
     // 全域帳戶範圍：scope 選 [期] 只顯示期貨區塊、[證] 只顯示證券區塊；
     // 市場篩選 chips 同樣生效
@@ -684,6 +692,7 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
         && (a.account_type === 'S' ? showStock : showFut));
     const stockAccounts = queryAccounts.filter(a => a.account_type === 'S');
     const esunEnv = useEsunEnvironment();
+    const { sim, stockSim, sinopacStock, overview: esunOverview } = useEsunAccountPane(queryAccounts, simulation === true);
     const selKey = queryAccounts.map(a => `${a.account_type}:${a.broker_id}:${a.account_id}`).sort().join('|');
 
     const selectedFunds = funds?.filter(row => queryAccounts.some(a => accountMatches(a, row.account)));
@@ -724,8 +733,7 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
                     for (const row of results.flat()) {
                         const key = `${row.T}`;
                         const previous = sums.get(key);
-                        if (previous && previous.date !== row.date) throw new Error('帳戶交割日期不一致，合計待確認');
-                        sums.set(key, { ...row, amount: (previous?.amount ?? 0) + row.amount });
+                        sums.set(key, mergeSettlementSlot(previous, row));
                     }
                     return [...sums.values()];
                 }),
@@ -773,7 +781,7 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
     const { data: limits, refresh: refreshLimits, loading: loadingLimits, error: errorLimits } = useQuery<TradingLimits | null>(
         useCallback(
             () =>
-                Promise.all(stockAccounts.map(a => fetchTradingLimits(a))).then(results => {
+                Promise.all(sinopacStock.map(a => fetchTradingLimits(a))).then(results => {
                     if (!results.length) return null;
                     const total: TradingLimits = { ...results[0]! };
                     for (const key of Object.keys(total) as (keyof TradingLimits)[]) total[key] = results.reduce((sum, row) => sum + row[key], 0);
@@ -792,7 +800,7 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
             if (!showStock) {
                 return { summary: null, detail: null, earmark: null };
             }
-            const batches = await Promise.all(stockAccounts.map(async account => {
+            const batches = await Promise.all(sinopacStock.map(async account => {
                 const [summary, detail, earmark] = await Promise.all([
                     fetchStockReserveSummary(account), fetchStockReserveDetail(account), fetchEarmarkingDetail(account),
                 ]);
@@ -812,10 +820,10 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
     );
 
     const refreshReports = useCallback(async () => {
-        await Promise.all([refreshSettle(), refreshPnl(), refreshLimits(), refreshReserve()]);
-    }, [refreshSettle, refreshPnl, refreshLimits, refreshReserve]);
-    const reportsLoading = loadingSettle || loadingPnl || loadingLimits || loadingReserve;
-    const reportsError = [errorSettle, errorPnl, errorLimits, errorReserve].filter(Boolean).join('；') || null;
+        await Promise.all([refreshSettle(), refreshPnl(), refreshLimits(), refreshReserve(), esunOverview.refresh()]);
+    }, [refreshSettle, refreshPnl, refreshLimits, refreshReserve, esunOverview.refresh]);
+    const reportsLoading = loadingSettle || loadingPnl || loadingLimits || loadingReserve || esunOverview.loading;
+    const reportsError = [errorSettle, errorPnl, errorLimits, errorReserve, esunOverview.error].filter(Boolean).join('；') || null;
     useEffect(() => {
         onRefreshControls?.({ refresh: refreshReports, loading: reportsLoading, error: reportsError });
         return () => onRefreshControls?.(null);
@@ -833,15 +841,18 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
                 showStock={showStock}
                 showFut={showFut}
                 sim={sim}
+                stockSim={stockSim}
                 privMoney={privMoney}
             />
             {showStock && (
                 <SettleSection
                     settlements={settlements}
                     privMoney={privMoney}
+                    error={errorSettle}
                 />
             )}
-            {showStock && (
+            <EsunAccountOverview accounts={stockAccounts} query={esunOverview} />
+            {showStock && sinopacStock.length > 0 && (
                 <LimitsSection
                     limits={limits}
                     loading={limits === undefined}
@@ -854,7 +865,7 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
     const right = (
         <div className={styles.acctCol}>
             <PnlSection pnl={pnl} privMoney={privMoney} />
-            {showStock && (
+            {showStock && sinopacStock.length > 0 && (
                 <ReserveSection
                     reserve={reserve}
                     sim={sim}

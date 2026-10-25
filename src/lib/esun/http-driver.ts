@@ -8,8 +8,12 @@
 // 舊版 bridge 沒有信封時：2xx 視為 SDK 原始回傳；送單前就擋下的已知錯誤碼與 4xx
 // （408／409 除外）視為未送出；其餘一律結果未知。GET 失敗照一般錯誤處理。
 
-import type { IEsunTradeDriver, EsunBridgeHealth, EsunMutationOptions } from './adapter';
+import type { IEsunTradeDriver, EsunBridgeHealth, EsunMutationOptions, EsunReconnectOptions, EsunReconnectResponse } from './adapter';
 import type {
+    EsunBalanceRaw,
+    EsunInventoryItem,
+    EsunMarketStatusRaw,
+    EsunTradeStatusRaw,
     EsunMutationOutcome,
     EsunOrderMutationPayload,
     EsunOrderPayload,
@@ -17,6 +21,8 @@ import type {
     EsunPlaceOrderResponse,
     EsunPriceFlag,
     EsunReplaceOrderResponse,
+    EsunSettlementItem,
+    EsunTransactionItem,
 } from './types';
 import type { Account, AccountBalance, StockPosition } from '../types/portfolio';
 import type {
@@ -46,6 +52,10 @@ export const ESUN_MUTATION_TIMEOUT_MS = 15_000;
 const QUERY_TIMEOUT_MS = 15_000;
 /** 委託查詢：bridge 的 refresh=true 可能先等間隔與每分鐘額度（最多約 12 秒）再呼叫 SDK */
 export const ESUN_ORDERS_QUERY_TIMEOUT_MS = 30_000;
+/** 重新連線：bridge 以目前設定檔重新登入券商（數秒） */
+export const ESUN_RECONNECT_TIMEOUT_MS = 30_000;
+/** 登入失效（台北換日 token 失效）：bridge 在呼叫 SDK 前回絕（503 not_sent） */
+export const ESUN_SESSION_EXPIRED_CODE = 'ESUN_SESSION_EXPIRED';
 
 /** 舊版 bridge（無信封）在呼叫 SDK 之前就回絕的錯誤碼 */
 const PRE_DISPATCH_CODES = new Set([
@@ -58,6 +68,7 @@ const PRE_DISPATCH_CODES = new Set([
     'AGR0001',
     'AGR0002',
     'NOT_LOGGED_IN',
+    ESUN_SESSION_EXPIRED_CODE,
 ]);
 
 export const ESUN_OUTCOME_UNKNOWN_MESSAGE = '玉山委託送出結果未確認；請求可能已送達券商，請先查詢委託，勿直接重送';
@@ -125,6 +136,12 @@ function messageOf(data: unknown, fallback: string): string {
 
 function codeOf(data: unknown): string | undefined {
     return isRecord(data) && typeof data.code === 'string' && data.code ? data.code : undefined;
+}
+
+/** 登入失效被擋下的委託：訊息一定要說「委託未送出」（bridge 的訊息已含時不重複） */
+function notSentText(code: string | undefined, text: string): string {
+    if (code !== ESUN_SESSION_EXPIRED_CODE || text.includes('未送出')) return text;
+    return `${text}；委託未送出`;
 }
 
 /** 429／503 的建議等待秒數：body 的 retry_after 優先，其次 Retry-After 標頭（秒） */
@@ -243,7 +260,7 @@ export class HttpEsunDriver implements IEsunTradeDriver {
             const fallback = known === 'unknown' ? ESUN_OUTCOME_UNKNOWN_MESSAGE : `HTTP ${res.status}`;
             const text = messageOf(envelope, fallback);
             throw new EsunBridgeError(
-                known === 'unknown' && text !== ESUN_OUTCOME_UNKNOWN_MESSAGE ? `${ESUN_OUTCOME_UNKNOWN_MESSAGE}（${text}）` : text,
+                known === 'unknown' && text !== ESUN_OUTCOME_UNKNOWN_MESSAGE ? `${ESUN_OUTCOME_UNKNOWN_MESSAGE}（${text}）` : notSentText(codeOf(envelope), text),
                 res.status,
                 {
                     mutation: true,
@@ -258,7 +275,7 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         const outcome = legacyOutcome(res.status, data);
         const text = messageOf(data, `HTTP ${res.status}`);
         throw new EsunBridgeError(
-            outcome === 'unknown' ? `${ESUN_OUTCOME_UNKNOWN_MESSAGE}（${text}）` : text,
+            outcome === 'unknown' ? `${ESUN_OUTCOME_UNKNOWN_MESSAGE}（${text}）` : notSentText(codeOf(data), text),
             res.status,
             { mutation: true, outcome, code: codeOf(data) },
         );
@@ -286,6 +303,16 @@ export class HttpEsunDriver implements IEsunTradeDriver {
     }> {
         // 切換需重新登入券商（數秒）；逾時由 service 視為失敗並以 health 重新同步
         return this.request('POST', '/esun/auth/environment', { environment: env }, 30_000);
+    }
+
+    /**
+     * 以目前設定檔重新登入券商（台北換日 token 失效後）。不是委託：走一般 request，
+     * 失敗（409 進行中、502 登入失敗、503 設定不完整、登入鎖定、423 熔斷鎖住且憑證未變）丟出 EsunBridgeError。
+     */
+    reconnect(opts?: EsunReconnectOptions): Promise<EsunReconnectResponse> {
+        // 只有明確 force:true 才帶旗標；其他情況維持空物件（bridge 依憑證是否變更決定能否重試）
+        const body = opts?.force === true ? { force: true } : {};
+        return this.request<EsunReconnectResponse>('POST', '/esun/auth/reconnect', body, ESUN_RECONNECT_TIMEOUT_MS);
     }
 
     placeOrder(payload: EsunOrderPayload, opts?: EsunMutationOptions): Promise<EsunPlaceOrderResponse> {
@@ -355,9 +382,15 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         throw new EsunBridgeError('玉山委託回應格式錯誤', 200);
     }
 
+    /** get_inventories 原始列（bridge 原樣回傳；unit 只隨查詢字串帶上，不影響回傳形狀） */
+    async getInventories(unit: 'Common' | 'Share' = 'Common'): Promise<EsunInventoryItem[]> {
+        const raw = await this.request<unknown>('GET', `/esun/portfolio/positions?unit=${encodeURIComponent(unit)}`);
+        if (!Array.isArray(raw) || raw.some(item => !isRecord(item))) throw new EsunBridgeError('玉山庫存回應格式錯誤', 200);
+        return raw as EsunInventoryItem[];
+    }
+
     async getPositions(unit: 'Common' | 'Share' = 'Common'): Promise<StockPosition[]> {
-        const raw = await this.request<any[]>('GET', `/esun/portfolio/positions?unit=${encodeURIComponent(unit)}`);
-        if (!Array.isArray(raw)) throw new EsunBridgeError('玉山庫存回應格式錯誤', 200);
+        const raw = await this.getInventories(unit);
         return raw.map((item, idx) => fromEsunInventoryToPosition(item, unit, idx + 1));
     }
 
@@ -366,9 +399,32 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         return fromEsunBalance(raw);
     }
 
+    async getBalanceRaw(): Promise<EsunBalanceRaw> {
+        const raw = await this.request<unknown>('GET', '/esun/portfolio/balance');
+        if (!isRecord(raw)) throw new EsunBridgeError('玉山餘額回應格式錯誤', 200);
+        return raw as EsunBalanceRaw;
+    }
+
+    async getTradeStatusRaw(): Promise<EsunTradeStatusRaw> {
+        const raw = await this.request<unknown>('GET', '/esun/portfolio/trading-limits');
+        if (!isRecord(raw)) throw new EsunBridgeError('玉山交易額度回應格式錯誤', 200);
+        return raw as EsunTradeStatusRaw;
+    }
+
+    async getMarketStatusRaw(): Promise<EsunMarketStatusRaw> {
+        const raw = await this.request<unknown>('GET', '/esun/market_status');
+        if (!isRecord(raw)) throw new EsunBridgeError('玉山市場狀態回應格式錯誤', 200);
+        return raw as EsunMarketStatusRaw;
+    }
+
+    /** 交割款與 market_status 同時讀取；market_status 只用來定 T+0，失敗時退回本地推算 */
     async getSettlements(): Promise<Settlement[]> {
-        const raw = await this.request<any[]>('GET', '/esun/portfolio/settlements');
-        return fromEsunSettlements(raw);
+        const [raw, status] = await Promise.all([
+            this.request<unknown>('GET', '/esun/portfolio/settlements'),
+            this.request<EsunMarketStatusRaw>('GET', '/esun/market_status').catch(() => null),
+        ]);
+        if (!Array.isArray(raw)) throw new EsunBridgeError('玉山交割款回應格式錯誤', 200);
+        return fromEsunSettlements(raw as EsunSettlementItem[], isRecord(status) ? status : null);
     }
 
     private profitLossPath(beginDate: string, endDate: string) {
@@ -379,9 +435,15 @@ export class HttpEsunDriver implements IEsunTradeDriver {
         };
     }
 
+    /** get_transactions_by_date 原始列（區間先裁切到 180 天內） */
+    async getTransactions(beginDate: string, endDate: string): Promise<EsunTransactionItem[]> {
+        const raw = await this.request<unknown>('GET', this.profitLossPath(beginDate, endDate).path);
+        if (!Array.isArray(raw) || raw.some(item => !isRecord(item))) throw new EsunBridgeError('玉山已實現損益回應格式錯誤', 200);
+        return raw as EsunTransactionItem[];
+    }
+
     async getProfitLoss(beginDate: string, endDate: string): Promise<StockProfitLoss[]> {
-        const raw = await this.request<any[]>('GET', this.profitLossPath(beginDate, endDate).path);
-        return fromEsunTransactionsToProfitLoss(raw);
+        return fromEsunTransactionsToProfitLoss(await this.getTransactions(beginDate, endDate));
     }
 
     async getProfitLossSummary(beginDate: string, endDate: string): Promise<ProfitLossSummaryTotal> {
@@ -434,7 +496,12 @@ export class UnavailableEsunDriver implements IEsunTradeDriver {
     async cancelOrder(): Promise<EsunReplaceOrderResponse> { return this.fail(); }
     async getOrders(): Promise<EsunOrderResult[]> { return this.unavailable(); }
     async getPositions(): Promise<StockPosition[]> { return this.unavailable(); }
+    async getInventories(): Promise<EsunInventoryItem[]> { return this.unavailable(); }
+    async getTransactions(): Promise<EsunTransactionItem[]> { return this.unavailable(); }
     async getBalance(): Promise<AccountBalance> { return this.unavailable(); }
+    async getBalanceRaw(): Promise<EsunBalanceRaw> { return this.unavailable(); }
+    async getTradeStatusRaw(): Promise<EsunTradeStatusRaw> { return this.unavailable(); }
+    async getMarketStatusRaw(): Promise<EsunMarketStatusRaw> { return this.unavailable(); }
     async getSettlements(): Promise<Settlement[]> { return this.unavailable(); }
     async getProfitLoss(): Promise<StockProfitLoss[]> { return this.unavailable(); }
     async getProfitLossSummary(): Promise<ProfitLossSummaryTotal> { return this.unavailable(); }

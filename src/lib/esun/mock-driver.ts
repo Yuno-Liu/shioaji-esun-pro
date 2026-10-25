@@ -4,8 +4,13 @@
 // 等鍵存取）：零股／興櫃（ap_code 3、4、5）的 *_qty 為「張」的小數、*_qty_share 為股數。
 // 環境綁定與 bridge 相同：expected_environment 不符時回 409（確定未送出）。
 
-import type { IEsunTradeDriver, EsunBridgeHealth, EsunMutationOptions } from './adapter';
+import type { IEsunTradeDriver, EsunBridgeHealth, EsunMutationOptions, EsunReconnectResponse } from './adapter';
 import type {
+    EsunBalanceRaw,
+    EsunInventoryItem,
+    EsunMarketStatusRaw,
+    EsunTradeStatusRaw,
+    EsunTransactionItem,
     EsunOrderMutationPayload,
     EsunOrderPayload,
     EsunOrderResult,
@@ -40,6 +45,12 @@ export class MockEsunDriver implements IEsunTradeDriver {
     public simulateFailure: string | null = null;
     private environment: 'SIMULATION' | 'PRODUCTION' = 'SIMULATION';
     private generation = 1;
+    /** 模擬券商 token 失效（台北換日）：health 回 loggedIn:false、sessionExpired:true */
+    private sessionExpiredAt: string | null = null;
+    /** 下一次 reconnect 失敗的錯誤（測試用；null = 成功） */
+    public reconnectFailure: string | null = null;
+    /** reconnect 呼叫次數（測試檢查用） */
+    public reconnectCalls = 0;
     /** 最後一筆委託類請求帶的預期環境／帳號（測試檢查用） */
     public lastGuard: EsunMutationOptions['guard'] | undefined;
     /** 最後一筆減量請求的數量單位（測試檢查用） */
@@ -50,9 +61,21 @@ export class MockEsunDriver implements IEsunTradeDriver {
     private customSettlements: Settlement[] | null = null;
     private customProfitLoss: StockProfitLoss[] | null = null;
     private customTradingLimits: TradingLimits | null = null;
+    private customInventories: EsunInventoryItem[] | null = null;
+    private customTransactions: EsunTransactionItem[] | null = null;
 
     setPositions(positions: StockPosition[]): void {
         this.customPositions = positions;
+    }
+
+    /** 自訂 get_inventories 原始列（service.fetchPositions 走這條） */
+    setInventories(rows: EsunInventoryItem[] | null): void {
+        this.customInventories = rows;
+    }
+
+    /** 自訂 get_transactions_by_date 原始列（service.fetchProfitLoss 走這條） */
+    setTransactions(rows: EsunTransactionItem[] | null): void {
+        this.customTransactions = rows;
     }
 
     setBalance(balance: AccountBalance): void {
@@ -77,6 +100,28 @@ export class MockEsunDriver implements IEsunTradeDriver {
         this.generation += 1;
     }
 
+    /** 模擬券商 token 失效（測試用） */
+    expireSession(at = '2026-01-02T00:00:05+08:00'): void {
+        this.sessionExpiredAt = at;
+    }
+
+    /** 與 bridge 相同：重新登入成功換新的 session 代次；失敗保留目前 session */
+    async reconnect(): Promise<EsunReconnectResponse> {
+        this.reconnectCalls += 1;
+        if (this.reconnectFailure) {
+            throw new EsunBridgeError(this.reconnectFailure, 502, { code: 'LOGIN_FAILED' });
+        }
+        this.sessionExpiredAt = null;
+        this.generation += 1;
+        return {
+            ok: true,
+            message: '玉山證券登入成功',
+            account: { broker_id: ESUN_BROKER_CODE, account_id: MOCK_ESUN_ACCOUNT_ID },
+            environment: this.environment,
+            sessionGeneration: this.generation,
+        };
+    }
+
     /** 模擬券商端成交（測試用） */
     fill(orderNo: string, quantity: number): void {
         const existing = this.orders.get(orderNo);
@@ -92,9 +137,10 @@ export class MockEsunDriver implements IEsunTradeDriver {
             simulation: this.environment === 'SIMULATION',
             entry: this.environment === 'SIMULATION' ? ESUN_SIMULATION_ENTRY : ESUN_PRODUCTION_ENTRY,
             account: { broker_id: ESUN_BROKER_CODE, account_id: MOCK_ESUN_ACCOUNT_ID },
-            loggedIn: true,
-            loginError: null,
+            loggedIn: this.sessionExpiredAt === null,
+            loginError: this.sessionExpiredAt === null ? null : '玉山登入已於換日失效，請以「重新連線」手動重新登入',
             sessionGeneration: this.generation,
+            ...(this.sessionExpiredAt === null ? {} : { sessionExpired: true, sessionExpiredAt: this.sessionExpiredAt }),
         };
     }
 
@@ -132,6 +178,11 @@ export class MockEsunDriver implements IEsunTradeDriver {
     /** 與 bridge 相同的前置檢查：環境不符 → 409 not_sent */
     private checkGuard(opts?: EsunMutationOptions): void {
         this.lastGuard = opts?.guard;
+        if (this.sessionExpiredAt !== null) {
+            throw new EsunBridgeError('玉山登入已失效（換日），請以「重新連線」手動重新登入；委託未送出', 503, {
+                mutation: true, outcome: 'not_sent', code: 'ESUN_SESSION_EXPIRED', environment: this.environment,
+            });
+        }
         const expected = opts?.guard?.expected_environment;
         if (expected && expected !== this.environment) {
             throw new EsunBridgeError(`玉山目前為 ${this.environment}，與預期環境 ${expected} 不符`, 409, {
@@ -284,21 +335,92 @@ export class MockEsunDriver implements IEsunTradeDriver {
         return out;
     }
 
+    /** get_inventories 原始列（stk_sums 形狀；數值為字串，與 SDK 相同）。setPositions 只影響 getPositions */
+    async getInventories(): Promise<EsunInventoryItem[]> {
+        if (this.customInventories) return this.customInventories;
+        return [{
+            ap_code: '',
+            stk_no: '2884',
+            stk_na: '玉山金',
+            s_type: 'H',
+            trade: '0',
+            cost_qty: '2000',
+            cost_sum: '-50071',
+            price_avg: '25.00',
+            price_evn: '25.11',
+            price_mkt: '26.50',
+            price_now: '26.50',
+            price_qty_sum: '50000',
+            make_a_sum: '3000',
+            make_a_per: '5.99',
+            rec_va_sum: '52800',
+            value_mkt: '53000',
+            value_now: '53000',
+            qty_b: '0',
+            qty_bm: '0',
+            qty_s: '0',
+            qty_sm: '0',
+            qty_c: '0',
+            qty_l: '2000',
+            stk_dats: [],
+        }];
+    }
+
     async getPositions(unit: 'Common' | 'Share' = 'Common'): Promise<StockPosition[]> {
         if (this.customPositions) {
             return this.customPositions;
         }
-        // get_inventories 的 stk_sums 形狀（cost_qty 為股數、trade 為交易類別）
-        const raw = [{
-            stk_no: '2884',
-            cost_qty: 2000,
-            price_avg: 25.0,
-            price_mkt: 26.5,
-            make_a_sum: 3000,
-            qty_l: 2000,
-            trade: '0',
-        }];
+        const raw = await this.getInventories();
         return raw.map((item, idx) => fromEsunInventoryToPosition(item, unit, idx + 1));
+    }
+
+    /** get_transactions_by_date 原始列（合成資料：一筆現股賣出） */
+    async getTransactions(): Promise<EsunTransactionItem[]> {
+        if (this.customTransactions) return this.customTransactions;
+        return [{
+            stk_no: '2884',
+            stk_na: '玉山金',
+            s_type: 'H',
+            buy_sell: 'S',
+            trade: '0',
+            t_date: '20261022',
+            c_date: '20261026',
+            qty: '1000',
+            price_avg: '27.00',
+            price_qty: '27000',
+            cost: '24500',
+            recv: '27000',
+            make: '2500',
+            make_per: '10.20',
+            mat_dats: [],
+        }];
+    }
+
+    async getBalanceRaw(): Promise<EsunBalanceRaw> {
+        return {
+            available_balance: 500000,
+            exchange_balance: 0,
+            stock_pre_save_amount: 0,
+            is_latest_data: true,
+            updated_at: Date.UTC(2026, 9, 23, 0, 30) / 1000,
+            cached: false,
+            cache_age_sec: 0,
+        };
+    }
+
+    async getTradeStatusRaw(): Promise<EsunTradeStatusRaw> {
+        return {
+            trade_limit: 1000000,
+            margin_limit: 500000,
+            short_limit: 500000,
+            day_trade_code: 'X',
+            margin_code: '0',
+            short_code: '0',
+        };
+    }
+
+    async getMarketStatusRaw(): Promise<EsunMarketStatusRaw> {
+        return { is_trading_day: true, last_trading_day: '20261022', next_trading_day: '20261026' };
     }
 
     async getBalance(): Promise<AccountBalance> {

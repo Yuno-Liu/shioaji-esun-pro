@@ -424,20 +424,40 @@ export interface EsunBalanceRaw {
     stockPreSaveAmount?: number | string;
     is_latest_data?: boolean;
     isLatestData?: boolean;
-    updated_at?: string;
+    updated_at?: string | number;
     updatedAt?: string | { seconds?: number; nanos?: number };
     errmsg?: string;
     [key: string]: unknown;
 }
 
-/** Raw settlement item from E.SUN get_settlements */
+/**
+ * Raw settlement item from E.SUN get_settlements。
+ * c_date＝交割日、date＝成交日（不是交割日）、price＝淨交割金額字串（正＝應收、負＝應付）。
+ */
 export interface EsunSettlementItem {
+    /** 交割日（YYYYMMDD） */
     c_date?: string;
+    cDate?: string;
     cdate?: string;
+    /** 成交日（YYYYMMDD），不可當成交割日 */
     date?: string;
+    /** 淨交割金額：正＝應收、負＝應付 */
     price?: number | string;
     amount?: number | string;
     T?: number;
+    [key: string]: unknown;
+}
+
+/** Raw market status from E.SUN get_market_status（bridge GET /esun/market_status） */
+export interface EsunMarketStatusRaw {
+    is_trading_day?: boolean;
+    isTradingDay?: boolean;
+    /** 上一個交易日（YYYYMMDD） */
+    last_trading_day?: string;
+    lastTradingDay?: string;
+    /** 下一個交易日（YYYYMMDD）；今天是交易日時為今天之後的下一個 */
+    next_trading_day?: string;
+    nextTradingDay?: string;
     [key: string]: unknown;
 }
 

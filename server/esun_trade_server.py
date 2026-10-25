@@ -1900,6 +1900,108 @@ WS_BACKOFF_INITIAL_SECONDS = 1.0
 WS_BACKOFF_MAX_SECONDS = 60.0
 WS_STABLE_SECONDS = 60.0
 WS_RESYNC_OPEN_WAIT_SECONDS = 5.0
+# Session expiry (E.SUN invalidates the login token at the Taipei day change) and automatic re-login:
+# only a day-change expiry is re-logged automatically. First attempt at max(detection + 2 s,
+# today NOT_BEFORE) + 0..JITTER s, then retries (network failures that never reached the server and
+# AGR0000 only) after 2 / 5 / 10 minutes; a failure that may have reached the server allows 2 attempts.
+AUTO_RELOGIN_INITIAL_DELAY_SECONDS = 2.0
+AUTO_RELOGIN_RETRY_DELAYS_SECONDS = (120.0, 300.0, 600.0)  # ESUN_AUTO_RELOGIN_RETRY_MINUTES (default "2,5,10")
+AUTO_RELOGIN_NOT_BEFORE_DEFAULT = "00:05"  # ESUN_AUTO_RELOGIN_NOT_BEFORE (Taipei, also the day-change grace)
+AUTO_RELOGIN_NOT_BEFORE_MAX = datetime.timedelta(hours=2)
+AUTO_RELOGIN_JITTER_SECONDS_DEFAULT = 60.0  # ESUN_AUTO_RELOGIN_JITTER_SECONDS
+AUTO_RELOGIN_JITTER_SECONDS_MAX = 600.0
+AUTO_RELOGIN_RETRY_MINUTES_MAX = 60.0
+AUTO_RELOGIN_RETRY_COUNT_MAX = 5
+AUTO_RELOGIN_MAYBE_SENT_MAX_ATTEMPTS = 2  # attempts per expiry once a failure may have reached the server
+AUTO_RELOGIN_LOCK_WAIT_SECONDS = 60.0  # waits out a manual reconnect / switch already logging in
+AUTO_RELOGIN_MIN_SESSION_SECONDS = 300.0  # a re-login session expiring sooner is not re-logged again (no loop)
+AUTO_RELOGIN_INTRADAY_TEXT = "登入 token 於日間失效（可能在其他地方重新登入），請手動重新連線"
+
+# WebSocket close (code 1011) / error text sent when the server rejects the session token.
+_WS_TOKEN_INVALID_RE = re.compile(r"token\s+validation\s+error", re.IGNORECASE)
+# SDK core error for a response it cannot parse (an expired token gets a non-JSON answer).
+_SDK_PARSE_ERROR_RE = re.compile(r"\bA0000\d\s*:\s*response\s+parse\s+error", re.IGNORECASE)
+
+
+def auto_relogin_enabled(environ: dict | None = None) -> bool:
+    """ESUN_AUTO_RELOGIN: enabled unless set to 0 / false / no / off."""
+    value = str((environ if environ is not None else os.environ).get("ESUN_AUTO_RELOGIN", "") or "").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _env_text(environ: dict | None, key: str) -> str:
+    return str((environ if environ is not None else os.environ).get(key, "") or "").strip()
+
+
+def auto_relogin_not_before(environ: dict | None = None) -> datetime.timedelta:
+    """
+    ESUN_AUTO_RELOGIN_NOT_BEFORE ("HH:MM" or "HH:MM:SS" Taipei time, default 00:05, at most 02:00):
+    the earliest first automatic re-login after the day change, and the grace after midnight within
+    which a login still counts as the previous day's session. Invalid values use the default.
+    """
+    raw = _env_text(environ, "ESUN_AUTO_RELOGIN_NOT_BEFORE") or AUTO_RELOGIN_NOT_BEFORE_DEFAULT
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", raw)
+    if match:
+        hours, minutes, seconds = int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+        if minutes < 60 and seconds < 60:
+            value = datetime.timedelta(hours=hours, minutes=minutes, seconds=seconds)
+            if value <= AUTO_RELOGIN_NOT_BEFORE_MAX:
+                return value
+    logger.warning(f"ESUN_AUTO_RELOGIN_NOT_BEFORE 無效（{raw!r}），改用 {AUTO_RELOGIN_NOT_BEFORE_DEFAULT}")
+    hours, minutes = AUTO_RELOGIN_NOT_BEFORE_DEFAULT.split(":")
+    return datetime.timedelta(hours=int(hours), minutes=int(minutes))
+
+
+def auto_relogin_jitter_seconds(environ: dict | None = None) -> float:
+    """ESUN_AUTO_RELOGIN_JITTER_SECONDS: random 0..N s added to the first re-login (default 60, max 600)."""
+    raw = _env_text(environ, "ESUN_AUTO_RELOGIN_JITTER_SECONDS")
+    if not raw:
+        return AUTO_RELOGIN_JITTER_SECONDS_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if math.isfinite(value) and 0.0 <= value <= AUTO_RELOGIN_JITTER_SECONDS_MAX:
+        return value
+    logger.warning(f"ESUN_AUTO_RELOGIN_JITTER_SECONDS 無效（{raw!r}），改用 {AUTO_RELOGIN_JITTER_SECONDS_DEFAULT:.0f}")
+    return AUTO_RELOGIN_JITTER_SECONDS_DEFAULT
+
+
+def auto_relogin_retry_delays(environ: dict | None = None) -> tuple[float, ...]:
+    """
+    ESUN_AUTO_RELOGIN_RETRY_MINUTES: comma-separated minutes between automatic re-login retries
+    (default "2,5,10"; each 0 < m <= 60, at most 5). Returns seconds. Invalid values use the default.
+    """
+    raw = _env_text(environ, "ESUN_AUTO_RELOGIN_RETRY_MINUTES")
+    if not raw:
+        return AUTO_RELOGIN_RETRY_DELAYS_SECONDS
+    try:
+        minutes = [float(part) for part in raw.split(",")]
+    except ValueError:
+        minutes = []
+    if 0 < len(minutes) <= AUTO_RELOGIN_RETRY_COUNT_MAX and all(
+        math.isfinite(m) and 0.0 < m <= AUTO_RELOGIN_RETRY_MINUTES_MAX for m in minutes
+    ):
+        return tuple(m * 60.0 for m in minutes)
+    logger.warning(f"ESUN_AUTO_RELOGIN_RETRY_MINUTES 無效（{raw!r}），改用 2,5,10")
+    return AUTO_RELOGIN_RETRY_DELAYS_SECONDS
+
+
+def _parse_taipei_stamp(value: str | None) -> datetime.datetime | None:
+    """ISO timestamp -> aware Asia/Taipei datetime (a naive one is taken as Taipei time)."""
+    if not value:
+        return None
+    try:
+        stamp = datetime.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return _as_taipei(stamp)
+
+
+def _as_taipei(stamp: datetime.datetime) -> datetime.datetime:
+    if stamp.tzinfo is None:
+        return stamp.replace(tzinfo=TAIPEI_TZ)
+    return stamp.astimezone(TAIPEI_TZ)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1922,10 +2024,26 @@ class EsunSession:
     config_overridden: bool = False  # [Core] rewritten in memory to match the requested environment
     cert_info: dict | None = None
     logged_in_at: str | None = None
+    login_reason: str | None = None  # startup | reconnect | switch | auto_relogin
+    login_monotonic: float | None = None
+    login_started_at: str | None = None  # Taipei time right before client.login() (day-change decision)
 
     @property
     def logged_in(self) -> bool:
         return self.sdk is not None
+
+    @property
+    def login_day(self) -> datetime.date | None:
+        """Taipei calendar day of the login (None when unknown)."""
+        if not self.logged_in_at:
+            return None
+        try:
+            stamp = datetime.datetime.fromisoformat(self.logged_in_at)
+        except (TypeError, ValueError):
+            return None
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(TAIPEI_TZ)
+        return stamp.date()
 
 
 @dataclasses.dataclass
@@ -2118,6 +2236,16 @@ _LOGIN_NETWORK_PATTERNS = (
     "error sending request", "timed out", "timeout", "connection", "connect", "dns", "network",
     "unreachable", "broken pipe", "temporarily unavailable", "reqwest", "eof", "502", "503", "504",
 )
+# Automatic re-login only: network failures where the login request may have reached the server
+# (checked first) and failures where it clearly never left (name resolution, refused, unreachable).
+_LOGIN_MAYBE_SENT_PATTERNS = (
+    "timed out", "timeout", "eof", "502", "503", "504", "connection reset", "reset by peer",
+    "broken pipe", "connection closed", "connection aborted",
+)
+_LOGIN_UNSENT_PATTERNS = (
+    "dns", "failed to lookup", "name resolution", "name or service not known", "nodename nor servname",
+    "getaddrinfo", "no such host", "connection refused", "actively refused", "unreachable", "no route to host",
+)
 
 
 def classify_login_error(message: str) -> str:
@@ -2136,6 +2264,34 @@ def classify_login_error(message: str) -> str:
     if any(p in low for p in _LOGIN_NETWORK_PATTERNS):
         return "network"
     return "credential"
+
+
+def classify_auto_relogin_error(message: str, *, panic: bool = False) -> str:
+    """
+    Automatic re-login only (manual paths keep classify_login_error). Returns 'daily_limit' |
+    'rate_limited' | 'credential' | 'network_maybe_sent' | 'network_unsent' | 'unknown'.
+    Only explicit credential errors count as 'credential' (circuit breaker). An unrecognized answer
+    (e.g. "A0000x: response parse Error") or an SDK core panic is 'unknown': the automatic re-login
+    pauses without tripping the breaker, so a manual reconnect stays possible.
+    """
+    low = str(message or "").lower()
+    if any(p in low for p in _LOGIN_CREDENTIAL_PATTERNS):
+        return "credential"
+    if panic:
+        return "unknown"
+    if "agr0004" in low:
+        return "daily_limit"
+    if re.search(r"agr000[0-9]", low):
+        return "rate_limited"
+    if _SDK_PARSE_ERROR_RE.search(str(message or "")):
+        return "unknown"
+    if any(p in low for p in _LOGIN_MAYBE_SENT_PATTERNS):
+        return "network_maybe_sent"
+    if any(p in low for p in _LOGIN_UNSENT_PATTERNS):
+        return "network_unsent"
+    if any(p in low for p in _LOGIN_NETWORK_PATTERNS):
+        return "network_maybe_sent"  # a generic network failure: assume the request may have arrived
+    return "unknown"
 
 
 def _extract_error_code(message: str, default: str = "LOGIN_FAILED") -> str:
@@ -2571,6 +2727,23 @@ class EsunTradeBridge:
         self.sse_fanout = SSEFanoutManager()
         self._ws_runtime: _WsRuntime | None = None
 
+        # Session expiry (token invalidated by the broker, e.g. at the Taipei day change). Keyed by
+        # generation and never removed: a request still holding an expired snapshot is refused even
+        # after a new session has been installed.
+        self._expired_sessions: dict[int, dict] = {}
+        self.auto_relogin = auto_relogin_enabled()
+        self.auto_relogin_initial_delay = AUTO_RELOGIN_INITIAL_DELAY_SECONDS
+        self.auto_relogin_not_before = auto_relogin_not_before()
+        self.auto_relogin_jitter = auto_relogin_jitter_seconds()
+        self.auto_relogin_retry_delays = auto_relogin_retry_delays()
+        self.auto_relogin_rng = random.random  # jitter fraction in [0, 1] (injectable)
+        self.auto_relogin_lock_wait = AUTO_RELOGIN_LOCK_WAIT_SECONDS
+        self._relogin_lock = threading.Lock()  # guards _relogin, the single re-login worker and its queue
+        self._relogin_thread: threading.Thread | None = None
+        self._relogin_queued: tuple[int, float] | None = None  # (generation, monotonic deadline) awaiting handover
+        self._relogin: dict = self._relogin_idle_state()
+        self._relogin_wake = threading.Event()  # set on a session change / shutdown: a waiting worker re-checks
+
         # Persistent login circuit breaker
         self.state_dir = resolve_state_dir(state_dir)
         self.login_state = LoginStateStore(self.state_dir)
@@ -2656,6 +2829,7 @@ class EsunTradeBridge:
                 self._shutdown_event.set()
                 self._orders_refresh_cond.notify_all()
             self._mutations_cond.notify_all()
+        self._relogin_wake.set()  # a pending automatic re-login gives up
 
     def try_begin_mutation(self) -> bool:
         """Registers an in-flight order mutation; False once shutdown has started."""
@@ -2821,9 +2995,16 @@ class EsunTradeBridge:
             self.login_state.record_login_attempts(today, self.reconnect_daily.get_count())
             return None
 
-    def _record_login_failure(self, message: str, material: bytes | None) -> str:
+    def _record_login_failure(
+        self, message: str, material: bytes | None, *, auto: bool = False, panic: bool = False
+    ) -> str:
+        """
+        Records a failed client.login(). auto=True (automatic re-login) uses classify_auto_relogin_error:
+        only explicit credential errors trip the persistent breaker there; every other path keeps the
+        fail-safe classify_login_error (anything unrecognized counts as a credential failure).
+        """
         self.login_error = message
-        kind = classify_login_error(message)
+        kind = classify_auto_relogin_error(message, panic=panic) if auto else classify_login_error(message)
         if "AGR0000" in message.upper():
             self.last_agr0000_time = time.time()
         if kind == "daily_limit":
@@ -2836,28 +3017,46 @@ class EsunTradeBridge:
             logger.error(f"玉山證券登入失敗（{kind}）：{message}")
         return kind
 
-    def _perform_login(self, prepared: _PreparedLogin, reason: str) -> tuple[bool, str | None]:
-        """Network login with a fresh SDK client; on success installs a new session snapshot."""
+    def _perform_login(
+        self, prepared: _PreparedLogin, reason: str, *, auto: bool = False
+    ) -> tuple[bool, str | None, str | None]:
+        """
+        Network login with a fresh SDK client; on success installs a new session snapshot.
+        Returns (ok, error message, failure kind): the kind travels with the result (never through
+        shared state read after the session-change lock is released).
+        """
         try:
             apply_headless_keyring_patches()
             client = self.sdk_factory(prepared.config)
-        except Exception as e:
+        except _PROPAGATED_BASE_EXCEPTIONS:
+            raise
+        except BaseException as e:
             # SDK(config) validation happens locally, before any login request.
             self.login_error = f"SDK 初始化失敗：{redact(e)}"
             logger.error(self.login_error)
-            return False, self.login_error
+            return False, self.login_error, "sdk_init"
+        login_started_at = taipei_now().isoformat(timespec="seconds")
         try:
             client.login()
-        except Exception as e:
+        except _PROPAGATED_BASE_EXCEPTIONS:
+            raise
+        except BaseException as e:
             message = redact(e)
-            self._record_login_failure(message, prepared.material)
-            return False, message
+            panic = not isinstance(e, Exception)
+            if panic:
+                # SDK core panic (pyo3 PanicException): the login answer could not be interpreted.
+                logger.error(f"玉山 SDK 登入時核心錯誤（{type(e).__name__}）：\n{redact(traceback.format_exc())}")
+                message = f"SDK 核心錯誤（{type(e).__name__}）：{message}"
+            kind = self._record_login_failure(message, prepared.material, auto=auto, panic=panic)
+            return False, message, kind
 
         cert_info = None
         try:
             info = client.certinfo() if hasattr(client, "certinfo") else None
             cert_info = info if isinstance(info, dict) else None
-        except Exception:
+        except _PROPAGATED_BASE_EXCEPTIONS:
+            raise
+        except BaseException:
             cert_info = None
 
         with self._state_lock:
@@ -2875,12 +3074,15 @@ class EsunTradeBridge:
             config_overridden=prepared.overridden,
             cert_info=cert_info,
             logged_in_at=taipei_now().isoformat(timespec="seconds"),
+            login_reason=reason,
+            login_monotonic=time.monotonic(),
+            login_started_at=login_started_at,
         )
         self.login_error = None
         self.login_state.clear_credential_lock()
         self._install_session(session, reason)
         logger.info(f"玉山證券登入成功（{session.environment}，{reason}，generation {generation}）")
-        return True, None
+        return True, None, None
 
     def _install_session(self, session: EsunSession, reason: str) -> None:
         """Atomically publishes a new session: caches are reset, the old WebSocket is stopped."""
@@ -2893,6 +3095,7 @@ class EsunTradeBridge:
                 cache.reset(session.generation)
             self.order_book_cache.reset(session.generation)
             self.last_orders_refresh_time = 0.0
+        self._relogin_wake.set()  # a waiting automatic re-login of the replaced session ends now
         self._stop_websocket(old_runtime, old_session)
         self._start_websocket(session)
         threading.Thread(
@@ -2903,14 +3106,18 @@ class EsunTradeBridge:
         ).start()
         self._publish_session_event(reason)
 
-    def _publish_session_event(self, reason: str, ok: bool = True, error: str | None = None) -> None:
-        session = self._session
+    def _publish_session_event(
+        self, reason: str, ok: bool = True, error: str | None = None, session: EsunSession | None = None
+    ) -> None:
+        """`session` SSE event describing `session` (default: the current one)."""
+        session = session or self._session
         lock = self.login_state.snapshot()
         payload = {
             "generation": session.generation,
             "environment": session.environment,
             "account": dict(session.account) if session.account else None,
-            "loggedIn": session.logged_in,
+            "loggedIn": self._session_usable(session),
+            "sessionExpired": self._session_expiry(session) is not None,
             "reason": reason,
             "ok": ok,
             "error": error,
@@ -2944,7 +3151,7 @@ class EsunTradeBridge:
                 self.login_error = refusal[1]["error"]
                 logger.warning(self.login_error)
                 return False
-            ok, _ = self._perform_login(prepared, reason="startup")
+            ok, _, _ = self._perform_login(prepared, reason="startup")
             if not ok:
                 self._publish_session_event("startup_failed", ok=False, error=self.login_error)
             return ok
@@ -2961,39 +3168,471 @@ class EsunTradeBridge:
         if not self._session_change_lock.acquire(blocking=False):
             return False, {"ok": False, "error": "另一個登入或環境切換作業進行中", "code": "ESUN_SESSION_BUSY"}, 409
         try:
-            session = self._session
-            target = session.environment if session.environment in ("SIMULATION", "PRODUCTION") else None
-            path = session.config_path
-            if (not path or not os.path.isfile(path)) and target:
-                profile = discover_esun_config_profiles(self.base_dir, path)["profiles"].get(target) or {}
-                path = profile.get("filePath") or path
-            prepared, err = self._prepare_login_config(path, target)
-            if err:
-                self.login_error = err
-                return False, {"ok": False, "error": f"玉山設定不完整：{err}", "code": "CONFIG_ERROR"}, 503
-            refusal = self._acquire_login_permit(explicit=True, force=bool(force), material=prepared.material)
-            if refusal:
-                status, body = refusal
-                return False, body, status
-            ok, message = self._perform_login(prepared, reason="reconnect")
-            if not ok:
-                self._publish_session_event("reconnect_failed", ok=False, error=message)
-                return False, {
-                    "ok": False,
-                    "error": f"玉山登入失敗：{message}",
-                    "code": "LOGIN_FAILED",
-                    "login_locked": self.login_locked,
-                }, 502
-            session = self._session
-            return True, {
-                "ok": True,
-                "message": "玉山證券登入成功",
-                "account": dict(session.account) if session.account else None,
-                "environment": session.environment,
-                "sessionGeneration": session.generation,
-            }, 200
+            ok, body, status, _ = self._login_current_profile(explicit=True, force=bool(force), reason="reconnect")
+            return ok, body, status
         finally:
             self._session_change_lock.release()
+
+    def _login_current_profile(
+        self, *, explicit: bool, force: bool, reason: str, auto: bool = False
+    ) -> tuple[bool, dict, int, tuple[str, str] | None]:
+        """
+        Logs in again with the current session's profile (caller holds _session_change_lock): the
+        flow of POST /esun/auth/reconnect, shared with the automatic re-login after a session expiry
+        (explicit=False: the credential circuit breaker is never lifted; auto=True: the automatic
+        re-login failure classification). On success a new session generation is installed
+        (WebSocket restarted, `session` SSE event, bootstrap orders query).
+        Returns (ok, body, status, failure) where failure is (kind, message) of a failed client.login().
+        """
+        session = self._session
+        target = session.environment if session.environment in ("SIMULATION", "PRODUCTION") else None
+        path = session.config_path
+        if (not path or not os.path.isfile(path)) and target:
+            profile = discover_esun_config_profiles(self.base_dir, path)["profiles"].get(target) or {}
+            path = profile.get("filePath") or path
+        prepared, err = self._prepare_login_config(path, target)
+        if err:
+            self.login_error = err
+            return False, {"ok": False, "error": f"玉山設定不完整：{err}", "code": "CONFIG_ERROR"}, 503, None
+        refusal = self._acquire_login_permit(explicit=explicit, force=force, material=prepared.material)
+        if refusal:
+            status, body = refusal
+            return False, body, status, None
+        ok, message, kind = self._perform_login(prepared, reason=reason, auto=auto)
+        if not ok:
+            self._publish_session_event(f"{reason}_failed", ok=False, error=message)
+            return False, {
+                "ok": False,
+                "error": f"玉山登入失敗：{message}",
+                "code": "LOGIN_FAILED",
+                "login_locked": self.login_locked,
+            }, 502, (kind or "unknown", message or "")
+        session = self._session
+        return True, {
+            "ok": True,
+            "message": "玉山證券登入成功",
+            "account": dict(session.account) if session.account else None,
+            "environment": session.environment,
+            "sessionGeneration": session.generation,
+        }, 200, None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Session expiry (token invalidated by the broker) and automatic re-login
+    # ─────────────────────────────────────────────────────────────────────────
+    #
+    # Detection (authoritative only):
+    #   * WebSocket error / close carrying "Token Validation Error" (code 1011);
+    #   * an SDK "A0000x: response parse Error" on a session that predates the day change.
+    # "Predates the day change": the login STARTED (login_started_at, recorded right before
+    # client.login()) before today 00:00 + grace (ESUN_AUTO_RELOGIN_NOT_BEFORE, default 00:05), so a
+    # login begun at 23:59:59 or finished between 00:00 and 00:05 still counts as yesterday's session.
+    # An expired generation stays expired: its WebSocket stops for good, order mutations are refused
+    # before any SDK call (503 ESUN_SESSION_EXPIRED, not_sent) and queries answer 503 without calling
+    # the SDK.
+    # Only a day-change expiry of the current session is re-logged automatically (one worker, single
+    # flight). A token rejected during the day (the session started after today's grace) most likely
+    # means a login elsewhere: re-logging would kick that session out, so it asks for a manual
+    # reconnect. The worker never lifts the credential circuit breaker; an unrecognized failure pauses
+    # it without tripping the breaker; only network failures and AGR0000 are retried, a bounded number
+    # of times. Success installs a new generation, which ends the expiry.
+
+    @staticmethod
+    def _relogin_idle_state() -> dict:
+        return {
+            # idle | pending | running | succeeded | paused | manual_required | disabled
+            "state": "idle",
+            "generation": None,
+            "attempts": 0,
+            "nextAttemptAt": None,
+            "lastError": None,
+        }
+
+    def _session_expiry(self, session: EsunSession | None = None) -> dict | None:
+        session = session or self._session
+        if not session.logged_in:
+            return None
+        return self._expired_sessions.get(session.generation)
+
+    def _session_usable(self, session: EsunSession | None = None) -> bool:
+        """Logged in and not known to be expired."""
+        session = session or self._session
+        return session.logged_in and session.generation not in self._expired_sessions
+
+    def _rollover_cutoff(self, now: datetime.datetime) -> datetime.datetime:
+        """Today (Taipei) 00:00 + grace: the first automatic re-login time and the day-change boundary."""
+        now = _as_taipei(now)
+        midnight = datetime.datetime.combine(now.date(), datetime.time(0), tzinfo=TAIPEI_TZ)
+        return midnight + self.auto_relogin_not_before
+
+    def _session_predates_rollover(self, session: EsunSession, now: datetime.datetime | None = None) -> bool:
+        """True when the session's login started before today 00:00 + grace (unknown start: False)."""
+        started = _parse_taipei_stamp(session.login_started_at or session.logged_in_at)
+        if started is None:
+            return False
+        return started < self._rollover_cutoff(now or taipei_now())
+
+    def _first_relogin_delay(self, detected_at: datetime.datetime) -> float:
+        """Seconds until the first re-login: max(detection + initial delay, today's not-before) + jitter."""
+        detected_at = _as_taipei(detected_at)
+        until_not_before = (self._rollover_cutoff(detected_at) - detected_at).total_seconds()
+        wait = max(float(self.auto_relogin_initial_delay), until_not_before)
+        try:
+            fraction = float(self.auto_relogin_rng())
+        except Exception:
+            fraction = 1.0
+        if not math.isfinite(fraction):
+            fraction = 1.0
+        fraction = min(max(fraction, 0.0), 1.0)
+        return wait + fraction * max(0.0, float(self.auto_relogin_jitter))
+
+    def _relogin_snapshot(self) -> dict:
+        with self._relogin_lock:
+            return dict(self._relogin)
+
+    def _set_relogin(self, generation: int, **fields: any) -> None:
+        """Updates the re-login status while it still describes `generation`."""
+        with self._relogin_lock:
+            if self._relogin.get("generation") == generation:
+                self._relogin.update(fields)
+
+    def _session_expired_text(self, expiry: dict, suffix: str) -> str:
+        relogin = self._relogin_snapshot()
+        active = relogin["generation"] == expiry["generation"] and relogin["state"] in ("pending", "running")
+        action = "正在重新登入" if active else "請以「重新連線」手動重新登入"
+        return f"玉山登入已失效（{expiry['label']}），{action}；{suffix}"
+
+    def _session_expired_login_error(self, expiry: dict) -> str:
+        """health.loginError while the session is expired."""
+        intraday = expiry.get("kind") == "intraday"
+        if intraday:
+            head = "玉山登入 token 於日間失效（可能在其他地方重新登入）"
+        elif expiry["label"] == "換日":
+            head = "玉山登入已於換日失效"
+        else:
+            head = f"玉山登入已失效（{expiry['label']}）"
+        relogin = self._relogin_snapshot()
+        state = relogin["state"] if relogin["generation"] == expiry["generation"] else None
+        if state == "disabled":
+            return f"{head}；已停用自動重新登入（ESUN_AUTO_RELOGIN），請以「重新連線」手動重新登入"
+        if intraday:
+            return f"{head}，請手動重新連線"
+        if state is None:
+            return f"{head}，請以「重新連線」手動重新登入"
+        if state in ("pending", "running"):
+            return f"{head}，正在重新登入"
+        if state == "paused":
+            detail = relogin.get("lastError") or "未知錯誤"
+            return f"{head}，自動重新登入失敗（無法辨識的回應：{detail}），請按「重新連線」手動登入"
+        detail = f"（{relogin['lastError']}）" if relogin.get("lastError") else ""
+        return f"{head}，自動重新登入未成功{detail}，請以「重新連線」手動重新登入"
+
+    def _session_expired_refusal(self, session: EsunSession) -> tuple[dict, int]:
+        expiry = self._expired_sessions.get(session.generation) or {"label": "換日", "generation": session.generation}
+        return not_sent(
+            503, "ESUN_SESSION_EXPIRED", self._session_expired_text(expiry, "委託未送出"),
+            environment=session.environment, sessionGeneration=session.generation,
+        )
+
+    def _session_expired_query_error(self, session: EsunSession) -> EsunQueryError:
+        expiry = self._expired_sessions.get(session.generation) or {"label": "換日", "generation": session.generation}
+        return EsunQueryError(503, "ESUN_SESSION_EXPIRED", self._session_expired_text(expiry, "請稍後再查詢"))
+
+    def _note_ws_failure(self, session: EsunSession, detail: any) -> bool:
+        """WebSocket error / close text: 'Token Validation Error' marks the session expired (never raises)."""
+        try:
+            text = redact(detail)
+            if not _WS_TOKEN_INVALID_RE.search(text):
+                return False
+            self._mark_session_expired(session, "ws_token", text)
+            return True
+        except Exception:
+            logger.error(f"[WebSocket] session expiry handling failed:\n{redact(traceback.format_exc())}")
+            return False
+
+    def _note_sdk_failure(self, session: EsunSession, error: any) -> bool:
+        """
+        An SDK call failed: a response parse error (A0000x) on a session that predates the day change
+        marks it expired. Returns True when the session is expired (now or before).
+        """
+        if not session.logged_in:
+            return False
+        try:
+            text = redact(error)
+            if _SDK_PARSE_ERROR_RE.search(text) and self._session_predates_rollover(session):
+                self._mark_session_expired(session, "date_rollover", text)
+        except Exception:  # never replaces the caller's own error handling
+            logger.error(f"session expiry handling failed:\n{redact(traceback.format_exc())}")
+        return session.generation in self._expired_sessions
+
+    def _mark_session_expired(self, session: EsunSession, source: str, detail: str) -> bool:
+        """
+        Records the expiry of `session` (once per generation) and stops its WebSocket for good. For
+        the current session, the re-login status (pending / manual_required / disabled) is set in the
+        same critical section as the expiry, so health never shows an intermediate state; a
+        day-change expiry then starts the single re-login worker. Returns True when this call
+        recorded it. An expiry of a non-current generation creates no worker and leaves the current
+        session (and its WebSocket) untouched.
+        """
+        if not session.logged_in:
+            return False
+        now = taipei_now()
+        rollover = self._session_predates_rollover(session, now)
+        label = "換日" if rollover else "token 於日間失效"
+        worker = None
+        with self._state_lock:
+            if session.generation in self._expired_sessions:
+                return False
+            expiry = {
+                "generation": session.generation,
+                "source": source,
+                "kind": "rollover" if rollover else "intraday",
+                "label": label,
+                "detail": str(detail or "")[:300],
+                "at": now.isoformat(timespec="seconds"),
+            }
+            current = self._is_current(session.generation)
+            runtime = self._ws_runtime if current else None
+            if current:
+                with self._relogin_lock:  # lock order: _state_lock -> _relogin_lock (never the reverse)
+                    worker = self._prepare_auto_relogin_locked(session, expiry, now)
+            self._expired_sessions[session.generation] = expiry
+        cause = "WebSocket Token Validation Error" if source == "ws_token" else "換日後 SDK 回應解析失敗"
+        logger.error(f"玉山登入已失效（{label}，{cause}，g{session.generation}）：{expiry['detail']}")
+        if runtime is not None and runtime.generation == session.generation:
+            self._stop_websocket(runtime, session)  # no more reconnects with the invalid token
+        if not current:
+            return True
+        # Describes the expired session itself (never a newer one installed meanwhile); published
+        # before the worker starts, so it always precedes the re-login's own session event.
+        self._publish_session_event(
+            "session_expired", ok=False, error=self._session_expired_login_error(expiry), session=session
+        )
+        if worker is not None:
+            self._start_relogin_worker(worker, session.generation)
+        return True
+
+    def _prepare_auto_relogin_locked(
+        self, session: EsunSession, expiry: dict, now: datetime.datetime
+    ) -> threading.Thread | None:
+        """
+        Caller holds _relogin_lock. Sets the re-login status of the expired current `session` and
+        returns the (not yet started) worker, or None: automatic re-login disabled, bridge shutting
+        down, a token rejected during the day (manual reconnect), the session itself came from an
+        automatic re-login less than AUTO_RELOGIN_MIN_SESSION_SECONDS ago (no login loop), or a worker
+        is still alive (queued: that worker starts it when it ends).
+        """
+        generation = session.generation
+
+        def stop(state: str, error: str | None = None) -> None:
+            self._relogin = {**self._relogin_idle_state(), "state": state, "generation": generation, "lastError": error}
+            return None
+
+        if self._shutdown_event.is_set():
+            return stop("manual_required", "bridge 關閉中")
+        if not self.auto_relogin:
+            logger.warning("ESUN_AUTO_RELOGIN 已停用：不自動重新登入，請以「重新連線」手動重新登入")
+            return stop("disabled")
+        if expiry.get("kind") != "rollover":
+            logger.error(
+                f"玉山{AUTO_RELOGIN_INTRADAY_TEXT}（g{generation}，登入開始於 "
+                f"{session.login_started_at or session.logged_in_at}）：不自動重新登入，避免踢掉其他地方的登入"
+            )
+            return stop("manual_required", AUTO_RELOGIN_INTRADAY_TEXT)
+        if (
+            session.login_reason == "auto_relogin"
+            and session.login_monotonic is not None
+            and time.monotonic() - session.login_monotonic < AUTO_RELOGIN_MIN_SESSION_SECONDS
+        ):
+            logger.error("自動重新登入後的 session 隨即再次失效：不再自動重新登入，請手動重新連線")
+            return stop("manual_required", "自動重新登入後的 session 隨即再次失效")
+        delay = self._first_relogin_delay(now)
+        next_at = (_as_taipei(now) + datetime.timedelta(seconds=delay)).isoformat(timespec="seconds")
+        self._relogin = {**self._relogin_idle_state(), "state": "pending", "generation": generation, "nextAttemptAt": next_at}
+        logger.warning(f"玉山登入換日失效（g{generation}）：預定 {next_at} 自動重新登入（{delay:.0f} 秒後）")
+        if self._relogin_thread is not None:
+            self._relogin_queued = (generation, time.monotonic() + delay)
+            return None
+        worker = self._create_relogin_worker(generation, delay)
+        self._relogin_thread = worker
+        return worker
+
+    def _create_relogin_worker(self, generation: int, delay: float) -> threading.Thread:
+        return threading.Thread(
+            target=self._auto_relogin_worker, args=(generation, delay), daemon=True, name=f"EsunAutoRelogin-g{generation}"
+        )
+
+    def _start_relogin_worker(self, worker: threading.Thread, generation: int) -> None:
+        """Starts a prepared worker; a failed start leaves no stale worker and asks for a manual reconnect."""
+        try:
+            worker.start()
+            return
+        except _PROPAGATED_BASE_EXCEPTIONS:
+            raise
+        except BaseException as e:
+            error = f"無法啟動自動重新登入：{redact(e)}"
+        logger.error(f"玉山{error}（g{generation}），需要手動重新連線")
+        with self._relogin_lock:
+            if self._relogin_thread is worker:
+                self._relogin_thread = None
+            if self._relogin.get("generation") == generation:
+                self._relogin.update(state="manual_required", nextAttemptAt=None, lastError=error)
+        self._publish_relogin_stopped(generation)
+
+    def _publish_relogin_stopped(self, generation: int) -> None:
+        session = self._session
+        expiry = self._expired_sessions.get(generation)
+        if expiry is not None and session.generation == generation:
+            self._publish_session_event(
+                "auto_relogin_stopped", ok=False, error=self._session_expired_login_error(expiry), session=session
+            )
+
+    def _auto_relogin_handover(self) -> None:
+        """A worker ended: starts the worker queued for a current session that expired meanwhile."""
+        worker = None
+        generation = None
+        with self._relogin_lock:
+            if self._relogin_thread is threading.current_thread():
+                self._relogin_thread = None
+            queued, self._relogin_queued = self._relogin_queued, None
+            if queued is not None and self._relogin_thread is None:
+                generation, deadline = queued
+                describes = self._relogin.get("generation") == generation and self._relogin.get("state") == "pending"
+                if describes and self._expired_and_current(generation) and not self._shutdown_event.is_set():
+                    worker = self._create_relogin_worker(generation, max(0.0, deadline - time.monotonic()))
+                    self._relogin_thread = worker
+                elif describes:
+                    self._relogin.update(state="idle", nextAttemptAt=None)
+        if worker is not None:
+            self._start_relogin_worker(worker, generation)
+
+    def _expired_and_current(self, generation: int) -> bool:
+        return self._is_current(generation) and generation in self._expired_sessions
+
+    def _relogin_should_stop(self, generation: int) -> bool:
+        return self._shutdown_event.is_set() or not self._expired_and_current(generation)
+
+    def _relogin_sleep(self, generation: int, delay: float) -> bool:
+        """
+        Waits `delay` seconds holding no lock (a manual reconnect / switch may log in meanwhile).
+        Returns True as soon as the worker must stop: shutdown, or the expired session was replaced.
+        """
+        deadline = time.monotonic() + max(0.0, delay)
+        while True:
+            self._relogin_wake.clear()  # cleared before the check: a later set() is never missed
+            if self._relogin_should_stop(generation):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._relogin_wake.wait(remaining)
+
+    def _auto_relogin_worker(self, generation: int, first_delay: float) -> None:
+        """
+        Logs in again after the day-change expiry of `generation`: the first attempt after
+        `first_delay`, then auto_relogin_retry_delays between retries of failures that never reached
+        the server (DNS, refused, unreachable) and AGR0000 (at least its cooldown). A failure that may
+        have reached the server (timeout, EOF, 502/503/504) allows AUTO_RELOGIN_MAYBE_SENT_MAX_ATTEMPTS
+        attempts in all. An unrecognized answer or an SDK core panic pauses (no breaker); credential
+        failures (breaker), AGR0004, configuration or SDK set-up errors stop at once. Then health asks
+        for a manual reconnect. Ends early when another login replaced the session or on shutdown.
+        Never ends in pending / running.
+        """
+        delays = tuple(self.auto_relogin_retry_delays)
+        delay = first_delay
+        attempt = 0
+        maybe_sent = False
+        try:
+            while True:
+                self._set_relogin(
+                    generation,
+                    state="pending",
+                    nextAttemptAt=(taipei_now() + datetime.timedelta(seconds=delay)).isoformat(timespec="seconds"),
+                )
+                if self._relogin_sleep(generation, delay):
+                    self._set_relogin(generation, state="idle", nextAttemptAt=None)  # replaced or shutting down
+                    return
+                attempt += 1
+                self._set_relogin(generation, state="running", attempts=attempt, nextAttemptAt=None)
+                logger.warning(
+                    f"玉山自動重新登入第 {attempt} 次嘗試開始（{taipei_now().isoformat(timespec='seconds')}，取代 g{generation}）"
+                )
+                outcome, detail, retry_after = self._auto_relogin_once(generation)
+                logger.warning(
+                    f"玉山自動重新登入第 {attempt} 次嘗試結果：{outcome}"
+                    f"（{taipei_now().isoformat(timespec='seconds')}）{('：' + detail) if detail else ''}"
+                )
+                if outcome == "ok":
+                    self._set_relogin(generation, state="succeeded", lastError=None)
+                    logger.info(f"玉山自動重新登入成功（第 {attempt} 次，取代 g{generation}）")
+                    return
+                if outcome == "superseded":
+                    self._set_relogin(generation, state="idle")
+                    return
+                self._set_relogin(generation, lastError=detail)
+                if outcome == "retry_maybe_sent":
+                    maybe_sent = True
+                limit = 1 + len(delays)
+                if maybe_sent:
+                    limit = min(limit, AUTO_RELOGIN_MAYBE_SENT_MAX_ATTEMPTS)
+                if outcome in ("retry", "retry_maybe_sent") and attempt < limit:
+                    delay = max(delays[attempt - 1], retry_after or 0.0)
+                    logger.warning(f"玉山自動重新登入失敗（第 {attempt} 次），{delay:.0f} 秒後重試：{detail}")
+                    continue
+                if outcome == "paused":
+                    self._set_relogin(generation, state="paused")
+                    logger.error(f"玉山自動重新登入暫停（無法辨識的回應，未啟動熔斷），請手動重新連線：{detail}")
+                else:
+                    self._set_relogin(generation, state="manual_required")
+                    logger.error(f"玉山自動重新登入停止（共 {attempt} 次），需要手動重新連線：{detail}")
+                self._publish_relogin_stopped(generation)
+                return
+        except _PROPAGATED_BASE_EXCEPTIONS:
+            raise
+        except BaseException:
+            logger.error(f"玉山自動重新登入發生錯誤：\n{redact(traceback.format_exc())}")
+            self._set_relogin(generation, state="manual_required", nextAttemptAt=None, lastError="自動重新登入發生內部錯誤")
+            self._publish_relogin_stopped(generation)
+        finally:
+            with self._relogin_lock:  # never left pending / running (e.g. KeyboardInterrupt propagating)
+                if self._relogin.get("generation") == generation and self._relogin.get("state") in ("pending", "running"):
+                    self._relogin.update(state="manual_required", nextAttemptAt=None,
+                                         lastError=self._relogin.get("lastError") or "自動重新登入中止")
+            self._auto_relogin_handover()
+
+    def _auto_relogin_once(self, generation: int) -> tuple[str, str | None, float | None]:
+        """
+        One re-login attempt: ('ok' | 'superseded' | 'retry' | 'retry_maybe_sent' | 'paused' | 'fatal',
+        error, retry_after). The failure kind comes with the login result (no shared state).
+        """
+        if not self._session_change_lock.acquire(timeout=max(0.0, self.auto_relogin_lock_wait)):
+            return "retry", "另一個登入或環境切換作業進行中", None
+        try:
+            if self._relogin_should_stop(generation):
+                return "superseded", None, None
+            ok, body, status, failure = self._login_current_profile(
+                explicit=False, force=False, reason="auto_relogin", auto=True
+            )
+        finally:
+            self._session_change_lock.release()
+        if ok:
+            return "ok", None, None
+        code = str(body.get("code") or "")
+        error = str(body.get("error") or code)
+        if status == 429 and code == "AGR0000":
+            wait = body.get("cooldown_remaining_sec") or body.get("retry_after") or LOGIN_AGR0000_COOLDOWN_SECONDS
+            return "retry", error, float(wait)
+        if failure is not None:
+            kind, message = failure
+            if kind == "network_unsent":
+                return "retry", error, None
+            if kind == "network_maybe_sent":
+                return "retry_maybe_sent", error, None
+            if kind == "rate_limited":
+                return "retry", error, LOGIN_AGR0000_COOLDOWN_SECONDS
+            if kind == "unknown":
+                return "paused", str(message)[:200], None
+        # credential (breaker set), AGR0004, ESUN_LOGIN_LOCKED, CONFIG_ERROR, SDK set-up: never retried
+        return "fatal", error, None
 
     # ─────────────────────────────────────────────────────────────────────────
     # WebSocket supervisor (generation scoped)
@@ -3004,6 +3643,7 @@ class EsunTradeBridge:
             not runtime.stop_event.is_set()
             and not self._shutdown_event.is_set()
             and self._is_current(session.generation)
+            and session.generation not in self._expired_sessions  # never reconnect with an invalid token
         )
 
     @staticmethod
@@ -3045,10 +3685,24 @@ class EsunTradeBridge:
 
         def _on_error(err: any) -> None:
             logger.error(f"[WebSocket] Error (g{generation}): {redact(err)}")
+            self._note_ws_failure(session, err)
 
         def _on_close(*args: any) -> None:
             runtime.note_closed()
             logger.info(f"[WebSocket] Closed (g{generation})")
+            # SDK: on_close(ws, close_status_code, close_msg); 1011 "Token Validation Error" = token rejected.
+            # Every argument is scanned: some call paths pass only the message (or fewer arguments).
+            parts = []
+            for arg in args:
+                try:
+                    if isinstance(arg, (bytes, bytearray)):
+                        arg = bytes(arg).decode("utf-8", "replace")
+                    if arg is not None:
+                        parts.append(str(arg))
+                except Exception:
+                    continue
+            if parts:
+                self._note_ws_failure(session, " ".join(parts))
 
         sdk.on("order")(_on_order)
         sdk.on("dealt")(_on_dealt)
@@ -3112,6 +3766,7 @@ class EsunTradeBridge:
                 session.sdk.connect_websocket()
             except Exception as e:
                 logger.warning(f"[WebSocket] 連線失敗或中斷（g{session.generation}）：{redact(e)}")
+                self._note_ws_failure(session, e)
             runtime.note_closed()
             first = False
             if not self._ws_should_run(session, runtime):
@@ -3160,7 +3815,7 @@ class EsunTradeBridge:
         interval, order-query limiter, snapshots applied in start order).
         """
         session = session or self._session
-        if session.sdk is None or not self._is_current(session.generation):
+        if session.sdk is None or not self._is_current(session.generation) or not self._session_usable(session):
             return False
         try:
             self._refresh_orders_snapshot(session, background=True)
@@ -3216,7 +3871,7 @@ class EsunTradeBridge:
         most one is pending per session: failed ACKs arriving before it starts share it; one
         arriving after it started gets one more query.
         """
-        if not session.logged_in or self._shutdown_event.is_set():
+        if not self._session_usable(session) or self._shutdown_event.is_set():
             return
         wanted = self.order_book_cache.report_mark()
         with self._failed_ack_refresh_lock:
@@ -3267,7 +3922,7 @@ class EsunTradeBridge:
                     since = self._refresh_orders_snapshot(session, background=True)
                 except EsunQueryError as e:
                     if (
-                        e.code in ("ESUN_SESSION_CHANGED", "ESUN_SHUTTING_DOWN")
+                        e.code in ("ESUN_SESSION_CHANGED", "ESUN_SHUTTING_DOWN", "ESUN_SESSION_EXPIRED")
                         or self._shutdown_event.is_set()
                         or not self._is_current(session.generation)
                     ):
@@ -3345,7 +4000,7 @@ class EsunTradeBridge:
             "time": taipei_now().isoformat(timespec="seconds"),
             "generation": session.generation,
             "environment": session.environment,
-            "loggedIn": session.logged_in,
+            "loggedIn": self._session_usable(session),
             "wsConnected": bool(runtime is not None and runtime.is_connected()),
         }
         if initial:
@@ -3402,6 +4057,12 @@ class EsunTradeBridge:
         lock_reason = None
         if lock["locked"]:
             lock_reason = f"{lock['code'] or 'LOGIN_FAILED'}：{lock['reason'] or ''}".rstrip("：")
+        expiry = self._session_expiry(session)
+        relogin = self._relogin_snapshot()
+        relogin_current = expiry is not None and relogin["generation"] == session.generation
+        relogin_state = relogin["state"] if relogin_current else ("idle" if expiry is None else "manual_required")
+        if expiry is None and relogin["state"] == "succeeded":
+            relogin_state = "succeeded"
 
         return {
             "ok": True,
@@ -3411,10 +4072,22 @@ class EsunTradeBridge:
             "simulation": session.environment == "SIMULATION",
             "entry": session.entry,
             "account": dict(session.account) if session.account else None,
-            "loggedIn": session.logged_in,
+            "loggedIn": session.logged_in and expiry is None,
+            "sessionExpired": expiry is not None,
+            "sessionExpiredAt": expiry["at"] if expiry else None,
+            "sessionExpiredReason": expiry["source"] if expiry else None,
+            "manualReconnectRequired": expiry is not None and relogin_state in ("manual_required", "disabled", "paused"),
+            "autoRelogin": {
+                "enabled": self.auto_relogin,
+                "state": relogin_state,
+                "attempts": relogin["attempts"] if relogin_current else 0,
+                "maxAttempts": 1 + len(self.auto_relogin_retry_delays),
+                "nextAttemptAt": relogin["nextAttemptAt"] if relogin_current else None,
+                "lastError": relogin["lastError"] if relogin_current else None,
+            },
             "loginLocked": lock["locked"],
             "loginLockReason": lock_reason,
-            "loginError": self.login_error,
+            "loginError": self._session_expired_login_error(expiry) if expiry else self.login_error,
             "certInfo": {"ca_expiretime": expire} if expire else None,
             "machineTime": None,
             "marketStatus": cached_market[0] if cached_market else None,
@@ -3472,7 +4145,7 @@ class EsunTradeBridge:
             "activeConfigFile": session.config_file_name if session.config_path and os.path.isfile(session.config_path) else None,
             "availableEnvironments": discovery["availableEnvironments"],
             "configProfiles": public_config_profiles(discovery),
-            "loggedIn": session.logged_in,
+            "loggedIn": self._session_usable(session),
             "loginLocked": self.login_locked,
             "sessionGeneration": session.generation,
             "configOverridden": session.config_overridden,
@@ -3508,7 +4181,7 @@ class EsunTradeBridge:
         try:
             session = self._session
             discovery = discover_esun_config_profiles(self.base_dir, session.config_path)
-            if session.logged_in and session.environment == target:
+            if self._session_usable(session) and session.environment == target:  # an expired one logs in again
                 self._publish_session_event("switch_unchanged")
                 return self._switch_response(True, discovery, extra={"message": f"已在 {target} 環境，未重新登入"}), 200
 
@@ -3531,7 +4204,7 @@ class EsunTradeBridge:
                 self._publish_session_event("switch_failed", ok=False, error=body["error"])
                 extra = {k: v for k, v in body.items() if k not in ("ok", "error", "code")}
                 return self._switch_response(False, discovery, error=body["error"], code=body["code"], extra=extra), status
-            ok, message = self._perform_login(prepared, reason="switch")
+            ok, message, _ = self._perform_login(prepared, reason="switch")
             if not ok:
                 self._publish_session_event("switch_failed", ok=False, error=message)
                 return self._switch_response(
@@ -3622,6 +4295,8 @@ class EsunTradeBridge:
         session = self._session
         if not session.logged_in:
             return None, not_sent(503, "ESUN_NOT_LOGGED_IN", self._not_logged_in_message())
+        if not self._session_usable(session):  # known-invalid token: never sent
+            return None, self._session_expired_refusal(session)
         context = {"environment": session.environment, "sessionGeneration": session.generation}
         raw_env = body.get("expected_environment", body.get("expectedEnvironment"))
         if raw_env is None or not str(raw_env).strip():
@@ -3700,12 +4375,17 @@ class EsunTradeBridge:
             self.end_mutation()
 
     def _call_sdk_mutation_now(self, session: EsunSession, label: str, call: any) -> tuple[dict, int]:
+        if session.generation in self._expired_sessions:  # expired while the request was being prepared
+            return self._session_expired_refusal(session)
         try:
             result = call()
         except _PROPAGATED_BASE_EXCEPTIONS:
             raise
         except BaseException as e:
             message = redact(e)
+            if isinstance(e, Exception):
+                # Marks the session expired for the requests that follow; this one stays unknown.
+                self._note_sdk_failure(session, e)
             if not isinstance(e, Exception):
                 # SDK core panic (pyo3 PanicException): the request may or may not have been sent.
                 logger.error(f"{label}結果未知（SDK 核心 panic）：\n{redact(traceback.format_exc())}")
@@ -3857,6 +4537,10 @@ class EsunTradeBridge:
         except EsunQueryError as e:
             if e.code == "ESUN_SESSION_CHANGED":
                 raise EsunValidationError(f"{e}（委託未送出）", e.code, 503)
+            if e.code == "ESUN_SESSION_EXPIRED":
+                raise EsunValidationError(
+                    self._session_expired_refusal(session)[0]["error"], "ESUN_SESSION_EXPIRED", 503
+                )
             if e.code == "ESUN_SHUTTING_DOWN":
                 raise shutting_down()
             if e.code == "AGR0005":  # no query can start / finish soon enough: the client retries later
@@ -4169,6 +4853,8 @@ class EsunTradeBridge:
         session = self._session
         if not session.logged_in:
             raise EsunQueryError(503, "ESUN_NOT_LOGGED_IN", self._not_logged_in_message())
+        if not self._session_usable(session):
+            raise self._session_expired_query_error(session)
         if not refresh:
             return self.order_book_cache.get_all()
         self._refresh_orders_snapshot(session)
@@ -4205,6 +4891,8 @@ class EsunTradeBridge:
             while True:
                 if not self._is_current(session.generation):
                     raise EsunQueryError(503, "ESUN_SESSION_CHANGED", "等待期間玉山 session 已切換，請重新查詢")
+                if session.generation in self._expired_sessions:  # no query with a known-invalid token
+                    raise self._session_expired_query_error(session)
                 check_shutdown()
                 flight = self._orders_refresh_flight
                 now = time.monotonic()
@@ -4273,7 +4961,10 @@ class EsunTradeBridge:
                 logger.warning(f"get_order_results failed: {redact(e)}")
             else:
                 logger.error(f"get_order_results 發生 SDK 核心 panic：\n{redact(traceback.format_exc())}")
-            error = EsunQueryError(502, "ORDERS_QUERY_ERROR", f"玉山查詢委託失敗：{redact(e)}")
+            if isinstance(e, Exception) and self._note_sdk_failure(session, e):
+                error = self._session_expired_query_error(session)
+            else:
+                error = EsunQueryError(502, "ORDERS_QUERY_ERROR", f"玉山查詢委託失敗：{redact(e)}")
         finally:
             with cond:
                 flight.error = error  # handed to the requests sharing this query only, never cached
@@ -4298,6 +4989,9 @@ class EsunTradeBridge:
         session = self._session
         if not session.logged_in:
             return {"ok": False, "error": self._not_logged_in_message(), "code": "ESUN_NOT_LOGGED_IN"}, 503
+        if not self._session_usable(session):
+            expired = self._session_expired_query_error(session)
+            return expired.to_body(), expired.status
         hit = cache.get(key)
         if hit is not None:
             return (decorate(hit[0], hit[1], True) if decorate else hit[0]), 200
@@ -4312,6 +5006,9 @@ class EsunTradeBridge:
                 token = cache.begin_fill()
             if not session.logged_in or token[0] != session.generation:
                 return {"ok": False, "error": self._not_logged_in_message(), "code": "ESUN_NOT_LOGGED_IN"}, 503
+            if not self._session_usable(session):
+                expired = self._session_expired_query_error(session)
+                return expired.to_body(), expired.status
             if limiter is not None and not limiter.acquire():
                 return {
                     "ok": False,
@@ -4326,6 +5023,9 @@ class EsunTradeBridge:
             except BaseException as e:  # also an SDK core panic (pyo3 PanicException)
                 if not isinstance(e, Exception):
                     logger.error(f"查詢{label}發生 SDK 核心 panic：\n{redact(traceback.format_exc())}")
+                elif self._note_sdk_failure(session, e):
+                    expired = self._session_expired_query_error(session)
+                    return expired.to_body(), expired.status
                 return {"ok": False, "error": f"玉山查詢{label}失敗：{redact(e)}", "code": error_code}, 502
             cache.set(key, data, fill_token=token)
             return (decorate(data, 0.0, False) if decorate else data), 200

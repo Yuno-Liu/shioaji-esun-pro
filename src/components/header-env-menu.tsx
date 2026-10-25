@@ -4,8 +4,10 @@
 // - 永豐環境一律以伺服器 /api/v1/info 的 simulation（server-info-store，與送單閘門同源）為準，
 //   選單只顯示唯讀狀態並引導到伺服器管理；頂欄不提供「只改標籤」的切換。
 // - 玉山環境在 bridge 回報前顯示「未知」；切正式前需明確確認；切換中鎖定；失敗依回傳 ok:false 回饋。
+// - 玉山登入失效（bridge 已連線但 loggedIn:false 或 sessionExpired:true，例如台北換日 token 失效）：
+//   徽章與選單顯示「玉山登入已失效」，提供「重新連線」（登入熔斷鎖定中需先確認，避免連續錯誤鎖帳）。
 
-import { Check, ChevronDown } from 'lucide-react';
+import { Check, ChevronDown, TriangleAlert } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { invalidateAllQueries } from '../hooks/use-query';
 import {
@@ -63,6 +65,25 @@ export function envOf(simulation: boolean | null | undefined): RouteEnv {
 function healthHasEnv(h: EsunBridgeHealth | null | undefined): boolean {
     return h?.environment === 'SIMULATION' || h?.environment === 'PRODUCTION';
 }
+
+/** bridge 已連線但券商登入不在（未登入或 token 失效）：需要重新連線 */
+export function esunSessionLost(h: EsunBridgeHealth | null | undefined): boolean {
+    return !!h && (h.loggedIn === false || h.sessionExpired === true);
+}
+
+/** 失效時間（ISO 或 epoch 秒／毫秒）以台北時間顯示；無法解析時原樣顯示 */
+function formatExpiredAt(at: string | number | null | undefined): string | null {
+    if (at === null || at === undefined || at === '') return null;
+    const ms = typeof at === 'number' ? (at < 1e12 ? at * 1000 : at) : Date.parse(at);
+    if (!Number.isFinite(ms)) return typeof at === 'string' ? at : null;
+    return new Date(ms).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+}
+
+export const ESUN_LOGIN_LOCK_WARNING =
+    '上次登入因密碼或憑證錯誤被鎖。若已確認設定正確（或已修改 .env 並重啟），按確定將強制重試一次；密碼連續錯誤 3 次會被玉山鎖帳';
+
+// 重新連線成功但讀不到 health 時的重讀排程（毫秒）；全部失敗後回到最後看到的 health
+export const ESUN_HEALTH_RECHECK_DELAYS = [2_000, 4_000, 8_000, 16_000, 30_000];
 
 function sameAccount(a: Account | null | undefined, b: Account | null | undefined): boolean {
     return !!a && !!b && a.broker_id === b.broker_id && a.account_id === b.account_id && a.account_type === b.account_type;
@@ -131,6 +152,12 @@ export function HeaderEnvMenu({
     const [switching, setSwitching] = useState<EsunEnvironment | null>(null);
     const [confirmProd, setConfirmProd] = useState(false);
     const [linking, setLinking] = useState(false);
+    const [reconnecting, setReconnecting] = useState(false);
+    const [confirmReconnect, setConfirmReconnect] = useState(false);
+    // 重新連線成功但讀不到 health：舊 health 仍是失效狀態，先顯示「狀態確認中」並排程重讀
+    const [confirmingHealth, setConfirmingHealth] = useState(false);
+    const recheckTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+    const reconnectingRef = useRef(false);
     const [bridgeHealth, setBridgeHealth] = useState<EsunBridgeHealth | null>(() => esunTradeService.getBridgeHealth());
     // 玉山環境是否已由 bridge 確認（health 回報或 bridge 確認的切換）；未確認一律顯示「未知」
     const [esunConfirmed, setEsunConfirmed] = useState(() => healthHasEnv(esunTradeService.getBridgeHealth()));
@@ -164,19 +191,41 @@ export function HeaderEnvMenu({
         return () => {
             cancelled = true;
             if (timer) clearTimeout(timer);
+            if (recheckTimer.current) clearTimeout(recheckTimer.current);
         };
     }, []);
+
+    const scheduleHealthRecheck = (attempt = 0) => {
+        if (recheckTimer.current) clearTimeout(recheckTimer.current);
+        if (attempt >= ESUN_HEALTH_RECHECK_DELAYS.length) {
+            setConfirmingHealth(false);
+            return;
+        }
+        recheckTimer.current = setTimeout(() => {
+            recheckTimer.current = undefined;
+            void esunTradeService.refreshHealth().then((health) => {
+                if (!health) {
+                    scheduleHealthRecheck(attempt + 1);
+                    return;
+                }
+                setBridgeHealth(health);
+                if (healthHasEnv(health)) setEsunConfirmed(true);
+                setConfirmingHealth(false);
+            });
+        }, ESUN_HEALTH_RECHECK_DELAYS[attempt]);
+    };
 
     const close = (restoreFocus = false) => {
         setOpen(false);
         setConfirmProd(false);
+        setConfirmReconnect(false);
         if (restoreFocus) badgeRef.current?.focus();
     };
 
     useEffect(() => {
         if (!open) return;
-        const first = popoverRef.current?.querySelector<HTMLElement>('button:not([disabled])');
-        first?.focus();
+        // 聚焦對話框本身（tabIndex=-1），不聚焦任何按鈕：第一個按鈕可能是「重新連線」或帳號，按 Enter 會立即產生副作用
+        popoverRef.current?.focus();
         const onKey = (e: KeyboardEvent) => {
             if (e.key === 'Escape') close(true);
         };
@@ -193,10 +242,15 @@ export function HeaderEnvMenu({
 
     const esunAccounts = accounts.filter((a) => isEsunAccount(a));
     const bridgeConnected = bridgeHealth !== null;
+    // 以 service 最新的 health 為準（SSE session 事件、開啟選單時都會重新讀取）
+    const liveHealth = bridgeConnected ? esunTradeService.getBridgeHealth() ?? bridgeHealth : null;
+    // 狀態確認中不採信舊的失效 health（重新連線已成功）
+    const sessionLost = !confirmingHealth && esunSessionLost(liveHealth);
+    const expiredAt = sessionLost ? formatExpiredAt(liveHealth?.sessionExpiredAt) : null;
     const showEsunSection = bridgeConnected || esunAccounts.length > 0 || routes.some((r) => r.broker === 'esun');
     const simProfile = esunEnv.configProfiles.SIMULATION;
     const prodProfile = esunEnv.configProfiles.PRODUCTION;
-    const locked = switching !== null;
+    const locked = switching !== null || reconnecting;
 
     const badgeClass =
         badgeEnv === 'prod' ? hud.prodBadge : badgeEnv === 'sim' ? hud.simBadge : styles.unknownBadge;
@@ -218,6 +272,8 @@ export function HeaderEnvMenu({
                     if (h && !bridgeHealth) {
                         setBridgeHealth(h);
                         if (healthHasEnv(h)) setEsunConfirmed(true);
+                    } else if (h) {
+                        setBridgeHealth(h);
                     }
                 });
         }
@@ -270,6 +326,48 @@ export function HeaderEnvMenu({
         }
     };
 
+    /** force：只有登入熔斷鎖定中、使用者在確認框按下確定時才為 true */
+    const runEsunReconnect = async (force = false) => {
+        if (reconnectingRef.current || switchingRef.current) return;
+        reconnectingRef.current = true;
+        setReconnecting(true);
+        setConfirmReconnect(false);
+        try {
+            const res = force ? await esunTradeService.reconnect({ force: true }) : await esunTradeService.reconnect();
+            if (res.health) setBridgeHealth(res.health);
+            if (!res.ok) {
+                notify({ kind: 'err', title: '玉山重新連線失敗', body: res.error || '玉山重新連線失敗' });
+                return;
+            }
+            if (res.health && healthHasEnv(res.health)) setEsunConfirmed(true);
+            if (res.health) {
+                setConfirmingHealth(false);
+            } else {
+                setConfirmingHealth(true);
+                scheduleHealthRecheck();
+            }
+            // 帳務查詢失效並立即重讀；委託權威重讀交給 trading-state 的 session 代次 hook（dispatch.ts），不在此重複
+            invalidateAllQueries();
+            const env = res.environment === 'SIMULATION' ? '模擬環境' : res.environment === 'PRODUCTION' ? '正式環境' : '';
+            notify({ kind: 'ok', title: '玉山重新連線', body: `已重新登入玉山證券${env ? `（${env}）` : ''}` });
+        } catch (err) {
+            notify({ kind: 'err', title: '玉山重新連線失敗', body: err instanceof Error ? err.message : String(err) });
+        } finally {
+            reconnectingRef.current = false;
+            setReconnecting(false);
+        }
+    };
+
+    const requestEsunReconnect = () => {
+        if (reconnectingRef.current || switchingRef.current || !bridgeConnected) return;
+        // 登入熔斷鎖定中：再試錯可能被玉山鎖帳，先確認
+        if (liveHealth?.loginLocked) {
+            setConfirmReconnect(true);
+            return;
+        }
+        void runEsunReconnect();
+    };
+
     const runEsunSwitch = async (target: EsunEnvironment) => {
         if (switchingRef.current) return;
         switchingRef.current = true;
@@ -311,7 +409,7 @@ export function HeaderEnvMenu({
     };
 
     const requestEsunSwitch = (target: EsunEnvironment) => {
-        if (switchingRef.current || !bridgeConnected) return;
+        if (switchingRef.current || reconnectingRef.current || !bridgeConnected) return;
         if (!esunTradeService.isEnvironmentAvailable(target)) return;
         if (esunConfirmed && esunEnv.environment === target) return;
         if (target === 'PRODUCTION') {
@@ -407,6 +505,12 @@ export function HeaderEnvMenu({
                     </>
                 )}
                 {externalLabel && hasSinopacRoute && <span className={hud.externalTag}>· 外部伺服器</span>}
+                {sessionLost && (
+                    <span className={styles.sessionLostTag} data-testid="esun-session-lost-badge">
+                        <TriangleAlert size={11} aria-hidden />
+                        玉山登入失效
+                    </span>
+                )}
                 <ChevronDown size={11} className={styles.chevron} />
             </button>
 
@@ -421,7 +525,69 @@ export function HeaderEnvMenu({
                         role="dialog"
                         aria-label="下單路由、帳號與交易環境"
                         aria-busy={locked}
+                        tabIndex={-1}
                     >
+                        {confirmingHealth && (
+                            <div className={styles.readonlyRow} role="status" data-testid="esun-health-confirming">
+                                <AsyncStatus phase="loading" size={12} text="玉山已重新登入，狀態確認中…" />
+                            </div>
+                        )}
+                        {sessionLost && (
+                            <div className={styles.sessionAlert} role="alert" data-testid="esun-session-lost">
+                                <span className={styles.sessionAlertTitle}>
+                                    <TriangleAlert size={13} aria-hidden />
+                                    玉山登入已失效
+                                </span>
+                                <span className={styles.optionSubtitle}>
+                                    {liveHealth?.loginError && (
+                                        <span className={styles.line} data-testid="esun-session-login-error">{liveHealth.loginError}</span>
+                                    )}
+                                    {expiredAt && <span className={styles.line}>失效時間：{expiredAt}</span>}
+                                    <span className={styles.line}>失效期間玉山委託一律不會送出，帳務查詢也可能失敗</span>
+                                    {liveHealth?.loginLocked && (
+                                        <span className={styles.line}>
+                                            登入熔斷鎖定中{liveHealth.loginLockReason ? `：${liveHealth.loginLockReason}` : ''}
+                                        </span>
+                                    )}
+                                </span>
+                                {confirmReconnect ? (
+                                    <div className={styles.confirmBox} role="alertdialog" aria-label="確認重新連線玉山證券" data-testid="esun-reconnect-confirm-box">
+                                        <span className={styles.confirmTitle}>玉山登入鎖定中，確定要重新連線？</span>
+                                        <span>{ESUN_LOGIN_LOCK_WARNING}。</span>
+                                        <span className={styles.confirmActions}>
+                                            <button
+                                                type="button"
+                                                className={styles.cancelBtn}
+                                                data-testid="esun-reconnect-cancel"
+                                                onClick={() => setConfirmReconnect(false)}
+                                            >
+                                                取消
+                                            </button>
+                                            <button
+                                                type="button"
+                                                className={styles.dangerBtn}
+                                                data-testid="esun-reconnect-confirm"
+                                                disabled={locked}
+                                                onClick={() => runEsunReconnect(liveHealth?.loginLocked === true)}
+                                            >
+                                                確定，強制重試一次
+                                            </button>
+                                        </span>
+                                    </div>
+                                ) : (
+                                    <button
+                                        type="button"
+                                        className={styles.reconnectBtn}
+                                        data-testid="esun-reconnect"
+                                        disabled={locked}
+                                        aria-busy={reconnecting}
+                                        onClick={() => requestEsunReconnect()}
+                                    >
+                                        {reconnecting ? <AsyncStatus phase="loading" size={12} text="重新連線中…" /> : '重新連線'}
+                                    </button>
+                                )}
+                            </div>
+                        )}
                         <div className={styles.section}>
                             <div className={styles.sectionHeader}>
                                 <span className={styles.sectionTitle}>目前下單路由</span>
@@ -519,7 +685,7 @@ export function HeaderEnvMenu({
                                     <span className={styles.sectionTitle}>玉山證券環境切換</span>
                                     <span className={styles.envTag[esunRouteEnv]}>{ENV_SHORT[esunRouteEnv]}</span>
                                 </div>
-                                {locked && (
+                                {switching !== null && (
                                     <AsyncStatus
                                         phase="loading"
                                         size={12}

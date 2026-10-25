@@ -30,6 +30,7 @@ import {
     EsunTradeType,
     EsunBalanceRaw,
     EsunSettlementItem,
+    EsunMarketStatusRaw,
     EsunTransactionItem,
     EsunTradeStatusRaw,
     type EsunEnvironment,
@@ -320,8 +321,8 @@ function parseDate(dStr: string): Date | null {
 }
 
 /** 台北的今天（UTC 欄位即台北日期） */
-function taipeiToday(): Date {
-    const now = new Date(Date.now() + 8 * 3600_000);
+function taipeiToday(nowMs: number = Date.now()): Date {
+    const now = new Date(nowMs + 8 * 3600_000);
     return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }
 
@@ -586,6 +587,36 @@ function esunFillDeals(raw: Record<string, unknown>, apCode: string, fallbackPri
     return deals;
 }
 
+/**
+ * 委託列的排序鍵：ord_date（YYYYMMDD）＋ ord_time 補成 9 碼的 HHMMSSmmm。ord_time 7～9 碼視為
+ * HHMMSSmmm（前導零可能被去掉，前補零到 9 碼）；5～6 碼視為 HHMMSS（前補零到 6 碼、毫秒補 000）。
+ * 缺日期或時間、格式不符 → null。
+ */
+export function esunOrderSortKey(raw: Record<string, unknown>): string | null {
+    const d = String(raw.ord_date ?? raw.ordDate ?? '').replace(/-/g, '').trim();
+    const t = String(raw.ord_time ?? raw.ordTime ?? '').replace(/[:.]/g, '').trim();
+    if (!/^\d{8}$/.test(d) || !/^\d{5,9}$/.test(t)) return null;
+    const time = t.length <= 6 ? `${t.padStart(6, '0')}000` : t.padStart(9, '0');
+    return `${d}${time}`;
+}
+
+/**
+ * 委託查詢列依 (ord_date, ord_time) 由舊到新穩定排序（上游約定：陣列由舊到新、UI 反轉成最新在前）。
+ * 同一秒內依毫秒排序；缺日期或時間的列保持原本相對順序並排在最前。不改動輸入陣列。
+ */
+export function sortEsunOrderResultsOldestFirst<T extends Record<string, unknown>>(rows: readonly T[]): T[] {
+    return rows
+        .map((row, idx) => ({ row, idx, key: row && typeof row === 'object' ? esunOrderSortKey(row) : null }))
+        .sort((a, b) => {
+            if (a.key === null || b.key === null) {
+                if (a.key === null && b.key === null) return a.idx - b.idx;
+                return a.key === null ? -1 : 1;
+            }
+            return a.key < b.key ? -1 : a.key > b.key ? 1 : a.idx - b.idx;
+        })
+        .map(x => x.row);
+}
+
 /** 台北時間 YYYYMMDD + HHMMSS[mmm] → epoch 秒；缺資料回 undefined */
 export function esunTimestamp(date: unknown, time: unknown): number | undefined {
     const d = String(date ?? '').replace(/-/g, '').trim();
@@ -747,6 +778,21 @@ export function fromEsunOrderResult(
     return trade;
 }
 
+/** 庫存列交易類別 → StockPosition.cond（'3' 融資、'4' 融券，其他為現股） */
+export function esunInventoryCondOf(trade: unknown): string {
+    const t = String(trade ?? '').trim();
+    return t === EsunTradeType.Margin ? 'MarginTrading' : t === EsunTradeType.Short ? 'ShortSelling' : 'Cash';
+}
+
+/** 第一個有限且大於 0 的價格；都沒有 → NaN（空字串、0、非數字都視為缺值） */
+function firstPositivePrice(...values: unknown[]): number {
+    for (const v of values) {
+        const n = finiteNumber(v);
+        if (n !== null && n > 0) return n;
+    }
+    return Number.NaN;
+}
+
 /** 將玉山庫存項目 (stk_sums) 轉換為 Shioaji-Pro 標準 StockPosition 物件 */
 export function fromEsunInventoryToPosition(
     item: EsunInventoryItem,
@@ -754,24 +800,23 @@ export function fromEsunInventoryToPosition(
     id = 1,
 ): StockPosition {
     const rawQty = Number(item.cost_qty ?? item.qty ?? 0);
-    // 玉山庫存 cost_qty 單位為股 (Share)
-    // Common unit 轉為張數 (Math.floor(shares / 1000) 或若未滿 1 張則保留股數)
-    const quantity = unit === 'Common'
-        ? (rawQty >= 1000 ? Math.floor(rawQty / 1000) : rawQty / 1000)
-        : rawQty;
+    // 玉山庫存 cost_qty、qty_l 單位為股；Common 單位一律精確換算成張（股/1000，不取整），
+    // 與已實現損益的張數一致（2500 股 → 2.5 張）
+    const quantity = unit === 'Common' ? rawQty / 1000 : rawQty;
 
-    const price = Number(item.price_avg ?? item.price ?? 0);
-    const lastPrice = Number(item.price_mkt ?? item.price_now ?? price);
+    // 價格欄位可能是空字串：Number('') 會變成 0，0 當參考價會讓第一個 tick 的 markPosition
+    // 把損益加上「價格×股數」。一律取第一個有限且大於 0 的值；都沒有時為 NaN（未知）：
+    // fmtPrice 顯示「—」、markPosition 對非有限 last_price 不重算損益、報酬率（price > 0 判斷）不計算。
+    const price = firstPositivePrice(item.price_avg, item.price);
+    const lastPrice = firstPositivePrice(item.price_mkt, item.price_now, item.price_avg);
     const pnl = Number(item.make_a_sum ?? 0);
     const ydQtyRaw = Number(item.qty_l ?? 0);
-    const ydQuantity = unit === 'Common'
-        ? (ydQtyRaw >= 1000 ? Math.floor(ydQtyRaw / 1000) : ydQtyRaw / 1000)
-        : ydQtyRaw;
+    const ydQuantity = unit === 'Common' ? ydQtyRaw / 1000 : ydQtyRaw;
 
     // 方向與信用別只看庫存列的交易類別 trade（'0' 現股、'3' 融資、'4' 融券）；
     // qty_b／qty_s／qty_bm／qty_sm 是當日委買賣與成交量，不代表持倉方向
     const trade = String(item.trade ?? '').trim();
-    const cond = trade === EsunTradeType.Margin ? 'MarginTrading' : trade === EsunTradeType.Short ? 'ShortSelling' : 'Cash';
+    const cond = esunInventoryCondOf(trade);
 
     return {
         id,
@@ -794,6 +839,10 @@ export function fromEsunBalance(raw: EsunBalanceRaw): AccountBalance {
     let date = '';
     if (typeof raw.updated_at === 'string') {
         date = raw.updated_at;
+    } else if (typeof raw.updated_at === 'number' && Number.isFinite(raw.updated_at)) {
+        // 正式環境回整數 epoch：≥ 1e12 視為毫秒，否則視為秒
+        const ms = raw.updated_at >= 1e12 ? raw.updated_at : raw.updated_at * 1000;
+        date = new Date(ms).toISOString();
     } else if (typeof raw.updatedAt === 'string') {
         date = raw.updatedAt;
     } else if (raw.updatedAt && typeof raw.updatedAt === 'object' && 'seconds' in raw.updatedAt) {
@@ -834,46 +883,193 @@ export function fromEsunBalanceToReserveSummary(
     };
 }
 
-/** 將玉山 get_settlements 回應清單轉換為 Settlement[] */
-export function fromEsunSettlements(rawList: EsunSettlementItem[]): Settlement[] {
-    if (!Array.isArray(rawList)) return [];
+const SETTLEMENT_FORMAT_ERROR = '玉山交割款回應格式錯誤';
 
-    const today = taipeiToday();
+/** YYYYMMDD 或 YYYY-MM-DD 且為合法日曆日期 → YYYY-MM-DD；否則 null */
+function toIsoDay(raw: unknown): string | null {
+    if (typeof raw !== 'string') return null;
+    const s = raw.trim();
+    const m = /^(\d{4})(\d{2})(\d{2})$/.exec(s) ?? /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (!m) return null;
+    const y = Number(m[1]);
+    const mo = Number(m[2]);
+    const d = Number(m[3]);
+    const dt = new Date(Date.UTC(y, mo - 1, d));
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+    return `${m[1]}-${m[2]}-${m[3]}`;
+}
 
-    return rawList.map((item, idx) => {
-        const rawDate = String(item.c_date ?? item.cdate ?? item.date ?? '');
-        const dateStr = rawDate.length === 8
-            ? `${rawDate.slice(0, 4)}-${rawDate.slice(4, 6)}-${rawDate.slice(6, 8)}`
-            : rawDate;
-        const amount = Number(item.amount ?? item.price ?? 0);
+function isoWeekday(iso: string): boolean {
+    const w = new Date(`${iso}T00:00:00Z`).getUTCDay();
+    return w !== 0 && w !== 6;
+}
 
-        let tOffset = item.T;
-        if (typeof tOffset !== 'number') {
-            const itemDate = parseDate(dateStr);
-            const diffDays = itemDate ? Math.round((itemDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)) : NaN;
-            tOffset = Math.max(0, Math.min(2, diffDays));
-        }
+/** iso 之後的第一個週一至週五（只跳過週六日，不知道國定假日） */
+function nextWeekday(iso: string): string {
+    const d = new Date(`${iso}T00:00:00Z`);
+    do {
+        d.setUTCDate(d.getUTCDate() + 1);
+    } while (d.getUTCDay() === 0 || d.getUTCDay() === 6);
+    return d.toISOString().slice(0, 10);
+}
 
-        return {
-            date: dateStr,
-            amount,
-            T: typeof tOffset === 'number' && !Number.isNaN(tOffset) ? tOffset : idx,
-        };
+function settlementAmount(raw: unknown): number | null {
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+    if (typeof raw !== 'string' || raw.trim() === '') return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+}
+
+/** 交割行事曆的 T+0／T+1 錨點；market_status 不可用時回 null */
+function settlementAnchors(
+    status: EsunMarketStatusRaw | null | undefined,
+    today: string,
+): { a0: string; a1?: string } | null {
+    if (!status || typeof status !== 'object') return null;
+    const isTrading = status.is_trading_day ?? status.isTradingDay;
+    const next = toIsoDay(status.next_trading_day ?? status.nextTradingDay);
+    if (typeof isTrading !== 'boolean' || !next) return null;
+    if (isTrading && isoWeekday(today) && next >= today) {
+        return { a0: today, a1: next > today ? next : undefined };
+    }
+    // 非交易日（或隔夜過期但 next==today 的快取）：T+0 是今天之後第一個交易日
+    if (next >= today) return { a0: next };
+    return null;
+}
+
+/**
+ * 玉山交割行事曆中「沒有任何玉山款項」的 0 元格（日期是推算的：market_status 錨點或只跳週末）。
+ * 不改上游 Settlement 型別，以物件身分標記；合併多帳戶時見 mergeSettlementSlot。
+ */
+const estimatedEsunSettlements = new WeakSet<Settlement>();
+
+/** row 是否為玉山推算的 0 元格（日期不具權威性，合併時讓位給其他帳戶的真實列） */
+export function isEstimatedEsunSettlement(row: Settlement): boolean {
+    return estimatedEsunSettlements.has(row);
+}
+
+/**
+ * 帳務 pane 合併多個證券帳戶同一個 T 的交割列：
+ * - 一方是玉山推算的 0 元格 → 採用另一方（真實列）的日期，金額加總；兩方都是推算格時沿用先到的日期，
+ *   合併結果仍標記為推算格。
+ * - 兩方都是真實列且日期不同 → throw（合計待確認）。
+ */
+export function mergeSettlementSlot(previous: Settlement | undefined, row: Settlement): Settlement {
+    const rowEstimated = isEstimatedEsunSettlement(row);
+    if (!previous) {
+        const first = { ...row };
+        if (rowEstimated) estimatedEsunSettlements.add(first);
+        return first;
+    }
+    const prevEstimated = isEstimatedEsunSettlement(previous);
+    if (previous.date !== row.date && !prevEstimated && !rowEstimated) {
+        throw new Error('帳戶交割日期不一致，合計待確認');
+    }
+    const merged = {
+        ...row,
+        date: prevEstimated && !rowEstimated ? row.date : previous.date,
+        amount: previous.amount + row.amount,
+    };
+    if (prevEstimated && rowEstimated) estimatedEsunSettlements.add(merged);
+    return merged;
+}
+
+/**
+ * 將玉山 get_settlements 回應轉成交割行事曆的三格 T+0／T+1／T+2（恰好三列，無資料的格金額為 0）。
+ * T+0＝今天起第一個交易日；交易日以玉山 market_status 為準，取不到或過期才退回只跳週末的推算
+ * （國定假日無法本地判斷，只影響金額為 0 的格的日期）。玉山的 date 是成交日，交割日是 c_date。
+ *
+ * 沒有玉山款項的格以 isEstimatedEsunSettlement 標記為推算格：與其他券商帳戶合計時改用對方真實列的日期。
+ *
+ * 取捨：market_status 不可用時，T+1 不以 nextWeekday(T+0) 當錨點，T+1／T+2 只由實際款項日期或
+ * 只跳週末的推算補位。若把 T+1 錨在 nextWeekday，T+0 與 T+1 之間遇到國定假日時，真實款項日期會
+ * 落在三格之外而 throw；現行做法最多讓「推算格」的日期在假日前後不精確（金額為 0，且合計時讓位給真實列）。
+ */
+export function fromEsunSettlements(
+    rawList: EsunSettlementItem[],
+    marketStatus?: EsunMarketStatusRaw | null,
+    nowMs: number = Date.now(),
+): Settlement[] {
+    if (!Array.isArray(rawList)) throw new Error(SETTLEMENT_FORMAT_ERROR);
+    const today = formatDate(taipeiToday(nowMs), true);
+
+    const byDate = new Map<string, number>();
+    for (const item of rawList) {
+        if (!item || typeof item !== 'object') throw new Error(SETTLEMENT_FORMAT_ERROR);
+        const date = toIsoDay(item.c_date ?? item.cDate ?? item.cdate);
+        const amount = settlementAmount(item.price ?? item.amount);
+        if (!date || amount === null) throw new Error(SETTLEMENT_FORMAT_ERROR);
+        if (date < today) continue; // 已交割
+        byDate.set(date, (byDate.get(date) ?? 0) + amount);
+    }
+    const pending = [...byDate.keys()].sort();
+
+    const anchors = settlementAnchors(marketStatus, today)
+        ?? { a0: isoWeekday(today) ? today : nextWeekday(today) };
+    const minDate = (a: string | undefined, b: string | undefined) =>
+        a === undefined ? b : b === undefined ? a : (a < b ? a : b);
+
+    const s0 = minDate(anchors.a0, pending[0]) as string;
+    const s1 = minDate(anchors.a1, pending.find(d => d > s0)) ?? nextWeekday(s0);
+    const s2 = pending.find(d => d > s1) ?? nextWeekday(s1);
+    const slots = [s0, s1, s2];
+
+    const outside = pending.filter(d => !slots.includes(d));
+    if (outside.length > 0) {
+        throw new Error(`玉山交割款日期超出 T+2（${outside.join('、')}），無法對應交割行事曆`);
+    }
+    return slots.map((date, T) => {
+        const settlement: Settlement = { date, amount: byDate.get(date) ?? 0, T };
+        if (!byDate.has(date)) estimatedEsunSettlements.add(settlement);
+        return settlement;
     });
+}
+
+/** 交易類別 9：信用當沖（只出現在帳務） */
+const ESUN_CREDIT_DAY_TRADE = '9';
+
+/**
+ * 成交紀錄交易類別 → cond：'3' 融資、'9' 信用當沖 → MarginTrading（信用當沖是同一日以
+ * 融資買進、融券賣出互相沖銷，App 的 cond 沒有對應值，歸入信用交易的融資）；'4' 融券 →
+ * ShortSelling；其他為現股。
+ */
+export function esunTransactionCondOf(trade: unknown): string {
+    const t = String(trade ?? '').trim().toUpperCase();
+    if (t === EsunTradeType.Margin || t === ESUN_CREDIT_DAY_TRADE) return 'MarginTrading';
+    if (t === EsunTradeType.Short) return 'ShortSelling';
+    return 'Cash';
 }
 
 /**
  * 成交明細中「已實現」的列：賣出（現股、融資、當沖）或融券回補（買進＋trade 4），
  * 且 make（損益）有值。買進建倉與融券賣出建倉不是已實現損益。
+ * 交易類別 9（信用當沖）：沖銷的兩邊都可能帶損益，S 側一律算已實現；B 側只有 make≠0
+ * 才算（make 為 0 的 B 側視為建倉腿，避免同一筆當沖被算兩次）。
  */
-function isRealizedTransaction(item: EsunTransactionItem): boolean {
-    if (finiteNumber(item.make) === null) return false;
+export function isEsunRealizedTransaction(item: EsunTransactionItem): boolean {
+    const make = finiteNumber(item.make);
+    if (make === null) return false;
     const side = String(item.buy_sell ?? '').trim().toUpperCase();
-    const short = String(item.trade ?? '') === EsunTradeType.Short;
-    if (side === 'B' || side === 'BUY') return short;
-    if (side === 'S' || side === 'SELL') return !short;
+    const trade = String(item.trade ?? '').trim().toUpperCase();
+    const buy = side === 'B' || side === 'BUY';
+    const sell = side === 'S' || side === 'SELL';
+    if (trade === ESUN_CREDIT_DAY_TRADE) {
+        if (sell) return true;
+        if (buy) return make !== 0;
+        return true;
+    }
+    const short = trade === EsunTradeType.Short;
+    if (buy) return short;
+    if (sell) return !short;
     // 沒有買賣別的舊資料：沿用 make 判定
     return true;
+}
+
+const isRealizedTransaction = isEsunRealizedTransaction;
+
+/** 成交紀錄的股數（qty；舊資料 quantity）；缺值或非有限值 → 0 */
+function transactionShares(item: EsunTransactionItem): number {
+    return finiteNumber(item.qty ?? item.quantity) ?? 0;
 }
 
 /** 將玉山成交紀錄 (mat_sums) 轉換為 StockProfitLoss[]（只含已實現損益的列，日期為成交日） */
@@ -886,16 +1082,15 @@ export function fromEsunTransactionsToProfitLoss(
         const code = String(item.stk_no ?? item.code ?? '');
         const rawDate = String(item.t_date ?? item.date ?? item.c_date ?? '');
         const date = rawDate.replace(/-/g, '');
-        const quantity = Number(item.qty ?? item.quantity ?? item.price_qty ?? 0);
+        // 玉山 qty 是股數（price_qty 是價金，不是股數）；App 的股票已實現損益數量以張為單位
+        // （上游 profit_loss 預設 unit Common），精確換算不取整
+        const shares = transactionShares(item);
+        const quantity = shares / 1000;
         const pnl = Number(item.make ?? 0);
         const prRatio = Number(item.make_per ?? 0);
         const cost = Math.abs(Number(item.cost ?? 0));
-        const price = Number(item.price ?? item.price_avg ?? (cost > 0 && quantity > 0 ? cost / quantity : 0));
-        const cond = item.trade === '3'
-            ? 'MarginTrading'
-            : item.trade === '4'
-                ? 'ShortSelling'
-                : 'Cash';
+        const price = Number(item.price ?? item.price_avg ?? (cost > 0 && shares > 0 ? cost / shares : 0));
+        const cond = esunTransactionCondOf(item.trade);
 
         return {
             id: idx + 1,
@@ -912,7 +1107,17 @@ export function fromEsunTransactionsToProfitLoss(
     });
 }
 
-/** 將玉山成交紀錄 (mat_sums) 轉換為 ProfitLossSummaryTotal（只彙總已實現損益的列） */
+/**
+ * 將玉山成交紀錄 (mat_sums) 轉換為 ProfitLossSummaryTotal（只彙總已實現損益的列）。
+ * - 分組鍵：code＋cond（同一檔的現股與融資／融券分開彙總）。
+ * - quantity：張（Σ股數/1000，與 fromEsunTransactionsToProfitLoss 的明細一致）。
+ * - entry_cost＝Σ|cost|（玉山「已實現損益成本小計」）；cover_cost＝Σrecv（「已實現損益收入小計」，
+ *   缺 recv 時以 |cost|＋make 推算）。
+ * - 價格以股數計算：cover_price＝Σprice_qty／Σ股數（price_qty 為價金小計，缺值時以 price×股數補）；
+ *   entry_price＝entry_cost／Σ股數。
+ * 融資、融券的 cost 與 recv 依玉山的定義（例如成本只含自備款、收入扣除融資金額），不是完整的
+ * 買進／賣出價金，因此信用交易的 entry_price 只是「成本小計／股數」，僅供參考。
+ */
 export function fromEsunTransactionsToProfitLossSummary(
     rawList: EsunTransactionItem[],
     _beginDate?: string,
@@ -934,9 +1139,10 @@ export function fromEsunTransactionsToProfitLossSummary(
         };
     }
 
-    const byCode = new Map<string, {
+    const groups = new Map<string, {
         code: string;
-        quantity: number;
+        shares: number;
+        priceQty: number;
         pnl: number;
         entryCost: number;
         coverCost: number;
@@ -944,43 +1150,49 @@ export function fromEsunTransactionsToProfitLossSummary(
     }>();
 
     for (const item of realized) {
-        const code = String(item.stk_no ?? item.code ?? '');
-        const quantity = Number(item.qty ?? item.quantity ?? item.price_qty ?? 0);
-        const pnl = Number(item.make ?? 0);
-        const cost = Math.abs(Number(item.cost ?? 0));
-        const recv = Number(item.recv ?? (cost + pnl));
-        const cond = item.trade === '3' ? 'MarginTrading' : item.trade === '4' ? 'ShortSelling' : 'Cash';
+        const code = String(item.stk_no ?? item.code ?? '').trim();
+        const shares = transactionShares(item);
+        const pnl = finiteNumber(item.make) ?? 0;
+        const cost = Math.abs(finiteNumber(item.cost) ?? 0);
+        const recv = finiteNumber(item.recv) ?? (cost + pnl);
+        const unitPrice = finiteNumber(item.price ?? item.price_avg);
+        const priceQty = finiteNumber(item.price_qty) ?? (unitPrice !== null ? unitPrice * shares : 0);
+        const cond = esunTransactionCondOf(item.trade);
+        const key = `${code}\u0000${cond}`;
 
-        const existing = byCode.get(code) || {
+        const existing = groups.get(key) || {
             code,
-            quantity: 0,
+            shares: 0,
+            priceQty: 0,
             pnl: 0,
             entryCost: 0,
             coverCost: 0,
             cond,
         };
 
-        existing.quantity += quantity;
+        existing.shares += shares;
+        existing.priceQty += priceQty;
         existing.pnl += pnl;
         existing.entryCost += cost;
         existing.coverCost += recv;
-        byCode.set(code, existing);
+        groups.set(key, existing);
     }
 
     const profitlossSum: StockProfitLossSummary[] = [];
-    let totalQty = 0;
+    let totalShares = 0;
     let totalPnl = 0;
     let totalEntryCost = 0;
     let totalCoverCost = 0;
 
-    for (const group of byCode.values()) {
-        const entryPrice = group.quantity > 0 ? group.entryCost / group.quantity : 0;
-        const coverPrice = group.quantity > 0 ? group.coverCost / group.quantity : 0;
+    for (const group of groups.values()) {
+        const quantity = group.shares / 1000;
+        const entryPrice = group.shares > 0 ? group.entryCost / group.shares : 0;
+        const coverPrice = group.shares > 0 ? group.priceQty / group.shares : 0;
         const prRatio = group.entryCost > 0 ? (group.pnl / group.entryCost) * 100 : 0;
 
         profitlossSum.push({
             code: group.code,
-            quantity: group.quantity,
+            quantity,
             pnl: group.pnl,
             pr_ratio: prRatio,
             entry_price: entryPrice,
@@ -993,7 +1205,7 @@ export function fromEsunTransactionsToProfitLossSummary(
             currency: 'TWD',
         });
 
-        totalQty += group.quantity;
+        totalShares += group.shares;
         totalPnl += group.pnl;
         totalEntryCost += group.entryCost;
         totalCoverCost += group.coverCost;
@@ -1004,7 +1216,7 @@ export function fromEsunTransactionsToProfitLossSummary(
     const total: ProfitLossTotal = {
         entry_amount: totalEntryCost,
         cover_amount: totalCoverCost,
-        quantity: totalQty,
+        quantity: totalShares / 1000,
         buy_cost: totalEntryCost,
         sell_cost: totalCoverCost,
         pnl: totalPnl,
