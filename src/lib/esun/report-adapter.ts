@@ -51,8 +51,14 @@ export interface EsunReportContext {
     lookup?: (orderId: string, account: Account, by?: 'id' | 'ordno') => EsunKnownOrder | undefined;
 }
 
+/** 失敗回報的操作別在本地推斷後仍未知：不能投影，只能由券商快照判定 */
+export interface EsunUnresolvedFailure {
+    opCode: string;
+    opMsg: string;
+}
+
 export type EsunReportResult =
-    | { kind: 'report'; wire: Rec; orderId: string; account: Account }
+    | { kind: 'report'; wire: Rec; orderId: string; account: Account; unresolvedFailure?: EsunUnresolvedFailure }
     | { kind: 'skip'; reason: 'environment' | 'malformed' };
 
 const positiveInt = (v: unknown, min: number): number | null => {
@@ -212,11 +218,12 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         : cancelledTotal;
     const errCode = str(raw.err_code ?? raw.errCode ?? rec(raw.operation)?.op_code);
     const failed = isEsunFailureCode(errCode);
+    const opMsg = str(raw.err_msg ?? raw.errMsg ?? rec(raw.operation)?.op_msg);
     const body: Rec = {
         operation: {
             op_type: opType,
             op_code: failed ? errCode : '00',
-            op_msg: str(raw.err_msg ?? raw.errMsg ?? rec(raw.operation)?.op_msg),
+            op_msg: opMsg,
         },
         order: {
             id: orderId,
@@ -245,5 +252,11 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         contract: { security_type: 'STK', exchange, code },
         event_id: eventId,
     };
-    return { kind: 'report', orderId, account, wire: { state: 'StockOrder', data: { StockOrder: body } } };
+    // 失敗回報推不出操作別（bridge Unknown、本地也推斷不出）：可能是新單被拒，也可能是刪改單被拒。
+    // 上游投影對操作別空白的失敗回報不改本地委託；呼叫端另外提出只有權威讀取能解除的待對帳。
+    const unresolvedFailure = failed && !opType ? { opCode: errCode, opMsg } : undefined;
+    return {
+        kind: 'report', orderId, account, wire: { state: 'StockOrder', data: { StockOrder: body } },
+        ...(unresolvedFailure ? { unresolvedFailure } : {}),
+    };
 }

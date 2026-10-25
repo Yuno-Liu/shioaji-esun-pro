@@ -166,6 +166,47 @@ describe('ACK → projected order (C-05)', () => {
         expect(report).toMatchObject({ failed: true, opCode: 'AG0003' });
     });
 
+    describe('a failed report (PB4-1)', () => {
+        const known = { id: 'C0001', quantity: 5, dealQuantity: 0, cancelQuantity: 0, price: 25.5 };
+        const working = () => projectOrderReport([], normalizeOrderEvent(wire('order', ack(1)))!, [account])!;
+        const failedAck = (seq: number, over: Record<string, unknown>) => toEsunReportWire('order',
+            ack(seq, { err_code: '00000123', err_msg: '委託已失效', ...over }), ctx({ lookup: () => known }));
+
+        it('whose operation stays unknown after local inference keeps the order and is flagged unresolved', () => {
+            // 0→0 被拒的新單與 5→5 被拒的刪改單形狀相同：bridge 說 Unknown，本地量價也推不出
+            const result = failedAck(2, { op_type: 'Unknown' });
+            if (result.kind !== 'report') throw new Error(result.reason);
+            expect(result.unresolvedFailure).toEqual({ opCode: '00000123', opMsg: '委託已失效' });
+            const report = normalizeOrderEvent(result.wire)!;
+            expect(report).toMatchObject({ failed: true, opType: '' });
+            const rows = working();
+            expect(projectOrderReport(rows, report, [account])).toBe(rows);
+            // 本地沒有這筆委託：不建列（不會變成 Failed 的新列）
+            const unknown = toEsunReportWire('order', ack(3, { op_type: 'Unknown', err_code: '00000123' }), ctx());
+            if (unknown.kind !== 'report') throw new Error(unknown.reason);
+            expect(unknown.unresolvedFailure).toMatchObject({ opCode: '00000123' });
+            expect(projectOrderReport([], normalizeOrderEvent(unknown.wire)!, [account])).toEqual([]);
+        });
+
+        it('inferred as a cancel or price change keeps the working order without a flag', () => {
+            const rows = working();
+            for (const [seq, over] of [[4, { op_type: 'Unknown', cel_qty: 5, cel_qty_share: 5000 }], [5, { op_type: 'Unknown', od_price: 26 }], [6, { op_type: 'ModifyQty' }]] as const) {
+                const result = failedAck(seq, over);
+                if (result.kind !== 'report') throw new Error(result.reason);
+                expect(result.unresolvedFailure).toBeUndefined();
+                expect(projectOrderReport(rows, normalizeOrderEvent(result.wire)!, [account])).toBe(rows);
+            }
+        });
+
+        it('of a new order still fails the order without a flag', () => {
+            const result = failedAck(7, { op_type: 'New' });
+            if (result.kind !== 'report') throw new Error(result.reason);
+            expect(result.unresolvedFailure).toBeUndefined();
+            const rows = projectOrderReport([], normalizeOrderEvent(result.wire)!, [account])!;
+            expect(rows[0]!.status).toMatchObject({ status: 'Failed', status_code: '00000123' });
+        });
+    });
+
     it('keeps odd-lot quantities in shares', () => {
         const report = normalizeOrderEvent(wire('order', ack(8, { ap_code: '5', org_qty: 0.1, org_qty_share: 100 })));
         expect(report).toMatchObject({ quantity: 100, orderLot: 'IntradayOdd' });

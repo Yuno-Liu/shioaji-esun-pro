@@ -22,12 +22,15 @@ export type EsunStreamSignal =
     /** bridge 的 resync：reason 為 ws_reconnected 時 cacheRefreshed 表示 bridge 是否已重讀委託快取 */
     | { kind: 'resync'; reason?: string; cacheRefreshed?: boolean }
     /** 收到但無法轉換的回報（欄位不足、環境未知）：不能投影，需要對帳 */
-    | { kind: 'untrackable'; deal: boolean };
+    | { kind: 'untrackable'; deal: boolean }
+    /** 失敗回報推不出操作別（新單或刪改單被拒都有可能）：本地委託不變，需要權威讀取 */
+    | { kind: 'unresolved-failure'; orderId: string; opCode: string };
 
 const STATUS_EVENT = 'esun_status';
 const SESSION_EVENT = 'esun_session';
 const RESYNC_EVENT = 'esun_resync';
 const UNTRACKABLE_EVENT = 'esun_untrackable';
+const UNRESOLVED_FAILURE_EVENT = 'esun_unresolved_failure';
 /** bridge 每 25 秒送心跳；超過兩個週期加寬限沒有任何訊息就視為停滯 */
 export const ESUN_STREAM_STALE_MS = 80_000;
 const RETRY_MAX_MS = 30_000;
@@ -128,7 +131,11 @@ function onReport(event: string, raw: string) {
         else untrackable(event, payload);
         return;
     }
+    // 回報照常進管線（回報序號連續、通知照常）；操作別空白的失敗回報不會改本地委託
     publishStreamEvent('order_event', JSON.stringify(result.wire));
+    if (result.unresolvedFailure) {
+        publishStreamEvent(UNRESOLVED_FAILURE_EVENT, JSON.stringify({ orderId: result.orderId, opCode: result.unresolvedFailure.opCode }));
+    }
 }
 
 function scheduleRetry() {
@@ -246,6 +253,12 @@ export function ensureEsunOrderStream(): void {
             let deal = false;
             try { deal = (JSON.parse(raw) as { deal?: unknown }).deal === true; } catch { /* malformed */ }
             signal({ kind: 'untrackable', deal });
+        }),
+        onStreamEvent(UNRESOLVED_FAILURE_EVENT, raw => {
+            try {
+                const { orderId, opCode } = JSON.parse(raw) as { orderId?: unknown; opCode?: unknown };
+                if (typeof orderId === 'string' && orderId) signal({ kind: 'unresolved-failure', orderId, opCode: typeof opCode === 'string' ? opCode : '' });
+            } catch { /* malformed */ }
         }),
         subscribeStreamOwner(() => {
             if (isStreamOwner()) connect();

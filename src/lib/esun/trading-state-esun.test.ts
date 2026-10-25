@@ -44,9 +44,13 @@ vi.mock('./service', () => ({ esunTradeService: {
 const epoch = 1792717200; // 2026-10-23 09:00 +08:00
 const account = mocks.account as Account;
 
+// trading-state（經 dispatch）使用的 order-mapping 實例：resetModules 後重新載入，
+// 快取列的 esun_unresolved_failure 標記記在該實例裡
+let toTrade = fromEsunOrderResult;
+
 /** bridge /esun/orders 的一列（整股 5 張） */
 function row(over: Record<string, unknown> = {}): Trade {
-    return fromEsunOrderResult({
+    return toTrade({
         ord_no: 'C0001', pre_ord_no: '', stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R', trade: '0',
         od_price: 25.5, org_qty: 5, org_qty_share: 5000, mat_qty: 0, mat_qty_share: 0, cel_qty: 0, cel_qty_share: 0,
         avg_price: 0, ord_date: '20261023', ord_time: '090000000', ...over,
@@ -85,6 +89,7 @@ async function authoritativeRead() {
 
 beforeEach(async () => {
     vi.resetModules(); vi.clearAllMocks(); vi.useFakeTimers(); vi.setSystemTime(epoch * 1000);
+    toTrade = (await import('./order-mapping')).fromEsunOrderResult;
     vi.stubGlobal('navigator', { locks: { request: (_n: string, _o: unknown, cb: (lock: object) => unknown) => cb({}) } });
     vi.stubGlobal('BroadcastChannel', undefined); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     mocks.order = null; mocks.signals.clear(); reportSeq = 0;
@@ -199,6 +204,105 @@ describe('cache rebuild of an E.SUN account (PB2-2 / PB3-1)', () => {
         await authoritativeRead();
         expect(reasons('orders')).toEqual([]);
         expect(local().status.status).toBe('Failed');
+    });
+});
+
+/** 失敗 ACK：回報（進上游管線）與 stream.ts 依轉換結果送出的 unresolved-failure 訊號 */
+function failedAck(over: Record<string, unknown>) {
+    reportSeq += 1;
+    const result = toEsunReportWire('order', {
+        event_id: `boot1-${100 + reportSeq}`, report_stream: 'order', report_seq: reportSeq, session_generation: 1,
+        ts: '2026-10-23T09:05:30+08:00', environment: 'PRODUCTION', account: { broker_id: '8840', account_id: '1234567' },
+        ord_date: '20261023', ord_time: '090530000', ord_no: 'C0001', pre_ord_no: '',
+        stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R', trade: '0', od_price: 25.5,
+        org_qty: 5, org_qty_share: 5000, mat_qty: 0, mat_qty_share: 0, cel_qty: 0, cel_qty_share: 0,
+        err_code: '00000123', err_msg: '委託已失效', op_code: '00000123', op_msg: '委託已失效', ...over,
+    }, { environment: 'PRODUCTION', account, lookup: id => {
+        const t = store.getTradingState().trades.find(r => r.order.id === id);
+        return t && { id: t.order.id, quantity: t.order.quantity, dealQuantity: t.status.deal_quantity, cancelQuantity: t.status.cancel_quantity, price: t.order.price };
+    } });
+    if (result.kind !== 'report') throw new Error(result.reason);
+    const unresolved = result.unresolvedFailure
+        ? { kind: 'unresolved-failure', orderId: result.orderId, opCode: result.unresolvedFailure.opCode } : null;
+    return { report: normalizeOrderEvent(result.wire)!, unresolved };
+}
+
+describe('a failed report whose operation cannot be inferred (PB4-1)', () => {
+    it('keeps the local order and raises a reason only an authoritative read clears, naming the order', async () => {
+        const { report, unresolved } = failedAck({ op_type: 'Unknown' });
+        expect(unresolved).not.toBeNull();
+        await emit(report);
+        await signal(unresolved);
+        expect(local().status).toMatchObject({ status: 'Submitted', deal_quantity: 0, cancel_quantity: 0 });
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(store.getTradingState().queries.orders.error).toContain('C0001');
+        // bridge 的背景權威查詢完成後的快取重建不會解除
+        await signal({ kind: 'resync', reason: 'failed_ack_refreshed', cacheRefreshed: true });
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(local().status.status).toBe('Submitted');
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+    });
+
+    it('keeps the working order without a reason when the failure is inferred as a cancel or price change', async () => {
+        for (const over of [{ op_type: 'Unknown', cel_qty: 5, cel_qty_share: 5000 }, { op_type: 'Unknown', od_price: 26 }, { op_type: 'Cancel' }]) {
+            const { report, unresolved } = failedAck(over);
+            expect(unresolved).toBeNull();
+            await emit(report);
+        }
+        expect(local().status).toMatchObject({ status: 'Submitted', cancel_quantity: 0 });
+        expect(local().order.price).toBe(25.5);
+        expect(reasons('orders')).toEqual([]);
+    });
+
+    it('fails the order when the failure is a rejected new order', async () => {
+        const { report, unresolved } = failedAck({ op_type: 'New' });
+        expect(unresolved).toBeNull();
+        await emit(report);
+        expect(local().status).toMatchObject({ status: 'Failed', status_code: '00000123' });
+        expect(reasons('orders')).toEqual([]);
+    });
+});
+
+describe('cache rows carrying esun_unresolved_failure (PB4-2)', () => {
+    const flagged = { esun_unresolved_failure: { op_code: '00000123', op_msg: '委託已失效' } };
+
+    it('keeps the local row on a cache rebuild and raises the same reason; an authoritative read takes the snapshot', async () => {
+        // 快取列即使知道更多（成交 1 張），失敗尚未判定前也不採用
+        mocks.trades.mockReset().mockResolvedValue([row({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5, ...flagged })]);
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(mocks.trades).toHaveBeenCalledWith('S', expect.anything(), { refresh: false });
+        expect(local().status).toMatchObject({ status: 'Submitted', deal_quantity: 0 });
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(reasons('orders')).not.toContain('sequence-gap');
+        expect(store.getTradingState().queries.orders.error).toContain('C0001');
+        // 權威讀取（refresh:true）照上游語意以快照為準
+        mocks.trades.mockReset().mockResolvedValue([row({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+        expect(local().status).toMatchObject({ status: 'PartFilled', deal_quantity: 1 });
+    });
+
+    it('shares the reason of the SSE path for the same failure (one cause, not two)', async () => {
+        const { report, unresolved } = failedAck({ op_type: 'Unknown' });
+        await emit(report);
+        await signal(unresolved);
+        const before = store.getTradingState().queries.orders.error;
+        await idle();
+        mocks.trades.mockReset().mockResolvedValue([row(flagged)]);
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(store.getTradingState().queries.orders.error).toBe(before);
+    });
+});
+
+describe('resync after the bridge re-read orders for a failed ACK (PB4-3)', () => {
+    it('runs the cache rebuild and does not raise the stale-cache snapshot-boundary', async () => {
+        mocks.trades.mockReset().mockResolvedValue([row({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+        await signal({ kind: 'resync', reason: 'failed_ack_refreshed', cacheRefreshed: true });
+        expect(mocks.trades).toHaveBeenCalledWith('S', expect.anything(), { refresh: false });
+        expect(local().status.deal_quantity).toBe(1);
+        expect(reasons('orders')).toEqual([]);
+        expect(store.getTradingState().queries.orders.error ?? '').not.toContain('重新連線後未能重讀委託');
     });
 });
 

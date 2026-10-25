@@ -590,6 +590,28 @@ export function esunTimestamp(date: unknown, time: unknown): number | undefined 
     return Number.isFinite(ms) ? ms / 1000 : undefined;
 }
 
+/** bridge 快取列的 esun_unresolved_failure（失敗 ACK 對到這筆委託，尚未由成功 ACK 或新快照判定） */
+export interface EsunRowUnresolvedFailure {
+    opCode: string;
+    opMsg: string;
+}
+
+// 以 Trade.status 物件為鍵：trading-state 合併前的淺複製（{ ...t, account }）沿用同一個 status，
+// 標記不會寫進 Trade 本身（不進本地狀態、不跨視窗廣播）
+const unresolvedFailures = new WeakMap<object, EsunRowUnresolvedFailure>();
+
+/** fromEsunOrderResult 轉出的列帶有 bridge 的 esun_unresolved_failure 時回傳它 */
+export function esunUnresolvedFailureOf(trade: Pick<Trade, 'status'>): EsunRowUnresolvedFailure | undefined {
+    return unresolvedFailures.get(trade.status);
+}
+
+function readUnresolvedFailure(raw: Record<string, unknown>): EsunRowUnresolvedFailure | undefined {
+    const v = raw.esun_unresolved_failure;
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+    const f = v as Record<string, unknown>;
+    return { opCode: String(f.op_code ?? '').trim(), opMsg: String(f.op_msg ?? '').trim() };
+}
+
 export interface EsunOrderResultOptions {
     /** 由 App 的合約快取補交易所（委託查詢沒有交易所欄位） */
     exchangeOf?: (code: string) => Exchange | undefined;
@@ -673,7 +695,7 @@ export function fromEsunOrderResult(
         ? [...fills, { seq: `${orderId}:agg`, price: fallbackPrice, quantity: rest, ts: orderTs ?? 0 }]
         : fills;
 
-    return {
+    const trade: Trade = {
         contract: {
             code: stockNo,
             security_type: 'STK',
@@ -713,6 +735,9 @@ export function fromEsunOrderResult(
             deals,
         },
     };
+    const unresolved = readUnresolvedFailure(raw);
+    if (unresolved) unresolvedFailures.set(trade.status, unresolved);
+    return trade;
 }
 
 /** 將玉山庫存項目 (stk_sums) 轉換為 Shioaji-Pro 標準 StockPosition 物件 */

@@ -21,7 +21,7 @@ import type { ServerModeGuard } from '../server-info-store';
 import type { ContractBase } from '../types/contract';
 import type { Action, OrderType, StockOrderCond, StockOrderLot, StockOrderReq, Trade, TradeCacheHealth } from '../types/order';
 import type { Account } from '../types/portfolio';
-import { isEsunAccount, isEsunBroker, validateEsunStockOrder } from './order-mapping';
+import { esunUnresolvedFailureOf, isEsunAccount, isEsunBroker, validateEsunStockOrder } from './order-mapping';
 import { esunTradeService } from './service';
 import { ensureEsunOrderStream, getEsunStreamStatus, isEsunStreamStarted, onEsunStreamSignal } from './stream';
 import { ESUN_BROKER_NAME } from './types';
@@ -375,15 +375,30 @@ export function esunCacheConflictMessage(orderId: string): string {
 }
 
 /**
+ * 失敗回報無法判定被拒的是哪一項操作時提出的待對帳訊息（SSE 回報與快取列的
+ * esun_unresolved_failure 共用；cause 依委託 id 與失敗碼區分，同一筆失敗只列一次）
+ */
+export function esunUnresolvedFailureMessage(orderId: string, opCode: string): string {
+    const code = opCode ? `（${opCode}）` : '';
+    return `玉山委託 ${orderId} 收到失敗回報${code}，無法判定被拒的是新單、刪單或改單，已保留本地資料；請按更新確認`;
+}
+
+/**
  * trading-state 快取重建（refresh:false 的 upsert）合併一筆本地列時的玉山規則。快取列的成交量與
  * 取消量都不低於本地、且狀態不矛盾時採用快取列（補回漏收的回報，這是快取重建的目的）。
  * 快取列的成交量或取消量低於本地，或本地已是終態（Filled／Cancelled／Failed）而快取列不是時，
  * 前端無法判定哪一方正確（快照落後與推播落後的資料形狀相同）：保留本地列，並對 orders 提出
  * snapshot-boundary（不在 CACHE_RESYNC_RESOLVES，只有權威讀取能解除）。非玉山帳戶原樣回傳快取列
- * （上游語意）。權威讀取（replace）不經過這裡。
+ * （上游語意）。權威讀取（replace）不經過這裡。快取列帶 esun_unresolved_failure（bridge 收到對到
+ * 這筆委託的失敗 ACK、還沒有快照判定）時同樣保留本地列並提出 snapshot-boundary。
  */
 export function esunCacheUpsertRow<T extends Trade & { account?: Account }>(local: T, cached: T): T {
     if (!isEsunAccount(cached.account ?? local.account)) return cached;
+    const unresolved = esunUnresolvedFailureOf(cached);
+    if (unresolved) {
+        hooks?.raise('orders', 'snapshot-boundary', esunUnresolvedFailureMessage(local.order.id, unresolved.opCode));
+        return local;
+    }
     const behind = cached.status.deal_quantity < local.status.deal_quantity
         || cached.status.cancel_quantity < local.status.cancel_quantity;
     const reopened = ESUN_TERMINAL_STATUSES.includes(local.status.status)
@@ -424,6 +439,9 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
             const message = '玉山回報無法解析（欄位不足或環境未知），已略過；請手動對帳';
             next.raise('orders', 'untrackable-event', message);
             if (signal.deal) next.raise('positions', 'untrackable-event', message);
+        } else if (signal.kind === 'unresolved-failure') {
+            // 失敗回報推不出操作別：本地委託不變（上游投影），只有權威讀取（券商快照）能判定
+            next.raise('orders', 'snapshot-boundary', esunUnresolvedFailureMessage(signal.orderId, signal.opCode));
         } else {
             const message = '玉山回報漏收超過 bridge 補送範圍；以 bridge 委託快取重建中，必要時請手動對帳';
             next.raise('orders', 'sequence-gap', message);

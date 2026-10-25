@@ -175,6 +175,25 @@ describe('E.SUN order stream', () => {
         expect(seen).toEqual([{ kind: 'untrackable', deal: true }, { kind: 'untrackable', deal: false }]);
     });
 
+    it('forwards a failed report whose operation is unknown and signals it as unresolved (PB4-1)', () => {
+        ensureEsunOrderStream();
+        latest().open();
+        const failed = {
+            event_id: 'boot1-5', seq: 5, report_stream: 'order', report_seq: 1, session_generation: 1,
+            ts: '2026-10-23T09:05:12+08:00', account: { broker_id: '8840', account_id: '1234567' },
+            ord_no: 'C0001', stock_no: '2884', buy_sell: 'B', ap_code: '1', od_price: 25, org_qty: 1, org_qty_share: 1000,
+        };
+        latest().fire('order', { ...failed, op_type: 'Unknown', err_code: '00000123', err_msg: '委託已失效', op_code: '00000123' });
+        // 回報照常進管線（回報序號連續），另外通知 trading-state 提出待對帳
+        expect(published('order_event')).toHaveLength(1);
+        expect(seen).toEqual([{ kind: 'unresolved-failure', orderId: 'C0001', opCode: '00000123' }]);
+        // 推得出操作別的失敗回報、成功回報都不另外通知
+        latest().fire('order', { ...failed, event_id: 'boot1-6', report_seq: 2, op_type: 'New', err_code: '00000123' });
+        latest().fire('order', { ...failed, event_id: 'boot1-7', report_seq: 3, op_type: 'Unknown', err_code: '00000000' });
+        expect(published('order_event')).toHaveLength(3);
+        expect(seen).toHaveLength(1);
+    });
+
     it('surfaces a report received while the bridge environment is unknown as untrackable', () => {
         vi.spyOn(esunTradeService, 'isEnvironmentKnown').mockReturnValue(false);
         const refresh = vi.spyOn(esunTradeService, 'refreshHealth');
