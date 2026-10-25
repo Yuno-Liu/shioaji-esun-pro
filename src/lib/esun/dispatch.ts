@@ -223,6 +223,37 @@ export function updateEsunOrderQty(tradeId: string, trade: Trade, account: Accou
 // 最近一次權威委託讀取（refresh:true）時的 bridge session 代次：代次變了就不能拿快取重建
 let authoritativeGeneration: number | null | undefined;
 
+const esunAccountKey = (a: Pick<Account, 'account_type' | 'broker_id' | 'account_id'>) => `${a.account_type}:${a.broker_id}:${a.account_id}`;
+
+// 進行中的權威委託讀取（esunAccountQuery 的 refresh:true，依帳戶）：bridge 保證這些讀取回傳的
+// 快照不比讀取進行中才完成的背景快照舊
+const authoritativeReads = new Map<string, Set<Promise<unknown>>>();
+
+function trackAuthoritativeRead(account: Account, read: Promise<unknown>) {
+    const key = esunAccountKey(account);
+    const reads = authoritativeReads.get(key) ?? new Set();
+    reads.add(read);
+    authoritativeReads.set(key, reads);
+    const done = () => {
+        reads.delete(read);
+        if (reads.size === 0 && authoritativeReads.get(key) === reads) authoritativeReads.delete(key);
+    };
+    read.then(done, done);
+}
+
+/** 每個玉山帳戶都有進行中的權威讀取時回傳這些讀取，否則 null */
+function authoritativeReadsCoveringAll(): Promise<unknown>[] | null {
+    const accounts = esunTradeService.getAccounts();
+    if (!accounts.length) return null;
+    const reads: Promise<unknown>[] = [];
+    for (const account of accounts) {
+        const pending = authoritativeReads.get(esunAccountKey(account));
+        if (!pending?.size) return null;
+        reads.push(...pending);
+    }
+    return reads;
+}
+
 const ESUN_DOWN_MESSAGE = '玉山回報串流中斷，期間可能漏收委託／成交回報；重新連線後請確認';
 let lastDownMessage = ESUN_DOWN_MESSAGE;
 
@@ -253,7 +284,7 @@ export function esunAccountQuery<T>(path: string, account: Account, extra: Recor
             // 上游語意：省略 refresh 時伺服器預設為 true（權威讀取）
             const refresh = extra.refresh === undefined ? true : Boolean(extra.refresh);
             const generation = esunTradeService.getSessionGeneration();
-            return esunTradeService.fetchTrades(account, refresh).then(rows => {
+            const read = esunTradeService.fetchTrades(account, refresh).then(rows => {
                 const skipped = esunTradeService.lastSkippedOrderRows;
                 if (skipped > 0) {
                     hooks?.raise('orders', 'pending-report', `玉山委託資料有 ${skipped} 筆缺少必要欄位，已略過；請手動對帳`);
@@ -261,9 +292,12 @@ export function esunAccountQuery<T>(path: string, account: Account, extra: Recor
                 if (refresh) {
                     authoritativeGeneration = generation;
                     keepDisconnectWhileDown('orders');
+                    raiseUnconfirmedFailures(rows);
                 }
                 return rows as T;
             });
+            if (refresh) trackAuthoritativeRead(account, read);
+            return read;
         }
         case '/api/v1/order/trade_cache_health':
             return Promise.resolve(esunCacheHealth() as T);
@@ -366,6 +400,10 @@ export interface EsunTradingHooks {
 let hooks: EsunTradingHooks | null = null;
 
 export const ESUN_STALE_CACHE_MESSAGE = '玉山 bridge 重新連線後未能重讀委託，快取可能缺少斷線期間的成交／取消；請按更新確認';
+export const ESUN_UNREFRESHED_CACHE_MESSAGE = '玉山 bridge 未能重讀委託，快取可能缺少部分成交／取消；請按更新確認';
+/** failed_ack_refreshed：快取重建（CACHE_RESYNC_RESOLVES 的 sequence-gap）即可解除 */
+export const ESUN_FAILED_ACK_REFRESHED_MESSAGE = 'bridge 已依失敗回報重讀委託，快取同步中';
+export const ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE = '玉山 bridge 依失敗回報重讀委託失敗，快取未反映被拒的操作；請按更新確認';
 
 const ESUN_TERMINAL_STATUSES: readonly string[] = ['Filled', 'Cancelled', 'Failed'];
 
@@ -381,6 +419,27 @@ export function esunCacheConflictMessage(orderId: string): string {
 export function esunUnresolvedFailureMessage(orderId: string, opCode: string): string {
     const code = opCode ? `（${opCode}）` : '';
     return `玉山委託 ${orderId} 收到失敗回報${code}，無法判定被拒的是新單、刪單或改單，已保留本地資料；請按更新確認`;
+}
+
+/** 權威讀取的列同時帶 esun_unresolved_failure 與 esun_snapshot_missing（券商最近一次快照沒列出）時的訊息 */
+export function esunSnapshotMissingFailureMessage(orderId: string, opCode: string): string {
+    const code = opCode ? `（${opCode}）` : '';
+    return `玉山委託 ${orderId} 收到失敗回報${code}，券商最近一次委託查詢沒有列出這筆，仍無法判定被拒的操作；請稍後按更新確認`;
+}
+
+/**
+ * 權威讀取（refresh:true）回傳的列同時帶 esun_unresolved_failure 與 esun_snapshot_missing：bridge
+ * 只是因近期保留而列出它，券商快照沒有判定這筆失敗，不能當成已確認。在讀取完成前（原因時間晚於
+ * 讀取開始）對 orders 提出 snapshot-boundary，同一次讀取不會解除，只有之後的權威讀取能解除。
+ * 只帶其中一個旗標的列不在這裡處理（維持上游語意：權威讀取以快照為準）。
+ */
+function raiseUnconfirmedFailures(rows: Trade[]) {
+    for (const row of rows) {
+        const unresolved = esunUnresolvedFailureOf(row);
+        if (unresolved?.snapshotMissing) {
+            hooks?.raise('orders', 'snapshot-boundary', esunSnapshotMissingFailureMessage(row.order.id, unresolved.opCode));
+        }
+    }
 }
 
 /**
@@ -409,7 +468,7 @@ export function esunCacheUpsertRow<T extends Trade & { account?: Account }>(loca
 }
 
 function esunAccountKeys() {
-    return esunTradeService.getAccounts().map(a => `${a.account_type}:${a.broker_id}:${a.account_id}`).sort().join('|');
+    return esunTradeService.getAccounts().map(esunAccountKey).sort().join('|');
 }
 
 /** trading-state.start() 呼叫：玉山 session／串流事件 → 重讀、待對帳原因、快取重建 */
@@ -442,14 +501,30 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
         } else if (signal.kind === 'unresolved-failure') {
             // 失敗回報推不出操作別：本地委託不變（上游投影），只有權威讀取（券商快照）能判定
             next.raise('orders', 'snapshot-boundary', esunUnresolvedFailureMessage(signal.orderId, signal.opCode));
+        } else if (signal.reason === 'failed_ack_refreshed' && signal.cacheRefreshed === true) {
+            // bridge 已依失敗 ACK 做完背景權威查詢並套用快照：沒有漏收回報，持倉不受影響。只提出一個
+            // 快取重建能解除的 orders 原因（讓健康檢查以快取重建委託）。每個玉山帳戶都有進行中的權威讀取時
+            // 不提出（bridge 保證那些讀取的快照不比背景快照舊）；那些讀取失敗時才補提出
+            const rebuild = () => {
+                if (hooks !== next) return;
+                next.raise('orders', 'sequence-gap', ESUN_FAILED_ACK_REFRESHED_MESSAGE);
+                void next.checkHealth('gap');
+            };
+            const covering = authoritativeReadsCoveringAll();
+            if (!covering) rebuild();
+            else void Promise.allSettled(covering).then(results => { if (results.some(r => r.status === 'rejected')) rebuild(); });
+        } else if (signal.reason === 'failed_ack_refresh_failed') {
+            // bridge 的背景權威查詢重試用盡：快取沒有反映失敗 ACK 的結果，快取重建不能解除（也沒有漏收回報，
+            // 不提出 positions 的原因、不做快取重建）。只有權威讀取能清除
+            next.raise('orders', 'snapshot-boundary', ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE);
         } else {
             const message = '玉山回報漏收超過 bridge 補送範圍；以 bridge 委託快取重建中，必要時請手動對帳';
             next.raise('orders', 'sequence-gap', message);
             next.raise('positions', 'sequence-gap', message);
-            // bridge 對券商的 WebSocket 重連後沒能重讀委託（額度用完、查詢失敗）：它的快取缺少斷線
-            // 期間的回報，快取重建不能解除。snapshot-boundary 不在 CACHE_RESYNC_RESOLVES，只有權威讀取能清除
-            if (signal.reason === 'ws_reconnected' && signal.cacheRefreshed !== true) {
-                next.raise('orders', 'snapshot-boundary', ESUN_STALE_CACHE_MESSAGE);
+            // bridge 沒能重讀委託快取（cacheRefreshed:false；ws_reconnected 未帶旗標時也視為沒有重讀）：
+            // 快取可能缺少期間的回報，快取重建不能解除。snapshot-boundary 不在 CACHE_RESYNC_RESOLVES，只有權威讀取能清除
+            if (signal.cacheRefreshed === false || (signal.reason === 'ws_reconnected' && signal.cacheRefreshed !== true)) {
+                next.raise('orders', 'snapshot-boundary', signal.reason === 'ws_reconnected' ? ESUN_STALE_CACHE_MESSAGE : ESUN_UNREFRESHED_CACHE_MESSAGE);
             }
             void next.checkHealth('gap');
         }

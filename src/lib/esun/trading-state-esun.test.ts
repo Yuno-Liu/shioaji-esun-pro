@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
     order: null as ((r: OrderEventReport) => void) | null,
     signals: new Set<(s: unknown) => void>(),
     positions: vi.fn(), trades: vi.fn(), balance: vi.fn(), margin: vi.fn(), subscribe: vi.fn(), health: vi.fn(),
+    bridgeTrades: vi.fn(),
 }));
 vi.mock('../account-store', () => ({ useAccounts: () => ({ accounts: [mocks.account], selectedStock: mocks.account, selectedFutures: null }),
     getAccountState: () => ({ accounts: [mocks.account] }), refreshAccounts: vi.fn(), subscribeAccounts: () => () => undefined }));
@@ -38,7 +39,7 @@ vi.mock('./stream', () => ({
 }));
 vi.mock('./service', () => ({ esunTradeService: {
     getAccounts: () => [mocks.account], getSessionGeneration: () => 1, subscribe: () => () => undefined,
-    refreshHealth: async () => undefined, lastSkippedOrderRows: 0,
+    refreshHealth: async () => undefined, lastSkippedOrderRows: 0, fetchTrades: mocks.bridgeTrades,
 } }));
 
 const epoch = 1792717200; // 2026-10-23 09:00 +08:00
@@ -75,6 +76,7 @@ function deferred<T>() { let resolve!: (v: T) => void; const promise = new Promi
 
 let root: ReactTestRenderer | undefined;
 let store: typeof import('../trading-state');
+let dispatch: typeof import('./dispatch');
 const local = () => store.getTradingState().trades.find(t => t.order.id === 'C0001')!;
 const reasons = (scope: 'orders' | 'positions') => store.getTradingState().queries[scope].reasons;
 async function emit(report: OrderEventReport) { await act(async () => { mocks.order!(report); vi.advanceTimersByTime(50); }); }
@@ -99,6 +101,7 @@ beforeEach(async () => {
     mocks.subscribe.mockReset().mockResolvedValue(undefined);
     mocks.health.mockReset().mockResolvedValue({ state: 'Healthy', reasons: [] });
     store = await import('../trading-state');
+    dispatch = await import('./dispatch');
     function Consumer() { store.useTradingState(); return null; }
     await act(async () => { root = create(createElement(Consumer)); });
     // 初次讀取（權威）：委託 C0001 5 張、尚未成交
@@ -295,18 +298,65 @@ describe('cache rows carrying esun_unresolved_failure (PB4-2)', () => {
     });
 });
 
-describe('resync after the bridge re-read orders for a failed ACK (PB4-3)', () => {
-    it('runs the cache rebuild and does not raise the stale-cache snapshot-boundary', async () => {
-        mocks.trades.mockReset().mockResolvedValue([row({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+/** 委託查詢改經玉山分派（dispatch.esunAccountQuery）讀 bridge：service.fetchTrades 由 `read` 回應 */
+function viaBridge(read: (refresh: boolean) => Promise<Trade[]>) {
+    mocks.bridgeTrades.mockReset().mockImplementation((_account: Account, refresh: boolean) => read(refresh));
+    mocks.trades.mockReset().mockImplementation((_type: string, current: Account, opts?: { refresh?: boolean }) =>
+        dispatch.esunAccountQuery('/api/v1/order/trades', current, opts?.refresh === undefined ? {} : { refresh: opts.refresh }));
+}
+
+describe('resync after the bridge re-read orders for a failed ACK (PB4-3 / PB5-1)', () => {
+    it('raises only an orders reason the cache rebuild clears: no positions reason, no stale-cache snapshot-boundary', async () => {
+        const cache = deferred<Trade[]>();
+        mocks.trades.mockReset().mockImplementation(() => cache.promise);
         await signal({ kind: 'resync', reason: 'failed_ack_refreshed', cacheRefreshed: true });
         expect(mocks.trades).toHaveBeenCalledWith('S', expect.anything(), { refresh: false });
+        // 快取重建進行中：只有 orders 的「快取同步中」
+        expect(reasons('orders')).toEqual(['sequence-gap']);
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.ESUN_FAILED_ACK_REFRESHED_MESSAGE);
+        expect(reasons('positions')).toEqual([]);
+        cache.resolve([row({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+        await act(async () => { await vi.advanceTimersByTimeAsync(100); });
         expect(local().status.deal_quantity).toBe(1);
         expect(reasons('orders')).toEqual([]);
-        expect(store.getTradingState().queries.orders.error ?? '').not.toContain('重新連線後未能重讀委託');
+        expect(reasons('positions')).toEqual([]);
+        expect(store.getTradingState().needsReconcile).toBe(false);
+    });
+
+    it('raises nothing while an authoritative read is in flight, and leaves no reason after it completes', async () => {
+        const response = deferred<Trade[]>();
+        viaBridge(refresh => refresh ? response.promise : Promise.resolve([row()]));
+        let run!: Promise<void>;
+        await act(async () => { vi.advanceTimersByTime(1600); run = store.refreshTradingState('orders'); await vi.advanceTimersByTimeAsync(10); });
+        expect(mocks.bridgeTrades).toHaveBeenCalledWith(expect.anything(), true);
+        await signal({ kind: 'resync', reason: 'failed_ack_refreshed', cacheRefreshed: true });
+        expect(reasons('orders')).toEqual([]);
+        // bridge 保證進行中的權威讀取不比背景快照舊：讀取本身就會帶回失敗 ACK 的結果
+        response.resolve([row({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+        await act(async () => { await run; await vi.advanceTimersByTimeAsync(100); });
+        expect(local().status.deal_quantity).toBe(1);
+        expect(reasons('orders')).toEqual([]);
+        expect(reasons('positions')).toEqual([]);
+        expect(mocks.bridgeTrades).not.toHaveBeenCalledWith(expect.anything(), false);
+    });
+
+    it('raises the cache-rebuild reason after all when the covering authoritative read fails', async () => {
+        let fail!: (e: Error) => void;
+        const response = new Promise<Trade[]>((_resolve, reject) => { fail = reject; });
+        viaBridge(refresh => refresh ? response : Promise.resolve([row()]));
+        let run!: Promise<void>;
+        await act(async () => { vi.advanceTimersByTime(1600); run = store.refreshTradingState('orders'); await vi.advanceTimersByTimeAsync(10); });
+        await signal({ kind: 'resync', reason: 'failed_ack_refreshed', cacheRefreshed: true });
+        expect(reasons('orders')).toEqual([]);
+        fail(new Error('bridge 503'));
+        await act(async () => { await run; await vi.advanceTimersByTimeAsync(100); });
+        expect(reasons('orders')).toContain('query-failed');
+        expect(store.getTradingState().queries.orders.error).toContain(dispatch.ESUN_FAILED_ACK_REFRESHED_MESSAGE);
+        expect(reasons('positions')).toEqual([]);
     });
 });
 
-describe('ws_reconnected resync without a cache refresh (PB2-3)', () => {
+describe('resync without a cache refresh (PB2-3 / PB5-2)', () => {
     it('keeps an orders reason through the cache rebuild; only an authoritative read clears it', async () => {
         mocks.trades.mockClear();
         await signal({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: false });
@@ -323,5 +373,60 @@ describe('ws_reconnected resync without a cache refresh (PB2-3)', () => {
     it('a ws_reconnected resync whose cache was re-read is cleared by the cache rebuild', async () => {
         await signal({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true });
         expect(reasons('orders')).toEqual([]);
+    });
+
+    it('a failed_ack_refresh_failed resync keeps an orders reason no cache rebuild clears, without a positions reason', async () => {
+        await signal({ kind: 'resync', reason: 'failed_ack_refresh_failed', cacheRefreshed: false });
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE);
+        expect(reasons('positions')).toEqual([]);
+        // 之後另一次 resync 的快取重建解除自己的 sequence-gap，但不解除這個原因
+        await idle();
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(mocks.trades).toHaveBeenLastCalledWith('S', expect.anything(), { refresh: false });
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+    });
+
+    it('any other resync with cacheRefreshed:false also keeps an orders reason through the cache rebuild', async () => {
+        await signal({ kind: 'resync', reason: 'bridge_restarted', cacheRefreshed: false });
+        expect(mocks.trades).toHaveBeenLastCalledWith('S', expect.anything(), { refresh: false });
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.ESUN_UNREFRESHED_CACHE_MESSAGE);
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+    });
+});
+
+describe('authoritative read of a row whose failure the latest snapshot did not list (PB5-3)', () => {
+    const unresolved = { esun_unresolved_failure: { op_code: '00000123', op_msg: '委託已失效' } };
+
+    it('is not taken as confirmed: the read keeps an orders reason that only a later authoritative read clears', async () => {
+        // SSE 已先提出同一筆失敗的待對帳
+        const { report, unresolved: sse } = failedAck({ op_type: 'Unknown' });
+        await emit(report);
+        await signal(sse);
+        viaBridge(async () => [row({ ...unresolved, esun_snapshot_missing: true })]);
+        await authoritativeRead();
+        expect(mocks.bridgeTrades).toHaveBeenLastCalledWith(expect.anything(), true);
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.esunSnapshotMissingFailureMessage('C0001', '00000123'));
+        // 還沒判定的列再讀一次也不會解除
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        // 券商快照列出（判定）之後由權威讀取解除
+        viaBridge(async () => [row({ err_code: '00000123', err_msg: '委託已失效' })]);
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+        expect(local().status.status).toBe('Failed');
+    });
+
+    it('keeps the current behaviour for a row carrying only one of the two flags', async () => {
+        for (const over of [unresolved, { esun_snapshot_missing: true }]) {
+            viaBridge(async () => [row(over)]);
+            await authoritativeRead();
+            expect(reasons('orders')).toEqual([]);
+        }
     });
 });

@@ -14,7 +14,10 @@ import { captureServerMode } from '../server-info-store';
 import { MOCK_ESUN_ACCOUNT_ID, MockEsunDriver } from './mock-driver';
 import { esunTradeService } from './service';
 import {
+    ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE,
+    ESUN_FAILED_ACK_REFRESHED_MESSAGE,
     ESUN_STALE_CACHE_MESSAGE,
+    ESUN_UNREFRESHED_CACHE_MESSAGE,
     esunAccountQuery,
     esunCacheConflictMessage,
     esunCacheUpsertRow,
@@ -133,6 +136,22 @@ describe('trading-state hooks (§5 consumer)', () => {
         emit({ kind: 'resync', reason: 'ws_reconnected' });
         expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', ESUN_STALE_CACHE_MESSAGE);
         expect(hooks.raise).not.toHaveBeenCalledWith('positions', 'snapshot-boundary', expect.any(String));
+        expect(hooks.checkHealth).toHaveBeenCalledWith('gap');
+    });
+
+    it('any resync with cacheRefreshed:false raises a reason only an authoritative read clears (PB5-2)', () => {
+        emit({ kind: 'resync', reason: 'bridge_restarted', cacheRefreshed: false });
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', ESUN_UNREFRESHED_CACHE_MESSAGE);
+        hooks.raise.mockClear();
+        hooks.checkHealth.mockClear();
+        emit({ kind: 'resync', reason: 'failed_ack_refresh_failed', cacheRefreshed: false });
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'snapshot-boundary', ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE]]);
+        expect(hooks.checkHealth).not.toHaveBeenCalled();
+    });
+
+    it('a failed_ack_refreshed resync raises only an orders reason the cache rebuild clears (PB5-1)', () => {
+        emit({ kind: 'resync', reason: 'failed_ack_refreshed', cacheRefreshed: true });
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'sequence-gap', ESUN_FAILED_ACK_REFRESHED_MESSAGE]]);
         expect(hooks.checkHealth).toHaveBeenCalledWith('gap');
     });
 

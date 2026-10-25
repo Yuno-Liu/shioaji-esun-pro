@@ -594,6 +594,8 @@ export function esunTimestamp(date: unknown, time: unknown): number | undefined 
 export interface EsunRowUnresolvedFailure {
     opCode: string;
     opMsg: string;
+    /** 同一列也帶 esun_snapshot_missing: true（券商最近一次快照沒列出、bridge 因近期而保留） */
+    snapshotMissing: boolean;
 }
 
 // 以 Trade.status 物件為鍵：trading-state 合併前的淺複製（{ ...t, account }）沿用同一個 status，
@@ -609,7 +611,7 @@ function readUnresolvedFailure(raw: Record<string, unknown>): EsunRowUnresolvedF
     const v = raw.esun_unresolved_failure;
     if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
     const f = v as Record<string, unknown>;
-    return { opCode: String(f.op_code ?? '').trim(), opMsg: String(f.op_msg ?? '').trim() };
+    return { opCode: String(f.op_code ?? '').trim(), opMsg: String(f.op_msg ?? '').trim(), snapshotMissing: raw.esun_snapshot_missing === true };
 }
 
 export interface EsunOrderResultOptions {

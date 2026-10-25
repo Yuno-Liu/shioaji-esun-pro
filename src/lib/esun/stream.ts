@@ -19,7 +19,8 @@ export type EsunStreamStatus = 'idle' | 'connecting' | 'live' | 'down';
 export type EsunStreamSignal =
     | { kind: 'down'; message: string }
     | { kind: 'reconnected' }
-    /** bridge 的 resync：reason 為 ws_reconnected 時 cacheRefreshed 表示 bridge 是否已重讀委託快取 */
+    /** bridge 的 resync：cacheRefreshed 表示 bridge 是否已重讀委託快取（ws_reconnected、failed_ack_refreshed、
+     *  failed_ack_refresh_failed 會帶） */
     | { kind: 'resync'; reason?: string; cacheRefreshed?: boolean }
     /** 收到但無法轉換的回報（欄位不足、環境未知）：不能投影，需要對帳 */
     | { kind: 'untrackable'; deal: boolean }
