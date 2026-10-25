@@ -3,9 +3,8 @@ import { createAccountQuery } from './account-query';
 import { getServerModeVersion, knownServerInfo } from './server-info-store';
 import { onTradeMutation } from './trade-mutations';
 import { useEffect, useSyncExternalStore } from 'react';
-import { getAccountState, refreshAccounts, subscribeAccounts, useAccounts } from './account-store';
-import { invalidateAllQueries } from '../hooks/use-query';
-import { esunTradeService } from './esun';
+import { getAccountState, refreshAccounts, useAccounts } from './account-store';
+import { esunCacheUpsertRow, startEsunTradingState } from './esun/dispatch';
 import { ensureContract, getCachedContract } from './contracts-cache';
 import { getApiBase } from './runtime';
 import { subscribeTradeReports } from './boot';
@@ -294,7 +293,7 @@ function mergeOrders(account: Account, trades: Trade[], accounts: Account[], pro
     if (mode === 'replace') merged = [...state.trades.filter(t => !matches(t.account)), ...incoming];
     else {
         const byId = new Map(incoming.map(t => [t.order.id, t]));
-        merged = state.trades.map(t => matches(t.account) && byId.has(t.order.id) ? byId.get(t.order.id)! : t);
+        merged = state.trades.map(t => matches(t.account) && byId.has(t.order.id) ? esunCacheUpsertRow(t, byId.get(t.order.id)!) : t);
         const known = new Set(state.trades.filter(t => matches(t.account)).map(t => t.order.id));
         merged.push(...incoming.filter(t => !known.has(t.order.id)));
     }
@@ -323,14 +322,6 @@ export function refreshTradingStateForModeChange(): Promise<void> {
     if (modeRefresh) return modeRefresh;
     modeRefresh = (async () => {
         if (inFlight) await inFlight;
-        snapshotEnds.clear();
-        const currentAccounts = tradableAccounts();
-        state = {
-            ...state,
-            positions: state.positions.filter(p => currentAccounts.some(a => p.account && accountKey(a) === accountKey(p.account))),
-            trades: state.trades.filter(t => currentAccounts.some(a => t.account && accountKey(a) === accountKey(t.account))),
-            funds: state.funds?.filter(f => currentAccounts.some(a => f.account && accountKey(a) === accountKey(f.account))),
-        };
         do {
             const version = getServerModeVersion();
             for (const key of queryScopes) nextRefreshAt[key] = 0;
@@ -339,6 +330,17 @@ export function refreshTradingStateForModeChange(): Promise<void> {
         } while (true);
     })().finally(() => { modeRefresh = null; });
     return modeRefresh;
+}
+
+/** Fork hook (src/lib/esun/dispatch.ts): the E.SUN bridge session re-keyed its accounts.
+ *  Drop rows of accounts that left the list, then read again right away. */
+export async function refreshTradingStateForAccountsChange(): Promise<void> {
+    if (inFlight) await inFlight.catch(() => undefined);
+    const keys = new Set(tradableAccounts().map(accountKey));
+    const listed = (row: { account?: Account }) => !row.account || keys.has(accountKey(row.account));
+    state = { ...state, positions: state.positions.filter(listed), trades: state.trades.filter(listed), funds: state.funds?.filter(listed) };
+    for (const key of queryScopes) nextRefreshAt[key] = 0;
+    return refreshTradingState();
 }
 
 /** Run `fn` over `items` with at most `limit` in flight; results keep the
@@ -1016,32 +1018,8 @@ function start() {
         });
         if (changed) { state = { ...state, positions }; schedulePublish(); }
     });
-    const accountSig = () => {
-        const s = getAccountState();
-        return `${s.accounts.map(a => `${a.broker_id}-${a.account_id}`).join(',')}|${s.selectedAccount ? `${s.selectedAccount.broker_id}-${s.selectedAccount.account_id}` : ''}|${s.selectedStock ? `${s.selectedStock.broker_id}-${s.selectedStock.account_id}` : ''}|${s.selectedFutures ? `${s.selectedFutures.broker_id}-${s.selectedFutures.account_id}` : ''}`;
-    };
-    let lastAccountSig = accountSig();
-    const stopAccounts = subscribeAccounts(() => {
-        const sig = accountSig();
-        if (sig !== lastAccountSig) {
-            lastAccountSig = sig;
-            invalidateAllQueries();
-            for (const key of queryScopes) nextRefreshAt[key] = 0;
-            void refreshTradingState('all');
-        }
-    });
-
-    const esunEnvSig = () => `${esunTradeService.getEnvironment()}|${esunTradeService.getActiveConfigFile() ?? ''}`;
-    let lastEsunEnvSig = esunEnvSig();
-    const stopEsun = esunTradeService.subscribe(() => {
-        const sig = esunEnvSig();
-        if (sig !== lastEsunEnvSig) {
-            lastEsunEnvSig = sig;
-            invalidateAllQueries();
-            void refreshTradingStateForModeChange();
-        }
-    });
-
+    const stopEsun = startEsunTradingState({ raise: (scope, reason, message) => { raise(scope, reason, message); schedulePublish(); },
+        accountsChanged: () => hasConnected ? refreshTradingStateForAccountsChange() : Promise.resolve(), checkHealth: checkTradeCacheHealth });
     const statusChanged = () => {
         const live = getStreamStatus() === 'live';
         if (live && !hasConnected) { hasConnected = true; void refreshTradingState(); }
@@ -1062,7 +1040,7 @@ function start() {
     };
     const stopStatus = subscribeStatusStore(statusChanged);
     import.meta.hot?.dispose(() => {
-        stopMutations(); stopResponses(); stopOrders(); stopHints(); stopGaps(); gapTimers.forEach(clearTimeout); stopTicks(); lastTicks.clear(); stopStatus(); stopAccounts(); stopEsun(); channel?.close();
+        stopMutations(); stopResponses(); stopOrders(); stopHints(); stopGaps(); gapTimers.forEach(clearTimeout); stopTicks(); lastTicks.clear(); stopStatus(); stopEsun(); channel?.close();
         positionQuotes.forEach(entry => entry.release?.());
         if (publishTimer) clearTimeout(publishTimer);
         clearInterval(stateHeartbeat);

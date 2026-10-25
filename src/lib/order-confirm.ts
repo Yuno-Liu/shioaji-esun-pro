@@ -1,4 +1,3 @@
-import { isEsunBroker, ESUN_BROKER_NAME } from './esun';
 // src/lib/order-confirm.ts — 手動下單的可視化委託確認（promise 服務）
 //
 // RiskSettings.confirmManualOrders 開啟時，手動下單路徑先呼叫
@@ -8,6 +7,7 @@ import { isEsunBroker, ESUN_BROKER_NAME } from './esun';
 //
 // 純 UX 安全帶，不是安全邊界：WebView 內的確認擋不了被汙染的 WebView。
 
+import { esunConfirmBrokerLabel, esunConfirmGuard, esunConfirmSimulation, subscribeEsunEnvironment } from './esun/dispatch';
 import { fetchInfo } from './shioaji';
 import { getAccountState } from './account-store';
 import { captureServerMode, currentServerInfoSequence, knownServerInfo, serverInfoFreshSince, SERVER_MODE_CHANGED_MESSAGE, subscribeServerInfo, type ServerModeGuard } from './server-info-store';
@@ -101,10 +101,10 @@ export function resolveOrderConfirm(approved: boolean): void {
 // 不另外長期快取 — sidecar 在同一位址由模擬重啟成正式時不會顯示舊的「模擬」
 let simulationOverride: boolean | null | undefined;
 let simulationInflight: { base: string; promise: Promise<void> } | null = null;
-function currentSimulation(): boolean | null {
+function currentSimulation(request?: { accountLabel?: string }): boolean | null {
     if (simulationOverride !== undefined) return simulationOverride;
     const s = knownServerInfo()?.simulation;
-    return typeof s === 'boolean' ? s : null;
+    return esunConfirmSimulation(request, typeof s === 'boolean' ? s : null);
 }
 
 // 確認視窗一律遮罩帳號（只露末四碼）；隱私模式開啟時與底部 dock 同規則（只露末兩碼）
@@ -113,8 +113,7 @@ export function accountConfirmLabel(account: Pick<Account, 'broker_id' | 'accoun
     const masked = getPrivacyMode()
         ? maskAccountId(id, true)
         : id.length > 4 ? `${'*'.repeat(id.length - 4)}${id.slice(-4)}` : id;
-    const broker = isEsunBroker(account.broker_id) ? ESUN_BROKER_NAME : account.broker_id;
-    return `${broker}-${masked}`;
+    return `${esunConfirmBrokerLabel(account.broker_id)}-${masked}`;
 }
 
 /**
@@ -167,9 +166,9 @@ function refreshPendingMode() {
     }
     const fresh = getApiBase() === current.base && serverInfoFreshSince(current.openSequence);
     if (fresh) {
-        current.sameServer = captureServerMode();
+        current.sameServer = esunConfirmGuard(captureServerMode(), current.request);
         current.shownKnown = true;
-        current.request = { ...current.request, simulation: currentSimulation(), awaitingMode: false, modeUnavailable: false };
+        current.request = { ...current.request, simulation: currentSimulation(current.request), awaitingMode: false, modeUnavailable: false };
     } else {
         if (current.request.awaitingMode && current.request.modeUnavailable === current.refreshFailed) return;
         current.request = { ...current.request, simulation: null, awaitingMode: true, modeUnavailable: current.refreshFailed };
@@ -177,6 +176,7 @@ function refreshPendingMode() {
     emit();
 }
 subscribeServerInfo(refreshPendingMode);
+subscribeEsunEnvironment(refreshPendingMode);
 
 export function requestOrderConfirm(
     request: Omit<OrderConfirmRequest, 'simulation'>,
@@ -199,10 +199,10 @@ export function requestOrderConfirm(
             accountLabel: request.accountLabel ?? selectedAccountLabel(request.unit),
         };
         const current: PendingConfirm = {
-            request: { ...withAccount, simulation: currentSimulation() },
+            request: { ...withAccount, simulation: currentSimulation(withAccount) },
             resolve,
             reject,
-            sameServer: captureServerMode(),
+            sameServer: esunConfirmGuard(captureServerMode(), withAccount),
             started: false,
             base: getApiBase(),
             openSequence: currentServerInfoSequence(),

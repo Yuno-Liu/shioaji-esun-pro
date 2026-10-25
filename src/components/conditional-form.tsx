@@ -20,6 +20,8 @@ import type { Account } from '../lib/types/portfolio';
 import { conditionalDemoActive, DEMO_ACCOUNTS, primeConditionalDemo } from '../lib/conditional/demo';
 import { Dialog, useLastPrice } from './conditional-ui';
 import * as styles from './conditional-panel.css';
+import { HEADER_LOCK_TITLE, headerAccountLocked } from '../lib/order-route';
+import { OrderRoutingBadge } from './order-routing-badge';
 
 export type CondFormType = 'trigger' | 'oco' | 'bracket' | 'time';
 const QUICK_QTY = [1, 5, 10];
@@ -49,12 +51,10 @@ function useTarget(initial: ContractInfo | null) {
     const futures = isFuturesLike(contract);
     const state = useAccounts();
     const accounts = useMemo(() => marketAccounts(demo ? DEMO_ACCOUNTS : state.accounts, futures), [demo, state.accounts, futures]);
-    const preferred = (futures
-        ? (state.selectedFutures ?? (state.selectedAccount?.account_type === 'F' ? state.selectedAccount : null))
-        : (state.selectedStock ?? (state.selectedAccount?.account_type === 'S' ? state.selectedAccount : null))) ?? state.selectedAccount;
+    const preferred = futures ? state.selectedFutures : state.selectedStock;
     const [accountId, setAccountId] = useState<string | null>(null);
-    const account = (preferred && accounts.find(a => accountKey(a) === accountKey(preferred)))
-        ?? accounts.find(a => accountKey(a) === accountId) ?? accounts[0] ?? null;
+    const account = accounts.find(a => accountKey(a) === accountId)
+        ?? accounts.find(a => preferred && accountKey(a) === accountKey(preferred)) ?? accounts[0] ?? null;
     const resolve = (raw: string) => {
         const c = raw.trim().toUpperCase();
         if (!c || c === resolved) return;
@@ -108,7 +108,7 @@ function TargetRows({ target }: { target: Target }) {
                 {target.accounts.length === 0 ? (
                     <span className={styles.tone.err}>沒有可下單的{target.futures ? '期貨' : '證券'}帳戶</span>
                 ) : (
-                    <select className={styles.select} aria-label='帳戶' disabled={true} title="帳號由頂欄 (Header) 統一控管切換" value={target.account ? accountKey(target.account) : ''}
+                    <select className={styles.select} aria-label='帳戶' disabled={headerAccountLocked()} title={headerAccountLocked() ? HEADER_LOCK_TITLE : undefined} value={target.account ? accountKey(target.account) : ''}
                         onChange={e => target.setAccountId(e.target.value)}>
                         {target.accounts.map(a => (
                             <option key={accountKey(a)} value={accountKey(a)}>
@@ -117,6 +117,7 @@ function TargetRows({ target }: { target: Target }) {
                         ))}
                     </select>
                 )}
+                <OrderRoutingBadge account={target.account} />
             </div>
             {target.contract && !target.futures && (
                 <div className={styles.formRow}>

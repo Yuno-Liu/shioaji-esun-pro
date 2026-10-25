@@ -34,3 +34,9 @@ __pycache__/
 *.py[cod]
 *.p12
 certs/
+*.pfx
+secrets/
+
+# E.Sun bridge runtime state (login breaker, ESUN_STATE_DIR default)
+.state/
+server/.state/

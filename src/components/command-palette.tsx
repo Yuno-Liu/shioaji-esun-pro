@@ -47,8 +47,9 @@ export function CommandPalette({
             return;
         }
         let active = true;
+        const controller = new AbortController();
         const timer = setTimeout(() => {
-            void searchProducts(value, 8)
+            void searchProducts(value, 8, { signal: controller.signal })
                 .then((items) => {
                     if (active) {
                         setSuggestions(items);
@@ -62,6 +63,7 @@ export function CommandPalette({
         return () => {
             active = false;
             clearTimeout(timer);
+            controller.abort();
         };
     }, [open, value]);
 

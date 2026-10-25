@@ -14,20 +14,32 @@ src-tauri/binaries
 .git
 .github
 .agents
+.claude
 .wt
 
-# Local configs and certs (mounted dynamically at runtime)
+# Local configs, secrets and certs (mounted dynamically at runtime — never in the build context)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.docker.example
 esun-config.ini
 esun-config.simulation.ini
 esun-config.sim.ini
 esun-config.test.ini
 esun-config.production.ini
 esun-config.prod.ini
-certs/*.p12
+certs/
 *.p12
+*.pfx
+*.pem
+*.key
+secrets/
+
+# Runtime state and logs
+.state/
+server/.state/
+*.log
+.esun-bridge.pid
 
 # Python artifacts
 __pycache__

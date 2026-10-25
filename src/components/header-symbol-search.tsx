@@ -66,6 +66,8 @@ export function HeaderSymbolSearch({
     const [suggestions, setSuggestions] = useState<ProductSuggestion[]>([]);
     const [activeIndex, setActiveIndex] = useState(0);
     const [addingCode, setAddingCode] = useState<string | null>(null);
+    // IME 組字中（注音／倉頡）不搜尋：只在組字結束後以最終文字搜尋
+    const [composing, setComposing] = useState(false);
 
     const wrapRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -101,8 +103,12 @@ export function HeaderSymbolSearch({
         return () => document.removeEventListener('mousedown', onMouseDown);
     }, [open]);
 
-    // 輸入變更時進行模糊搜尋
+    // 輸入變更時進行模糊搜尋；新的輸入會取消上一筆尚未完成的搜尋
     useEffect(() => {
+        if (composing) {
+            setSearching(false);
+            return;
+        }
         if (!open || !trimmedQuery) {
             setSuggestions([]);
             setSearching(false);
@@ -110,9 +116,15 @@ export function HeaderSymbolSearch({
             return;
         }
         let active = true;
+        const controller =
+            typeof AbortController !== 'undefined'
+                ? new AbortController()
+                : undefined;
         setSearching(true);
         const timer = setTimeout(() => {
-            void searchProducts(trimmedQuery, 10)
+            void searchProducts(trimmedQuery, 10, {
+                signal: controller?.signal,
+            })
                 .then((items) => {
                     if (!active) return;
                     resolvedQueryRef.current = trimmedQuery;
@@ -130,15 +142,21 @@ export function HeaderSymbolSearch({
         return () => {
             active = false;
             clearTimeout(timer);
+            controller?.abort();
         };
-    }, [open, trimmedQuery]);
+    }, [open, trimmedQuery, composing]);
 
     const closeSearch = () => {
         setOpen(false);
         setQuery('');
         setError(null);
+        setComposing(false);
         inputRef.current?.blur();
     };
+
+    const optionId = (idx: number) => `header-symbol-search-opt-${idx}`;
+    const activeDescendant =
+        open && visibleItems[activeIndex] ? optionId(activeIndex) : undefined;
 
     const pickSuggestion = async (item: ProductSuggestion) => {
         if (submitting) return;
@@ -240,6 +258,7 @@ export function HeaderSymbolSearch({
                     aria-expanded={open}
                     aria-autocomplete='list'
                     aria-controls='header-symbol-search-listbox'
+                    aria-activedescendant={activeDescendant}
                     className={styles.input}
                     value={open ? query : idleText}
                     placeholder={placeholder}
@@ -257,8 +276,26 @@ export function HeaderSymbolSearch({
                         setError(null);
                         setActiveIndex(0);
                     }}
+                    onCompositionStart={() => setComposing(true)}
+                    onCompositionEnd={(e) => {
+                        setComposing(false);
+                        setQuery(e.currentTarget.value);
+                    }}
+                    onBlur={(e) => {
+                        // Tab 或其他方式把焦點移出元件時收起下拉選單
+                        const next = e.relatedTarget as Node | null;
+                        if (next && wrapRef.current?.contains(next)) return;
+                        setOpen(false);
+                        setQuery('');
+                        setError(null);
+                        setComposing(false);
+                    }}
                     onKeyDown={(e) => {
-                        if (e.nativeEvent?.isComposing || e.keyCode === 229) {
+                        if (
+                            composing ||
+                            e.nativeEvent?.isComposing ||
+                            e.keyCode === 229
+                        ) {
                             return;
                         }
                         if (e.key === 'ArrowDown' && visibleItems.length > 0) {
@@ -309,12 +346,7 @@ export function HeaderSymbolSearch({
             </div>
 
             {open && (
-                <div
-                    id='header-symbol-search-listbox'
-                    role='listbox'
-                    aria-label='商品搜尋建議'
-                    className={styles.dropdown}
-                >
+                <div className={styles.dropdown}>
                     <div className={styles.sectionHeader}>
                         <span>
                             {trimmedQuery
@@ -326,7 +358,8 @@ export function HeaderSymbolSearch({
                         )}
                     </div>
 
-                    <div className={styles.list}>
+                    {/* 狀態列放在 listbox 之外：listbox 只包含 option */}
+                    <div role='status' aria-live='polite'>
                         {searching && visibleItems.length === 0 && (
                             <div className={styles.statusRow}>
                                 <AsyncStatus
@@ -338,6 +371,7 @@ export function HeaderSymbolSearch({
                         )}
 
                         {!searching &&
+                            !composing &&
                             trimmedQuery &&
                             visibleItems.length === 0 && (
                                 <div className={styles.statusRow}>
@@ -351,6 +385,14 @@ export function HeaderSymbolSearch({
                                 輸入代號或中文名稱（如：2330、台積、元大50、小台）
                             </div>
                         )}
+                    </div>
+
+                    <div
+                        id='header-symbol-search-listbox'
+                        role='listbox'
+                        aria-label='商品搜尋建議'
+                        className={styles.list}
+                    >
 
                         {visibleItems.map((item, idx) => {
                             const isSelected = selected?.code === item.code;
@@ -359,6 +401,7 @@ export function HeaderSymbolSearch({
                             return (
                                 <div
                                     key={`${item.security_type}:${item.code}`}
+                                    id={optionId(idx)}
                                     role='option'
                                     aria-selected={isActive}
                                     className={
@@ -394,6 +437,7 @@ export function HeaderSymbolSearch({
                                         ) : onAddWatchlist ? (
                                             <button
                                                 type='button'
+                                                tabIndex={-1}
                                                 className={styles.watchBtn}
                                                 disabled={
                                                     addingCode === item.code

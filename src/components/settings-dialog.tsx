@@ -1,5 +1,4 @@
 import { canTrade } from '../lib/account-tradable';
-import type { Account } from '../lib/types/portfolio';
 // src/components/settings-dialog.tsx — 統一設定面板：外觀／音效與隱私／
 // 帳號／風控／版面 五分類。原本散在 header 的主題/帳號/版面 popover 全數
 // 收斂到這裡；風控「規則」也在此（Kill Switch 留在 header，一鍵可達）。
@@ -19,7 +18,7 @@ import { AsyncStatus } from './async-status';
 import {
     ensureAccounts,
     refreshAccounts,
-
+    selectAccount,
     useAccounts,
 } from '../lib/account-store';
 import {
@@ -304,9 +303,7 @@ function SoundPrivacySection() {
 }
 
 export function AccountsSection() {
-    const accountState = useAccounts();
-    const { accounts, selectedStock, selectedFutures, selectedAccount, loaded, loadError } = accountState;
-    const activeAccount = selectedAccount ?? selectedStock ?? selectedFutures ?? null;
+    const { accounts, selectedStock, selectedFutures, loaded, loadError } = useAccounts();
     const simulation = useServerInfo()?.simulation === true;
     const priv = usePrivacyMode();
     const [refreshing, setRefreshing] = useState(false);
@@ -314,27 +311,24 @@ export function AccountsSection() {
     const unsignedTypes = (['S', 'F'] as const).filter((t) =>
         accounts.some((a) => a.account_type === t && !a.signed),
     );
-    const groups: { label: string; type: 'S' | 'F' }[] = [
+    const groups: { label: string; type: 'S' | 'F'; selected: string }[] = [
         {
             label: '證券帳戶',
             type: 'S',
+            selected: selectedStock
+                ? `${selectedStock.broker_id}-${selectedStock.account_id}`
+                : '',
         },
         {
             label: '期貨帳戶',
             type: 'F',
+            selected: selectedFutures
+                ? `${selectedFutures.broker_id}-${selectedFutures.account_id}`
+                : '',
         },
     ];
-    const isSelected = (a: Account) =>
-        activeAccount
-            ? a.broker_id === activeAccount.broker_id &&
-              a.account_id === activeAccount.account_id &&
-              a.account_type === activeAccount.account_type
-            : false;
     return (
         <>
-            <div style={{ fontSize: 11, color: 'var(--text-muted, #888)', marginBottom: 6 }}>
-                帳號切換統一由頂欄 (Header) 控制
-            </div>
             {groups.map((g) => {
                 const list = accounts.filter(
                     (a) => a.account_type === g.type,
@@ -345,18 +339,22 @@ export function AccountsSection() {
                         <span className={hud.settingLabel}>{g.label}</span>
                         {list.map((a) => {
                             const key = `${a.broker_id}-${a.account_id}`;
-                            const on = isSelected(a);
                             return (
                                 <button
                                     key={key}
                                     className={`${
                                         hud.opt[
-                                            on ? 'on' : 'off'
+                                            g.selected === key ? 'on' : 'off'
                                         ]
                                     } ${canTrade(a) ? '' : styles.acctUnsigned}`}
                                     style={{ width: '100%', marginTop: 4 }}
-                                    disabled={true}
-                                    title="帳號由頂欄 (Header) 統一控管切換"
+                                    disabled={!canTrade(a)}
+                                    title={
+                                        a.signed
+                                            ? undefined
+                                            : unsignedAccountTitle(simulation)
+                                    }
+                                    onClick={() => selectAccount(a)}
                                 >
                                     {a.broker_id}-
                                     {maskAccountId(a.account_id, priv)}（

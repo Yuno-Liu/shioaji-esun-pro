@@ -151,7 +151,11 @@ describe('HeaderSymbolSearch', () => {
         await act(async () => {
             await vi.advanceTimersByTimeAsync(120);
         });
-        expect(mocks.searchProducts).toHaveBeenCalledWith('元大50', 10);
+        expect(mocks.searchProducts).toHaveBeenCalledWith(
+            '元大50',
+            10,
+            expect.objectContaining({ signal: expect.anything() }),
+        );
 
         // Move down to second suggestion (0050) and press Enter
         await act(async () => {
@@ -197,5 +201,127 @@ describe('HeaderSymbolSearch', () => {
         expect(mocks.notify).toHaveBeenCalledWith(
             expect.objectContaining({ title: '已加入自選' }),
         );
+        // ＋自選 不在 Tab 順序中（listbox 內不放可聚焦控制項）
+        expect(addBtn.props.tabIndex).toBe(-1);
+    });
+
+    const openWithQuery = async (value: string) => {
+        await act(async () => {
+            view = create(
+                createElement(HeaderSymbolSearch, {
+                    selected: tsmc,
+                    watchlistItems: [{ contract: tsmc }],
+                    onSelectCode: vi.fn(),
+                }),
+            );
+        });
+        const input = view!.root.findByType('input');
+        await act(async () => {
+            input.props.onFocus();
+            input.props.onChange({ target: { value } });
+        });
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(120);
+        });
+        return () => view!.root.findByType('input');
+    };
+
+    it('combobox 以 aria-activedescendant 指向目前選項，option 都有 id', async () => {
+        const input = await openWithQuery('鴻海');
+        const options = view!.root.findAll(
+            (n) => n.type === 'div' && n.props.role === 'option',
+        );
+        expect(options.map((o) => o.props.id)).toEqual([
+            'header-symbol-search-opt-0',
+            'header-symbol-search-opt-1',
+        ]);
+        expect(input().props['aria-activedescendant']).toBe(
+            'header-symbol-search-opt-0',
+        );
+        await act(async () => {
+            input().props.onKeyDown({ key: 'ArrowDown' });
+        });
+        expect(input().props['aria-activedescendant']).toBe(
+            'header-symbol-search-opt-1',
+        );
+        // listbox 只包含 option
+        const listbox = view!.root.find(
+            (n) => n.type === 'div' && n.props.role === 'listbox',
+        );
+        expect(
+            listbox.children.every(
+                (c) => typeof c !== 'string' && c.props.role === 'option',
+            ),
+        ).toBe(true);
+    });
+
+    it('Tab 讓焦點離開元件時收起下拉選單', async () => {
+        const input = await openWithQuery('鴻海');
+        expect(input().props['aria-expanded']).toBe(true);
+        await act(async () => {
+            input().props.onBlur({ relatedTarget: null });
+        });
+        expect(input().props['aria-expanded']).toBe(false);
+        expect(
+            view!.root.findAll((n) => n.props.role === 'listbox'),
+        ).toHaveLength(0);
+    });
+
+    it('IME 組字中不搜尋也不以 Enter 選取，組字結束後才搜尋', async () => {
+        const onSelectCode = vi.fn();
+        await act(async () => {
+            view = create(
+                createElement(HeaderSymbolSearch, {
+                    selected: tsmc,
+                    watchlistItems: [{ contract: tsmc }],
+                    onSelectCode,
+                }),
+            );
+        });
+        const input = () => view!.root.findByType('input');
+        await act(async () => {
+            input().props.onFocus();
+            input().props.onCompositionStart();
+            input().props.onChange({ target: { value: 'ㄊㄞ' } });
+        });
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(200);
+        });
+        expect(mocks.searchProducts).not.toHaveBeenCalled();
+        const text = JSON.stringify(view!.toJSON());
+        expect(text).not.toContain('找不到相符商品');
+        await act(async () => {
+            input().props.onKeyDown({ key: 'Enter', nativeEvent: {} });
+        });
+        expect(onSelectCode).not.toHaveBeenCalled();
+
+        await act(async () => {
+            input().props.onCompositionEnd({ currentTarget: { value: '台積' } });
+        });
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(120);
+        });
+        expect(mocks.searchProducts).toHaveBeenCalledTimes(1);
+        expect(mocks.searchProducts.mock.calls[0]?.[0]).toBe('台積');
+    });
+
+    it('輸入變更時取消上一筆尚未完成的搜尋', async () => {
+        const signals: AbortSignal[] = [];
+        mocks.searchProducts.mockImplementation(
+            (_q: string, _l: number, opts?: { signal?: AbortSignal }) => {
+                if (opts?.signal) signals.push(opts.signal);
+                return new Promise(() => undefined);
+            },
+        );
+        const input = await openWithQuery('23');
+        await act(async () => {
+            input().props.onChange({ target: { value: '233' } });
+        });
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(120);
+        });
+        expect(signals).toHaveLength(2);
+        expect(signals[0]!.aborted).toBe(true);
+        expect(signals[1]!.aborted).toBe(false);
     });
 });

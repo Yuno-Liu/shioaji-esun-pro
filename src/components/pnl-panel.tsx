@@ -1,5 +1,5 @@
 import { canTrade } from '../lib/account-tradable';
-import { useEsunEnvironment } from '../lib/esun';
+import { esunProfitLossRows } from '../lib/esun/dispatch';
 import { RefreshButton } from './refresh-button';
 // src/components/pnl-panel.tsx — realized P&L analytics (30 days)
 
@@ -26,7 +26,7 @@ async function fetchPnl(accounts: Account[]): Promise<PnlRow[]> {
     const query = createAccountQuery();
     const rows: PnlRow[] = [];
     for (const account of accounts) {
-        const result = await query.read(account.account_type as 'S' | 'F', account, current => apiPost<PnlRow[]>('/api/v1/portfolio/profit_loss', {
+        const result = await query.read(account.account_type as 'S' | 'F', account, current => esunProfitLossRows(current, dateStrOffset(30), dateStrOffset(0)) ?? apiPost<PnlRow[]>('/api/v1/portfolio/profit_loss', {
             begin_date: dateStrOffset(30), end_date: dateStrOffset(0),
             account_type: current.account_type, broker_id: current.broker_id,
             account_id: current.account_id, ...(current.account_type === 'S' ? { unit: 'Common' } : {}),
@@ -83,13 +83,13 @@ function EquityCurve({ rows }: { rows: PnlRow[] }) {
 
 export function PnlPanel() {
     const { accounts, selectedAccount } = useAccounts();
-    const esunEnv = useEsunEnvironment();
     const privMoney = usePrivacyMoney();
+    // 頂欄的作用中帳戶決定損益面板範圍（帳戶鍵含玉山環境，切換環境即為不同帳戶）
     const effectiveAccounts = selectedAccount ? accounts.filter(a => a.account_type === selectedAccount.account_type && a.broker_id === selectedAccount.broker_id && a.account_id === selectedAccount.account_id) : accounts;
     const tradable = effectiveAccounts.filter(a => canTrade(a) && ['S', 'F'].includes(a.account_type));
     const key = tradable.map(a => `${a.account_type}:${a.broker_id}:${a.account_id}`).join(',');
     const { data, error, loading, refresh } = useQuery<PnlRow[]>(
-        useCallback(() => fetchPnl(tradable), [key]), `pnl-30d:${key}:${esunEnv.environment}`, tradable.length > 0, tradable,
+        useCallback(() => fetchPnl(tradable), [key]), `pnl-30d:${key}`, tradable.length > 0, tradable,
     );
     const controls = <div className={panel.refreshToolbar}>
         {error && <span role="status">查詢失敗，保留上次資料：{error}</span>}

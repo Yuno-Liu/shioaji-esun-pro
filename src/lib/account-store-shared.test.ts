@@ -168,34 +168,54 @@ describe('unified active account & broker account replacement', () => {
         expect(mod.getActiveAccount()).toEqual(f1);
     });
 
-    it('replaceExternalAccountsForBroker replaces accounts of matched broker and updates active account', async () => {
-        const esun1 = { account_type: 'S', broker_id: '8840', account_id: '0664718', signed: true, username: '玉山模擬', person_id: '' };
-        const esun2 = { account_type: 'S', broker_id: '8840', account_id: '9988776', signed: true, username: '玉山正式', person_id: '' };
-        fetchAccounts.mockResolvedValue([account, esun1]);
+    it('replaceExternalAccountsForBroker re-keys the broker accounts and moves the selection without mutating the old snapshot', async () => {
+        // 玉山帳戶鍵含環境：同一帳號切到正式環境就是另一個帳戶鍵
+        const esunSim = { account_type: 'S', broker_id: '8840-SIM', account_id: '1234567', signed: true, username: '玉山證券', person_id: '' };
+        const esunProd = { account_type: 'S', broker_id: '8840', account_id: '1234567', signed: true, username: '玉山證券', person_id: '' };
+        fetchAccounts.mockResolvedValue([account, esunSim]);
         await mod.loadAccountsShared();
-        mod.selectAccount(esun1);
-        expect(mod.getActiveAccount()).toEqual(esun1);
-
-        mod.replaceExternalAccountsForBroker((b) => b === '8840', [esun2]);
-        const state = mod.getAccountState();
-        expect(state.accounts).toEqual([account, esun2]);
-        expect(state.selectedAccount).toEqual(esun2);
-        expect(state.selectedStock).toEqual(esun2);
-    });
-
-    it('registerExternalAccounts replaces stale account with same broker_id and account_type', async () => {
-        const esunSim = { account_type: 'S', broker_id: '8840', account_id: '0664718', signed: true, username: '玉山', person_id: '' };
-        const esunProd = { account_type: 'S', broker_id: '8840', account_id: '1234567', signed: true, username: '玉山', person_id: '' };
-        fetchAccounts.mockResolvedValue([account]);
-        await mod.loadAccountsShared();
-        mod.registerExternalAccounts([esunSim]);
         mod.selectAccount(esunSim);
         expect(mod.getActiveAccount()).toEqual(esunSim);
+        const before = mod.getAccountState();
 
-        // Registering prod account should replace esunSim without duplicating
-        mod.registerExternalAccounts([esunProd]);
+        mod.replaceExternalAccountsForBroker((b) => b.startsWith('8840'), [esunProd]);
         const state = mod.getAccountState();
-        expect(state.accounts.filter(a => a.broker_id === '8840')).toEqual([esunProd]);
-        expect(mod.getActiveAccount()).toEqual(esunProd);
+        expect(state.accounts).toEqual([account, esunProd]);
+        expect(state.selectedAccount).toEqual(esunProd);
+        expect(state.selectedStock).toEqual(esunProd);
+        // useSyncExternalStore 的舊快照物件不可被改寫
+        expect(state).not.toBe(before);
+        expect(before.selectedAccount).toEqual(esunSim);
+        expect(before.selectedStock).toEqual(esunSim);
+    });
+
+    it('replaceExternalAccountsForBroker falls back to the default pick when the broker has no accounts left', async () => {
+        const esunSim = { account_type: 'S', broker_id: '8840-SIM', account_id: '1234567', signed: true, username: '玉山證券', person_id: '' };
+        fetchAccounts.mockResolvedValue([account, esunSim]);
+        await mod.loadAccountsShared();
+        mod.selectAccount(esunSim);
+        mod.replaceExternalAccountsForBroker((b) => b.startsWith('8840'), []);
+        const state = mod.getAccountState();
+        expect(state.accounts).toEqual([account]);
+        expect(state.selectedStock).toEqual(account);
+        expect(mod.getActiveAccount()).toEqual(account);
+    });
+
+    it('registerExternalAccounts keys accounts by type, broker and account id', async () => {
+        const esunA = { account_type: 'S', broker_id: '8840', account_id: '1234567', signed: true, username: '玉山', person_id: '' };
+        const esunB = { account_type: 'S', broker_id: '8840', account_id: '7654321', signed: true, username: '玉山', person_id: '' };
+        fetchAccounts.mockResolvedValue([account]);
+        await mod.loadAccountsShared();
+        mod.registerExternalAccounts([esunA]);
+        mod.selectAccount(esunA);
+        const before = mod.getAccountState();
+
+        // 同一券商的另一個帳號是另一個帳戶，不會無聲取代已選取的帳戶
+        mod.registerExternalAccounts([esunB]);
+        mod.registerExternalAccounts([{ ...esunA, username: '玉山證券' }]);
+        const state = mod.getAccountState();
+        expect(state.accounts.filter(a => a.broker_id === '8840').map(a => a.account_id)).toEqual(['1234567', '7654321']);
+        expect(mod.getActiveAccount()).toMatchObject({ account_id: '1234567' });
+        expect(before.accounts.filter(a => a.broker_id === '8840')).toHaveLength(1);
     });
 });

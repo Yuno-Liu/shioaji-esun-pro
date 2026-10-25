@@ -1,3 +1,11 @@
+# Shioaji Pro Web — Docker Compose（詳細說明見 docs/fork/esun.md）
+#
+# 安全預設：
+# - web 只綁 127.0.0.1（WEB_BIND），esun-bridge 不發佈任何埠到主機（只在 compose 內網 expose）。
+# - nginx 只接受 localhost / 127.0.0.1 / WEB_SERVER_NAMES 的 Host，並把 ESUN_BRIDGE_TOKEN
+#   注入 /esun/ 請求；橋接要求此 token，瀏覽器不持有。
+# - 專案目錄以唯讀掛載給橋接（ESUN_CONFIG_HOST_DIR，預設 .），登入熔斷狀態存於具名 volume。
+# 需要區網存取時，請設定 WEB_BIND、WEB_SERVER_NAMES 並啟用 WEB_BASIC_AUTH，切勿直接開放 8080/8090。
 services:
   shioaji-pro-web:
     container_name: shioaji-pro-web
@@ -7,27 +15,39 @@ services:
       target: runner
     restart: unless-stopped
     ports:
-      - "${WEB_PORT:-8080}:${PORT:-8080}"
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:${PORT:-8080}"
     environment:
       - PORT=${PORT:-8080}
       - SHIOAJI_API_UPSTREAM=${SHIOAJI_API_UPSTREAM:-http://127.0.0.1:21322}
       - ESUN_BRIDGE_UPSTREAM=${ESUN_BRIDGE_UPSTREAM:-http://esun-bridge:8090}
-      - NGINX_ENVSUBST_FILTER=PORT|SHIOAJI_API_UPSTREAM|ESUN_BRIDGE_UPSTREAM
+      - ESUN_BRIDGE_TOKEN=${ESUN_BRIDGE_TOKEN:-}
+      - WEB_SERVER_NAMES=${WEB_SERVER_NAMES:-}
+      - WEB_BASIC_AUTH=${WEB_BASIC_AUTH:-off}
+      # NGINX_ENVSUBST_FILTER 由 Dockerfile 的 runner stage 統一定義
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - esun-bridge
+      # 只決定啟動順序：nginx 以 resolver 執行期解析 esun-bridge，
+      # 橋接未啟動或不健康時 web 仍可運作（/esun/ 回 502），不會互相拖垮
+      esun-bridge:
+        condition: service_started
+        required: false
 
   shioaji-server:
     container_name: shioaji-pro-sinopac
     build:
       context: .
       dockerfile: Dockerfile
-      target: esun-bridge
+      target: shioaji
     restart: unless-stopped
+    init: true
+    # 共用 web 的網路命名空間：永豐 sidecar 只綁 127.0.0.1，nginx 以 loopback 存取
     network_mode: "service:shioaji-pro-web"
     depends_on:
-      - shioaji-pro-web
+      shioaji-pro-web:
+        condition: service_started
+        # web 被重建或重啟時一併重啟，重新加入新的網路命名空間
+        restart: true
     environment:
       - SJ_HTTP_ADDR=127.0.0.1:21322
       - SJ_API_KEY=${SJ_API_KEY:-}
@@ -35,10 +55,14 @@ services:
       - SJ_PRODUCTION=${SJ_PRODUCTION:-false}
       - SJ_CA_PATH=${SJ_CA_PATH:-}
       - SJ_CA_PASSWD=${SJ_CA_PASSWD:-}
+      # 與上游桌面版相同：關閉逐筆請求日誌，避免容器日誌無限成長
+      - SJ_HTTP_LOG=false
+      - RUST_LOG=${SJ_RUST_LOG:-warn}
     volumes:
       - ./certs:/app/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "test -z \"$$SJ_API_KEY\" || curl -sf http://127.0.0.1:21322/api/v1/info > /dev/null"]
+      # 未設定金鑰時只會 sleep，回報 unhealthy 才不會讓人誤以為行情正常
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:21322/api/v1/info > /dev/null"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -56,17 +80,33 @@ services:
       dockerfile: Dockerfile
       target: esun-bridge
     restart: unless-stopped
-    ports:
-      - "${BRIDGE_PORT:-8090}:8090"
+    init: true
+    # SIGTERM 後橋接最多等 8 秒讓進行中的委託完成並回應，再關閉 WebSocket／SSE；預設 10 秒不夠
+    stop_grace_period: 15s
+    # 不發佈到主機；排錯請用 docker compose exec esun-bridge curl -s localhost:8090/esun/livez
+    expose:
+      - "8090"
     environment:
       - ESUN_SERVER_HOST=0.0.0.0
       - ESUN_SERVER_PORT=8090
       - ESUN_CONFIG_DIR=/app/host-config
+      - ESUN_STATE_DIR=/app/state
+      - ESUN_BRIDGE_TOKEN=${ESUN_BRIDGE_TOKEN:-}
+      - ESUN_ALLOWED_HOSTS=${WEB_SERVER_NAMES:-}
       - ESUN_ACCOUNT_PASSWORD=${ESUN_ACCOUNT_PASSWORD:-}
       - ESUN_PASSWORD=${ESUN_PASSWORD:-}
       - ESUN_CERT_PASSWORD=${ESUN_CERT_PASSWORD:-}
     volumes:
-      - .:/app/host-config
+      # 設定檔目錄（預設專案根目錄）唯讀掛載；[Cert] Path 的相對路徑以此目錄為基準，
+      # 因此既有的 certs/esun_cert.p12 不需搬移
+      - ${ESUN_CONFIG_HOST_DIR:-.}:/app/host-config:ro
       - ./certs:/app/certs:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - esun-state:/app/state
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+
+volumes:
+  esun-state:

@@ -16,6 +16,7 @@ import {
     fromEsunTradeStatusToLimits,
     fromEsunTransactionsToProfitLoss,
     fromEsunTransactionsToProfitLossSummary,
+    esunMktSeqNum,
     isEsunAccount,
     isEsunBroker,
     isReservationOrder,
@@ -104,9 +105,12 @@ describe('Dual-Broker Account Identification (isEsunBroker and isEsunAccount)', 
         expect(isEsunBroker('8840')).toBe(true);
         expect(isEsunBroker('884M')).toBe(true);
         expect(isEsunBroker('8849')).toBe(true);
-        expect(isEsunBroker('9600')).toBe(true);
-        expect(isEsunBroker('9601')).toBe(true);
-        expect(isEsunBroker('96AB')).toBe(true);
+        expect(isEsunBroker('8840-SIM')).toBe(true);
+        // 96xx 是其他券商（例如富邦）的代號，不是玉山 (B-14)
+        expect(isEsunBroker('9600')).toBe(false);
+        expect(isEsunBroker('9601')).toBe(false);
+        expect(isEsunBroker('96AB')).toBe(false);
+        expect(isEsunBroker('88401')).toBe(false);
         expect(isEsunBroker('esun')).toBe(true);
         expect(isEsunBroker('ESUN')).toBe(true);
         expect(isEsunBroker('E.SUN')).toBe(true);
@@ -124,7 +128,8 @@ describe('Dual-Broker Account Identification (isEsunBroker and isEsunAccount)', 
     it('identifies E.SUN accounts', () => {
         expect(isEsunAccount(esunAccount)).toBe(true);
         expect(isEsunAccount({ broker_id: '8840' })).toBe(true);
-        expect(isEsunAccount({ broker_id: '9600' })).toBe(true);
+        expect(isEsunAccount({ broker_id: '8840-SIM' })).toBe(true);
+        expect(isEsunAccount({ broker_id: '9600' })).toBe(false);
         expect(isEsunAccount(sinopacAccount)).toBe(false);
         expect(isEsunAccount(null)).toBe(false);
     });
@@ -271,46 +276,18 @@ describe('validateEsunStockOrder', () => {
         ).toContain('不支援現股當沖');
     });
 
-    it('enforces emerging stock rules (OES: APCode 4, 1 <= qty <= 499,000, multiples of 1,000)', () => {
-        expect(
-            validateEsunStockOrder(oesContract, {
-                action: 'Buy',
-                price: 50,
-                quantity: 500,
-                price_type: 'LMT',
-                order_type: 'ROD',
-            }),
-        ).toBeNull();
-
-        expect(
-            validateEsunStockOrder(oesContract, {
-                action: 'Buy',
-                price: 50,
-                quantity: 2000,
-                price_type: 'LMT',
-                order_type: 'ROD',
-            }),
-        ).toBeNull();
-
-        expect(
-            validateEsunStockOrder(oesContract, {
-                action: 'Buy',
-                price: 50,
-                quantity: 1500,
-                price_type: 'LMT',
-                order_type: 'ROD',
-            }),
-        ).toContain('1,000 股的整數倍');
-
-        expect(
-            validateEsunStockOrder(oesContract, {
-                action: 'Buy',
-                price: 50,
-                quantity: 500000,
-                price_type: 'LMT',
-                order_type: 'ROD',
-            }),
-        ).toContain('1 至 499,000 股');
+    it('blocks emerging stocks (ap_code 4 is in shares; the App order quantity is in sheets) (B-07)', () => {
+        for (const quantity of [2, 500, 2000]) {
+            expect(
+                validateEsunStockOrder(oesContract, {
+                    action: 'Buy',
+                    price: 50,
+                    quantity,
+                    price_type: 'LMT',
+                    order_type: 'ROD',
+                }),
+            ).toContain('興櫃');
+        }
     });
 
     it('enforces daytrade_short constraints', () => {
@@ -415,11 +392,15 @@ describe('Mutation validations (validateEsunOrderPriceMutation and validateEsunO
         expect(err).toContain('預約單不可改單');
     });
 
-    it('validates quantity value on quantity modification', () => {
+    it('validates the reduction (reduce-by) against the remaining quantity (B-02)', () => {
         expect(validateEsunOrderQtyMutation(sampleTrade, 0)).toContain('正整數');
+        expect(validateEsunOrderQtyMutation(sampleTrade, 1.5)).toContain('正整數');
         expect(validateEsunOrderQtyMutation(sampleTrade, 3)).toBeNull();
-        expect(validateEsunOrderQtyMutation(sampleTrade, 5)).toContain('減量');
+        expect(validateEsunOrderQtyMutation(sampleTrade, 5)).toBeNull();
         expect(validateEsunOrderQtyMutation(sampleTrade, 6)).toContain('減量');
+        const partly = { ...sampleTrade, status: { ...sampleTrade.status, status: 'PartFilled' as const, deal_quantity: 2, cancel_quantity: 1 } };
+        expect(validateEsunOrderQtyMutation(partly, 2)).toBeNull();
+        expect(validateEsunOrderQtyMutation(partly, 3)).toContain('剩餘 2');
     });
 
     it('identifies reservation orders correctly', () => {
@@ -495,15 +476,13 @@ describe('clampEsunDateRange180Days', () => {
 });
 
 describe('toEsunOrderPayload', () => {
-    it('maps emerging stocks to APCode 4', () => {
-        const payload = toEsunOrderPayload(oesContract, {
-            action: 'Buy',
-            price: 50,
-            quantity: 1000,
-            price_type: 'LMT',
-            order_type: 'ROD',
-        });
-        expect(payload.apCode).toBe(EsunApCode.Emg);
+    it('maps lots to the matching ap_code', () => {
+        const base: StockOrderReq = { action: 'Buy', price: 50, quantity: 1, price_type: 'LMT', order_type: 'ROD' };
+        expect(toEsunOrderPayload(oesContract, base).apCode).toBe(EsunApCode.Emg);
+        expect(toEsunOrderPayload(stockContract, base).apCode).toBe(EsunApCode.Common);
+        expect(toEsunOrderPayload(stockContract, { ...base, order_lot: 'IntradayOdd' }).apCode).toBe(EsunApCode.IntradayOdd);
+        expect(toEsunOrderPayload(stockContract, { ...base, order_lot: 'Odd' }).apCode).toBe(EsunApCode.Odd);
+        expect(toEsunOrderPayload(stockContract, { ...base, order_lot: 'Fixing' }).apCode).toBe(EsunApCode.AfterMarket);
     });
 
     it('truncates custom_field / userDef to 50 characters', () => {
@@ -569,8 +548,9 @@ describe('fromEsunOrderResponse and fromEsunOrderResult', () => {
             bsFlag: 'R',
             memo: '',
         };
-        const mappedResult = fromEsunOrderResult(item, esunAccount);
+        const mappedResult = fromEsunOrderResult(item, esunAccount)!;
         expect(mappedResult.status.status).toBe('PreSubmitted');
+        expect(mappedResult.order.id).toBe('P0001');
         expect(mappedResult.order.order_type).toBe('ROD');
         expect(mappedResult.order.price_type).toBe('LMT');
     });
@@ -625,7 +605,7 @@ describe('fromEsunOrderResponse and fromEsunOrderResult', () => {
             ret_msg: '',
         };
 
-        const trade = fromEsunOrderResult(pythonItem as any, esunAccount);
+        const trade = fromEsunOrderResult(pythonItem as any, esunAccount)!;
         expect(trade.order.ordno).toBe('O9988');
         expect(trade.contract.code).toBe('2330');
         expect(trade.order.action).toBe('Sell');
@@ -635,7 +615,9 @@ describe('fromEsunOrderResponse and fromEsunOrderResult', () => {
         expect(trade.order.custom_field).toBe('my-custom-order');
         expect(trade.status.status).toBe('PartFilled');
         expect(trade.status.deal_quantity).toBe(2);
-        expect(trade.status.modified_price).toBe(950.0);
+        // 均價不是委託價：不寫入 modified_price，改以一筆彙總成交呈現 (B-10)
+        expect(trade.status.modified_price).toBe(0);
+        expect(trade.status.deals).toEqual([{ seq: 'O9988:agg', price: 950, quantity: 2, ts: expect.any(Number) }]);
     });
 
     it('maps raw Python snake_case FOK and Limit order result with ap_code and numeric quantities', () => {
@@ -653,13 +635,64 @@ describe('fromEsunOrderResponse and fromEsunOrderResult', () => {
             ord_status: 'Filled',
         };
 
-        const trade = fromEsunOrderResult(pythonItem as any, esunAccount);
+        const trade = fromEsunOrderResult(pythonItem as any, esunAccount)!;
         expect(trade.order.order_type).toBe('FOK');
         expect(trade.order.price_type).toBe('LMT');
         expect(trade.order.order_lot).toBe('IntradayOdd');
         expect(trade.status.status).toBe('Filled');
         expect(trade.order.quantity).toBe(100);
         expect(trade.status.deal_quantity).toBe(100);
+    });
+});
+
+describe('fromEsunOrderResult per-fill deals (esun_fills)', () => {
+    const row = (over: Record<string, unknown> = {}) => ({
+        ord_no: 'C0001', pre_ord_no: '', stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R',
+        trade: '0', od_price: 25.5, org_qty: 5, org_qty_share: 5000, mat_qty: 2, mat_qty_share: 2000, cel_qty: 0, cel_qty_share: 0,
+        avg_price: 25.4, ord_date: '20261023', ord_time: '090512345', ...over,
+    });
+    const deals = (over: Record<string, unknown>) => fromEsunOrderResult(row(over) as EsunOrderResult, esunAccount)!.status.deals
+        .map(d => ({ seq: d.seq, price: d.price, quantity: d.quantity }));
+
+    it('uses mkt_seq_num and mat_price per fill, in lots for common shares', () => {
+        expect(deals({ esun_fills: [
+            { mkt_seq_num: '000417', mat_qty_share: 1000, mat_price: 25.5 },
+            { mkt_seq_num: '000418', mat_qty_share: 1000, mat_price: 25.3 },
+        ] })).toEqual([
+            { seq: '000417', price: 25.5, quantity: 1 },
+            { seq: '000418', price: 25.3, quantity: 1 },
+        ]);
+    });
+
+    it('adds only the part of the fill quantity the fills do not cover as `${id}:agg`', () => {
+        expect(deals({ mat_qty: 3, mat_qty_share: 3000, esun_fills: [{ mkt_seq_num: '000417', mat_qty_share: 1000, mat_price: null }] })).toEqual([
+            { seq: '000417', price: 25.4, quantity: 1 }, // 沒有成交價：用均價
+            { seq: 'C0001:agg', price: 25.4, quantity: 2 },
+        ]);
+    });
+
+    it('folds a fill that is not a whole lot, or has no sequence number, into the aggregate', () => {
+        expect(deals({ esun_fills: [
+            { mkt_seq_num: '000417', mat_qty_share: 1500, mat_price: 25.5 },
+            { mkt_seq_num: 0, mat_qty_share: 500, mat_price: 25.5 },
+        ] })).toEqual([{ seq: 'C0001:agg', price: 25.4, quantity: 2 }]);
+    });
+
+    it('keeps odd-lot fills in shares', () => {
+        expect(deals({ ap_code: '5', org_qty: 0.1, org_qty_share: 100, mat_qty: 0.03, mat_qty_share: 30,
+            esun_fills: [{ mkt_seq_num: '9', mat_qty_share: 30, mat_price: 25.5 }] })).toEqual([{ seq: '9', price: 25.5, quantity: 30 }]);
+    });
+
+    it('keeps the legacy aggregate when the row has no fills, or fills exceed the fill quantity', () => {
+        expect(deals({})).toEqual([{ seq: 'C0001:agg', price: 25.4, quantity: 2 }]);
+        expect(deals({ esun_fills: [{ mkt_seq_num: '1', mat_qty_share: 3000, mat_price: 25.5 }] })).toEqual([{ seq: 'C0001:agg', price: 25.4, quantity: 2 }]);
+    });
+
+    it('reads mkt_seq_num like the bridge (0 and empty string mean none)', () => {
+        expect(esunMktSeqNum({ mkt_seq_num: 0, mktSeqNum: ' 12 ' })).toBe('12');
+        expect(esunMktSeqNum({ mkt_seq_num: '' })).toBe('');
+        expect(esunMktSeqNum({ mkt_seq_num: 0 })).toBe('');
+        expect(esunMktSeqNum({ mkt_seq_num: 7 })).toBe('7');
     });
 });
 
@@ -699,10 +732,15 @@ describe('Portfolio & SSE Mapping', () => {
         expect(balance.acc_balance).toBe(650000);
         expect(balance.date).toBe('2026-10-23T08:30:00.000Z');
 
+        // 圈存金額不是股數：不放進 reserved_share (B-13)
         const reserve = fromEsunBalanceToReserveSummary(rawBalance, esunAccount);
-        expect(reserve.stocks).toHaveLength(1);
-        expect(reserve.stocks[0]?.reserved_share).toBe(50000);
+        expect(reserve.stocks).toEqual([]);
         expect(reserve.account.broker_id).toBe(ESUN_BROKER_CODE);
+
+        // 快取的餘額以實際取得時間為資料時間，不假裝剛更新
+        const cached = fromEsunBalance({ available_balance: 1, cache_age_sec: 120 });
+        expect(Date.now() - Date.parse(cached.date)).toBeGreaterThanOrEqual(119_000);
+        expect(fromEsunBalance({ available_balance: 1 }).date).toBe('');
     });
 
     it('maps settlements correctly', () => {
@@ -770,6 +808,7 @@ describe('Portfolio & SSE Mapping', () => {
 
         const limits = fromEsunTradeStatusToLimits(rawStatus);
         expect(limits.trading_limit).toBe(2000000);
+        expect(limits.trading_used).toBe(500000);
         expect(limits.trading_available).toBe(1500000);
         expect(limits.trading_used).toBe(500000);
         expect(limits.margin_limit).toBe(1000000);

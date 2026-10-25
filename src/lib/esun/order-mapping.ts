@@ -1,6 +1,6 @@
 // src/lib/esun/order-mapping.ts — Order translation and validation for E.SUN Securities
 
-import type { ContractBase } from '../types/contract';
+import type { ContractBase, Exchange } from '../types/contract';
 import type { Action, OrderResult, OrderStatusInfo, OrderStatusName, OrderType, StockOrderReq, StockPriceType, Trade } from '../types/order';
 import type { Account, AccountBalance, StockPosition } from '../types/portfolio';
 import type {
@@ -12,13 +12,16 @@ import type {
     TradingLimits,
     ReserveStocksSummary,
 } from '../shioaji';
+import { remainingWorkingOrderQuantity } from '../working-order-quantity';
 import {
     ESUN_BROKER_CODE,
     ESUN_BROKER_NAME,
+    ESUN_SIMULATION_BROKER_SUFFIX,
     EsunApCode,
     EsunBsFlag,
     EsunErrorCode,
     EsunInventoryItem,
+    EsunOrderMutationPayload,
     EsunOrderPayload,
     EsunOrderResult,
     EsunPlaceOrderResponse,
@@ -29,6 +32,8 @@ import {
     EsunSettlementItem,
     EsunTransactionItem,
     EsunTradeStatusRaw,
+    type EsunEnvironment,
+    type EsunQuantityUnit,
 } from './types';
 
 /** 官方玉山錯誤代碼中文診斷映射表 */
@@ -52,26 +57,77 @@ const ESUN_ERROR_MESSAGES: Record<string, string> = {
     [EsunErrorCode.WS1001]: 'WebSocket 連線數已達上限 (最多 1~2 條)，請關閉多餘連線',
 };
 
+const ESUN_BROKER_NAMES = new Set(['ESUN', 'E.SUN', 'ESUNSEC', '玉山', ESUN_BROKER_NAME]);
+// 玉山證券券商代號為 884x（總公司 8840 與分公司）；模擬環境帳戶另帶 -SIM 後綴。
+// 96xx 不是玉山（例如富邦證券），不可認定。
+const ESUN_BROKER_PATTERN = /^884[0-9A-Z](-SIM)?$/;
+
 /** 判斷 broker_id 是否為玉山證券代號或名稱 */
 export function isEsunBroker(brokerId?: string | null): boolean {
     if (!brokerId || typeof brokerId !== 'string') return false;
     const b = brokerId.trim().toUpperCase();
-    return (
-        b === '8840' ||
-        b === '9600' ||
-        b.startsWith('884') ||
-        b.startsWith('96') ||
-        b === 'ESUN' ||
-        b === 'E.SUN' ||
-        b === 'ESUNSEC' ||
-        b === '玉山' ||
-        b === ESUN_BROKER_NAME
-    );
+    return ESUN_BROKER_PATTERN.test(b) || ESUN_BROKER_NAMES.has(b) || ESUN_BROKER_NAMES.has(brokerId.trim());
 }
 
 /** 判斷帳戶是否為玉山證券帳戶 */
 export function isEsunAccount(account?: Pick<Account, 'broker_id'> | null): boolean {
     return !!account && isEsunBroker(account.broker_id);
+}
+
+/** 玉山帳戶所屬的交易環境（由帳戶鍵決定）；非玉山帳戶回 null */
+export function esunEnvironmentOfAccount(account?: Pick<Account, 'broker_id'> | null): EsunEnvironment | null {
+    if (!isEsunAccount(account)) return null;
+    return account!.broker_id.trim().toUpperCase().endsWith(ESUN_SIMULATION_BROKER_SUFFIX) ? 'SIMULATION' : 'PRODUCTION';
+}
+
+/** 去掉環境後綴的實際分公司代號（送 bridge、與回報比對用） */
+export function esunWireBrokerId(brokerId: string): string {
+    const b = brokerId.trim();
+    return b.toUpperCase().endsWith(ESUN_SIMULATION_BROKER_SUFFIX) ? b.slice(0, -ESUN_SIMULATION_BROKER_SUFFIX.length) : b;
+}
+
+/**
+ * 由 bridge 回報的帳號組出 App 內的玉山帳戶（帳戶鍵含環境：模擬帳戶 broker_id 加 -SIM）。
+ * 同一個帳號換環境就是不同的帳戶鍵，舊環境綁定的委託入口一律失效。
+ */
+export function esunAccountForEnvironment(
+    raw: { broker_id?: string | null; account_id: string; person_id?: string | null; username?: string | null; signed?: boolean },
+    environment: EsunEnvironment,
+): Account {
+    const wireBroker = esunWireBrokerId(String(raw.broker_id || ESUN_BROKER_CODE));
+    return {
+        account_type: 'S',
+        broker_id: environment === 'SIMULATION' ? `${wireBroker}${ESUN_SIMULATION_BROKER_SUFFIX}` : wireBroker,
+        account_id: String(raw.account_id).trim(),
+        signed: raw.signed !== false,
+        username: String(raw.username || ESUN_BROKER_NAME),
+        person_id: String(raw.person_id ?? ''),
+    };
+}
+
+// ---- 成功碼 ----
+
+/** mutation 回應的 ret_code（snake_case 為 SDK 實際欄位；camelCase 為舊 mock 相容） */
+export function esunRetCode(res: Record<string, unknown> | null | undefined): string | undefined {
+    const raw = res?.ret_code ?? res?.retCode;
+    if (raw === undefined || raw === null) return undefined;
+    const code = String(raw).trim();
+    return code ? code : undefined;
+}
+
+export function esunRetMessage(res: Record<string, unknown> | null | undefined): string {
+    const raw = res?.ret_msg ?? res?.retMsg ?? res?.err_msg ?? res?.errMsg ?? '';
+    return String(raw ?? '').trim();
+}
+
+/** 成功碼：全為 0（'0'、'000000'、'00000000'）；空值不算「明確成功」 */
+export function isEsunSuccessCode(code?: string | null): boolean {
+    return typeof code === 'string' && /^0+$/.test(code.trim());
+}
+
+/** 明確的失敗碼：有值且不是全 0 */
+export function isEsunFailureCode(code?: string | null): boolean {
+    return typeof code === 'string' && code.trim() !== '' && !/^0+$/.test(code.trim());
 }
 
 /** 判斷是否為預約單 (Pre-submitted / reservation order) */
@@ -126,24 +182,18 @@ export function validateEsunStockOrder(
         return '玉山證券 API 不支援借券賣出委託';
     }
 
-    // 興櫃股票規則：1 <= quantity <= 499,000 股，超過 1,000 股需為 1,000 股整數倍
+    // 興櫃（玉山 ap_code 4）以「股」為委託單位，App 的整股數量是「張」；在 App 支援
+    // 以股為單位的興櫃委託之前一律擋下，避免把 2 張當成 2 股送出。
     if (contract.exchange === 'OES') {
-        if (order.quantity < 1 || order.quantity > 499000) {
-            return '興櫃股票委託數量必須在 1 至 499,000 股之間';
-        }
-        if (order.quantity > 1000 && order.quantity % 1000 !== 0) {
-            return '興櫃股票委託數量超過 1,000 股時，必須為 1,000 股的整數倍';
-        }
+        return '玉山證券興櫃股票委託以「股」為單位，本 App 尚未支援；請改用玉山官方 App 下單';
     }
 
     // 整股 / 盤後定價規則：1 <= quantity <= 499 張
-    if (contract.exchange !== 'OES') {
-        if (order.order_lot === 'Common' || order.order_lot === 'Fixing' || !order.order_lot) {
-            if (order.quantity < 1 || order.quantity > 499) {
-                return order.order_lot === 'Fixing'
-                    ? '盤後定價委託數量必須在 1 至 499 張之間'
-                    : '整股委託數量必須在 1 至 499 張之間';
-            }
+    if (order.order_lot === 'Common' || order.order_lot === 'Fixing' || !order.order_lot) {
+        if (order.quantity < 1 || order.quantity > 499) {
+            return order.order_lot === 'Fixing'
+                ? '盤後定價委託數量必須在 1 至 499 張之間'
+                : '整股委託數量必須在 1 至 499 張之間';
         }
     }
 
@@ -206,19 +256,25 @@ export function validateEsunOrderPriceMutation(trade: Trade, newPrice: number): 
     return null;
 }
 
-/** 驗證玉山證券改量條件 */
-export function validateEsunOrderQtyMutation(trade: Trade, quantity: number): string | null {
+/**
+ * 驗證玉山證券減量條件。`reduction` 是「減少量」（與上游 updateOrderQty、
+ * SDK cancel_order(cel_qty=…) 相同語意），必須 0 < reduction ≤ 目前剩餘量。
+ */
+export function validateEsunOrderQtyMutation(trade: Trade, reduction: number): string | null {
     if (isReservationOrder(trade)) {
         return '玉山證券預約單不可改單 (AG0006)，請先刪單後重新下單';
     }
 
-    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
-        return '改量必須為正整數';
+    if (!Number.isSafeInteger(reduction) || reduction <= 0) {
+        return '減量數量必須為正整數';
     }
 
-    const origQty = trade.order?.quantity ?? trade.status?.order_quantity;
-    if (typeof origQty === 'number' && origQty > 0 && quantity >= origQty) {
-        return '玉山證券僅支援減量，新數量必須小於原委託數量';
+    const remaining = remainingWorkingOrderQuantity(trade);
+    if (remaining <= 0) {
+        return '委託已無剩餘量可減量';
+    }
+    if (reduction > remaining) {
+        return `玉山證券僅支援減量，減少數量 ${reduction} 不可超過目前剩餘 ${remaining}`;
     }
 
     return null;
@@ -249,16 +305,24 @@ export function formatEsunErrorMessage(errCode?: string | null, errMsg?: string 
     return '未知錯誤';
 }
 
-/** 日期字串解析為 Date */
-function parseDate(dStr: string): Date {
-    const clean = dStr.replace(/-/g, '');
-    if (clean.length === 8) {
+/** 日期字串解析為 Date；無法解析時回 null */
+function parseDate(dStr: string): Date | null {
+    const clean = String(dStr ?? '').replace(/-/g, '').trim();
+    if (/^\d{8}$/.test(clean)) {
         const y = parseInt(clean.slice(0, 4), 10);
         const m = parseInt(clean.slice(4, 6), 10) - 1;
         const d = parseInt(clean.slice(6, 8), 10);
         return new Date(Date.UTC(y, m, d));
     }
-    return new Date(dStr);
+    if (!clean) return null;
+    const parsed = new Date(dStr);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/** 台北的今天（UTC 欄位即台北日期） */
+function taipeiToday(): Date {
+    const now = new Date(Date.now() + 8 * 3600_000);
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }
 
 /** 日期格式化為與輸入同風格字串 */
@@ -274,11 +338,13 @@ export function clampEsunDateRange180Days(
     beginDate: string,
     endDate: string,
 ): { beginDate: string; endDate: string; clamped: boolean } {
-    const hasHyphens = beginDate.includes('-') || endDate.includes('-');
-    let start = parseDate(beginDate);
-    const end = parseDate(endDate);
-
+    const hasHyphens = String(beginDate ?? '').includes('-') || String(endDate ?? '').includes('-');
     let clamped = false;
+    // 空白或無法解析的日期：結束日退回台北今天、起始日退回結束日（不產生 NaN 日期）
+    let end = parseDate(endDate);
+    if (!end) { end = taipeiToday(); clamped = true; }
+    let start = parseDate(beginDate);
+    if (!start) { start = new Date(end.getTime()); clamped = true; }
 
     // 起始大於結束：修正為同一天
     if (start.getTime() > end.getTime()) {
@@ -299,23 +365,29 @@ export function clampEsunDateRange180Days(
     };
 }
 
+// ---- 委託類別與數量單位 ----
+
+/** App 委託對應的玉山 ap_code */
+export function esunApCodeFor(order: { order_lot?: string | null }, contract?: { exchange?: Exchange | string | null }): EsunApCode {
+    if (contract?.exchange === 'OES') return EsunApCode.Emg;
+    if (order.order_lot === 'IntradayOdd') return EsunApCode.IntradayOdd;
+    if (order.order_lot === 'Odd') return EsunApCode.Odd;
+    if (order.order_lot === 'Fixing') return EsunApCode.AfterMarket;
+    return EsunApCode.Common;
+}
+
+/** 整股／盤後（1、2）以張計，零股／興櫃（3、4、5）以股計 */
+export function esunQuantityUnitFor(apCode: string): EsunQuantityUnit {
+    return apCode === EsunApCode.Odd || apCode === EsunApCode.Emg || apCode === EsunApCode.IntradayOdd ? 'share' : 'lot';
+}
+
 /** 將 Shioaji-Pro 的委託規格轉換為玉山證券 SDK 的 OrderPayload */
 export function toEsunOrderPayload(
     contract: ContractBase,
     order: StockOrderReq,
 ): EsunOrderPayload {
     const buySell = order.action === 'Buy' ? EsunSide.Buy : EsunSide.Sell;
-
-    let apCode = EsunApCode.Common;
-    if (contract.exchange === 'OES') {
-        apCode = EsunApCode.Emg;
-    } else if (order.order_lot === 'IntradayOdd') {
-        apCode = EsunApCode.IntradayOdd;
-    } else if (order.order_lot === 'Odd') {
-        apCode = EsunApCode.Odd;
-    } else if (order.order_lot === 'Fixing') {
-        apCode = EsunApCode.AfterMarket;
-    }
+    const apCode = esunApCodeFor(order, contract);
 
     const priceFlag =
         order.price_type === 'MKT'
@@ -353,26 +425,55 @@ export function toEsunOrderPayload(
     };
 }
 
-function isSuccessRetCode(retCode: string): boolean {
-    return retCode === '000000' || retCode === '0' || retCode === '';
+/**
+ * 改單／刪單隨請求附上的原委託內容（bridge 快取沒命中時用，不再以預設值合成）。
+ * quantity 為 App 單位：ap_code 1、2 為張，3、4、5 為股。
+ */
+export function toEsunMutationPayload(trade: Trade): EsunOrderMutationPayload {
+    const order = trade.order;
+    const apCode = esunApCodeFor(order, trade.contract);
+    let tradeType = EsunTradeType.Cash;
+    if (order.daytrade_short && order.action === 'Sell') tradeType = EsunTradeType.DayTradingSell;
+    else if (order.order_cond === 'MarginTrading') tradeType = EsunTradeType.Margin;
+    else if (order.order_cond === 'ShortSelling') tradeType = EsunTradeType.Short;
+    const preOrdNo = order.seqno && order.seqno !== order.ordno ? order.seqno : undefined;
+    return {
+        ...(order.ordno ? { ordNo: order.ordno } : {}),
+        ...(preOrdNo ? { preOrdNo } : {}),
+        stockNo: (trade.contract.target_code || trade.contract.code || '').trim(),
+        buySell: order.action === 'Buy' ? EsunSide.Buy : EsunSide.Sell,
+        apCode,
+        priceFlag: order.price_type === 'MKT' ? EsunPriceFlag.Market : EsunPriceFlag.Limit,
+        bsFlag: order.order_type === 'IOC' ? EsunBsFlag.IOC : order.order_type === 'FOK' ? EsunBsFlag.FOK : EsunBsFlag.ROD,
+        trade: tradeType,
+        price: order.price,
+        quantity: order.quantity,
+    };
 }
 
-/** 將玉山證券 placeOrder 回應轉換為 Shioaji-Pro 標準 Trade 物件 */
+/** 玉山委託的穩定識別：預約單開盤後才有 ord_no，pre_ord_no 優先才不會換 id */
+export function esunOrderId(raw: Record<string, unknown> | null | undefined): string {
+    const pre = String(raw?.pre_ord_no ?? raw?.preOrdNo ?? '').trim();
+    const ord = String(raw?.ord_no ?? raw?.ordNo ?? '').trim();
+    return pre || ord;
+}
+
+/** 將玉山證券 placeOrder 回應轉換為 Shioaji-Pro 標準 Trade 物件（呼叫端先確認有委託編號） */
 export function fromEsunOrderResponse(
     res: EsunPlaceOrderResponse,
     contract: ContractBase,
     order: StockOrderReq,
     account: Account,
 ): Trade {
-    const retCode = String(res.retCode ?? res.ret_code ?? '');
-    const retMsg = String(res.retMsg ?? res.ret_msg ?? '');
-    const ordNo = String(res.ordNo ?? res.ord_no ?? '');
-    const success = isSuccessRetCode(retCode);
-    const orderId = ordNo || `ESUN-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const retCode = esunRetCode(res) ?? '';
+    const retMsg = esunRetMessage(res);
+    const ordNo = String(res.ord_no ?? res.ordNo ?? '').trim();
+    const orderId = esunOrderId(res);
+    const failed = isEsunFailureCode(retCode);
 
     const orderResult: OrderResult = {
         id: orderId,
-        seqno: ordNo,
+        seqno: orderId,
         ordno: ordNo,
         action: order.action,
         price: order.price,
@@ -392,9 +493,9 @@ export function fromEsunOrderResponse(
 
     const statusInfo: OrderStatusInfo = {
         id: orderId,
-        status: (success ? 'Submitted' : 'Failed') as OrderStatusName,
+        status: (failed ? 'Failed' : (ordNo ? 'Submitted' : 'PreSubmitted')) as OrderStatusName,
         status_code: retCode,
-        msg: retMsg ? formatEsunErrorMessage(retCode, retMsg) : (success ? '委託已送出' : '委託失敗'),
+        msg: (retMsg || failed) ? formatEsunErrorMessage(retCode, retMsg) : '委託已送出',
         order_quantity: order.quantity,
         deal_quantity: 0,
         cancel_quantity: 0,
@@ -413,63 +514,158 @@ export function fromEsunOrderResponse(
     };
 }
 
-/** 將玉山證券查詢回傳的委託紀錄轉換為 Trade 物件 */
+const finiteNumber = (v: unknown): number | null => {
+    if (v === undefined || v === null || v === '') return null;
+    const n = typeof v === 'number' ? v : Number(String(v).trim());
+    return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * 委託數量欄位（App 單位）：ap_code 1、2 讀 *_qty（張）；3、4、5 讀 *_qty_share（股），
+ * 沒有股數欄位時才由 *_qty 換算 — SDK recover_order_result 會把零股／興櫃的 *_qty
+ * 乘以每張股數再送 API，可知這些欄位是「張」的小數。
+ */
+export function esunQuantityFromFields(
+    raw: Record<string, unknown>,
+    base: 'org' | 'mat' | 'cel',
+    apCode: string,
+): number | null {
+    const camel = { org: 'orgQty', mat: 'matQty', cel: 'celQty' }[base];
+    const lots = finiteNumber(raw[`${base}_qty`] ?? raw[camel]);
+    if (esunQuantityUnitFor(apCode) === 'lot') return lots === null ? null : Math.round(lots);
+    const shares = finiteNumber(raw[`${base}_qty_share`] ?? raw[`${camel}Share`]);
+    if (shares !== null) return Math.round(shares);
+    if (lots === null) return null;
+    // 零股（3、5）一定少於 1 張：≥ 1 的值只可能已是股數
+    if (apCode !== EsunApCode.Emg && lots >= 1) return Math.round(lots);
+    return Math.round(lots * 1000);
+}
+
+/** Python 的真值判斷：bridge 以 `a or b` 取值，None、0、空字串、False 都視為沒有值 */
+const pyTruthy = (v: unknown): boolean => v !== undefined && v !== null && v !== 0 && v !== '' && v !== false;
+
+/**
+ * MAT 的成交序號，取值規則與 bridge 的去重鍵相同：
+ * `str(mkt_seq_num or mktSeqNum or "").strip()`。數值 0 與空字串視為沒有序號（回 ''）。
+ */
+export function esunMktSeqNum(raw: Record<string, unknown>): string {
+    const value = [raw.mkt_seq_num, raw.mktSeqNum].find(pyTruthy);
+    return value === undefined ? '' : String(value).trim();
+}
+
+type EsunDeal = Trade['status']['deals'][number];
+
+/**
+ * 列上的 esun_fills（bridge 本快取代次內經 MAT 套用的逐筆成交，依接收順序）→ App 單位的逐筆成交。
+ * seq 用 mkt_seq_num（與 SSE 成交的 exchange_seq 相同），所以權威讀取或快取重建時重播的 SSE 成交
+ * 會被 projectTradeDeal 當成重複。整股（ap_code 1、2）的股數必須是 1000 的倍數；缺序號、序號重複、
+ * 數量不是正整數的元素略過（由呼叫端併入彙總成交）。
+ */
+function esunFillDeals(raw: Record<string, unknown>, apCode: string, fallbackPrice: number, ts: number): EsunDeal[] {
+    const fills = Array.isArray(raw.esun_fills) ? raw.esun_fills : [];
+    const lot = esunQuantityUnitFor(apCode) === 'lot';
+    const seen = new Set<string>();
+    const deals: EsunDeal[] = [];
+    for (const fill of fills) {
+        if (!fill || typeof fill !== 'object' || Array.isArray(fill)) continue;
+        const f = fill as Record<string, unknown>;
+        const seq = esunMktSeqNum(f);
+        const shares = finiteNumber(f.mat_qty_share);
+        if (!seq || seen.has(seq) || shares === null || shares <= 0 || !Number.isInteger(shares)) continue;
+        const quantity = lot ? shares / 1000 : shares;
+        if (!Number.isInteger(quantity)) continue;
+        const matPrice = finiteNumber(f.mat_price);
+        seen.add(seq);
+        deals.push({ seq, price: matPrice !== null && matPrice > 0 ? matPrice : fallbackPrice, quantity, ts });
+    }
+    return deals;
+}
+
+/** 台北時間 YYYYMMDD + HHMMSS[mmm] → epoch 秒；缺資料回 undefined */
+export function esunTimestamp(date: unknown, time: unknown): number | undefined {
+    const d = String(date ?? '').replace(/-/g, '').trim();
+    const t = String(time ?? '').replace(/:/g, '').trim();
+    if (!/^\d{8}$/.test(d) || !/^\d{6}/.test(t)) return undefined;
+    const ms = Date.UTC(+d.slice(0, 4), +d.slice(4, 6) - 1, +d.slice(6, 8), +t.slice(0, 2), +t.slice(2, 4), +t.slice(4, 6)) - 8 * 3600_000;
+    return Number.isFinite(ms) ? ms / 1000 : undefined;
+}
+
+/** bridge 快取列的 esun_unresolved_failure（失敗 ACK 對到這筆委託，尚未由成功 ACK 或新快照判定） */
+export interface EsunRowUnresolvedFailure {
+    opCode: string;
+    opMsg: string;
+    /** 同一列也帶 esun_snapshot_missing: true（券商最近一次快照沒列出、bridge 因近期而保留） */
+    snapshotMissing: boolean;
+}
+
+// 以 Trade.status 物件為鍵：trading-state 合併前的淺複製（{ ...t, account }）沿用同一個 status，
+// 標記不會寫進 Trade 本身（不進本地狀態、不跨視窗廣播）
+const unresolvedFailures = new WeakMap<object, EsunRowUnresolvedFailure>();
+
+/** fromEsunOrderResult 轉出的列帶有 bridge 的 esun_unresolved_failure 時回傳它 */
+export function esunUnresolvedFailureOf(trade: Pick<Trade, 'status'>): EsunRowUnresolvedFailure | undefined {
+    return unresolvedFailures.get(trade.status);
+}
+
+function readUnresolvedFailure(raw: Record<string, unknown>): EsunRowUnresolvedFailure | undefined {
+    const v = raw.esun_unresolved_failure;
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+    const f = v as Record<string, unknown>;
+    return { opCode: String(f.op_code ?? '').trim(), opMsg: String(f.op_msg ?? '').trim(), snapshotMissing: raw.esun_snapshot_missing === true };
+}
+
+export interface EsunOrderResultOptions {
+    /** 由 App 的合約快取補交易所（委託查詢沒有交易所欄位） */
+    exchangeOf?: (code: string) => Exchange | undefined;
+}
+
+/**
+ * 將玉山證券查詢回傳的委託紀錄轉換為 Trade 物件。缺少識別所需欄位（委託編號、
+ * 股票代號、買賣別、委託數量）的列回 null，由呼叫端略過並標示待對帳，絕不以
+ * 預設值（賣出、數量 0）補上。
+ */
 export function fromEsunOrderResult(
     item: EsunOrderResult,
     account: Account,
-): Trade {
-    const buySell = String(item.buySell ?? item.buy_sell ?? '').toUpperCase();
-    const action: Action = (buySell === 'B' || buySell === 'BUY') ? 'Buy' : 'Sell';
-    const rawPrice = item.odPrice ?? item.od_price ?? 0;
-    const price = typeof rawPrice === 'number' ? rawPrice : (parseFloat(String(rawPrice)) || 0);
+    opts: EsunOrderResultOptions = {},
+): Trade | null {
+    const raw = item as Record<string, unknown>;
+    const orderId = esunOrderId(raw);
+    const ordNo = String(item.ord_no ?? item.ordNo ?? '').trim();
+    const stockNo = String(item.stock_no ?? item.stockNo ?? '').trim();
+    const buySell = String(item.buy_sell ?? item.buySell ?? '').trim().toUpperCase();
+    const action: Action | null = buySell === 'B' || buySell === 'BUY' ? 'Buy' : buySell === 'S' || buySell === 'SELL' ? 'Sell' : null;
+    const apCode = String(item.ap_code ?? item.apCode ?? EsunApCode.Common).trim() || EsunApCode.Common;
+    const orgQty = esunQuantityFromFields(raw, 'org', apCode);
+    if (!orderId || !stockNo || !action || orgQty === null || orgQty <= 0) return null;
+    const matQty = esunQuantityFromFields(raw, 'mat', apCode) ?? 0;
+    const celQty = esunQuantityFromFields(raw, 'cel', apCode) ?? 0;
 
-    const rawOrgQty = item.orgQty ?? item.org_qty ?? item.orgQtyShare ?? item.org_qty_share ?? 0;
-    const orgQty = typeof rawOrgQty === 'number' ? rawOrgQty : (parseInt(String(rawOrgQty), 10) || 0);
-
-    const rawMatQty = item.matQty ?? item.mat_qty ?? item.matQtyShare ?? item.mat_qty_share ?? 0;
-    const matQty = typeof rawMatQty === 'number' ? rawMatQty : (parseInt(String(rawMatQty), 10) || 0);
-
-    const rawCelQty = item.celQty ?? item.cel_qty ?? item.celQtyShare ?? item.cel_qty_share ?? 0;
-    const celQty = typeof rawCelQty === 'number' ? rawCelQty : (parseInt(String(rawCelQty), 10) || 0);
-
-    const ordStatus = String(item.ordStatus ?? item.ord_status ?? '');
-    const errCode = String(item.errCode ?? item.err_code ?? item.retCode ?? item.ret_code ?? '');
-    const errMsg = String(item.errMsg ?? item.err_msg ?? item.retMsg ?? item.ret_msg ?? '');
-    const ordNo = String(item.ordNo ?? item.ord_no ?? '');
-    const preOrdNo = String(item.preOrdNo ?? item.pre_ord_no ?? '');
-    const stockNo = String(item.stockNo ?? item.stock_no ?? '');
-    const apCode = String(item.apCode ?? item.ap_code ?? '');
-    const rawBsFlag = String(item.bsFlag ?? item.bs_flag ?? item.order_type ?? item.orderType ?? 'R').toUpperCase();
-    const rawPriceFlag = String(item.priceFlag ?? item.price_flag ?? item.price_type ?? item.priceType ?? '0').toUpperCase();
-    const memo = String(item.memo ?? item.user_def ?? '');
-    const rawAvgPrice = item.avgPrice ?? item.avg_price ?? 0;
-    const avgPrice = typeof rawAvgPrice === 'number' ? rawAvgPrice : (parseFloat(String(rawAvgPrice)) || 0);
+    const price = finiteNumber(item.od_price ?? item.odPrice) ?? 0;
+    const errCode = String(item.err_code ?? item.errCode ?? '').trim();
+    const errMsg = String(item.err_msg ?? item.errMsg ?? '').trim();
+    const ordStatus = String(item.ord_status ?? item.ordStatus ?? '').trim();
+    const preOrdNo = String(item.pre_ord_no ?? item.preOrdNo ?? '').trim();
+    const rawBsFlag = String(item.bs_flag ?? item.bsFlag ?? item.order_type ?? item.orderType ?? 'R').toUpperCase();
+    const rawPriceFlag = String(item.price_flag ?? item.priceFlag ?? item.price_type ?? item.priceType ?? '0').toUpperCase();
+    const memo = String(item.user_def ?? item.memo ?? '');
+    const avgPrice = finiteNumber(item.avg_price ?? item.avgPrice) ?? 0;
     const tradeType = String(item.trade ?? '');
 
-    let status: OrderStatusName = 'Submitted';
-    if (matQty >= orgQty && orgQty > 0) {
-        status = 'Filled';
-    } else if (celQty >= orgQty && orgQty > 0) {
-        status = 'Cancelled';
-    } else if (matQty > 0) {
-        status = 'PartFilled';
-    } else if (ordStatus === 'Fail' || ordStatus === 'Failed' || (errCode && errCode !== '000000' && errCode !== '0')) {
-        status = 'Failed';
-    } else if (ordStatus === '1' || ordStatus === 'PreSubmitted' || (preOrdNo && !ordNo)) {
-        status = 'PreSubmitted';
-    } else if (ordStatus === 'Filled') {
-        status = 'Filled';
-    } else if (ordStatus === 'PartFilled' || ordStatus === 'PartiallyFilled') {
-        status = 'PartFilled';
-    } else if (ordStatus === 'Cancelled') {
-        status = 'Cancelled';
-    }
+    // 狀態依數量判定：成交＋取消涵蓋委託量即為終態（有取消就是 Cancelled，並保留成交量）
+    let status: OrderStatusName;
+    if (matQty + celQty >= orgQty) status = celQty > 0 ? 'Cancelled' : 'Filled';
+    else if (isEsunFailureCode(errCode) || ordStatus === 'Fail' || ordStatus === 'Failed') status = 'Failed';
+    else if (matQty > 0) status = 'PartFilled';
+    else if ((preOrdNo && !ordNo) || ordStatus === 'PreSubmitted') status = 'PreSubmitted';
+    else status = 'Submitted';
 
     let orderLot = 'Common';
-    if (apCode === EsunApCode.IntradayOdd || apCode === '5') orderLot = 'IntradayOdd';
-    else if (apCode === EsunApCode.Odd || apCode === '3') orderLot = 'Odd';
-    else if (apCode === EsunApCode.AfterMarket || apCode === '2') orderLot = 'Fixing';
-    else if (apCode === EsunApCode.Emg || apCode === '4') orderLot = 'Common';
+    if (apCode === EsunApCode.IntradayOdd) orderLot = 'IntradayOdd';
+    else if (apCode === EsunApCode.Odd) orderLot = 'Odd';
+    else if (apCode === EsunApCode.AfterMarket) orderLot = 'Fixing';
+    // 興櫃以股為單位：以零股的單位顯示與計算（App 不送出興櫃委託，只顯示他處下的單）
+    else if (apCode === EsunApCode.Emg) orderLot = 'IntradayOdd';
 
     let orderType: OrderType = 'ROD';
     if (rawBsFlag === 'I' || rawBsFlag === 'IOC') {
@@ -485,25 +681,32 @@ export function fromEsunOrderResult(
 
     let orderCond = 'Cash';
     let daytradeShort = false;
-    if (tradeType === EsunTradeType.Margin || tradeType === '3') orderCond = 'MarginTrading';
-    else if (tradeType === EsunTradeType.Short || tradeType === '4') orderCond = 'ShortSelling';
-    else if (tradeType === EsunTradeType.DayTradingSell || tradeType === 'A') {
-        orderCond = 'Cash';
-        daytradeShort = true;
-    }
+    if (tradeType === EsunTradeType.Margin) orderCond = 'MarginTrading';
+    else if (tradeType === EsunTradeType.Short) orderCond = 'ShortSelling';
+    else if (tradeType === EsunTradeType.DayTradingSell) daytradeShort = true;
 
-    const orderId = ordNo || preOrdNo;
+    const exchange: Exchange = apCode === EsunApCode.Emg ? 'OES' : (opts.exchangeOf?.(stockNo) ?? 'TSE');
+    const orderTs = esunTimestamp(item.ord_date ?? item.ordDate ?? item.work_date ?? item.workDate, item.ord_time ?? item.ordTime);
+    // 逐筆成交來自 bridge 的 esun_fills；成交量超出逐筆總和的部分（快照已含、bridge 沒收到 MAT
+    // 的成交）以一筆彙總成交（均價）表示。逐筆總和超過成交量（不符 bridge 契約）時只用彙總。
+    const fallbackPrice = avgPrice > 0 ? avgPrice : price;
+    let fills = matQty > 0 ? esunFillDeals(raw, apCode, fallbackPrice, orderTs ?? 0) : [];
+    if (fills.reduce((sum, d) => sum + d.quantity, 0) > matQty) fills = [];
+    const rest = matQty - fills.reduce((sum, d) => sum + d.quantity, 0);
+    const deals: EsunDeal[] = rest > 0
+        ? [...fills, { seq: `${orderId}:agg`, price: fallbackPrice, quantity: rest, ts: orderTs ?? 0 }]
+        : fills;
 
-    return {
+    const trade: Trade = {
         contract: {
             code: stockNo,
             security_type: 'STK',
-            exchange: 'TSE',
+            exchange,
             target_code: null,
         },
         order: {
             id: orderId,
-            seqno: ordNo,
+            seqno: orderId,
             ordno: ordNo,
             action,
             price,
@@ -523,15 +726,20 @@ export function fromEsunOrderResult(
         status: {
             id: orderId,
             status,
-            status_code: errCode || '000000',
+            status_code: errCode,
+            ...(orderTs !== undefined ? { order_ts: orderTs } : {}),
             msg: errMsg ? formatEsunErrorMessage(errCode, errMsg) : '',
             order_quantity: orgQty,
             deal_quantity: matQty,
             cancel_quantity: celQty,
-            modified_price: avgPrice,
-            deals: [],
+            // 委託查詢只有目前委託價（od_price）；均價不是委託價，不寫入 modified_price
+            modified_price: 0,
+            deals,
         },
     };
+    const unresolved = readUnresolvedFailure(raw);
+    if (unresolved) unresolvedFailures.set(trade.status, unresolved);
+    return trade;
 }
 
 /** 將玉山庫存項目 (stk_sums) 轉換為 Shioaji-Pro 標準 StockPosition 物件 */
@@ -555,17 +763,15 @@ export function fromEsunInventoryToPosition(
         ? (ydQtyRaw >= 1000 ? Math.floor(ydQtyRaw / 1000) : ydQtyRaw / 1000)
         : ydQtyRaw;
 
-    const isSell = Number(item.qty_s ?? 0) > 0 || Number(item.qty_sm ?? 0) > 0;
-    const cond = Number(item.qty_bm ?? 0) > 0
-        ? 'MarginTrading'
-        : Number(item.qty_sm ?? 0) > 0
-            ? 'ShortSelling'
-            : 'Cash';
+    // 方向與信用別只看庫存列的交易類別 trade（'0' 現股、'3' 融資、'4' 融券）；
+    // qty_b／qty_s／qty_bm／qty_sm 是當日委買賣與成交量，不代表持倉方向
+    const trade = String(item.trade ?? '').trim();
+    const cond = trade === EsunTradeType.Margin ? 'MarginTrading' : trade === EsunTradeType.Short ? 'ShortSelling' : 'Cash';
 
     return {
         id,
         code: String(item.stk_no ?? ''),
-        direction: isSell ? 'Sell' : 'Buy',
+        direction: trade === EsunTradeType.Short ? 'Sell' : 'Buy',
         quantity,
         price,
         last_price: lastPrice,
@@ -588,7 +794,9 @@ export function fromEsunBalance(raw: EsunBalanceRaw): AccountBalance {
     } else if (raw.updatedAt && typeof raw.updatedAt === 'object' && 'seconds' in raw.updatedAt) {
         date = new Date((raw.updatedAt.seconds || 0) * 1000).toISOString();
     } else {
-        date = new Date().toISOString();
+        // bridge 回快取時附 cache_age_sec：以資料實際取得時間為準，不假裝剛更新
+        const age = finiteNumber(raw.cache_age_sec);
+        date = age !== null && age >= 0 ? new Date(Date.now() - age * 1000).toISOString() : '';
     }
 
     return {
@@ -598,14 +806,14 @@ export function fromEsunBalance(raw: EsunBalanceRaw): AccountBalance {
     };
 }
 
-/** 將玉山圈存 (stock_pre_save_amount) 轉換為 ReserveStocksSummary */
+/**
+ * 玉山 get_balance 只有圈存「金額」（stock_pre_save_amount），沒有逐檔圈存股數；
+ * ReserveStocksSummary 只表達股數，因此不放入任何股數列（不把金額當股數）。
+ */
 export function fromEsunBalanceToReserveSummary(
-    raw: EsunBalanceRaw,
+    _raw: EsunBalanceRaw,
     account?: Account,
 ): ReserveStocksSummary {
-    const reservedAmount = Number(
-        raw.stock_pre_save_amount ?? raw.stockPreSaveAmount ?? 0,
-    );
     const targetAccount: Account = account ?? {
         broker_id: ESUN_BROKER_CODE,
         account_id: '',
@@ -616,20 +824,7 @@ export function fromEsunBalanceToReserveSummary(
     };
 
     return {
-        stocks: reservedAmount > 0
-            ? [
-                {
-                    contract: {
-                        code: 'TOTAL',
-                        security_type: 'STK',
-                        exchange: 'TSE',
-                        target_code: null,
-                    },
-                    available_share: 0,
-                    reserved_share: reservedAmount,
-                },
-            ]
-            : [],
+        stocks: [],
         account: targetAccount,
     };
 }
@@ -638,8 +833,7 @@ export function fromEsunBalanceToReserveSummary(
 export function fromEsunSettlements(rawList: EsunSettlementItem[]): Settlement[] {
     if (!Array.isArray(rawList)) return [];
 
-    const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
+    const today = taipeiToday();
 
     return rawList.map((item, idx) => {
         const rawDate = String(item.c_date ?? item.cdate ?? item.date ?? '');
@@ -651,8 +845,7 @@ export function fromEsunSettlements(rawList: EsunSettlementItem[]): Settlement[]
         let tOffset = item.T;
         if (typeof tOffset !== 'number') {
             const itemDate = parseDate(dateStr);
-            itemDate.setUTCHours(0, 0, 0, 0);
-            const diffDays = Math.round((itemDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+            const diffDays = itemDate ? Math.round((itemDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)) : NaN;
             tOffset = Math.max(0, Math.min(2, diffDays));
         }
 
@@ -664,15 +857,29 @@ export function fromEsunSettlements(rawList: EsunSettlementItem[]): Settlement[]
     });
 }
 
-/** 將玉山成交紀錄 (mat_sums) 轉換為 StockProfitLoss[] */
+/**
+ * 成交明細中「已實現」的列：賣出（現股、融資、當沖）或融券回補（買進＋trade 4），
+ * 且 make（損益）有值。買進建倉與融券賣出建倉不是已實現損益。
+ */
+function isRealizedTransaction(item: EsunTransactionItem): boolean {
+    if (finiteNumber(item.make) === null) return false;
+    const side = String(item.buy_sell ?? '').trim().toUpperCase();
+    const short = String(item.trade ?? '') === EsunTradeType.Short;
+    if (side === 'B' || side === 'BUY') return short;
+    if (side === 'S' || side === 'SELL') return !short;
+    // 沒有買賣別的舊資料：沿用 make 判定
+    return true;
+}
+
+/** 將玉山成交紀錄 (mat_sums) 轉換為 StockProfitLoss[]（只含已實現損益的列，日期為成交日） */
 export function fromEsunTransactionsToProfitLoss(
     rawList: EsunTransactionItem[],
 ): StockProfitLoss[] {
     if (!Array.isArray(rawList)) return [];
 
-    return rawList.map((item, idx) => {
+    return rawList.filter(isRealizedTransaction).map((item, idx) => {
         const code = String(item.stk_no ?? item.code ?? '');
-        const rawDate = String(item.c_date ?? item.t_date ?? item.date ?? '');
+        const rawDate = String(item.t_date ?? item.date ?? item.c_date ?? '');
         const date = rawDate.replace(/-/g, '');
         const quantity = Number(item.qty ?? item.quantity ?? item.price_qty ?? 0);
         const pnl = Number(item.make ?? 0);
@@ -700,13 +907,14 @@ export function fromEsunTransactionsToProfitLoss(
     });
 }
 
-/** 將玉山成交紀錄 (mat_sums) 轉換為 ProfitLossSummaryTotal */
+/** 將玉山成交紀錄 (mat_sums) 轉換為 ProfitLossSummaryTotal（只彙總已實現損益的列） */
 export function fromEsunTransactionsToProfitLossSummary(
     rawList: EsunTransactionItem[],
     _beginDate?: string,
     _endDate?: string,
 ): ProfitLossSummaryTotal {
-    if (!Array.isArray(rawList) || rawList.length === 0) {
+    const realized = Array.isArray(rawList) ? rawList.filter(isRealizedTransaction) : [];
+    if (realized.length === 0) {
         return {
             profitloss_sum: [],
             total: {
@@ -730,7 +938,7 @@ export function fromEsunTransactionsToProfitLossSummary(
         cond: string;
     }>();
 
-    for (const item of rawList) {
+    for (const item of realized) {
         const code = String(item.stk_no ?? item.code ?? '');
         const quantity = Number(item.qty ?? item.quantity ?? item.price_qty ?? 0);
         const pnl = Number(item.make ?? 0);

@@ -26,6 +26,6 @@ Secret = YOUR_PRODUCTION_API_SECRET_HERE
 # 證券帳號 (支援 11 碼或 7 碼)
 Account = 88401234567
 
-[Server]
-Host = 127.0.0.1
-Port = 8090
+# 注意：橋接的監聽位址與埠號不從本設定檔讀取（舊版範本的 [Server] Host/Port 從未生效），
+# 請改用環境變數 ESUN_SERVER_HOST（預設 127.0.0.1；Docker 容器內為 0.0.0.0，且不發佈到主機）
+# 與 ESUN_SERVER_PORT（預設 8090）。

@@ -6,8 +6,14 @@ import type { Account, AccountBalance, StockPosition } from '../types/portfolio'
 import type { Settlement, StockProfitLoss, ProfitLossSummaryTotal, TradingLimits, ReserveStocksSummary } from '../shioaji';
 
 export const ESUN_BROKER_CODE = '8840';
-export const ESUN_BROKER_CODE_LEGACY = '9600';
 export const ESUN_BROKER_NAME = '玉山證券';
+/**
+ * 模擬環境帳戶的 broker_id 後綴（例：8840-SIM）。玉山 bridge 的環境是行程全域，
+ * 同一個帳號在模擬／正式兩邊的帳戶鍵必須不同：環境一換，以帳戶鍵綁定的觸價單、
+ * 括號單、確認視窗與閃電面板就會自動視為「帳戶已不可用」而不送單。
+ * 送往 bridge 的 expected_account 只帶 account_id，不含此後綴。
+ */
+export const ESUN_SIMULATION_BROKER_SUFFIX = '-SIM';
 
 export type EsunEnvironment = 'SIMULATION' | 'PRODUCTION';
 export const ESUN_SIMULATION_ENTRY = 'https://esuntradingapi-simulation.esunsec.com.tw/api/v1';
@@ -238,15 +244,36 @@ export enum EsunErrorCode {
     WS1001 = '1001',     // WebSocket 連線數達上限
 }
 
-/** Configuration required to connect to E.SUN Trading API */
-export interface EsunClientConfig {
-    apiUrl: string;
-    apiKey: string;
-    apiSecret: string;
-    certPath: string;
-    certPass: string;
-    aid: string;
-    password: string;
+/** Mutation 回應信封的結果（esun-bridge §4 契約） */
+export type EsunMutationOutcome = 'accepted' | 'not_sent' | 'rejected' | 'unknown';
+
+/** 所有 mutation 端點的回應信封 */
+export interface EsunMutationEnvelope<T = Record<string, unknown>> {
+    ok: boolean;
+    outcome: EsunMutationOutcome;
+    code?: string;
+    error?: string;
+    result?: T;
+    environment?: EsunEnvironment;
+    sessionGeneration?: number;
+}
+
+/** 改量的數量單位：整股／盤後（ap_code 1、2）用張，零股／興櫃（3、4、5）用股 */
+export type EsunQuantityUnit = 'lot' | 'share';
+
+/** 每筆 mutation 綁定的預期環境與帳號（bridge 不符時回 409，確定未送出） */
+export interface EsunMutationGuard {
+    expected_environment: EsunEnvironment;
+    expected_account: string;
+}
+
+/** bridge SSE `session` 事件與 health 的 session 欄位 */
+export interface EsunSessionInfo {
+    generation?: number | null;
+    environment?: EsunEnvironment | null;
+    account?: { broker_id: string; account_id: string } | null;
+    loggedIn?: boolean;
+    reason?: string | null;
 }
 
 /** Order payload matching @esun/trade OrderPayload */
@@ -260,6 +287,15 @@ export interface EsunOrderPayload {
     bsFlag: EsunBsFlag;
     trade: EsunTradeType;
     userDef?: string;
+}
+
+/**
+ * 改單／刪單時隨請求帶給 bridge 的原委託內容（bridge 委託快取沒命中時，
+ * 用來組出 SDK 需要的 order_result，而不是以「整股買進現股」的預設值合成）。
+ */
+export interface EsunOrderMutationPayload extends Partial<EsunOrderPayload> {
+    ordNo?: string;
+    preOrdNo?: string;
 }
 
 /** Response returned by E.SUN placeOrder */
@@ -368,6 +404,8 @@ export interface EsunInventoryItem {
     qty_sm?: number | string;
     qty_l?: number | string;
     s_type?: string;
+    /** 交易類別：'0' 現股、'3' 融資、'4' 融券（決定持倉方向與信用別） */
+    trade?: string;
     value_mkt?: number | string;
     [key: string]: unknown;
 }
