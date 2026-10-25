@@ -8,7 +8,9 @@
 // （才能做去重與跳號偵測）。這裡只做轉換，不讀網路、不改狀態。
 //
 // 數量一律換成 App 單位：整股／盤後為張，零股／興櫃為股（零股的 *_qty 是張的小數）。
-// 興櫃（ap_code 4）回報的 *_qty 單位沒有實測資料：沒有 *_qty_share 時不推測股數，整筆視為無法判定。
+// 興櫃（ap_code 4）回報的 *_qty 單位沒有實測資料：沒有 *_qty_share 時不推測股數，整筆不投影，
+// 回 skip unit-unknown（帶委託 id）。bridge 也不把這類數量寫進快取，所以呼叫端提出的待對帳
+// 只有權威讀取能解除（快取重建不能）。
 
 import type { Exchange } from '../types/contract';
 import type { Account } from '../types/portfolio';
@@ -60,7 +62,9 @@ export interface EsunUnresolvedFailure {
 
 export type EsunReportResult =
     | { kind: 'report'; wire: Rec; orderId: string; account: Account; unresolvedFailure?: EsunUnresolvedFailure }
-    | { kind: 'skip'; reason: 'environment' | 'malformed' };
+    | { kind: 'skip'; reason: 'environment' | 'malformed' }
+    /** 興櫃回報缺 *_qty_share：單位未知、不投影（bridge 快取也沒套用），只有權威讀取能對帳 */
+    | { kind: 'skip'; reason: 'unit-unknown'; orderId: string };
 
 const positiveInt = (v: unknown, min: number): number | null => {
     const n = num(v);
@@ -182,8 +186,12 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
             mat_qty: raw.mat_qty ?? raw.deal_qty ?? raw.qty,
             mat_qty_share: raw.mat_qty_share ?? raw.deal_qty_share,
         };
-        // 興櫃成交沒有股數欄位：不投影（呼叫端提出委託與持倉的待對帳）
-        if (emgSharesMissing(matFields, 'mat', apCode)) return { kind: 'skip', reason: 'malformed' };
+        // 預約單的本地 id 是 pre_ord_no；只帶 ord_no 的成交回報依 ord_no 找回本地同帳戶的委託
+        const ordNo = str(raw.ord_no ?? raw.ordNo);
+        const preOrdNo = str(raw.pre_ord_no ?? raw.preOrdNo);
+        const tradeId = (!preOrdNo && ordNo ? ctx.lookup?.(ordNo, account, 'ordno')?.id : undefined) || orderId;
+        // 興櫃成交沒有股數欄位：不投影（呼叫端提出委託與持倉只有權威讀取能解除的待對帳）
+        if (emgSharesMissing(matFields, 'mat', apCode)) return { kind: 'skip', reason: 'unit-unknown', orderId: tradeId };
         const quantity = esunQuantityFromFields(matFields, 'mat', apCode);
         const price = num(raw.mat_price ?? raw.deal_price ?? raw.price);
         // 成交識別與 bridge 的 MAT 去重鍵（mkt_seq_num，Python `or` 取值：0、空字串視為沒有）一致，
@@ -191,10 +199,6 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         const seq = esunMktSeqNum(raw) || str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no)
             || str(raw.event_id);
         if (quantity === null || quantity <= 0 || price === null || price <= 0) return { kind: 'skip', reason: 'malformed' };
-        // 預約單的本地 id 是 pre_ord_no；只帶 ord_no 的成交回報依 ord_no 找回本地同帳戶的委託
-        const ordNo = str(raw.ord_no ?? raw.ordNo);
-        const preOrdNo = str(raw.pre_ord_no ?? raw.preOrdNo);
-        const tradeId = (!preOrdNo && ordNo ? ctx.lookup?.(ordNo, account, 'ordno')?.id : undefined) || orderId;
         const body: Rec = {
             trade_id: tradeId,
             exchange_seq: seq,
@@ -214,8 +218,11 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         return { kind: 'report', orderId: tradeId, account, wire: { state: 'StockDeal', data: { StockDeal: body } } };
     }
 
-    // 興櫃委託回報沒有股數欄位：不投影（呼叫端提出委託的待對帳）
-    if ((['org', 'mat', 'cel'] as const).some(base => emgSharesMissing(raw, base, apCode))) return { kind: 'skip', reason: 'malformed' };
+    // 興櫃委託回報沒有股數欄位：不投影（呼叫端提出委託只有權威讀取能解除的待對帳）。失敗 ACK 同樣在此
+    // 略過，待對帳不比可投影的失敗回報（unresolvedFailure 的 snapshot-boundary）寬鬆
+    if ((['org', 'mat', 'cel'] as const).some(base => emgSharesMissing(raw, base, apCode))) {
+        return { kind: 'skip', reason: 'unit-unknown', orderId };
+    }
     const quantity = esunQuantityFromFields(raw, 'org', apCode);
     if (quantity === null || quantity <= 0) return { kind: 'skip', reason: 'malformed' };
     const dealt = esunQuantityFromFields(raw, 'mat', apCode) ?? 0;

@@ -22,8 +22,9 @@ export type EsunStreamSignal =
     /** bridge 的 resync：cacheRefreshed 表示 bridge 是否已重讀委託快取（ws_reconnected、failed_ack_refreshed、
      *  failed_ack_refresh_failed 會帶） */
     | { kind: 'resync'; reason?: string; cacheRefreshed?: boolean }
-    /** 收到但無法轉換的回報（欄位不足、環境未知）：不能投影，需要對帳 */
-    | { kind: 'untrackable'; deal: boolean }
+    /** 收到但無法轉換的回報（欄位不足、環境未知）：不能投影，需要對帳。authoritativeOnly（興櫃回報缺
+     *  股數欄位、單位未知；bridge 快取也沒套用）表示快取重建不能解除，只有權威讀取能對帳 */
+    | { kind: 'untrackable'; deal: boolean; authoritativeOnly?: { orderId: string } }
     /** 失敗回報推不出操作別（新單或刪改單被拒都有可能）：本地委託不變，需要權威讀取 */
     | { kind: 'unresolved-failure'; orderId: string; opCode: string };
 
@@ -104,10 +105,10 @@ function knownOrder(orderId: string, account: Account, by: 'id' | 'ordno' = 'id'
     } : undefined;
 }
 
-/** 無法轉換的回報不靜默丟棄：經 trading-state 提出 untrackable-event（所有視窗） */
-function untrackable(event: string, payload: unknown) {
+/** 無法轉換的回報不靜默丟棄：經 trading-state 提出待對帳（所有視窗）。authoritativeOrderId 為只有權威讀取能解除的委託 */
+function untrackable(event: string, payload: unknown, authoritativeOrderId?: string) {
     const deal = event === 'deal' || (payload as { state?: unknown } | null)?.state === 'StockDeal';
-    publishStreamEvent(UNTRACKABLE_EVENT, JSON.stringify({ deal }));
+    publishStreamEvent(UNTRACKABLE_EVENT, JSON.stringify({ deal, ...(authoritativeOrderId ? { authoritativeOrderId } : {}) }));
 }
 
 function onReport(event: string, raw: string) {
@@ -129,7 +130,7 @@ function onReport(event: string, raw: string) {
     if (result.kind === 'skip') {
         // 舊 session（切換前環境）的事件：丟棄並重新同步環境
         if (result.reason === 'environment') void esunTradeService.refreshHealth();
-        else untrackable(event, payload);
+        else untrackable(event, payload, result.reason === 'unit-unknown' ? result.orderId : undefined);
         return;
     }
     // 回報照常進管線（回報序號連續、通知照常）；操作別空白的失敗回報不會改本地委託
@@ -251,9 +252,14 @@ export function ensureEsunOrderStream(): void {
             });
         }),
         onStreamEvent(UNTRACKABLE_EVENT, raw => {
-            let deal = false;
-            try { deal = (JSON.parse(raw) as { deal?: unknown }).deal === true; } catch { /* malformed */ }
-            signal({ kind: 'untrackable', deal });
+            let payload: { deal?: unknown; authoritativeOrderId?: unknown } = {};
+            try { payload = (JSON.parse(raw) ?? {}) as typeof payload; } catch { /* malformed: still untrackable */ }
+            const orderId = payload.authoritativeOrderId;
+            signal({
+                kind: 'untrackable',
+                deal: payload.deal === true,
+                ...(typeof orderId === 'string' && orderId ? { authoritativeOnly: { orderId } } : {}),
+            });
         }),
         onStreamEvent(UNRESOLVED_FAILURE_EVENT, raw => {
             try {

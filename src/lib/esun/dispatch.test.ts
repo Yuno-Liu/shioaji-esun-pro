@@ -25,6 +25,7 @@ import {
     esunConfirmGuard,
     esunConfirmSimulation,
     esunProfitLossRows,
+    esunUnitUnknownMessage,
     startEsunTradingState,
     type EsunTradingHooks,
 } from './dispatch';
@@ -161,6 +162,19 @@ describe('trading-state hooks (§5 consumer)', () => {
         expect(hooks.raise).not.toHaveBeenCalledWith('positions', 'untrackable-event', expect.any(String));
         emit({ kind: 'untrackable', deal: true });
         expect(hooks.raise).toHaveBeenCalledWith('positions', 'untrackable-event', expect.any(String));
+    });
+
+    it('raises snapshot-boundary naming the order for an emerging-stock report of unknown unit (PB8-3)', () => {
+        emit({ kind: 'untrackable', deal: false, authoritativeOnly: { orderId: 'E0001' } });
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'snapshot-boundary', esunUnitUnknownMessage('E0001')]]);
+        expect(esunUnitUnknownMessage('E0001')).toContain('E0001');
+        hooks.raise.mockClear();
+        emit({ kind: 'untrackable', deal: true, authoritativeOnly: { orderId: 'E0001' } });
+        expect(hooks.raise.mock.calls).toEqual([
+            ['orders', 'snapshot-boundary', esunUnitUnknownMessage('E0001')],
+            ['positions', 'snapshot-boundary', esunUnitUnknownMessage('E0001')],
+        ]);
+        expect(hooks.checkHealth).not.toHaveBeenCalled();
     });
 
     it('keeps the E.SUN disconnect open when an authoritative read completes while the stream is down', async () => {

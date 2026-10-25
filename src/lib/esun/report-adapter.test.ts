@@ -317,8 +317,9 @@ describe('MAT → projected fill', () => {
     });
 });
 
-describe('emerging-stock (ap_code 4) reports without share fields (PB7-1)', () => {
-    // 興櫃 *_qty 的單位沒有實測資料：沒有 *_qty_share 時不推測股數，整筆不投影（走 untrackable 路徑）
+describe('emerging-stock (ap_code 4) reports without share fields (PB7-1 / PB8-1)', () => {
+    // 興櫃 *_qty 的單位沒有實測資料：沒有 *_qty_share 時不推測股數，整筆不投影。skip 原因與一般
+    // malformed 不同（unit-unknown，帶委託 id）：呼叫端提出只有權威讀取能解除的待對帳
     const emgAck = (over: Record<string, unknown> = {}) => {
         const base: Record<string, unknown> = ack(1, { ap_code: '4', stock_no: '6488', ...over });
         for (const k of ['org_qty_share', 'mat_qty_share', 'cel_qty_share']) if (!(k in over)) delete base[k];
@@ -331,19 +332,32 @@ describe('emerging-stock (ap_code 4) reports without share fields (PB7-1)', () =
     };
 
     it('does not project an ACK that only has org_qty', () => {
-        expect(toEsunReportWire('order', emgAck({ org_qty: '1000' }), ctx())).toEqual({ kind: 'skip', reason: 'malformed' });
+        expect(toEsunReportWire('order', emgAck({ org_qty: '1000' }), ctx())).toEqual({ kind: 'skip', reason: 'unit-unknown', orderId: 'C0001' });
     });
 
     it('does not project an ACK whose cancel or dealt quantity has no share field', () => {
-        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, cel_qty: '1000' }), ctx()).kind).toBe('skip');
-        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, mat_qty: '0.5' }), ctx()).kind).toBe('skip');
+        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, cel_qty: '1000' }), ctx())).toMatchObject({ kind: 'skip', reason: 'unit-unknown' });
+        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, mat_qty: '0.5' }), ctx())).toMatchObject({ kind: 'skip', reason: 'unit-unknown' });
+    });
+
+    it('skips a failed ACK without share fields with the same unit-unknown reason (not a projected failure)', () => {
+        expect(toEsunReportWire('order', emgAck({ org_qty: '1000', op_type: 'Unknown', err_code: '00000123', err_msg: '委託已失效' }), ctx()))
+            .toEqual({ kind: 'skip', reason: 'unit-unknown', orderId: 'C0001' });
     });
 
     it('does not project a MAT that only has mat_qty (deal_qty)', () => {
-        expect(toEsunReportWire('deal', emgMat({ mat_qty: '1000' }), ctx())).toEqual({ kind: 'skip', reason: 'malformed' });
+        expect(toEsunReportWire('deal', emgMat({ mat_qty: '1000' }), ctx())).toEqual({ kind: 'skip', reason: 'unit-unknown', orderId: 'C0001' });
         const legacy = emgMat({ deal_qty: '1000' });
         delete legacy.mat_qty;
-        expect(toEsunReportWire('deal', legacy, ctx()).kind).toBe('skip');
+        expect(toEsunReportWire('deal', legacy, ctx())).toMatchObject({ kind: 'skip', reason: 'unit-unknown' });
+        // 預約單只帶 ord_no 的成交：委託 id 依 ord_no 找回本地的 pre_ord_no
+        const lookup: EsunReportContext['lookup'] = (id, _a, by) => (by === 'ordno' && id === 'C0001'
+            ? { id: 'P0001', quantity: 1000, dealQuantity: 0, cancelQuantity: 0, price: 25.5 } : undefined);
+        expect(toEsunReportWire('deal', emgMat({ mat_qty: '1000' }), ctx({ lookup }))).toEqual({ kind: 'skip', reason: 'unit-unknown', orderId: 'P0001' });
+    });
+
+    it('keeps other missing fields as a generic malformed skip', () => {
+        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, stock_no: '' }), ctx())).toEqual({ kind: 'skip', reason: 'malformed' });
     });
 
     it('projects emerging-stock reports that carry the share fields', () => {
