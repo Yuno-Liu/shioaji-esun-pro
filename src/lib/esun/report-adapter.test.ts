@@ -317,6 +317,49 @@ describe('MAT → projected fill', () => {
     });
 });
 
+describe('emerging-stock (ap_code 4) reports without share fields (PB7-1)', () => {
+    // 興櫃 *_qty 的單位沒有實測資料：沒有 *_qty_share 時不推測股數，整筆不投影（走 untrackable 路徑）
+    const emgAck = (over: Record<string, unknown> = {}) => {
+        const base: Record<string, unknown> = ack(1, { ap_code: '4', stock_no: '6488', ...over });
+        for (const k of ['org_qty_share', 'mat_qty_share', 'cel_qty_share']) if (!(k in over)) delete base[k];
+        return base;
+    };
+    const emgMat = (over: Record<string, unknown> = {}) => {
+        const base: Record<string, unknown> = mat(1, { ap_code: '4', stock_no: '6488', ...over });
+        if (!('mat_qty_share' in over)) delete base.mat_qty_share;
+        return base;
+    };
+
+    it('does not project an ACK that only has org_qty', () => {
+        expect(toEsunReportWire('order', emgAck({ org_qty: '1000' }), ctx())).toEqual({ kind: 'skip', reason: 'malformed' });
+    });
+
+    it('does not project an ACK whose cancel or dealt quantity has no share field', () => {
+        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, cel_qty: '1000' }), ctx()).kind).toBe('skip');
+        expect(toEsunReportWire('order', emgAck({ org_qty_share: 1000, mat_qty: '0.5' }), ctx()).kind).toBe('skip');
+    });
+
+    it('does not project a MAT that only has mat_qty (deal_qty)', () => {
+        expect(toEsunReportWire('deal', emgMat({ mat_qty: '1000' }), ctx())).toEqual({ kind: 'skip', reason: 'malformed' });
+        const legacy = emgMat({ deal_qty: '1000' });
+        delete legacy.mat_qty;
+        expect(toEsunReportWire('deal', legacy, ctx()).kind).toBe('skip');
+    });
+
+    it('projects emerging-stock reports that carry the share fields', () => {
+        const report = normalizeOrderEvent(wire('order', emgAck({ org_qty: '1', org_qty_share: '1000', mat_qty: 0, cel_qty: 0 })));
+        expect(report).toMatchObject({ quantity: 1000, orderLot: 'IntradayOdd' });
+        const deal = normalizeOrderEvent(wire('deal', emgMat({ mat_qty: '0.5', mat_qty_share: '500' })));
+        expect(deal).toMatchObject({ quantity: 500, orderLot: 'IntradayOdd' });
+    });
+
+    it('keeps the current rules for the other classes (odd-lot *_qty without share fields)', () => {
+        const odd: Record<string, unknown> = ack(2, { ap_code: '5', org_qty: 0.1 });
+        delete odd.org_qty_share;
+        expect(normalizeOrderEvent(wire('order', odd))).toMatchObject({ quantity: 100 });
+    });
+});
+
 describe('stale session events', () => {
     it('drops events from the other environment', () => {
         expect(toEsunReportWire('order', ack(1, { environment: 'PRODUCTION' }), ctx())).toEqual({ kind: 'skip', reason: 'environment' });

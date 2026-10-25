@@ -8,6 +8,7 @@
 // （才能做去重與跳號偵測）。這裡只做轉換，不讀網路、不改狀態。
 //
 // 數量一律換成 App 單位：整股／盤後為張，零股／興櫃為股（零股的 *_qty 是張的小數）。
+// 興櫃（ap_code 4）回報的 *_qty 單位沒有實測資料：沒有 *_qty_share 時不推測股數，整筆視為無法判定。
 
 import type { Exchange } from '../types/contract';
 import type { Account } from '../types/portfolio';
@@ -123,6 +124,18 @@ function orderLotOf(apCode: string): string {
     return 'Common';
 }
 
+/**
+ * 興櫃（ap_code 4）回報只有 *_qty、沒有 *_qty_share（且數量不為 0）：單位無從判定，不能以推測的
+ * 換算投影。缺少的數量欄位（委託量另由必要欄位檢查擋下）與 0 和單位無關，不在此列。
+ */
+function emgSharesMissing(raw: Rec, base: 'org' | 'mat' | 'cel', apCode: string): boolean {
+    if (apCode !== EsunApCode.Emg) return false;
+    const camel = { org: 'orgQty', mat: 'matQty', cel: 'celQty' }[base];
+    if (num(raw[`${base}_qty_share`] ?? raw[`${camel}Share`]) !== null) return false;
+    const lots = num(raw[`${base}_qty`] ?? raw[camel]);
+    return lots !== null && lots !== 0;
+}
+
 function condOf(trade: string): { cond: string; daytradeShort: boolean } {
     if (trade === EsunTradeType.Margin) return { cond: 'MarginTrading', daytradeShort: false };
     if (trade === EsunTradeType.Short) return { cond: 'ShortSelling', daytradeShort: false };
@@ -165,10 +178,13 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
     if (!orderId || !code || !action) return { kind: 'skip', reason: 'malformed' };
 
     if (isDeal) {
-        const quantity = esunQuantityFromFields({
+        const matFields = {
             mat_qty: raw.mat_qty ?? raw.deal_qty ?? raw.qty,
             mat_qty_share: raw.mat_qty_share ?? raw.deal_qty_share,
-        }, 'mat', apCode);
+        };
+        // 興櫃成交沒有股數欄位：不投影（呼叫端提出委託與持倉的待對帳）
+        if (emgSharesMissing(matFields, 'mat', apCode)) return { kind: 'skip', reason: 'malformed' };
+        const quantity = esunQuantityFromFields(matFields, 'mat', apCode);
         const price = num(raw.mat_price ?? raw.deal_price ?? raw.price);
         // 成交識別與 bridge 的 MAT 去重鍵（mkt_seq_num，Python `or` 取值：0、空字串視為沒有）一致，
         // 其次才是其他 SDK 欄位與事件 id
@@ -198,6 +214,8 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         return { kind: 'report', orderId: tradeId, account, wire: { state: 'StockDeal', data: { StockDeal: body } } };
     }
 
+    // 興櫃委託回報沒有股數欄位：不投影（呼叫端提出委託的待對帳）
+    if ((['org', 'mat', 'cel'] as const).some(base => emgSharesMissing(raw, base, apCode))) return { kind: 'skip', reason: 'malformed' };
     const quantity = esunQuantityFromFields(raw, 'org', apCode);
     if (quantity === null || quantity <= 0) return { kind: 'skip', reason: 'malformed' };
     const dealt = esunQuantityFromFields(raw, 'mat', apCode) ?? 0;
