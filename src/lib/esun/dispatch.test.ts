@@ -2,11 +2,11 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const signals = vi.hoisted(() => ({ listeners: new Set<(s: unknown) => void>() }));
+const signals = vi.hoisted(() => ({ listeners: new Set<(s: unknown) => void>(), status: 'live' }));
 vi.mock('./stream', () => ({
     ensureEsunOrderStream: vi.fn(),
     isEsunStreamStarted: () => true,
-    getEsunStreamStatus: () => 'live',
+    getEsunStreamStatus: () => signals.status,
     onEsunStreamSignal: (listener: (s: unknown) => void) => { signals.listeners.add(listener); return () => signals.listeners.delete(listener); },
 }));
 
@@ -14,6 +14,13 @@ import { captureServerMode } from '../server-info-store';
 import { MOCK_ESUN_ACCOUNT_ID, MockEsunDriver } from './mock-driver';
 import { esunTradeService } from './service';
 import {
+    ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE,
+    ESUN_FAILED_ACK_REFRESHED_MESSAGE,
+    ESUN_STALE_CACHE_MESSAGE,
+    ESUN_UNREFRESHED_CACHE_MESSAGE,
+    esunAccountQuery,
+    esunCacheConflictMessage,
+    esunCacheUpsertRow,
     esunConfirmBrokerLabel,
     esunConfirmGuard,
     esunConfirmSimulation,
@@ -117,5 +124,126 @@ describe('trading-state hooks (§5 consumer)', () => {
         emit({ kind: 'resync' });
         expect(hooks.raise).toHaveBeenCalledWith('orders', 'sequence-gap', expect.any(String));
         expect(hooks.checkHealth).toHaveBeenCalledWith('gap');
+        expect(hooks.raise).not.toHaveBeenCalledWith('orders', 'snapshot-boundary', expect.any(String));
+    });
+
+    it('a ws_reconnected resync whose bridge cache was not re-read raises a reason only an authoritative read clears', () => {
+        emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true });
+        expect(hooks.raise).not.toHaveBeenCalledWith('orders', 'snapshot-boundary', expect.any(String));
+        emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: false });
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', ESUN_STALE_CACHE_MESSAGE);
+        hooks.raise.mockClear();
+        emit({ kind: 'resync', reason: 'ws_reconnected' });
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', ESUN_STALE_CACHE_MESSAGE);
+        expect(hooks.raise).not.toHaveBeenCalledWith('positions', 'snapshot-boundary', expect.any(String));
+        expect(hooks.checkHealth).toHaveBeenCalledWith('gap');
+    });
+
+    it('any resync with cacheRefreshed:false raises a reason only an authoritative read clears (PB5-2)', () => {
+        emit({ kind: 'resync', reason: 'bridge_restarted', cacheRefreshed: false });
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', ESUN_UNREFRESHED_CACHE_MESSAGE);
+        hooks.raise.mockClear();
+        hooks.checkHealth.mockClear();
+        emit({ kind: 'resync', reason: 'failed_ack_refresh_failed', cacheRefreshed: false });
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'snapshot-boundary', ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE]]);
+        expect(hooks.checkHealth).not.toHaveBeenCalled();
+    });
+
+    it('a failed_ack_refreshed resync raises only an orders reason the cache rebuild clears (PB5-1)', () => {
+        emit({ kind: 'resync', reason: 'failed_ack_refreshed', cacheRefreshed: true });
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'sequence-gap', ESUN_FAILED_ACK_REFRESHED_MESSAGE]]);
+        expect(hooks.checkHealth).toHaveBeenCalledWith('gap');
+    });
+
+    it('raises untrackable-event for a report the stream could not convert (positions too for a deal)', () => {
+        emit({ kind: 'untrackable', deal: false });
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'untrackable-event', expect.any(String));
+        expect(hooks.raise).not.toHaveBeenCalledWith('positions', 'untrackable-event', expect.any(String));
+        emit({ kind: 'untrackable', deal: true });
+        expect(hooks.raise).toHaveBeenCalledWith('positions', 'untrackable-event', expect.any(String));
+    });
+
+    it('keeps the E.SUN disconnect open when an authoritative read completes while the stream is down', async () => {
+        const account = esunTradeService.getAccounts()[0]!;
+        try {
+            signals.status = 'down';
+            emit({ kind: 'down', message: '玉山回報串流中斷' });
+            hooks.raise.mockClear();
+            // trading-state 讀取成功後 resolve 讀取開始前的原因；讀取期間重新提出的原因會保留
+            await esunAccountQuery('/api/v1/order/trades', account, { refresh: true });
+            expect(hooks.raise).toHaveBeenCalledWith('orders', 'disconnect', '玉山回報串流中斷');
+            await esunAccountQuery('/api/v1/portfolio/position_unit', account, { unit: 'Common' });
+            expect(hooks.raise).toHaveBeenCalledWith('positions', 'disconnect', '玉山回報串流中斷');
+            hooks.raise.mockClear();
+            await esunAccountQuery('/api/v1/order/trades', account, { refresh: false });
+            expect(hooks.raise).not.toHaveBeenCalled();
+            signals.status = 'live';
+            await esunAccountQuery('/api/v1/order/trades', account, { refresh: true });
+            await esunAccountQuery('/api/v1/portfolio/position_unit', account, { unit: 'Common' });
+            expect(hooks.raise).not.toHaveBeenCalled();
+        } finally {
+            signals.status = 'live';
+        }
+    });
+});
+
+describe('cache rebuild row merge (esunCacheUpsertRow)', () => {
+    const esun = { account_type: 'S', broker_id: '8840', account_id: '1234567', signed: true, username: '', person_id: '' };
+    const row = (deal: number, cancel: number, over: { status?: string; broker?: string } = {}) => {
+        const account = { ...esun, broker_id: over.broker ?? esun.broker_id };
+        return {
+            contract: { code: '2884', security_type: 'STK' as const, exchange: 'TSE' as const, target_code: null },
+            order: { id: 'C0001', seqno: 'C0001', ordno: 'C0001', action: 'Buy' as const, price: 25.5, quantity: 5, order_type: 'ROD' as const, price_type: 'LMT' as const, account },
+            status: { id: 'C0001', status: (over.status ?? (deal > 0 ? 'PartFilled' : 'Submitted')) as 'Submitted', status_code: '', msg: '', order_quantity: 5,
+                deal_quantity: deal, cancel_quantity: cancel, modified_price: 0,
+                deals: deal > 0 ? [{ seq: `d${deal}`, price: 25.5, quantity: deal, ts: 1 }] : [] },
+            account,
+        };
+    };
+
+    let hooks: { [K in keyof EsunTradingHooks]: ReturnType<typeof vi.fn> };
+    let stop: (() => void) | undefined;
+    beforeEach(() => {
+        hooks = { raise: vi.fn(), accountsChanged: vi.fn(async () => undefined), checkHealth: vi.fn(async () => undefined) };
+        stop?.();
+        stop = startEsunTradingState(hooks as unknown as EsunTradingHooks);
+    });
+
+    it('keeps the local row and raises snapshot-boundary when the cache is behind on fills or cancels (PB3-1)', () => {
+        const local = row(3, 0);
+        expect(esunCacheUpsertRow(local, row(2, 0))).toBe(local);
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', esunCacheConflictMessage('C0001'));
+        expect(esunCacheConflictMessage('C0001')).toContain('C0001');
+        hooks.raise.mockClear();
+        // 成交較多但取消較少：仍是矛盾，不合併兩邊
+        const cancelled = row(1, 2);
+        expect(esunCacheUpsertRow(cancelled, row(2, 0))).toBe(cancelled);
+        expect(hooks.raise).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps a local terminal row the cache reports as live (PB3-1)', () => {
+        for (const status of ['Failed', 'Cancelled', 'Filled']) {
+            hooks.raise.mockClear();
+            const local = row(0, 0, { status });
+            expect(esunCacheUpsertRow(local, row(0, 0))).toBe(local);
+            expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', esunCacheConflictMessage('C0001'));
+        }
+        hooks.raise.mockClear();
+        // 快取也是終態：採用快取列
+        const failed = row(0, 0, { status: 'Failed' });
+        expect(esunCacheUpsertRow(row(0, 0, { status: 'Cancelled' }), failed)).toBe(failed);
+        expect(hooks.raise).not.toHaveBeenCalled();
+    });
+
+    it('takes the cache row without a reason when it is not behind, and for other brokers', () => {
+        const cached = row(4, 0);
+        expect(esunCacheUpsertRow(row(3, 0), cached)).toBe(cached);
+        const same = row(3, 0);
+        expect(esunCacheUpsertRow(row(3, 0), same)).toBe(same);
+        const sinopac = row(2, 0, { broker: '9A95' });
+        expect(esunCacheUpsertRow(row(3, 0, { broker: '9A95' }), sinopac)).toBe(sinopac);
+        const sinopacLive = row(0, 0, { broker: '9A95' });
+        expect(esunCacheUpsertRow(row(0, 0, { broker: '9A95', status: 'Failed' }), sinopacLive)).toBe(sinopacLive);
+        expect(hooks.raise).not.toHaveBeenCalled();
     });
 });

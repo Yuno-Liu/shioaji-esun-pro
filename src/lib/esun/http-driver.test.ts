@@ -164,6 +164,27 @@ describe('HttpEsunDriver queries', () => {
         await expect(cacheOk.getOrders(false)).resolves.toHaveLength(1);
     });
 
+    it('waits at least 25 s for an order read (the bridge may wait ~12 s for its refresh interval first)', async () => {
+        vi.useFakeTimers();
+        let aborted = false;
+        const fetchImpl = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => { aborted = true; reject(Object.assign(new Error('aborted'), { name: 'AbortError' })); });
+            setTimeout(() => resolve(new Response(JSON.stringify({ source: 'broker', orders: [] }), { status: 200 })), 24_000);
+        }));
+        const pending = new HttpEsunDriver('', fetchImpl as never).getOrders(true);
+        await vi.advanceTimersByTimeAsync(24_001);
+        await expect(pending).resolves.toEqual([]);
+        expect(aborted).toBe(false);
+    });
+
+    it('keeps code and retry_after of a refresh throttled by the bridge (429 AGR0005)', async () => {
+        const driver = new HttpEsunDriver('', reply(429, { ok: false, code: 'AGR0005', error: '委託查詢過於頻繁', retry_after: 3 }) as never);
+        const e = await caught(driver.getOrders(true));
+        expect(e).toMatchObject({ status: 429, code: 'AGR0005', retryAfter: 3 });
+        const header = vi.fn(async () => new Response(JSON.stringify({ ok: false, code: 'AGR0005', error: 'x' }), { status: 429, headers: { 'Retry-After': '2' } }));
+        expect(await caught(new HttpEsunDriver('', header as never).getOrders(true))).toMatchObject({ retryAfter: 2 });
+    });
+
     it('encodes query parameters', async () => {
         const fetchImpl = reply(200, { ca_expiretime: '2027-12-31' });
         await new HttpEsunDriver('', fetchImpl as never).getCaExpire('A1 2&x');

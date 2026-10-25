@@ -13,6 +13,7 @@ import type { Exchange } from '../types/contract';
 import type { Account } from '../types/portfolio';
 import {
     esunAccountForEnvironment,
+    esunMktSeqNum,
     esunOrderId,
     esunQuantityFromFields,
     esunTimestamp,
@@ -31,6 +32,8 @@ const num = (v: unknown): number | null => {
 
 /** 本地已知的同一筆委託（用來把累計取消量換成「這次」的取消量） */
 export interface EsunKnownOrder {
+    /** 本地委託 id（預約單為 pre_ord_no） */
+    id: string;
     quantity: number;
     dealQuantity: number;
     cancelQuantity: number;
@@ -44,24 +47,41 @@ export interface EsunReportContext {
     account: Pick<Account, 'broker_id' | 'account_id'> | null;
     /** App 合約快取的交易所 */
     exchangeOf?: (code: string) => Exchange | undefined;
-    /** 本地同一帳戶、同一 id 的委託 */
-    lookup?: (orderId: string, account: Account) => EsunKnownOrder | undefined;
+    /** 本地同一帳戶、同一 id（by 'ordno' 時為同一 ord_no）的委託 */
+    lookup?: (orderId: string, account: Account, by?: 'id' | 'ordno') => EsunKnownOrder | undefined;
+}
+
+/** 失敗回報的操作別在本地推斷後仍未知：不能投影，只能由券商快照判定 */
+export interface EsunUnresolvedFailure {
+    opCode: string;
+    opMsg: string;
 }
 
 export type EsunReportResult =
-    | { kind: 'report'; wire: Rec; orderId: string; account: Account }
+    | { kind: 'report'; wire: Rec; orderId: string; account: Account; unresolvedFailure?: EsunUnresolvedFailure }
     | { kind: 'skip'; reason: 'environment' | 'malformed' };
 
-/** <boot_id>-<seq> → v1:esun-<env>:<boot_id>:<seq>（同一 bridge 行程內單調遞增） */
-export function esunEventId(rawId: unknown, rawSeq: unknown, environment: EsunEnvironment): string {
-    const id = str(rawId);
-    const seqNum = num(rawSeq);
+const positiveInt = (v: unknown, min: number): number | null => {
+    const n = num(v);
+    return n !== null && Number.isSafeInteger(n) && n >= min ? n : null;
+};
+
+/**
+ * 回報序號 → v1:esun-<sim|prod>-<order|deal>:<boot_id>.g<generation>:<report_seq>。
+ * bridge 的 SSE seq（event_id 的 <boot_id>-<seq>）由 session／resync 事件共用，不能當回報序號；
+ * report_seq 以（session generation, report_stream）為範圍、每次新 session 從 1 起算，所以
+ * reset 段帶 generation（重新登入、環境來回切換都是新的基準）。缺 report_seq 或
+ * session_generation（舊版 bridge）就不產生 v1 id：不做跳號推論。
+ */
+export function esunEventId(raw: Rec, environment: EsunEnvironment, fallbackStream?: 'order' | 'deal'): string {
+    const id = str(raw.event_id);
     const dash = id.lastIndexOf('-');
     const boot = dash > 0 ? id.slice(0, dash) : '';
-    const tail = dash > 0 ? id.slice(dash + 1) : '';
-    const seq = seqNum !== null && Number.isSafeInteger(seqNum) && seqNum >= 0 ? String(seqNum) : /^\d+$/.test(tail) ? tail : '';
-    if (!boot || !seq || boot.includes(':')) return '';
-    return `v1:esun-${environment === 'SIMULATION' ? 'sim' : 'prod'}:${boot}:${seq}`;
+    const stream = str(raw.report_stream) || fallbackStream || '';
+    const reportSeq = positiveInt(raw.report_seq, 1);
+    const generation = positiveInt(raw.session_generation, 0);
+    if (!boot || boot.includes(':') || (stream !== 'order' && stream !== 'deal') || reportSeq === null || generation === null) return '';
+    return `v1:esun-${environment === 'SIMULATION' ? 'sim' : 'prod'}-${stream}:${boot}.g${generation}:${reportSeq}`;
 }
 
 /** ISO8601（含時區）或 epoch → epoch 秒 */
@@ -137,7 +157,7 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
     const action = side.startsWith('B') ? 'Buy' : side.startsWith('S') ? 'Sell'
         : legacyAction === 'Buy' || legacyAction === 'Sell' ? legacyAction : '';
     const apCode = str(raw.ap_code ?? raw.apCode) || EsunApCode.Common;
-    const eventId = esunEventId(raw.event_id, raw.seq, ctx.environment);
+    const eventId = esunEventId(raw, ctx.environment, isDeal ? 'deal' : 'order');
     const ts = epochSeconds(raw.ts) ?? esunTimestamp(raw.mat_date ?? raw.ord_date ?? raw.work_date, raw.mat_time ?? raw.ord_time);
     const { cond, daytradeShort } = condOf(str(raw.trade));
     const orderLot = orderLotOf(apCode);
@@ -150,11 +170,17 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
             mat_qty_share: raw.mat_qty_share ?? raw.deal_qty_share,
         }, 'mat', apCode);
         const price = num(raw.mat_price ?? raw.deal_price ?? raw.price);
-        const seq = str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no)
-            || (eventId ? eventId.slice(eventId.indexOf(':') + 1) : '');
+        // 成交識別與 bridge 的 MAT 去重鍵（mkt_seq_num，Python `or` 取值：0、空字串視為沒有）一致，
+        // 其次才是其他 SDK 欄位與事件 id
+        const seq = esunMktSeqNum(raw) || str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no)
+            || str(raw.event_id);
         if (quantity === null || quantity <= 0 || price === null || price <= 0) return { kind: 'skip', reason: 'malformed' };
+        // 預約單的本地 id 是 pre_ord_no；只帶 ord_no 的成交回報依 ord_no 找回本地同帳戶的委託
+        const ordNo = str(raw.ord_no ?? raw.ordNo);
+        const preOrdNo = str(raw.pre_ord_no ?? raw.preOrdNo);
+        const tradeId = (!preOrdNo && ordNo ? ctx.lookup?.(ordNo, account, 'ordno')?.id : undefined) || orderId;
         const body: Rec = {
-            trade_id: orderId,
+            trade_id: tradeId,
             exchange_seq: seq,
             code,
             action,
@@ -164,12 +190,12 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
             order_cond: cond,
             broker_id: account.broker_id,
             account_id: account.account_id,
-            seqno: orderId,
-            ordno: str(raw.ord_no ?? raw.ordNo),
+            seqno: tradeId,
+            ordno: ordNo,
             ...(ts !== undefined ? { ts } : {}),
             event_id: eventId,
         };
-        return { kind: 'report', orderId, account, wire: { state: 'StockDeal', data: { StockDeal: body } } };
+        return { kind: 'report', orderId: tradeId, account, wire: { state: 'StockDeal', data: { StockDeal: body } } };
     }
 
     const quantity = esunQuantityFromFields(raw, 'org', apCode);
@@ -192,11 +218,12 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         : cancelledTotal;
     const errCode = str(raw.err_code ?? raw.errCode ?? rec(raw.operation)?.op_code);
     const failed = isEsunFailureCode(errCode);
+    const opMsg = str(raw.err_msg ?? raw.errMsg ?? rec(raw.operation)?.op_msg);
     const body: Rec = {
         operation: {
             op_type: opType,
             op_code: failed ? errCode : '00',
-            op_msg: str(raw.err_msg ?? raw.errMsg ?? rec(raw.operation)?.op_msg),
+            op_msg: opMsg,
         },
         order: {
             id: orderId,
@@ -225,5 +252,11 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         contract: { security_type: 'STK', exchange, code },
         event_id: eventId,
     };
-    return { kind: 'report', orderId, account, wire: { state: 'StockOrder', data: { StockOrder: body } } };
+    // 失敗回報推不出操作別（bridge Unknown、本地也推斷不出）：可能是新單被拒，也可能是刪改單被拒。
+    // 上游投影對操作別空白的失敗回報不改本地委託；呼叫端另外提出只有權威讀取能解除的待對帳。
+    const unresolvedFailure = failed && !opType ? { opCode: errCode, opMsg } : undefined;
+    return {
+        kind: 'report', orderId, account, wire: { state: 'StockOrder', data: { StockOrder: body } },
+        ...(unresolvedFailure ? { unresolvedFailure } : {}),
+    };
 }

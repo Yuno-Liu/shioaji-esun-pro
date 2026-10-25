@@ -4,7 +4,7 @@ import { getServerModeVersion, knownServerInfo } from './server-info-store';
 import { onTradeMutation } from './trade-mutations';
 import { useEffect, useSyncExternalStore } from 'react';
 import { getAccountState, refreshAccounts, useAccounts } from './account-store';
-import { startEsunTradingState } from './esun/dispatch';
+import { esunCacheUpsertRow, startEsunTradingState } from './esun/dispatch';
 import { ensureContract, getCachedContract } from './contracts-cache';
 import { getApiBase } from './runtime';
 import { subscribeTradeReports } from './boot';
@@ -293,7 +293,7 @@ function mergeOrders(account: Account, trades: Trade[], accounts: Account[], pro
     if (mode === 'replace') merged = [...state.trades.filter(t => !matches(t.account)), ...incoming];
     else {
         const byId = new Map(incoming.map(t => [t.order.id, t]));
-        merged = state.trades.map(t => matches(t.account) && byId.has(t.order.id) ? byId.get(t.order.id)! : t);
+        merged = state.trades.map(t => matches(t.account) && byId.has(t.order.id) ? esunCacheUpsertRow(t, byId.get(t.order.id)!) : t);
         const known = new Set(state.trades.filter(t => matches(t.account)).map(t => t.order.id));
         merged.push(...incoming.filter(t => !known.has(t.order.id)));
     }
