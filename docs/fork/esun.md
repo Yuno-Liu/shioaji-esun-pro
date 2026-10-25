@@ -10,7 +10,7 @@ fork 專屬內容都放在 `docs/fork/`。詞彙定義見 [context-esun.md](cont
 
 ```mermaid
 flowchart TD
-    Client["瀏覽器<br/>http://localhost:8080"]
+    Client["瀏覽器<br/>http://127.0.0.1:8080"]
     subgraph Docker["Docker Compose"]
         Nginx["shioaji-pro-web（nginx 1.30）<br/>127.0.0.1:8080 → 容器 :8080<br/>SPA ＋ 零緩衝 SSE 反向代理"]
         Sinopac["shioaji-pro-sinopac（shioaji-cli，版本＝SHIOAJI_VERSION）<br/>共用 web 網路命名空間 127.0.0.1:21322"]
@@ -127,7 +127,7 @@ pnpm run docker:deploy                 # 需要 PowerShell 7（pwsh）
 docker compose up -d --build
 ```
 
-開啟 <http://localhost:8080>。
+開啟 <http://127.0.0.1:8080>。web 預設只綁 IPv4 的 127.0.0.1；Windows 會先以 IPv6（::1）解析 `localhost`，用 `localhost` 開啟時每條新連線都要等退回 IPv4 才成功（瀏覽器約 0.2–0.3 秒，部分程式約 2 秒），建議改用 127.0.0.1。
 
 `package.json` 的 `docker:deploy`／`docker:down`／`docker:status` 呼叫 `pwsh`；Linux／macOS 請安裝 PowerShell 7，或改用
 `./scripts/deploy-docker.sh`。
@@ -221,8 +221,8 @@ Linux 主機請確認設定檔與 `certs/esun_cert.p12` 對其他使用者可讀
 
 ```bash
 pnpm run docker:status                    # 或 docker compose ps
-curl http://localhost:8080/esun/health    # 玉山登入狀態、環境、待配置項目
-curl http://localhost:8080/api/v1/info    # 永豐 sidecar 狀態
+curl http://127.0.0.1:8080/esun/health    # 玉山登入狀態、環境、待配置項目
+curl http://127.0.0.1:8080/api/v1/info    # 永豐 sidecar 狀態
 docker compose exec esun-bridge curl -s localhost:8090/esun/livez   # 直接檢查橋接存活（不經 nginx）
 docker compose up -d                      # 修改 .env 後重新載入
 docker compose logs -f esun-bridge        # 或 shioaji-server、shioaji-pro-web
@@ -232,11 +232,11 @@ pnpm run docker:down                      # 或 docker compose down
 修正玉山密碼或設定檔後，手動解除熔斷並重新登入：
 
 ```bash
-curl -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:8080/esun/auth/reconnect
+curl -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8080/esun/auth/reconnect
 ```
 
 ```powershell
-Invoke-RestMethod -Method Post -ContentType 'application/json' -Body '{}' http://localhost:8080/esun/auth/reconnect
+Invoke-RestMethod -Method Post -ContentType 'application/json' -Body '{}' http://127.0.0.1:8080/esun/auth/reconnect
 ```
 
 ## 開發模式（Vite）

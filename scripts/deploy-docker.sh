@@ -185,8 +185,9 @@ action_status() {
     echo ""
     echo -e "${CYAN}─────────────────────────── [服務連線檢測] ───────────────────────────${NC}"
     WEB_PORT_EFFECTIVE="$(effective_setting WEB_PORT 8080)"
-    WEB_URL="http://localhost:${WEB_PORT_EFFECTIVE}"
-    HEALTH_URL="http://localhost:${WEB_PORT_EFFECTIVE}/esun/health"
+    # web 預設只綁 IPv4 的 127.0.0.1；以 localhost 連線時可能先嘗試 IPv6 ::1 而多等一段時間
+    WEB_URL="http://127.0.0.1:${WEB_PORT_EFFECTIVE}"
+    HEALTH_URL="http://127.0.0.1:${WEB_PORT_EFFECTIVE}/esun/health"
 
     if curl -s -f -m 5 "${WEB_URL}" > /dev/null 2>&1; then
         success "Web 終端 (Nginx): 連線正常 [HTTP 200] -> ${WEB_URL}"
