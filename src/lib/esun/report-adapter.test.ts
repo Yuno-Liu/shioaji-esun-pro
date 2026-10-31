@@ -11,7 +11,9 @@ import { positionFill } from '../portfolio-projection';
 import { createReportLedger, parseEventId } from '../report-ledger';
 import type { AccountedTrade } from '../types/order';
 import type { Account } from '../types/portfolio';
+import { fromEsunOrderResult } from './order-mapping';
 import { esunEventId, toEsunReportWire, type EsunReportContext } from './report-adapter';
+import type { EsunOrderResult } from './types';
 
 const account: Account = {
     account_type: 'S', broker_id: '8840-SIM', account_id: '1234567', signed: true, username: '玉山證券', person_id: '',
@@ -314,6 +316,43 @@ describe('MAT → projected fill', () => {
         expect(projectTradeDeal(reserved, deal!)![0]!.status.deal_quantity).toBe(2);
         // 本地找不到時維持 ord_no
         expect(normalizeOrderEvent(wire('deal', mat(3, { ord_no: 'C0010', order_no: 'C0010' }), ctx({ lookup })))).toMatchObject({ tradeId: 'C0010' });
+    });
+});
+
+describe('MAT the bridge marks as covered by an earlier order snapshot (RC1)', () => {
+    const body = (w: Record<string, unknown>) => (w.data as Record<string, Record<string, unknown>>).StockDeal!;
+    const covered = { mkt_seq_num: '000417', mat_qty: 1, mat_qty_share: 1000, esun_covered_by_snapshot: true };
+
+    it('uses the aggregate seq of fromEsunOrderResult, so the snapshot row and the fill dedup', () => {
+        const result = toEsunReportWire('deal', mat(2, covered), ctx());
+        expect(result).toMatchObject({ kind: 'report', orderId: 'C0001', coveredBySnapshot: true });
+        expect(body(wire('deal', mat(2, covered))).exchange_seq).toBe('C0001:agg');
+        // 快照列：3 張、成交 1 張、沒有逐筆成交 → 彙總成交 C0001:agg
+        const snapshot = fromEsunOrderResult({
+            ord_no: 'C0001', pre_ord_no: '', stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R', trade: '0',
+            od_price: 25.5, org_qty: 3, org_qty_share: 3000, mat_qty: 1, mat_qty_share: 1000, cel_qty: 0, cel_qty_share: 0, avg_price: 25.5,
+            ord_date: '20261023', ord_time: '090512345',
+        } as EsunOrderResult, account)!;
+        const rows: AccountedTrade[] = [{ ...snapshot, account }];
+        const same = projectTradeDeal(rows, normalizeOrderEvent(wire('deal', mat(2, covered)))!)!;
+        expect(same[0]!.status).toMatchObject({ deal_quantity: 1, status: 'PartFilled' });
+        const next = projectTradeDeal(same, normalizeOrderEvent(wire('deal', mat(3, { mkt_seq_num: '000418', mat_qty: 1, mat_qty_share: 1000 })))!)!;
+        expect(next[0]!.status).toMatchObject({ deal_quantity: 2, status: 'PartFilled' });
+    });
+
+    it('uses the local id of a reservation order matched by ord_no', () => {
+        const lookup: EsunReportContext['lookup'] = (orderId, _acc, by) => (by === 'ordno' && orderId === 'C0009'
+            ? { id: 'P0001', quantity: 3, dealQuantity: 1, cancelQuantity: 0, price: 25.5 } : undefined);
+        const w = wire('deal', mat(2, { ...covered, ord_no: 'C0009', order_no: 'C0009', pre_ord_no: '' }), ctx({ lookup }));
+        expect(body(w)).toMatchObject({ trade_id: 'P0001', exchange_seq: 'P0001:agg' });
+    });
+
+    it('keeps the mkt_seq_num without the flag (older bridge) or when the flag is not true', () => {
+        for (const over of [{}, { esun_covered_by_snapshot: false }, { esun_covered_by_snapshot: 'true' }]) {
+            const result = toEsunReportWire('deal', mat(2, { mkt_seq_num: '000417', ...over }), ctx());
+            expect(result.kind === 'report' && result.coveredBySnapshot).toBeFalsy();
+            expect(body(wire('deal', mat(2, { mkt_seq_num: '000417', ...over }))).exchange_seq).toBe('000417');
+        }
     });
 });
 

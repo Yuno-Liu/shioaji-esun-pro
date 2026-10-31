@@ -16,6 +16,7 @@ import type { Exchange } from '../types/contract';
 import type { Account } from '../types/portfolio';
 import {
     esunAccountForEnvironment,
+    esunAggregateDealSeq,
     esunMktSeqNum,
     esunOrderId,
     esunQuantityFromFields,
@@ -61,7 +62,11 @@ export interface EsunUnresolvedFailure {
 }
 
 export type EsunReportResult =
-    | { kind: 'report'; wire: Rec; orderId: string; account: Account; unresolvedFailure?: EsunUnresolvedFailure }
+    | {
+        kind: 'report'; wire: Rec; orderId: string; account: Account; unresolvedFailure?: EsunUnresolvedFailure;
+        /** bridge 標示這筆成交已含在先前的委託快照內（esun_covered_by_snapshot）：以彙總 seq 投影 */
+        coveredBySnapshot?: true;
+    }
     | { kind: 'skip'; reason: 'environment' | 'malformed' }
     /** 興櫃回報缺 *_qty_share：單位未知、不投影（bridge 快取也沒套用），只有權威讀取能對帳 */
     | { kind: 'skip'; reason: 'unit-unknown'; orderId: string };
@@ -196,8 +201,11 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
         const price = num(raw.mat_price ?? raw.deal_price ?? raw.price);
         // 成交識別與 bridge 的 MAT 去重鍵（mkt_seq_num，Python `or` 取值：0、空字串視為沒有）一致，
         // 其次才是其他 SDK 欄位與事件 id
-        const seq = esunMktSeqNum(raw) || str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no)
-            || str(raw.event_id);
+        // bridge 判定這筆 MAT 已含在先前的委託快照內（esun_covered_by_snapshot）：與 fromEsunOrderResult 的彙總
+        // 成交用同一個 seq，上游 projectTradeDeal（含權威讀取、快取重建的重播）才會當成重複。舊版 bridge 沒有這個欄位
+        const covered = raw.esun_covered_by_snapshot === true;
+        const seq = covered ? esunAggregateDealSeq(tradeId)
+            : esunMktSeqNum(raw) || str(raw.mat_no ?? raw.mat_seq ?? raw.deal_seq ?? raw.match_no ?? raw.seq_no) || str(raw.event_id);
         if (quantity === null || quantity <= 0 || price === null || price <= 0) return { kind: 'skip', reason: 'malformed' };
         const body: Rec = {
             trade_id: tradeId,
@@ -215,7 +223,10 @@ export function toEsunReportWire(event: string, payload: unknown, ctx: EsunRepor
             ...(ts !== undefined ? { ts } : {}),
             event_id: eventId,
         };
-        return { kind: 'report', orderId: tradeId, account, wire: { state: 'StockDeal', data: { StockDeal: body } } };
+        return {
+            kind: 'report', orderId: tradeId, account, wire: { state: 'StockDeal', data: { StockDeal: body } },
+            ...(covered ? { coveredBySnapshot: true as const } : {}),
+        };
     }
 
     // 興櫃委託回報沒有股數欄位：不投影（呼叫端提出委託只有權威讀取能解除的待對帳）。失敗 ACK 同樣在此

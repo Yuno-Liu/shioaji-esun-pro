@@ -562,19 +562,30 @@ export function esunMktSeqNum(raw: Record<string, unknown>): string {
 type EsunDeal = Trade['status']['deals'][number];
 
 /**
+ * 委託列彙總成交（快照已含、沒有逐筆序號的成交量）的 seq。bridge 標示已含在委託快照內的 SSE 成交
+ * （esun_covered_by_snapshot）也用這個 seq，上游 projectTradeDeal 才會把兩者當成同一筆。
+ */
+export function esunAggregateDealSeq(orderId: string): string {
+    return `${orderId}:agg`;
+}
+
+/**
  * 列上的 esun_fills（bridge 本快取代次內經 MAT 套用的逐筆成交，依接收順序）→ App 單位的逐筆成交。
  * seq 用 mkt_seq_num（與 SSE 成交的 exchange_seq 相同），所以權威讀取或快取重建時重播的 SSE 成交
  * 會被 projectTradeDeal 當成重複。整股（ap_code 1、2）的股數必須是 1000 的倍數；缺序號、序號重複、
- * 數量不是正整數的元素略過（由呼叫端併入彙總成交）。
+ * 數量不是正整數的元素略過（由呼叫端併入彙總成交）。`covered`：有元素帶 esun_covered_by_snapshot。
  */
-function esunFillDeals(raw: Record<string, unknown>, apCode: string, fallbackPrice: number, ts: number): EsunDeal[] {
+function esunFillDeals(raw: Record<string, unknown>, apCode: string, fallbackPrice: number, ts: number): { deals: EsunDeal[]; covered: boolean } {
     const fills = Array.isArray(raw.esun_fills) ? raw.esun_fills : [];
     const lot = esunQuantityUnitFor(apCode) === 'lot';
     const seen = new Set<string>();
     const deals: EsunDeal[] = [];
+    let covered = false;
     for (const fill of fills) {
         if (!fill || typeof fill !== 'object' || Array.isArray(fill)) continue;
         const f = fill as Record<string, unknown>;
+        // bridge 判定已含在委託快照內的成交：SSE 回報以彙總 seq 送出，這裡也併入彙總成交才能去重
+        if (f.esun_covered_by_snapshot === true) { covered = true; continue; }
         const seq = esunMktSeqNum(f);
         const shares = finiteNumber(f.mat_qty_share);
         if (!seq || seen.has(seq) || shares === null || shares <= 0 || !Number.isInteger(shares)) continue;
@@ -584,7 +595,7 @@ function esunFillDeals(raw: Record<string, unknown>, apCode: string, fallbackPri
         seen.add(seq);
         deals.push({ seq, price: matPrice !== null && matPrice > 0 ? matPrice : fallbackPrice, quantity, ts });
     }
-    return deals;
+    return { deals, covered };
 }
 
 /**
@@ -643,6 +654,60 @@ export function esunUnresolvedFailureOf(trade: Pick<Trade, 'status'>): EsunRowUn
     return unresolvedFailures.get(trade.status);
 }
 
+// 成交＋取消超過委託量（矛盾資料）或 bridge 標示 esun_quantity_conflict 的列（鍵同 unresolvedFailures）
+const quantityConflicts = new WeakSet<object>();
+// 其中不判終態（holdOpen：成交＋取消超過委託量，或 bridge 標示的矛盾不是由較晚的券商快照決定）的列
+const quantityHoldOpen = new WeakSet<object>();
+
+/** fromEsunOrderResult 轉出的列數量矛盾（不判終態、需要權威讀取對帳）時回 true */
+export function esunQuantityConflictOf(trade: Pick<Trade, 'status'>): boolean {
+    return quantityConflicts.has(trade.status);
+}
+
+/**
+ * fromEsunOrderResult 轉出的列數量矛盾且不判終態（holdOpen）時回 true：列上的成交／取消量不可信，
+ * 快取重建時不可用它蓋掉本地一致的列。later_snapshot（券商快照決定）的列不算。
+ */
+export function esunQuantityHoldOpenOf(trade: Pick<Trade, 'status'>): boolean {
+    return quantityHoldOpen.has(trade.status);
+}
+
+interface EsunQuantityConflict {
+    flagged: boolean;
+    snapshotDecided: boolean;
+    /** exceeds_order 的 raw_shares：bridge 以委託量為上限之前，列原本（快照或 ACK）的股數 */
+    rawShares: { mat?: number; cel?: number };
+}
+
+/**
+ * bridge 的 esun_quantity_conflict（{mat|cel: {reason, ...}}）：回傳是否帶旗標，以及列上的數量是否仍可判終態。
+ * 只有 later_snapshot（讀取晚於最後一筆 MAT 開始的券商快照決定成交量）的列以快照為準可判終態；
+ * exceeds_order（回報累計超過委託量、bridge 以委託量為上限）或其他形狀一律不判終態。
+ * exceeds_order 帶 raw_shares（非負有限數）時一併回傳，供不判終態的列顯示列原本的數量。
+ */
+function readQuantityConflict(raw: Record<string, unknown>): EsunQuantityConflict {
+    const v = raw.esun_quantity_conflict;
+    const rawShares: EsunQuantityConflict['rawShares'] = {};
+    if (!v) return { flagged: false, snapshotDecided: false, rawShares };
+    const map = typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {};
+    const entries = Object.values(map);
+    const snapshotDecided = entries.length > 0
+        && entries.every(e => !!e && typeof e === 'object' && (e as Record<string, unknown>).reason === 'later_snapshot');
+    for (const base of ['mat', 'cel'] as const) {
+        const e = map[base];
+        if (!e || typeof e !== 'object' || Array.isArray(e)) continue;
+        const info = e as Record<string, unknown>;
+        const shares = finiteNumber(info.raw_shares);
+        if (info.reason === 'exceeds_order' && shares !== null && shares >= 0) rawShares[base] = shares;
+    }
+    return { flagged: true, snapshotDecided, rawShares };
+}
+
+/** 股數 → App 數量單位（整股為張、無條件捨去；零股、興櫃為股） */
+function esunSharesToQuantity(shares: number, apCode: string): number {
+    return esunQuantityUnitFor(apCode) === 'lot' ? Math.floor(shares / 1000) : Math.floor(shares);
+}
+
 function readUnresolvedFailure(raw: Record<string, unknown>): EsunRowUnresolvedFailure | undefined {
     const v = raw.esun_unresolved_failure;
     if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
@@ -674,8 +739,22 @@ export function fromEsunOrderResult(
     const apCode = String(item.ap_code ?? item.apCode ?? EsunApCode.Common).trim() || EsunApCode.Common;
     const orgQty = esunQuantityFromFields(raw, 'org', apCode);
     if (!orderId || !stockNo || !action || orgQty === null || orgQty <= 0) return null;
-    const matQty = esunQuantityFromFields(raw, 'mat', apCode) ?? 0;
-    const celQty = esunQuantityFromFields(raw, 'cel', apCode) ?? 0;
+    const rawMatQty = esunQuantityFromFields(raw, 'mat', apCode) ?? 0;
+    const rawCelQty = esunQuantityFromFields(raw, 'cel', apCode) ?? 0;
+    // 成交＋取消超過委託量是矛盾資料（例如 bridge 多計 MAT）：不判終態，數量以委託量為上限，並標記待對帳。
+    // bridge 標示 esun_quantity_conflict 的列同樣標記；除非由較晚的券商快照決定，也不判終態
+    const flag = readQuantityConflict(raw);
+    const exceeds = rawMatQty + rawCelQty > orgQty;
+    const conflict = exceeds || flag.flagged;
+    const holdOpen = exceeds || (flag.flagged && !flag.snapshotDecided);
+    // 不判終態的列：bridge 以委託量為上限的數量（exceeds_order）改用它附上的列原始股數（raw_shares），
+    // 剩餘量大於 0 時委託留在「有效」、保留刪單（已無剩餘量時刪單會被券商明確拒絕，沒有害處）
+    const shown = (base: 'mat' | 'cel', value: number) => {
+        const rawShares = holdOpen ? flag.rawShares[base] : undefined;
+        return rawShares === undefined ? value : Math.min(value, esunSharesToQuantity(rawShares, apCode));
+    };
+    const celQty = Math.min(shown('cel', rawCelQty), orgQty);
+    const matQty = Math.min(shown('mat', rawMatQty), orgQty - celQty);
 
     const price = finiteNumber(item.od_price ?? item.odPrice) ?? 0;
     const errCode = String(item.err_code ?? item.errCode ?? '').trim();
@@ -690,7 +769,7 @@ export function fromEsunOrderResult(
 
     // 狀態依數量判定：成交＋取消涵蓋委託量即為終態（有取消就是 Cancelled，並保留成交量）
     let status: OrderStatusName;
-    if (matQty + celQty >= orgQty) status = celQty > 0 ? 'Cancelled' : 'Filled';
+    if (!holdOpen && matQty + celQty >= orgQty) status = celQty > 0 ? 'Cancelled' : 'Filled';
     else if (isEsunFailureCode(errCode) || ordStatus === 'Fail' || ordStatus === 'Failed') status = 'Failed';
     else if (matQty > 0) status = 'PartFilled';
     else if ((preOrdNo && !ordNo) || ordStatus === 'PreSubmitted') status = 'PreSubmitted';
@@ -724,13 +803,22 @@ export function fromEsunOrderResult(
     const exchange: Exchange = apCode === EsunApCode.Emg ? 'OES' : (opts.exchangeOf?.(stockNo) ?? 'TSE');
     const orderTs = esunTimestamp(item.ord_date ?? item.ordDate ?? item.work_date ?? item.workDate, item.ord_time ?? item.ordTime);
     // 逐筆成交來自 bridge 的 esun_fills；成交量超出逐筆總和的部分（快照已含、bridge 沒收到 MAT
-    // 的成交）以一筆彙總成交（均價）表示。逐筆總和超過成交量（不符 bridge 契約）時只用彙總。
+    // 的成交）以一筆彙總成交（均價）表示。逐筆總和超過列的成交量（later_snapshot：較晚的快照較小、
+    // 數量矛盾的列）時，逐筆 seq 全部保留當去重身分（權威讀取、快取重建重播的 SSE 成交一律被當成重複），
+    // 依接收順序分配列的成交量：較早的逐筆保留原數量，超出的部分從最後幾筆截掉（可能截成 0），
+    // 總和等於列的成交量。esun_fills 有 covered 元素時（SSE 以彙總 seq 送出）彙總成交即使截成 0 也保留。
+    // 最差只是少計，不會因重播多計而誤判已成交。
     const fallbackPrice = avgPrice > 0 ? avgPrice : price;
-    let fills = matQty > 0 ? esunFillDeals(raw, apCode, fallbackPrice, orderTs ?? 0) : [];
-    if (fills.reduce((sum, d) => sum + d.quantity, 0) > matQty) fills = [];
-    const rest = matQty - fills.reduce((sum, d) => sum + d.quantity, 0);
-    const deals: EsunDeal[] = rest > 0
-        ? [...fills, { seq: `${orderId}:agg`, price: fallbackPrice, quantity: rest, ts: orderTs ?? 0 }]
+    const listed = esunFillDeals(raw, apCode, fallbackPrice, orderTs ?? 0);
+    let budget = matQty;
+    const fills = listed.deals.map(d => {
+        const quantity = Math.min(d.quantity, budget);
+        budget -= quantity;
+        return quantity === d.quantity ? d : { ...d, quantity };
+    });
+    const rest = budget;
+    const deals: EsunDeal[] = rest > 0 || listed.covered
+        ? [...fills, { seq: esunAggregateDealSeq(orderId), price: fallbackPrice, quantity: rest, ts: orderTs ?? 0 }]
         : fills;
 
     const trade: Trade = {
@@ -775,6 +863,8 @@ export function fromEsunOrderResult(
     };
     const unresolved = readUnresolvedFailure(raw);
     if (unresolved) unresolvedFailures.set(trade.status, unresolved);
+    if (conflict) quantityConflicts.add(trade.status);
+    if (holdOpen) quantityHoldOpen.add(trade.status);
     return trade;
 }
 

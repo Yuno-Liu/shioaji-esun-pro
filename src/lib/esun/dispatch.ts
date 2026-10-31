@@ -21,7 +21,9 @@ import type { ServerModeGuard } from '../server-info-store';
 import type { ContractBase } from '../types/contract';
 import type { Action, OrderType, StockOrderCond, StockOrderLot, StockOrderReq, Trade, TradeCacheHealth } from '../types/order';
 import type { Account } from '../types/portfolio';
-import { esunUnresolvedFailureOf, isEsunAccount, isEsunBroker, validateEsunStockOrder } from './order-mapping';
+import {
+    esunAggregateDealSeq, esunQuantityConflictOf, esunQuantityHoldOpenOf, esunUnresolvedFailureOf, isEsunAccount, isEsunBroker, validateEsunStockOrder,
+} from './order-mapping';
 import { esunTradeService } from './service';
 import { ensureEsunOrderStream, getEsunStreamStatus, isEsunStreamStarted, onEsunStreamSignal } from './stream';
 import { ESUN_BROKER_NAME } from './types';
@@ -435,6 +437,21 @@ export function esunSnapshotMissingFailureMessage(orderId: string, opCode: strin
     return `玉山委託 ${orderId} 收到失敗回報${code}，券商最近一次委託查詢沒有列出這筆，仍無法判定被拒的操作；請稍後按更新確認`;
 }
 
+/** 委託列數量矛盾（成交＋取消超過委託量，或 bridge 標示 esun_quantity_conflict）時的待對帳訊息 */
+export function esunQuantityConflictMessage(orderId: string): string {
+    return `玉山委託 ${orderId} 的成交／取消量與委託量矛盾，未判定為已成交或已取消；請按更新確認`;
+}
+
+/** 快取重建時本地成交量重複計入快照已含的成交（多出的部分只來自彙總成交）、已改採快取列時的訊息 */
+export function esunAggregateRepairMessage(orderId: string): string {
+    return `玉山委託 ${orderId} 的本地成交量重複計入快照已含的成交，已改採 bridge 快取；請按更新確認`;
+}
+
+/** bridge 標示已含在委託快照內的成交回報：持倉即時估算待對帳的訊息 */
+export function esunCoveredDealMessage(orderId: string): string {
+    return `玉山委託 ${orderId} 的成交回報晚於委託快照，持倉的即時估算可能不準；請按更新確認持倉`;
+}
+
 /**
  * 權威讀取（refresh:true）回傳的列同時帶 esun_unresolved_failure 與 esun_snapshot_missing：bridge
  * 只是因近期保留而列出它，券商快照沒有判定這筆失敗，不能當成已確認。在讀取完成前（原因時間晚於
@@ -447,7 +464,25 @@ function raiseUnconfirmedFailures(rows: Trade[]) {
         if (unresolved?.snapshotMissing) {
             hooks?.raise('orders', 'snapshot-boundary', esunSnapshotMissingFailureMessage(row.order.id, unresolved.opCode));
         }
+        // 數量矛盾的列：權威讀取也不能當成已確認（同一次讀取不解除）
+        if (esunQuantityConflictOf(row)) hooks?.raise('orders', 'snapshot-boundary', esunQuantityConflictMessage(row.order.id));
     }
+}
+
+/**
+ * 本地成交量多出的部分只來自彙總成交 `${id}:agg`：快照已含的成交（彙總）之後又以 MAT 逐筆計入一次。
+ * 判定條件：本地有彙總成交與至少一筆逐筆成交，逐筆成交都在快取列的逐筆成交內，快取成交量不少於本地
+ * 彙總量與逐筆總和（快取知道的不比本地任一來源少，只是沒有把兩者相加），且快取取消量不低於本地。
+ */
+function aggregateDoubleCounted(local: Trade, cached: Trade): boolean {
+    const agg = esunAggregateDealSeq(local.order.id);
+    const sum = (deals: Trade['status']['deals']) => deals.reduce((total, d) => total + d.quantity, 0);
+    const localAgg = sum(local.status.deals.filter(d => d.seq === agg));
+    const perFill = local.status.deals.filter(d => d.seq !== agg);
+    const cachedSeqs = new Set(cached.status.deals.filter(d => d.seq !== agg).map(d => d.seq));
+    return localAgg > 0 && perFill.length > 0 && perFill.every(d => cachedSeqs.has(d.seq))
+        && cached.status.deal_quantity >= Math.max(localAgg, sum(perFill))
+        && cached.status.cancel_quantity >= local.status.cancel_quantity;
 }
 
 /**
@@ -458,6 +493,8 @@ function raiseUnconfirmedFailures(rows: Trade[]) {
  * snapshot-boundary（不在 CACHE_RESYNC_RESOLVES，只有權威讀取能解除）。非玉山帳戶原樣回傳快取列
  * （上游語意）。權威讀取（replace）不經過這裡。快取列帶 esun_unresolved_failure（bridge 收到對到
  * 這筆委託的失敗 ACK、還沒有快照判定）時同樣保留本地列並提出 snapshot-boundary。
+ * 數量矛盾且不判終態（holdOpen）的快取列，數量不可信：本地列不是同樣矛盾的列時保留本地列；
+ * 其他數量矛盾的快取列（later_snapshot）照下列規則合併。兩者都提出只有權威讀取能解除的待對帳。
  */
 export function esunCacheUpsertRow<T extends Trade & { account?: Account }>(local: T, cached: T): T {
     if (!isEsunAccount(cached.account ?? local.account)) return cached;
@@ -466,11 +503,20 @@ export function esunCacheUpsertRow<T extends Trade & { account?: Account }>(loca
         hooks?.raise('orders', 'snapshot-boundary', esunUnresolvedFailureMessage(local.order.id, unresolved.opCode));
         return local;
     }
+    if (esunQuantityConflictOf(cached)) {
+        hooks?.raise('orders', 'snapshot-boundary', esunQuantityConflictMessage(local.order.id));
+        if (esunQuantityHoldOpenOf(cached) && !esunQuantityHoldOpenOf(local)) return local;
+    }
     const behind = cached.status.deal_quantity < local.status.deal_quantity
         || cached.status.cancel_quantity < local.status.cancel_quantity;
     const reopened = ESUN_TERMINAL_STATUSES.includes(local.status.status)
         && !ESUN_TERMINAL_STATUSES.includes(cached.status.status);
     if (!behind && !reopened) return cached;
+    // 本地的錯誤（重複計入彙總成交，可能誤判為 Filled）：改採快取列，讓委託回到有效、可刪改單
+    if (aggregateDoubleCounted(local, cached)) {
+        hooks?.raise('orders', 'snapshot-boundary', esunAggregateRepairMessage(local.order.id));
+        return cached;
+    }
     hooks?.raise('orders', 'snapshot-boundary', esunCacheConflictMessage(local.order.id));
     return local;
 }
@@ -515,6 +561,9 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
         } else if (signal.kind === 'unresolved-failure') {
             // 失敗回報推不出操作別：本地委託不變（上游投影），只有權威讀取（券商快照）能判定
             next.raise('orders', 'snapshot-boundary', esunUnresolvedFailureMessage(signal.orderId, signal.opCode));
+        } else if (signal.kind === 'covered-deal') {
+            // 委託已以彙總 seq 去重；持倉的即時估算以成交序號去重，同一委託第二筆這類成交會被略過，只有權威讀取能對帳
+            next.raise('positions', 'snapshot-boundary', esunCoveredDealMessage(signal.orderId));
         } else if (signal.reason === 'failed_ack_refreshed' && signal.cacheRefreshed === true) {
             // bridge 已依失敗 ACK 做完背景權威查詢並套用快照：沒有漏收回報，持倉不受影響。只提出一個
             // 快取重建能解除的 orders 原因（讓健康檢查以快取重建委託）。每個玉山帳戶都有進行中的權威讀取時

@@ -194,6 +194,24 @@ describe('E.SUN order stream', () => {
         expect(published('order_event')).toHaveLength(1);
     });
 
+    it('forwards a fill covered by an order snapshot with the aggregate seq and signals it (RC1)', () => {
+        ensureEsunOrderStream();
+        latest().open();
+        const fill = {
+            event_id: 'boot1-8', seq: 8, report_stream: 'deal', report_seq: 1, session_generation: 1,
+            ts: '2026-10-23T09:06:00+08:00', account: { broker_id: '8840', account_id: '1234567' },
+            ord_no: 'C0001', stock_no: '2884', buy_sell: 'B', ap_code: '1', trade: '0', mat_price: 25.5, mat_qty: 1, mat_qty_share: 1000,
+        };
+        latest().fire('deal', { ...fill, mkt_seq_num: '000417', esun_covered_by_snapshot: true });
+        expect(published('order_event')).toHaveLength(1);
+        expect(JSON.parse(published('order_event')[0]!.raw).data.StockDeal.exchange_seq).toBe('C0001:agg');
+        expect(seen).toEqual([{ kind: 'covered-deal', orderId: 'C0001' }]);
+        // 沒有旗標（舊版 bridge）：照舊以 mkt_seq_num 送出、不另外通知
+        latest().fire('deal', { ...fill, event_id: 'boot1-9', report_seq: 2, mkt_seq_num: '000418' });
+        expect(JSON.parse(published('order_event')[1]!.raw).data.StockDeal.exchange_seq).toBe('000418');
+        expect(seen).toHaveLength(1);
+    });
+
     it('forwards a failed report whose operation is unknown and signals it as unresolved (PB4-1)', () => {
         ensureEsunOrderStream();
         latest().open();

@@ -6,6 +6,7 @@ import type { StockOrderReq, Trade } from '../types/order';
 import type { Account } from '../types/portfolio';
 import type { StockProfitLossSummary } from '../shioaji';
 import { markPosition } from '../portfolio-projection';
+import { remainingWorkingOrderQuantity } from '../working-order-quantity';
 import {
     clampEsunDateRange180Days,
     formatEsunErrorMessage,
@@ -20,6 +21,8 @@ import {
     fromEsunTransactionsToProfitLossSummary,
     esunMktSeqNum,
     esunOrderSortKey,
+    esunQuantityConflictOf,
+    esunQuantityHoldOpenOf,
     esunTransactionCondOf,
     isEsunAccount,
     isEsunBroker,
@@ -506,6 +509,30 @@ describe('toEsunOrderPayload', () => {
         expect(payload.userDef).toHaveLength(50);
         expect(payload.userDef).toBe('A'.repeat(50));
     });
+
+    // fork：融券買進＝回補（B＋trade '4'），市價 IOC 2 張的完整 payload（資料為合成）
+    it('maps a 融券買進 (Buy＋ShortSelling) market IOC order to B / trade 4', () => {
+        const payload = toEsunOrderPayload(stockContract, {
+            action: 'Buy',
+            price: 436,
+            quantity: 2,
+            price_type: 'MKT',
+            order_type: 'IOC',
+            order_lot: 'Common',
+            order_cond: 'ShortSelling',
+        });
+        expect(payload).toEqual({
+            stockNo: '2884',
+            buySell: 'B',
+            price: 0,
+            quantity: 2,
+            apCode: '1',
+            priceFlag: '4',
+            bsFlag: 'I',
+            trade: '4',
+            userDef: undefined,
+        });
+    });
 });
 
 describe('fromEsunOrderResponse and fromEsunOrderResult', () => {
@@ -691,9 +718,45 @@ describe('fromEsunOrderResult per-fill deals (esun_fills)', () => {
             esun_fills: [{ mkt_seq_num: '9', mat_qty_share: 30, mat_price: 25.5 }] })).toEqual([{ seq: '9', price: 25.5, quantity: 30 }]);
     });
 
-    it('keeps the legacy aggregate when the row has no fills, or fills exceed the fill quantity', () => {
+    it('keeps the legacy aggregate when the row has no fills', () => {
         expect(deals({})).toEqual([{ seq: 'C0001:agg', price: 25.4, quantity: 2 }]);
-        expect(deals({ esun_fills: [{ mkt_seq_num: '1', mat_qty_share: 3000, mat_price: 25.5 }] })).toEqual([{ seq: 'C0001:agg', price: 25.4, quantity: 2 }]);
+    });
+
+    it('keeps every per-fill seq when fills exceed the row fill quantity, truncating the last ones (later_snapshot)', () => {
+        // 單筆超過：保留 seq，數量截到列的成交量，不另加彙總
+        expect(deals({ esun_fills: [{ mkt_seq_num: '1', mat_qty_share: 3000, mat_price: 25.5 }] })).toEqual([{ seq: '1', price: 25.5, quantity: 2 }]);
+        // 較晚的快照 mat 1、逐筆 S1、S2：S1 保留 1 張，S2 截成 0（仍是去重身分）
+        const later = { esun_quantity_conflict: { mat: { reason: 'later_snapshot', report_shares: 2000, snapshot_shares: 1000 } } };
+        const trade = fromEsunOrderResult(row({ org_qty: 3, org_qty_share: 3000, mat_qty: 1, mat_qty_share: 1000, ...later, esun_fills: [
+            { mkt_seq_num: 'S1', mat_qty_share: 1000, mat_price: 25.5 }, { mkt_seq_num: 'S2', mat_qty_share: 1000, mat_price: 25.6 },
+        ] }) as EsunOrderResult, esunAccount)!;
+        expect(trade.status).toMatchObject({ status: 'PartFilled', deal_quantity: 1 });
+        expect(trade.status.deals.map(d => [d.seq, d.quantity])).toEqual([['S1', 1], ['S2', 0]]);
+        // 列沒有成交量（快照 0）：逐筆全部截成 0，仍保留
+        expect(deals({ mat_qty: 0, mat_qty_share: 0, esun_fills: [{ mkt_seq_num: 'S1', mat_qty_share: 1000, mat_price: 25.5 }] }))
+            .toEqual([{ seq: 'S1', price: 25.5, quantity: 0 }]);
+    });
+
+    it('keeps the aggregate seq (possibly 0) when a covered fill is listed and the per-fill sum already reaches the row', () => {
+        expect(deals({ mat_qty: 1, mat_qty_share: 1000, esun_fills: [
+            { mkt_seq_num: 'S0', mat_qty_share: 1000, mat_price: 25.5, esun_covered_by_snapshot: true },
+            { mkt_seq_num: 'S1', mat_qty_share: 1000, mat_price: 25.3 },
+            { mkt_seq_num: 'S2', mat_qty_share: 1000, mat_price: 25.3 },
+        ] })).toEqual([
+            { seq: 'S1', price: 25.3, quantity: 1 },
+            { seq: 'S2', price: 25.3, quantity: 0 },
+            { seq: 'C0001:agg', price: 25.4, quantity: 0 },
+        ]);
+    });
+
+    it('folds fills the bridge marks as covered by the snapshot into the aggregate (same seq as the covered SSE fill)', () => {
+        expect(deals({ mat_qty: 3, mat_qty_share: 3000, esun_fills: [
+            { mkt_seq_num: '000417', mat_qty_share: 1000, mat_price: 25.5, esun_covered_by_snapshot: true },
+            { mkt_seq_num: '000418', mat_qty_share: 1000, mat_price: 25.3 },
+        ] })).toEqual([
+            { seq: '000418', price: 25.3, quantity: 1 },
+            { seq: 'C0001:agg', price: 25.4, quantity: 2 },
+        ]);
     });
 
     it('reads mkt_seq_num like the bridge (0 and empty string mean none)', () => {
@@ -701,6 +764,95 @@ describe('fromEsunOrderResult per-fill deals (esun_fills)', () => {
         expect(esunMktSeqNum({ mkt_seq_num: '' })).toBe('');
         expect(esunMktSeqNum({ mkt_seq_num: 0 })).toBe('');
         expect(esunMktSeqNum({ mkt_seq_num: 7 })).toBe('7');
+    });
+});
+
+describe('fromEsunOrderResult contradictory quantities (RC2)', () => {
+    const row = (over: Record<string, unknown> = {}) => fromEsunOrderResult({
+        ord_no: 'C0002', pre_ord_no: '', stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R',
+        trade: '0', od_price: 25.5, org_qty: 3, org_qty_share: 3000, mat_qty: 0, mat_qty_share: 0, cel_qty: 0, cel_qty_share: 0,
+        avg_price: 25.5, ord_date: '20261023', ord_time: '090512345', ...over,
+    } as EsunOrderResult, esunAccount)!;
+
+    it('does not judge Filled when fills exceed the order; caps the quantities and marks the row', () => {
+        const trade = row({ mat_qty: 4, mat_qty_share: 4000 });
+        expect(trade.status).toMatchObject({ status: 'PartFilled', deal_quantity: 3, cancel_quantity: 0 });
+        expect(trade.status.deals.reduce((s, d) => s + d.quantity, 0)).toBe(3);
+        expect(esunQuantityConflictOf(trade)).toBe(true);
+        // 盤中零股：300 股委託、成交 400 股
+        const odd = row({ ap_code: '5', org_qty: 0.3, org_qty_share: 300, mat_qty: 0.4, mat_qty_share: 400 });
+        expect(odd.status).toMatchObject({ status: 'PartFilled', deal_quantity: 300 });
+        expect(esunQuantityConflictOf(odd)).toBe(true);
+    });
+
+    it('does not judge Cancelled when fills plus cancels exceed the order', () => {
+        const trade = row({ mat_qty: 2, mat_qty_share: 2000, cel_qty: 2, cel_qty_share: 2000 });
+        expect(trade.status).toMatchObject({ status: 'PartFilled', deal_quantity: 1, cancel_quantity: 2 });
+        expect(esunQuantityConflictOf(trade)).toBe(true);
+    });
+
+    it('marks a row the bridge flags esun_quantity_conflict and does not judge it terminal (report total capped at the order)', () => {
+        const capped = { mat: { reason: 'exceeds_order', report_shares: 4000, org_shares: 3000 } };
+        const flagged = row({ mat_qty: 3, mat_qty_share: 3000, esun_quantity_conflict: capped });
+        expect(flagged.status).toMatchObject({ status: 'PartFilled', deal_quantity: 3 });
+        expect(esunQuantityConflictOf(flagged)).toBe(true);
+        expect(row({ mat_qty: 3, mat_qty_share: 3000, esun_quantity_conflict: true }).status.status).toBe('PartFilled');
+        const partial = row({ mat_qty: 2, mat_qty_share: 2000, esun_quantity_conflict: capped });
+        expect(partial.status).toMatchObject({ status: 'PartFilled', deal_quantity: 2 });
+        expect(esunQuantityConflictOf(partial)).toBe(true);
+        expect(esunQuantityHoldOpenOf(flagged)).toBe(true);
+    });
+
+    it('shows the raw quantity the bridge attaches (raw_shares) on a held-open row, so a remaining quantity stays working', () => {
+        // bridge 回報累計 4000 股、列被截到委託量 3 張；快照原本 2000 股 -> 顯示 2/3，剩 1 張可刪單
+        const capped = { mat: { reason: 'exceeds_order', report_shares: 4000, org_shares: 3000, raw_shares: 2000 } };
+        const trade = row({ mat_qty: 3, mat_qty_share: 3000, esun_quantity_conflict: capped });
+        expect(trade.status).toMatchObject({ status: 'PartFilled', deal_quantity: 2, cancel_quantity: 0 });
+        expect(remainingWorkingOrderQuantity(trade)).toBe(1);
+        expect(trade.status.deals.reduce((s, d) => s + d.quantity, 0)).toBe(2);
+        expect(esunQuantityHoldOpenOf(trade)).toBe(true);
+        // raw_shares 不低於上限：仍取 min(raw, 委託量 − 取消量)
+        expect(row({ mat_qty: 3, mat_qty_share: 3000, esun_quantity_conflict: { mat: { ...capped.mat, raw_shares: 5000 } } }).status.deal_quantity).toBe(3);
+        // 整股以張無條件捨去；零股以股
+        expect(row({ mat_qty: 3, mat_qty_share: 3000, esun_quantity_conflict: { mat: { ...capped.mat, raw_shares: 1500 } } }).status.deal_quantity).toBe(1);
+        const odd = row({ ap_code: '5', org_qty: 0.3, org_qty_share: 300, mat_qty: 0.3, mat_qty_share: 300,
+            esun_quantity_conflict: { mat: { reason: 'exceeds_order', report_shares: 400, org_shares: 300, raw_shares: 120 } } });
+        expect(odd.status).toMatchObject({ status: 'PartFilled', deal_quantity: 120 });
+        // 取消量被截到委託量（cel exceeds_order）：同樣改用原始取消股數
+        const cel = row({ cel_qty: 3, cel_qty_share: 3000,
+            esun_quantity_conflict: { cel: { reason: 'exceeds_order', report_shares: 4000, org_shares: 3000, raw_shares: 1000 } } });
+        expect(cel.status).toMatchObject({ status: 'Submitted', cancel_quantity: 1, deal_quantity: 0 });
+        expect(remainingWorkingOrderQuantity(cel)).toBe(2);
+        // 沒有 raw_shares（舊版 bridge）或形狀不符：維持以委託量為上限
+        for (const bad of [undefined, 'x', -1, null]) {
+            expect(row({ mat_qty: 3, mat_qty_share: 3000, esun_quantity_conflict: { mat: { ...capped.mat, raw_shares: bad } } }).status.deal_quantity).toBe(3);
+        }
+        // later_snapshot 的 raw_shares 不採用（快照決定、可判終態）
+        const later = row({ mat_qty: 3, mat_qty_share: 3000,
+            esun_quantity_conflict: { mat: { reason: 'later_snapshot', report_shares: 4000, snapshot_shares: 3000, raw_shares: 1000 } } });
+        expect(later.status).toMatchObject({ status: 'Filled', deal_quantity: 3 });
+        expect(esunQuantityHoldOpenOf(later)).toBe(false);
+    });
+
+    it('lets a later broker snapshot decide (later_snapshot) but still marks the row', () => {
+        const later = { mat: { reason: 'later_snapshot', report_shares: 4000, snapshot_shares: 3000 } };
+        const filled = row({ mat_qty: 3, mat_qty_share: 3000, esun_quantity_conflict: later });
+        expect(filled.status).toMatchObject({ status: 'Filled', deal_quantity: 3 });
+        expect(esunQuantityConflictOf(filled)).toBe(true);
+        // mat 以快照為準、cel 超過委託量：不判終態
+        const mixed = row({ mat_qty: 1, mat_qty_share: 1000, cel_qty: 2, cel_qty_share: 2000,
+            esun_quantity_conflict: { ...later, cel: { reason: 'exceeds_order', report_shares: 4000, org_shares: 3000 } } });
+        expect(mixed.status.status).toBe('PartFilled');
+    });
+
+    it('keeps consistent rows unmarked: exactly filled is Filled, partly filled is PartFilled', () => {
+        const filled = row({ mat_qty: 3, mat_qty_share: 3000 });
+        expect(filled.status).toMatchObject({ status: 'Filled', deal_quantity: 3 });
+        expect(esunQuantityConflictOf(filled)).toBe(false);
+        const part = row({ mat_qty: 2, mat_qty_share: 2000 });
+        expect(part.status).toMatchObject({ status: 'PartFilled', deal_quantity: 2 });
+        expect(esunQuantityConflictOf(part)).toBe(false);
+        expect(esunQuantityConflictOf(row({ mat_qty: 1, mat_qty_share: 1000, cel_qty: 2, cel_qty_share: 2000 }))).toBe(false);
     });
 });
 
