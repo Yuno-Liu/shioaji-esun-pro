@@ -29,11 +29,15 @@ beforeEach(() => {
     m.stock.mockResolvedValue({ status: { status: 'PendingSubmit' } });
 });
 
-it('sends 融資 on both sides and 融券 on a sell, with the condition on the stock order', async () => {
+it('sends 融資 and 融券 on both sides (融券買進＝回補), with the condition on the stock order', async () => {
     await placeQuickOrder(stock, 'Buy', 100, 2, { account, orderCond: 'MarginTrading' });
     await placeQuickOrder(stock, 'Sell', 100, 2, { account, orderCond: 'MarginTrading' });
     await placeQuickOrder(stock, 'Sell', 100, 1, { account, orderCond: 'ShortSelling' });
-    expect(m.stock.mock.calls.map(c => c[1].order_cond)).toEqual(['MarginTrading', 'MarginTrading', 'ShortSelling']);
+    await placeQuickOrder(stock, 'Buy', null, 2, { account, orderCond: 'ShortSelling' });
+    expect(m.stock.mock.calls.map(c => c[1].order_cond)).toEqual(['MarginTrading', 'MarginTrading', 'ShortSelling', 'ShortSelling']);
+    expect(m.stock.mock.calls[3]![1]).toMatchObject({ action: 'Buy', quantity: 2, price_type: 'MKT', order_type: 'IOC', order_lot: 'Common', order_cond: 'ShortSelling' });
+    // 確認視窗的動作名稱是「融券買進」
+    expect(m.confirm.mock.calls[3]![0]).toMatchObject({ action: 'Buy', credit: '融券' });
     expect(m.stock.mock.calls.every(c => c[1].daytrade_short === undefined)).toBe(true);
 });
 
@@ -56,8 +60,9 @@ it('sends 現股當沖先賣 only on the sell side of a day-trade stock', async 
 });
 
 it.each([
-    ['融券買進', stock, 'Buy', { orderCond: 'ShortSelling' }, CREDIT_TEXT.shortBuy],
     ['借券買進', stock, 'Buy', { orderCond: 'SBLShort' }, CREDIT_TEXT.shortBuy],
+    ['借券豁免買進', stock, 'Buy', { orderCond: 'SBLShortPriceExempt' }, CREDIT_TEXT.shortBuy],
+    ['零股融券買進', stock, 'Buy', { orderCond: 'ShortSelling', orderLot: 'IntradayOdd' }, ODD_LOT_TEXT.cond],
     ['不可當沖的當沖先賣', onlyBuy, 'Sell', { daytradeShort: true }, CREDIT_TEXT.daytradeStock],
     ['融資＋當沖先賣', stock, 'Sell', { orderCond: 'MarginTrading', daytradeShort: true }, CREDIT_TEXT.daytradeCond],
     ['零股融資', stock, 'Buy', { orderCond: 'MarginTrading', orderLot: 'IntradayOdd' }, ODD_LOT_TEXT.cond],

@@ -144,6 +144,8 @@ export function chartOrderSummary(s: ChartOrderSettings, market: ChartOrderMarke
     const sellOnly = SELL_ONLY.has(eff.credit.cond);
     const what = sellOnly
         ? `點價賣以 ${eff.orderType} 限價${tag}賣出 ${lotText(s, market)}（點價買停用：${tag}只能賣出）`
+        : eff.credit.cond === 'ShortSelling'
+            ? `點價買以 ${eff.orderType} 限價融券買進（回補）、點價賣以 ${eff.orderType} 限價融券賣出 ${lotText(s, market)}`
         : eff.credit.daytradeShort
             ? `點價買以 ${eff.orderType} 限價現股買進、點價賣以 ${eff.orderType} 限價現沖賣出 ${lotText(s, market)}`
             : `點價買／賣以 ${eff.orderType} 限價送出 ${lotText(s, market)}${oc ? `（${oc}）` : tag ? `（${tag}）` : ''}`;
@@ -151,7 +153,8 @@ export function chartOrderSummary(s: ChartOrderSettings, market: ChartOrderMarke
         + `停損停利${chartExitText(s, market)}${odd ? '。零股只能現股、ROD 限價' : ''}。`;
 }
 
-const SELL_ONLY: ReadonlySet<string> = new Set(['ShortSelling', 'SBLShort', 'SBLShortPriceExempt']);
+// 融券買進＝回補，只有借券類限賣出（fork 修正，同 odd-lot.ts）
+const SELL_ONLY: ReadonlySet<string> = new Set(['SBLShort', 'SBLShortPriceExempt']);
 
 /** 點價／停損／停利模式啟用時，圖上的提示。 */
 export function chartModeHint(mode: 'buy' | 'sell' | 'stop' | 'take' | 'alert', s: ChartOrderSettings, market: ChartOrderMarket): string {
@@ -160,7 +163,7 @@ export function chartModeHint(mode: 'buy' | 'sell' | 'stop' | 'take' | 'alert', 
     const eff = chartEffective(s, market);
     const type = eff.orderType === 'ROD' ? '' : ` ${eff.orderType}`;
     const oc = eff.octype && eff.octype !== 'Auto' ? `（${octypeLabel(eff.octype)}）` : '';
-    if (mode === 'buy') return `點擊價位 → ${chartActionCredit(eff.credit, 'Buy')}限價買進${type} ${what}${oc}`;
+    if (mode === 'buy') return `點擊價位 → ${chartActionCredit(eff.credit, 'Buy')}限價買進${type} ${what}${oc}${eff.credit.cond === 'ShortSelling' ? '（回補）' : ''}`;
     if (mode === 'sell') return `點擊價位 → ${chartActionCredit(eff.credit, 'Sell')}限價賣出${type} ${what}${oc}`;
     if (mode === 'stop') return `點擊價位 → 停損 ${what}（${chartExitText(s, market)}）`;
     if (mode === 'take') return `點擊價位 → 停利 ${what}（${chartExitText(s, market)}）`;

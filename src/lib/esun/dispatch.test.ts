@@ -12,19 +12,24 @@ vi.mock('./stream', () => ({
 
 import { captureServerMode } from '../server-info-store';
 import { MOCK_ESUN_ACCOUNT_ID, MockEsunDriver } from './mock-driver';
+import { fromEsunOrderResult } from './order-mapping';
 import { esunTradeService } from './service';
+import type { EsunOrderResult } from './types';
 import {
     ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE,
     ESUN_FAILED_ACK_REFRESHED_MESSAGE,
     ESUN_STALE_CACHE_MESSAGE,
     ESUN_UNREFRESHED_CACHE_MESSAGE,
     esunAccountQuery,
+    esunAggregateRepairMessage,
     esunCacheConflictMessage,
     esunCacheUpsertRow,
     esunConfirmBrokerLabel,
     esunConfirmGuard,
     esunConfirmSimulation,
+    esunCoveredDealMessage,
     esunProfitLossRows,
+    esunQuantityConflictMessage,
     esunUnitUnknownMessage,
     startEsunTradingState,
     type EsunTradingHooks,
@@ -208,6 +213,13 @@ describe('trading-state hooks (§5 consumer)', () => {
         expect(hooks.checkHealth).not.toHaveBeenCalled();
     });
 
+    it('raises a positions snapshot-boundary naming the order for a fill covered by an order snapshot (RC1)', () => {
+        emit({ kind: 'covered-deal', orderId: 'C0001' });
+        expect(hooks.raise.mock.calls).toEqual([['positions', 'snapshot-boundary', esunCoveredDealMessage('C0001')]]);
+        expect(esunCoveredDealMessage('C0001')).toContain('C0001');
+        expect(hooks.checkHealth).not.toHaveBeenCalled();
+    });
+
     it('keeps the E.SUN disconnect open when an authoritative read completes while the stream is down', async () => {
         const account = esunTradeService.getAccounts()[0]!;
         try {
@@ -280,6 +292,80 @@ describe('cache rebuild row merge (esunCacheUpsertRow)', () => {
         expect(hooks.raise).not.toHaveBeenCalled();
     });
 
+    /** 委託 C0001 5 張的本地／快取列，deals 為 [seq, 張] */
+    const withDeals = (deals: [string, number][], over: { status?: string; cancel?: number } = {}) => {
+        const deal = deals.reduce((s, [, q]) => s + q, 0);
+        const base = row(deal, over.cancel ?? 0, over.status ? { status: over.status } : {});
+        return { ...base, status: { ...base.status, deals: deals.map(([seq, quantity]) => ({ seq, price: 25.5, quantity, ts: 1 })) } };
+    };
+
+    it('takes the cache row when the local excess comes only from the aggregate fill counted again by MATs (RC1)', () => {
+        // 本地：快照彙總 1 張＋之後同一筆成交的 MAT（S1）再計入＋S2 → 3 張；快取：逐筆 S1、S2 共 2 張
+        const local = withDeals([['C0001:agg', 1], ['S1', 1], ['S2', 1]]);
+        const cached = withDeals([['S1', 1], ['S2', 1]]);
+        expect(esunCacheUpsertRow(local, cached)).toBe(cached);
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'snapshot-boundary', esunAggregateRepairMessage('C0001')]]);
+        // 本地已誤判為 Filled（5 張全成交）：同樣改採快取列（委託回到有效）
+        hooks.raise.mockClear();
+        const filled = withDeals([['C0001:agg', 2], ['S1', 1], ['S2', 1], ['S3', 1]], { status: 'Filled' });
+        const live = withDeals([['S1', 1], ['S2', 1], ['S3', 1]]);
+        expect(esunCacheUpsertRow(filled, live)).toBe(live);
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', esunAggregateRepairMessage('C0001'));
+    });
+
+    it('keeps the local row when the excess is not explained by the aggregate fill alone', () => {
+        const cases: [ReturnType<typeof withDeals>, ReturnType<typeof withDeals>][] = [
+            // 本地有快取沒有的逐筆成交
+            [withDeals([['C0001:agg', 1], ['S1', 1], ['S9', 1]]), withDeals([['S1', 1], ['S2', 1]])],
+            // 只有彙總成交（快取落後，例如 bridge 重啟）
+            [withDeals([['C0001:agg', 2]]), withDeals([['C0001:agg', 1]])],
+            // 快取成交量少於本地彙總量：快取不知道快照的成交
+            [withDeals([['C0001:agg', 2], ['S1', 1]]), withDeals([['S1', 1]])],
+            // 快取取消量較低
+            [withDeals([['C0001:agg', 1], ['S1', 1]], { cancel: 1 }), withDeals([['S1', 1]])],
+        ];
+        for (const [local, cached] of cases) {
+            hooks.raise.mockClear();
+            expect(esunCacheUpsertRow(local, cached)).toBe(local);
+            expect(hooks.raise.mock.calls).toEqual([['orders', 'snapshot-boundary', esunCacheConflictMessage('C0001')]]);
+        }
+    });
+
+    const esunRow = (over: Record<string, unknown>) => ({ ...fromEsunOrderResult({
+        ord_no: 'C0001', pre_ord_no: '', stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R', trade: '0',
+        od_price: 25.5, org_qty: 5, org_qty_share: 5000, mat_qty: 0, mat_qty_share: 0, cel_qty: 0, cel_qty_share: 0, avg_price: 25.5,
+        ord_date: '20261023', ord_time: '090512345', ...over,
+    } as EsunOrderResult, esun)!, account: esun });
+
+    it('keeps the consistent local row over a held-open cache row with contradictory quantities, and raises a reason (RC2)', () => {
+        const cached = esunRow({ mat_qty: 6, mat_qty_share: 6000 });
+        expect(cached.status).toMatchObject({ status: 'PartFilled', deal_quantity: 5 });
+        // 本地 2/5（一致、剩 3 張可刪單）：不被矛盾的快取列（5/5、無剩餘量）蓋掉
+        const local = row(2, 0) as typeof cached;
+        expect(esunCacheUpsertRow(local, cached)).toBe(local);
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'snapshot-boundary', esunQuantityConflictMessage('C0001')]]);
+        expect(esunQuantityConflictMessage('C0001')).toContain('C0001');
+        // bridge 標示 exceeds_order 的快取列同樣保留本地列（快取即使知道得比本地多也不採用）
+        hooks.raise.mockClear();
+        const capped = esunRow({ mat_qty: 5, mat_qty_share: 5000,
+            esun_quantity_conflict: { mat: { reason: 'exceeds_order', report_shares: 6000, org_shares: 5000, raw_shares: 4000 } } });
+        expect(capped.status.deal_quantity).toBe(4);
+        expect(esunCacheUpsertRow(local, capped)).toBe(local);
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'snapshot-boundary', esunQuantityConflictMessage('C0001')]]);
+        // 本地也是同樣矛盾的列：照一般規則合併（快取不落後 -> 採用快取列）
+        hooks.raise.mockClear();
+        const heldLocal = esunRow({ mat_qty: 6, mat_qty_share: 6000 });
+        expect(esunCacheUpsertRow(heldLocal, cached)).toBe(cached);
+        expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', esunQuantityConflictMessage('C0001'));
+    });
+
+    it('merges a later_snapshot cache row by the usual rules, still raising a reason', () => {
+        const later = esunRow({ mat_qty: 3, mat_qty_share: 3000,
+            esun_quantity_conflict: { mat: { reason: 'later_snapshot', report_shares: 4000, snapshot_shares: 3000 } } });
+        expect(esunCacheUpsertRow(row(2, 0) as typeof later, later)).toBe(later);
+        expect(hooks.raise.mock.calls).toEqual([['orders', 'snapshot-boundary', esunQuantityConflictMessage('C0001')]]);
+    });
+
     it('takes the cache row without a reason when it is not behind, and for other brokers', () => {
         const cached = row(4, 0);
         expect(esunCacheUpsertRow(row(3, 0), cached)).toBe(cached);
@@ -290,5 +376,13 @@ describe('cache rebuild row merge (esunCacheUpsertRow)', () => {
         const sinopacLive = row(0, 0, { broker: '9A95' });
         expect(esunCacheUpsertRow(row(0, 0, { broker: '9A95', status: 'Failed' }), sinopacLive)).toBe(sinopacLive);
         expect(hooks.raise).not.toHaveBeenCalled();
+    });
+});
+
+describe('mock driver settlements', () => {
+    it('returns the same shape as the HTTP driver (ISO dates, T+0..T+2)', async () => {
+        const list = await new MockEsunDriver().getSettlements();
+        expect(list.map(s => s.T)).toEqual([0, 1, 2]);
+        for (const s of list) expect(s.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     });
 });

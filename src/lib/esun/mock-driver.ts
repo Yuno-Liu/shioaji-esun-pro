@@ -434,10 +434,11 @@ export class MockEsunDriver implements IEsunTradeDriver {
 
     async getSettlements(): Promise<Settlement[]> {
         if (this.customSettlements) return this.customSettlements;
+        // 與 http-driver（fromEsunSettlements）相同的形狀：ISO 日期、依交易日排的 T+0～T+2
         return [
-            { date: '20261023', amount: 50000, T: 0 },
-            { date: '20261024', amount: -25000, T: 1 },
-            { date: '20261025', amount: 12000, T: 2 },
+            { date: '2026-10-23', amount: 50000, T: 0 },
+            { date: '2026-10-26', amount: -25000, T: 1 },
+            { date: '2026-10-27', amount: 12000, T: 2 },
         ];
     }
 

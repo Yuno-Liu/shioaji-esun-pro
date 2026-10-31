@@ -854,7 +854,7 @@ export function placeStockOrder(
     opts?: { agentInitiated?: boolean; agentCallId?: string; agentAuto?: boolean; beforeDispatch?: () => void; onResponse?: (res: Response) => void },
 ) {
     // 零股不支援的組合（融資券／當沖／市價／IOC／超過 999 股）與整股信用規則
-    // （融券買進、不可當沖的當沖先賣）一律在送出前擋下（#204）
+    // （借券類買進、不可當沖的當沖先賣）一律在送出前擋下（#204）；融券買進＝回補照送
     const problem = stockOrderProblem({ ...order, day_trade: (contract as { day_trade?: string }).day_trade });
     if (problem) return Promise.reject(Object.assign(new Error(problem), { mutationNotStarted: true as const }));
     const selected = account ?? accountFor('S');

@@ -8,6 +8,7 @@ import { createElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { normalizeOrderEvent, type OrderEventReport } from '../order-report';
 import type { Trade } from '../types/order';
+import { remainingWorkingOrderQuantity } from '../working-order-quantity';
 import type { Account } from '../types/portfolio';
 import { fromEsunOrderResult } from './order-mapping';
 import { toEsunReportWire } from './report-adapter';
@@ -60,13 +61,13 @@ function row(over: Record<string, unknown> = {}): Trade {
 
 let reportSeq = 0;
 /** bridge SSE 的 MAT（經前端轉換後進上游回報管線） */
-function mat(mktSeqNum: string, lots: number): OrderEventReport {
+function mat(mktSeqNum: string, lots: number, over: Record<string, unknown> = {}): OrderEventReport {
     reportSeq += 1;
     const result = toEsunReportWire('deal', {
         event_id: `boot1-${100 + reportSeq}`, report_stream: 'deal', report_seq: reportSeq, session_generation: 1,
         ts: '2026-10-23T09:06:00+08:00', environment: 'PRODUCTION', account: { broker_id: '8840', account_id: '1234567' },
         ord_no: 'C0001', stock_no: '2884', buy_sell: 'B', ap_code: '1', trade: '0', mat_price: 25.5,
-        mat_qty: lots, mat_qty_share: lots * 1000, mkt_seq_num: mktSeqNum, mat_no: `M-${mktSeqNum}`,
+        mat_qty: lots, mat_qty_share: lots * 1000, mkt_seq_num: mktSeqNum, mat_no: `M-${mktSeqNum}`, ...over,
     }, { environment: 'PRODUCTION', account });
     if (result.kind !== 'report') throw new Error(result.reason);
     return normalizeOrderEvent(result.wire)!;
@@ -127,18 +128,195 @@ describe('authoritative read racing an SSE fill (PB2-1)', () => {
         expect(reasons('orders')).not.toContain('projection-failed');
     });
 
-    it('keeps the legacy behaviour for a row with only the aggregate (no esun_fills)', async () => {
+    it('does not count a fill twice when the response has it only in the aggregate and the bridge marks the fill covered (RC1)', async () => {
         const response = deferred<Trade[]>();
         mocks.trades.mockImplementationOnce(() => response.promise);
         let run!: Promise<void>;
         await act(async () => { vi.advanceTimersByTime(1600); run = store.refreshTradingState('orders'); await Promise.resolve(); });
-        await emit(mat('000417', 2));
-        response.resolve([row({ mat_qty: 2, mat_qty_share: 2000, avg_price: 25.5 })]);
+        // bridge 收到 MAT 時，委託快照已含這筆成交：SSE 成交帶 esun_covered_by_snapshot，以彙總 seq 投影
+        await emit(mat('000417', 2, { esun_covered_by_snapshot: true }));
+        expect(local().status.deal_quantity).toBe(2);
+        // bridge 的實際輸出：esun_fills 也列出這筆，並帶同一個 covered 旗標
+        response.resolve([row({ mat_qty: 2, mat_qty_share: 2000, avg_price: 25.5,
+            esun_fills: [{ mkt_seq_num: '000417', mat_qty_share: 2000, mat_price: 25.5, esun_covered_by_snapshot: true }] })]);
         await act(async () => { await run; });
-        // 舊格式的 `${id}:agg` 對不上 mkt_seq_num：重播照舊套用（只能由快照邊界提示）
-        expect(local().status.deal_quantity).toBe(4);
-        expect(local().status.deals.map(d => d.seq)).toEqual(['C0001:agg', '000417']);
+        // 重播的成交與快照列的 `${id}:agg` 是同一個 seq：不重複計入（5 張委託成交 2 張）
+        expect(local().status).toMatchObject({ deal_quantity: 2, status: 'PartFilled' });
+        expect(local().status.deals.map(d => d.seq)).toEqual(['C0001:agg']);
+        expect(reasons('orders')).not.toContain('projection-failed');
+        // 讀取期間收到回報：快照邊界仍待確認（上游語意）
         expect(reasons('orders')).toContain('snapshot-boundary');
+    });
+
+    it('a covered fill arriving during the next authoritative read, listed covered in esun_fills, stays counted once (2 lots, 1 filled)', async () => {
+        // 2 張委託；快照已含 S1（1 張），MAT 還沒到 -> 彙總 1 張
+        const order2 = (over: Record<string, unknown> = {}) => row({ org_qty: 2, org_qty_share: 2000, ...over });
+        mocks.trades.mockReset().mockResolvedValue([order2({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+        await authoritativeRead();
+        expect(local().status).toMatchObject({ deal_quantity: 1, status: 'PartFilled' });
+        const response = deferred<Trade[]>();
+        mocks.trades.mockReset().mockImplementationOnce(() => response.promise);
+        let run!: Promise<void>;
+        await act(async () => { vi.advanceTimersByTime(1600); run = store.refreshTradingState('orders'); await Promise.resolve(); });
+        // 讀取進行中 MAT S1 才到：bridge 判 covered，以彙總 seq 投影 -> 去重
+        await emit(mat('S1', 1, { esun_covered_by_snapshot: true }));
+        expect(local().status.deal_quantity).toBe(1);
+        response.resolve([order2({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5,
+            esun_fills: [{ mkt_seq_num: 'S1', mat_qty_share: 1000, mat_price: 25.5, esun_covered_by_snapshot: true }] })]);
+        await act(async () => { await run; });
+        // 重播的 S1 與回應列的彙總成交是同一個 seq：仍是 1/2，委託留在有效
+        expect(local().status).toMatchObject({ deal_quantity: 1, status: 'PartFilled' });
+        expect(remainingWorkingOrderQuantity(local())).toBe(1);
+        expect(reasons('orders')).not.toContain('projection-failed');
+    });
+
+    it('a later, smaller snapshot (later_snapshot) replaying the fills received during the read does not count them again', async () => {
+        mocks.trades.mockReset().mockResolvedValue([lots3()]);
+        await authoritativeRead();
+        const response = deferred<Trade[]>();
+        mocks.trades.mockReset().mockImplementationOnce(() => response.promise);
+        let run!: Promise<void>;
+        await act(async () => { vi.advanceTimersByTime(1600); run = store.refreshTradingState('orders'); await Promise.resolve(); });
+        await emit(mat('S1', 1));
+        await emit(mat('S2', 1));
+        expect(local().status.deal_quantity).toBe(2);
+        // 玉山 REST 落後：快照只有 1 張，bridge 以較晚的快照為準，esun_fills 仍列出 S1、S2
+        response.resolve([lots3({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5,
+            esun_quantity_conflict: { mat: { reason: 'later_snapshot', report_shares: 2000, snapshot_shares: 1000 } },
+            esun_fills: [{ mkt_seq_num: 'S1', mat_qty_share: 1000, mat_price: 25.5 }, { mkt_seq_num: 'S2', mat_qty_share: 1000, mat_price: 25.5 }] })]);
+        await act(async () => { await run; });
+        // 重播的 S1、S2 都被去重：最差少計（1/3），不會誤判 3/3 已成交
+        expect(local().status).toMatchObject({ deal_quantity: 1, status: 'PartFilled' });
+        expect(remainingWorkingOrderQuantity(local())).toBe(2);
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(reasons('orders')).not.toContain('projection-failed');
+    });
+});
+
+/** 整股 3 張（權威讀取 replace 或快取重建 upsert 的快照列） */
+const lots3 = (over: Record<string, unknown> = {}) => row({ org_qty: 3, org_qty_share: 3000, ...over });
+/** 盤中零股 300 股（*_qty 為張的小數、*_qty_share 為股） */
+const odd300 = (over: Record<string, unknown> = {}) => row({ ap_code: '5', org_qty: 0.3, org_qty_share: 300, ...over });
+const oddMat = (mktSeqNum: string, shares: number, over: Record<string, unknown> = {}) =>
+    mat(mktSeqNum, shares / 1000, { ap_code: '5', mat_qty_share: shares, ...over });
+
+describe('partial fills after a snapshot that already had one (RC1)', () => {
+    const working = () => remainingWorkingOrderQuantity(local());
+
+    it('whole lots, authoritative replace: 3 lots, snapshot 1, then MAT S1 (covered) and S2 -> 2 filled, 1 working', async () => {
+        mocks.trades.mockReset().mockResolvedValue([lots3({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+        await authoritativeRead();
+        expect(local().status).toMatchObject({ deal_quantity: 1, status: 'PartFilled' });
+        await emit(mat('S1', 1, { esun_covered_by_snapshot: true }));
+        expect(local().status.deal_quantity).toBe(1);
+        await emit(mat('S2', 1));
+        expect(local().status).toMatchObject({ deal_quantity: 2, cancel_quantity: 0, status: 'PartFilled' });
+        expect(local().status.deals.map(d => d.seq)).toEqual(['C0001:agg', 'S2']);
+        expect(working()).toBe(1);
+        expect(reasons('orders')).toEqual([]);
+        // stream.ts 對 covered 成交另外送出的訊號：持倉估算待對帳
+        await signal({ kind: 'covered-deal', orderId: 'C0001' });
+        expect(reasons('positions')).toContain('snapshot-boundary');
+        expect(reasons('orders')).toEqual([]);
+    });
+
+    it('whole lots, cache rebuild upsert: the same sequence stays PartFilled 2/3', async () => {
+        mocks.trades.mockReset().mockResolvedValue([lots3()]);
+        await authoritativeRead();
+        await idle();
+        mocks.trades.mockReset().mockResolvedValue([lots3({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(mocks.trades).toHaveBeenCalledWith('S', expect.anything(), { refresh: false });
+        expect(local().status).toMatchObject({ deal_quantity: 1, status: 'PartFilled' });
+        await emit(mat('S1', 1, { esun_covered_by_snapshot: true }));
+        await emit(mat('S2', 1));
+        expect(local().status).toMatchObject({ deal_quantity: 2, status: 'PartFilled' });
+        expect(working()).toBe(1);
+        expect(reasons('orders')).toEqual([]);
+    });
+
+    it('intraday odd lot: 300 shares, snapshot 100, then MAT 100 (covered) and 100 -> 200 filled, 100 working', async () => {
+        mocks.trades.mockReset().mockResolvedValue([odd300({ mat_qty: 0.1, mat_qty_share: 100, avg_price: 25.5 })]);
+        await authoritativeRead();
+        expect(local().order.quantity).toBe(300);
+        expect(local().status).toMatchObject({ deal_quantity: 100, status: 'PartFilled' });
+        await emit(oddMat('S1', 100, { esun_covered_by_snapshot: true }));
+        await emit(oddMat('S2', 100));
+        expect(local().status).toMatchObject({ deal_quantity: 200, status: 'PartFilled' });
+        expect(working()).toBe(100);
+        expect(reasons('orders')).toEqual([]);
+        // 第三筆成交才是全部成交
+        await emit(oddMat('S3', 100));
+        expect(local().status).toMatchObject({ deal_quantity: 300, status: 'Filled' });
+        expect(working()).toBe(0);
+    });
+
+    it('a cache rebuild repairs a local Filled that counted the snapshot fill twice (older bridge without the flag)', async () => {
+        mocks.trades.mockReset().mockResolvedValue([lots3({ mat_qty: 1, mat_qty_share: 1000, avg_price: 25.5 })]);
+        await authoritativeRead();
+        // 舊版 bridge：已含在快照的 S1 照常以 mkt_seq_num 送出 -> 本地 1+1+1 = 3，誤判為 Filled
+        await emit(mat('S1', 1));
+        await emit(mat('S2', 1));
+        expect(local().status).toMatchObject({ deal_quantity: 3, status: 'Filled' });
+        expect(working()).toBe(0);
+        // 快取列（bridge 的有效成交量 max(快照, 逐筆總和) = 2，逐筆 S1、S2）
+        await idle();
+        mocks.trades.mockReset().mockResolvedValue([lots3({ mat_qty: 2, mat_qty_share: 2000, avg_price: 25.5,
+            esun_fills: [{ mkt_seq_num: 'S1', mat_qty_share: 1000, mat_price: 25.5 }, { mkt_seq_num: 'S2', mat_qty_share: 1000, mat_price: 25.5 }] })]);
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(local().status).toMatchObject({ deal_quantity: 2, status: 'PartFilled' });
+        expect(working()).toBe(1);
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.esunAggregateRepairMessage('C0001'));
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+    });
+
+    it('an authoritative read of a row whose fills exceed the order is not Filled and keeps a reason (RC2)', async () => {
+        viaBridge(async () => [lots3({ mat_qty: 4, mat_qty_share: 4000, avg_price: 25.5 })]);
+        await authoritativeRead();
+        expect(local().status.status).not.toBe('Filled');
+        expect(local().status).toMatchObject({ deal_quantity: 3, status: 'PartFilled' });
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.esunQuantityConflictMessage('C0001'));
+        // 同樣的矛盾資料再讀一次也不解除；資料一致後由權威讀取解除
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+        viaBridge(async () => [lots3({ mat_qty: 2, mat_qty_share: 2000, avg_price: 25.5 })]);
+        await authoritativeRead();
+        expect(reasons('orders')).toEqual([]);
+        expect(local().status).toMatchObject({ deal_quantity: 2, status: 'PartFilled' });
+        // bridge 標示 esun_quantity_conflict 的列同樣不判終態並保留待對帳
+        viaBridge(async () => [lots3({ mat_qty: 3, mat_qty_share: 3000, avg_price: 25.5, esun_quantity_conflict: true })]);
+        await authoritativeRead();
+        expect(local().status.status).toBe('PartFilled');
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+    });
+
+    it('a held-open row with the raw quantity attached stays working with a remaining quantity (exceeds_order + raw_shares)', async () => {
+        const capped = { mat: { reason: 'exceeds_order', report_shares: 4000, org_shares: 3000, raw_shares: 2000 } };
+        viaBridge(async () => [lots3({ mat_qty: 3, mat_qty_share: 3000, avg_price: 25.5, esun_quantity_conflict: capped })]);
+        await authoritativeRead();
+        expect(local().status).toMatchObject({ deal_quantity: 2, status: 'PartFilled' });
+        expect(working()).toBe(1);
+        expect(reasons('orders')).toEqual(['snapshot-boundary']);
+    });
+
+    it('a cache rebuild keeps the consistent local row over a held-open contradictory cache row', async () => {
+        mocks.trades.mockReset().mockResolvedValue([lots3()]);
+        await authoritativeRead();
+        await emit(mat('S1', 1));
+        await emit(mat('S2', 1));
+        expect(local().status).toMatchObject({ deal_quantity: 2, status: 'PartFilled' });
+        await idle();
+        // 快取列被 bridge 截到委託量 3/3（沒有 raw_shares）：不可蓋掉本地 2/3
+        mocks.trades.mockReset().mockResolvedValue([lots3({ mat_qty: 3, mat_qty_share: 3000, avg_price: 25.5,
+            esun_quantity_conflict: { mat: { reason: 'exceeds_order', report_shares: 4000, org_shares: 3000 } } })]);
+        await signal({ kind: 'resync', reason: 'bridge_restarted' });
+        expect(mocks.trades).toHaveBeenCalledWith('S', expect.anything(), { refresh: false });
+        expect(local().status).toMatchObject({ deal_quantity: 2, status: 'PartFilled' });
+        expect(working()).toBe(1);
+        expect(reasons('orders')).toContain('snapshot-boundary');
+        expect(store.getTradingState().queries.orders.error).toBe(dispatch.esunQuantityConflictMessage('C0001'));
     });
 });
 

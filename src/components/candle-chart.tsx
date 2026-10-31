@@ -109,6 +109,7 @@ import { captureServerMode } from '../lib/server-info-store';
 import { captureRouteEnv, routeConfirmNote } from '../lib/order-route';
 import { creditEnquireCond, creditSideBlocks, creditStatus, prepareCreditOrder, useCreditEnquire, type CreditCheck } from '../lib/credit-eligibility';
 import { creditLabel } from '../lib/odd-lot';
+import { manualStockCreditHint } from '../lib/stock-exit-cond';
 import { octypeLabel, quickOrderNote } from '../lib/order-conditions';
 import { ORDER_CONTEXT_CHANGED_MESSAGE, useOrderContext } from '../hooks/use-order-context';
 import {
@@ -446,9 +447,16 @@ export function CandleChart({
             const serverMode = captureServerMode();
             const gate = creditOn ? await prepareCreditOrder(c, action, eff.credit) : null;
             if (gate?.afterConfirm && !isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
+            // fork：現股點價買／賣遇到同帳戶同碼的融券空單／融資多單、融券買進查無空單：
+            // 只寫進確認與通知，不擋單、不改條件；讀不到持倉就不提醒
+            const creditHint = !creditOn ? null : await import('../lib/trading-state').then(ts => {
+                const s = ts.getTradingState();
+                const hint = manualStockCreditHint(s.positions ?? [], account, c.code, action, eff.credit.cond);
+                return hint && (hint.suggest !== null || s.queries?.positions?.updatedAt != null) ? hint.text : null;
+            }).catch(() => null);
             const trade = await placeQuickOrder(c, action, price, qty, {
                 ...chartPlaceOptions(settings, market), account, isAccountCurrent, serverMode,
-                confirmNote: routeConfirmNote(account),
+                confirmNote: [creditHint, routeConfirmNote(account)].filter(Boolean).join('・'),
                 ...(gate?.afterConfirm ? { afterConfirm: gate.afterConfirm } : {}),
                 beforeSend: () => {
                     if (!isContextCurrent()) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
@@ -463,7 +471,7 @@ export function CandleChart({
             notify({
                 kind: 'ok',
                 title: `📈 圖表${label}${action === 'Buy' ? '買進' : '賣出'}已送出`,
-                body: `${c.code} ${qty}${odd ? ' 股（零股）' : ''} @ ${fmtPrice(price)}${conditions ? ` · ${conditions}` : ''}（${orderStatusWithNumber(trade)}）`,
+                body: `${c.code} ${qty}${odd ? ' 股（零股）' : ''} @ ${fmtPrice(price)}${conditions ? ` · ${conditions}` : ''}（${orderStatusWithNumber(trade)}）${creditHint ? `\n${creditHint}` : ''}`,
             });
         } catch (e) {
             reportOrderError('圖表下單', e, notify);

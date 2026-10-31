@@ -135,7 +135,12 @@ describe('chart order credit and day-trade conditions', () => {
         expect(chartModeHint('buy', dt, 'S')).toBe('點擊價位 → 限價買進 1 張');
         expect(chartOrderSummary(normalizeChartOrder({ ...dt, orderType: 'IOC' }, 'S'), 'S', '••••21')).toMatch(/^點價買以 IOC 限價現股買進、點價賣以 IOC 限價現沖賣出 1 張/);
         const short = normalizeChartOrder({ credit: { cond: 'ShortSelling', daytradeShort: false } }, 'S');
-        expect(chartOrderSummary(short, 'S', '••••21')).toContain('點價買停用');
+        // 融券買進＝回補（fork 修正）：點價買不再停用；借券類仍只能賣
+        expect(chartOrderSummary(short, 'S', '••••21')).toMatch(/^點價買以 ROD 限價融券買進（回補）、點價賣以 ROD 限價融券賣出 1 張/);
+        expect(chartModeHint('buy', short, 'S')).toBe('點擊價位 → 融券限價買進 1 張（回補）');
+        expect(chartPlaceOptions(short, 'S')).toMatchObject({ orderCond: 'ShortSelling' });
+        const sbl = normalizeChartOrder({ credit: { cond: 'SBLShort', daytradeShort: false } }, 'S');
+        expect(chartOrderSummary(sbl, 'S', '••••21')).toContain('點價買停用');
         expect(chartOrderSummary(normalizeChartOrder({ octype: 'DayTrade' }, 'F'), 'F', '••••07')).toContain('（當沖）');
     });
 });

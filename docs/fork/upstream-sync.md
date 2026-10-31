@@ -70,6 +70,23 @@ git diff $(git merge-base HEAD upstream/main) -- <檔案> | grep -c '^[+-][^+-]'
 3. 若 fork 曾刪除上游程式碼，優先「還原上游程式碼＋以小條件停用」。
 4. 上游新增的委託／回報語意（CONTEXT.md）要同步檢查玉山路徑是否也要跟上（見 [context-esun.md](context-esun.md)）。
 
+## fork 修正的上游信用交易缺陷（合併時要保留）
+
+2026-10 玉山正式帳號實測發現，上游把「融券買進（回補）」當成禁止組合，而且有幾處會把融券空單與現股混在一起。
+台股的融券回補就是「買進＋融券」（Shioaji 為 `Buy`＋`ShortSelling`，玉山為 `B`＋trade `4`），只有借券、借券豁免限賣出。
+這些缺陷在上游共用程式碼裡，永豐也會受影響。本 fork 以最小差異修正下列上游檔案。合併上游時，**不要讓上游版本蓋掉這些修正**：
+
+| 檔案 | 修正 | 原因 |
+| --- | --- | --- |
+| `src/lib/odd-lot.ts` | `SELL_ONLY_CONDS` 只保留 `SBLShort`、`SBLShortPriceExempt`；`CREDIT_TEXT.shortBuy` 改為說明借券限賣、融券回補請用「融券」買進 | `creditProblem` 會擋下 `Buy`＋`ShortSelling`，而 `placeStockOrder`、`placeQuickOrder` 都經過這個閘門，所以 App 沒有任何路徑能送出融券回補 |
+| `src/lib/credit-eligibility.ts` | 同步 `SELL_ONLY_CONDS`；可否融券為 0 時只擋融券賣出，回補照常 | 閃電與 K 線的買邊被停用。信用了結不受暫停限制 |
+| `src/lib/chart-order-settings.ts` | 同步 `SELL_ONLY`；摘要與提示寫明「融券買進（回補）」 | K 線點價買被停用 |
+| `src/components/order-ticket.tsx` | 移除「切回買進時把融券改成現股」的 effect；買進提供「融券（回補）」；借券類買進保留選取並明確擋下說明；確認視窗帶 `credit`，動作名稱為「融券買進」 | 原本會靜默把融券改成現股，送出的是現股買進而不是回補 |
+| `src/components/flash-order.tsx`、`src/lib/flash-trigger.ts` | 股票的持有量只算與面板信用條件相同 cond 的列（`sameCondRows`）；持倉依 cond 分開顯示（`stockPositionGroups`）；現股面板遇到融券空單時顯示「現股買進不會回補融券」；融券面板的買邊為「融券買（回補）」 | 原本融券空單與現股合併成一個淨額：有空單時，現股買進會被判成「減倉」而不附保護；淨額為 0 時，持倉列整個消失 |
+
+同一批修正也改了持倉面板平倉、全平、`placeStockExitByShares` 與成交投影（`src/components/bottom-dock-positions.tsx`、`src/lib/conditional/flatten.ts`、`src/lib/trade.ts`、`src/lib/portfolio-projection.ts`），讓信用部位能用正確的條件平倉並套用成交。合併時同樣要保留。
+相關測試：`src/lib/odd-lot.test.ts`、`src/lib/trade-credit.test.ts`、`src/lib/credit-eligibility.test.ts`、`src/lib/chart-order-settings.test.ts`、`src/lib/flash-trigger.test.ts`、`src/components/order-ticket-credit.test.tsx`、`src/components/flash-order-credit.test.tsx`、`src/components/flash-order-short-cover.test.tsx`、`src/components/flash-order-cost.test.tsx`。上游若改寫這些規則，這些測試應該會失敗；不要直接改回上游的預期。
+
 ## 同步後必跑
 
 ```bash

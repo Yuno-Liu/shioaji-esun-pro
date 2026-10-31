@@ -83,15 +83,20 @@ const cash = { cond: 'Cash', daytradeShort: false } as const;
 const margin = { cond: 'MarginTrading', daytradeShort: false } as const;
 const short = { cond: 'ShortSelling', daytradeShort: false } as const;
 
-it('side blocks: 融券／借券 never buy, 融資 0 stops only 融資買進, 現沖 needs a day-tradable stock', () => {
+it('side blocks: 借券 never buy, 融券 buys (回補), 融資 0 stops only 融資買進, 現沖 needs a day-tradable stock', () => {
     const c = { code: '2330', day_trade: 'Yes' };
     expect(creditSideBlocks(c, cash, 'ok')).toMatchObject({ buy: null, sell: null });
-    expect(creditSideBlocks(c, short, 'ok').buy).toMatch(/只能賣出/);
-    expect(creditSideBlocks(c, { cond: 'SBLShort', daytradeShort: false }, 'ok')).toMatchObject({ sell: null, sellOnly: true });
+    // fork：融券買進＝回補，是標準委託
+    expect(creditSideBlocks(c, short, 'ok')).toMatchObject({ buy: null, sell: null, sellOnly: false, rule: { Buy: null, Sell: null } });
+    expect(creditSideBlocks(c, { cond: 'SBLShort', daytradeShort: false }, 'ok')).toMatchObject({ sell: null, sellOnly: true, buy: expect.stringMatching(/只能賣出/) });
+    expect(creditSideBlocks(c, { cond: 'SBLShortPriceExempt', daytradeShort: false }, 'ok').rule.Buy).toMatch(/只能賣出/);
     const m0 = creditSideBlocks(c, margin, 'blocked');
     expect(m0.buy).toMatch(/不能融資買進/);
     expect(m0.sell).toBeNull();
     expect(creditSideBlocks(c, short, 'blocked').sell).toMatch(/不能融券賣出/);
+    // 信用了結不受暫停限制：可否融券為 0 也不擋融券買進（回補）
+    expect(creditSideBlocks(c, short, 'blocked')).toMatchObject({ buy: null, rule: { Buy: null } });
+    expect(creditSideBlocks(c, short, 'blocked').creditBlocked).toMatch(/融券買進（回補）照常/);
     expect(creditSideBlocks({ code: '2330', day_trade: 'OnlyBuy' }, { cond: 'Cash', daytradeShort: true }, 'ok'))
         .toMatchObject({ buy: null, sell: expect.stringMatching(/只能先買後賣/) });
     expect(creditSideBlocks({ code: '2330', day_trade: 'No' }, { cond: 'Cash', daytradeShort: true }, 'ok').sell).toMatch(/不可當沖/);

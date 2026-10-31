@@ -19,8 +19,8 @@ vi.mock('../server-info-store', () => ({ captureServerMode: () => () => m.same }
 vi.mock('../account-store', () => ({ getAccountState: () => ({ accounts: [F, S] }) }));
 vi.mock('../account-tradable', () => ({ canTrade: () => true }));
 vi.mock('../account-query', () => ({ createAccountQuery: () => ({ read: (_t: string, a: Account, f: (a: Account) => unknown) => f(a) }) }));
-vi.mock('../contracts-cache', () => ({ ensureContract: async (code: string) => code === '2330'
-    ? { code, security_type: 'STK', limit_up: 1100, limit_down: 900 } : { code, security_type: 'FUT', target_code: code } }));
+vi.mock('../contracts-cache', () => ({ ensureContract: async (code: string) => { if (code === '9999') throw new Error('contract fetch failed'); return code === '2330'
+    ? { code, security_type: 'STK', limit_up: 1100, limit_down: 900 } : { code, security_type: 'FUT', target_code: code }; } }));
 vi.mock('../shioaji', () => ({
     fetchTrades: (t: string, a: Account) => { m.order.push(`trades:${a.account_id}`); return m.trades(a); },
     fetchPositions: (t: string, a: Account) => { m.order.push(`positions:${a.account_id}`); return m.positions(a); },
@@ -54,12 +54,29 @@ describe('planFlatten', () => {
         ]);
     });
 
-    it('no position → no order; credit stock positions and both-sided holdings are left to the user', () => {
+    it('no position → no order; both-sided holdings are left to the user', () => {
         expect(planFlatten([], { type: 'all' }).orders).toEqual([]);
-        const plan = planFlatten([pos({ code: '2330', account: S, quantity: 1000, cond: 'MarginTrading' }),
-            pos({ code: 'MXFJ6' }), pos({ code: 'MXFJ6', direction: 'Sell' })], { type: 'all' });
+        const plan = planFlatten([pos({ code: 'MXFJ6' }), pos({ code: 'MXFJ6', direction: 'Sell' })], { type: 'all' });
         expect(plan.orders).toEqual([]);
-        expect(plan.skipped.map(s => s.code)).toEqual(['2330', 'MXFJ6']);
+        expect(plan.skipped.map(s => s.code)).toEqual(['MXFJ6']);
+    });
+
+    it('credit stock positions close with their own condition (whole lots) or are skipped — never as 現股', () => {
+        const sa = { account_type: 'S', broker_id: 'bs', account_id: 's1' };
+        const plan = planFlatten([pos({ code: '2330', account: S, quantity: 1000, cond: 'MarginTrading' }),
+            pos({ code: '1234', account: S, direction: 'Sell', quantity: 2000, cond: 'ShortSelling' }),
+            pos({ code: '3008', account: S, direction: 'Sell', quantity: 1500, cond: 'ShortSelling' }),
+            pos({ code: '2603', account: S, quantity: 1000, cond: 'Cash' }), pos({ code: '2603', account: S, direction: 'Sell', quantity: 1000, cond: 'ShortSelling' })],
+        { type: 'all' });
+        expect(plan.orders).toEqual([
+            { account: sa, code: '2330', action: 'Sell', quantity: 1000, market: 'stock', cond: 'MarginTrading' },
+            { account: sa, code: '1234', action: 'Buy', quantity: 2000, market: 'stock', cond: 'ShortSelling' },
+        ]);
+        expect(plan.skipped.map(s => [s.code, s.reason])).toEqual([
+            ['3008', expect.stringContaining('整張')],
+            ['2603', expect.stringContaining('現股與信用部位')],
+        ]);
+        expect(closeHowText('stock', 2000, 'ShortSelling')).toBe('融券買進・整股市價');
     });
 
     it('scope: this product / this account', () => {
@@ -126,6 +143,26 @@ describe('executeFlatten', () => {
         await executeFlatten({ type: 'account', account: { account_type: 'S', broker_id: 'bs', account_id: 's1' } }, { sleep: noWait, stopConditional });
         expect(m.place.mock.calls.map(c => [c[1], c[2], c[3], (c[4] as { orderLot?: string }).orderLot])).toEqual([
             ['Sell', null, 2, undefined], ['Sell', 900, 300, 'IntradayOdd']]);
+    });
+
+    it('a contract read that fails before sending is reported as not sent and is not read back (review)', async () => {
+        m.positions.mockImplementation(async (a: Account) => a === S ? [{ id: 1, code: '9999', direction: 'Sell', quantity: 2000, cond: 'ShortSelling' }] : []);
+        const reads = m.positions.mock.calls.length;
+        const r = await executeFlatten({ type: 'account', account: { account_type: 'S', broker_id: 'bs', account_id: 's1' } }, { sleep: noWait, stopConditional });
+        expect(m.place).not.toHaveBeenCalled();
+        expect(r.sent).toEqual([]);
+        expect(r.notSent).toEqual([expect.stringContaining('9999：未送出（商品資料讀取失敗，未送出委託：contract fetch failed）')]);
+        expect(r.notSent.join()).not.toContain('結果不明');
+        expect(r.remaining).toEqual([]);
+        expect(m.positions.mock.calls.length - reads).toBe(1);
+    });
+
+    it('a short closes as ONE whole-lot Buy with ShortSelling (no odd leg)', async () => {
+        m.positions.mockImplementation(async (a: Account) => a === S ? [{ id: 1, code: '2330', direction: 'Sell', quantity: 2000, cond: 'ShortSelling' }] : []);
+        const r = await executeFlatten({ type: 'account', account: { account_type: 'S', broker_id: 'bs', account_id: 's1' } }, { sleep: noWait, stopConditional });
+        expect(m.place.mock.calls.map(c => [c[1], c[2], c[3], (c[4] as { orderCond?: string }).orderCond, (c[4] as { orderLot?: string }).orderLot]))
+            .toEqual([['Buy', null, 2, 'ShortSelling', undefined]]);
+        expect(r.sent).toMatchObject([{ code: '2330', action: 'Buy', quantity: 2000 }]);
     });
 
     it('a conditional order that could not be stopped, or one still sending, blocks everything', async () => {

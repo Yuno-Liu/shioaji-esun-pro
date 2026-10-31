@@ -202,6 +202,46 @@ describe('position projection', () => {
         expect(closed).toEqual([other]);
         expect(closed[0]).toBe(other);
     });
+    // 實盤 bug 3：融券回補／融資了結的成交要套到信用列（合成資料）
+    describe('credit fills', () => {
+        const short: AccountedPosition = { ...base, code: '1234', direction: 'Sell', quantity: 2000, price: 380.5, last_price: 392, pnl: -23000, yd_quantity: 2000, cond: 'ShortSelling' };
+        const cover: PositionFill = { ...fill, code: '1234', action: 'Buy', quantity: 2000, price: 392, condition: 'ShortSelling' };
+        it('a ShortSelling buy covers the short: full → row removed, partial → proportional', () => {
+            expect(applyPositionFill([short], cover, 1)).toEqual([]);
+            expect(applyPositionFill([short], { ...cover, quantity: 1000 }, 1)).toEqual([
+                expect.objectContaining({ direction: 'Sell', cond: 'ShortSelling', quantity: 1000, pnl: -11500, yd_quantity: 1000 })]);
+        });
+        it('a cover beyond the short or without one stays unknown (null)', () => {
+            expect(applyPositionFill([short], { ...cover, quantity: 3000 }, 1)).toBeNull();
+            expect(applyPositionFill([], cover, 1)).toBeNull();
+            // a Cash row of the same code is never consumed by a credit fill
+            expect(applyPositionFill([{ ...base, code: '1234' }], cover, 1)).toBeNull();
+        });
+        it('a ShortSelling sell opens or adds a short row carrying cond', () => {
+            const open = applyPositionFill([], { ...cover, action: 'Sell', price: 380.5 }, 1, 392)!;
+            expect(open).toEqual([expect.objectContaining({ direction: 'Sell', quantity: 2000, price: 380.5, cond: 'ShortSelling', yd_quantity: 0, pnl: -23000 })]);
+            expect(applyPositionFill([short], { ...cover, action: 'Sell', quantity: 1000, price: 392 }, 1)![0]).toMatchObject({ quantity: 3000, cond: 'ShortSelling' });
+        });
+        it('margin: Sell + MarginTrading reduces the margin long, Buy + MarginTrading opens one; beyond held → null', () => {
+            const margin: AccountedPosition = { ...base, cond: 'MarginTrading', quantity: 2000, yd_quantity: 2000 };
+            const sell: PositionFill = { ...fill, action: 'Sell', quantity: 1000, price: 110, condition: 'MarginTrading' };
+            expect(applyPositionFill([margin], sell, 1)![0]).toMatchObject({ quantity: 1000, cond: 'MarginTrading' });
+            expect(applyPositionFill([margin], { ...sell, quantity: 3000 }, 1)).toBeNull();
+            expect(applyPositionFill([], { ...sell, action: 'Buy' }, 1)).toEqual([expect.objectContaining({ direction: 'Buy', quantity: 1000, cond: 'MarginTrading' })]);
+            // a Cash sell never closes the margin row
+            expect(applyPositionFill([margin], { ...sell, condition: 'Cash' }, 1)).toBeNull();
+        });
+        it('with only a short held, a Cash buy still adds a separate Cash long', () => {
+            const next = applyPositionFill([short], { ...cover, condition: 'Cash' }, 1)!;
+            expect(next).toHaveLength(2);
+            expect(next[0]).toBe(short);
+            expect(next[1]).toMatchObject({ direction: 'Buy', quantity: 2000, cond: 'Cash' });
+        });
+        it('inconsistent credit rows are not guessed', () => {
+            expect(applyPositionFill([{ ...short, direction: 'Buy' }], cover, 1)).toBeNull();
+            expect(applyPositionFill([{ ...short, direction: 'Buy' }], { ...cover, action: 'Sell' }, 1)).toBeNull();
+        });
+    });
     it('requires account and fill identity; normalizes lots to shares', () => {
         const body = { trade_id: 'order', exchange_seq: 'fill-1', broker_id: 'test', account_id: 'a', code: '2330', action: 'Buy', price: 120, quantity: 1, order_lot: 'Common', order_cond: 'Cash', ts: fill.ts };
         const parse = (b: object) => positionFill(normalizeOrderEvent({ state: 'StockDeal', data: { StockDeal: b } })!, [account], []);
@@ -209,7 +249,9 @@ describe('position projection', () => {
         expect(parse({ ...body, order_lot: 'IntradayOdd' })?.quantity).toBe(1);
         expect(parse({ ...body, account_id: '' })).toBeNull();
         expect(parse({ ...body, exchange_seq: '' })).toBeNull();
-        expect(parse({ ...body, order_cond: 'MarginTrading' })).toBeNull();
+        expect(parse({ ...body, order_cond: 'MarginTrading' })).toMatchObject({ condition: 'MarginTrading', quantity: 1000 });
+        expect(parse({ ...body, order_cond: 'ShortSelling', action: 'Buy' })).toMatchObject({ condition: 'ShortSelling', action: 'Buy' });
+        expect(parse({ ...body, order_cond: 'SBLShort' })).toBeNull();
         expect(parse({ ...body, order_cond: 'Netting' })).toBeNull();
         expect(parse({ ...body, quantity: 0 })).toBeNull();
     });

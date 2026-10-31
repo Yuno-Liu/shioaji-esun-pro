@@ -8,9 +8,11 @@ export function quantityText(market: 'stock' | 'futures', quantity: number): str
     return [lots > 0 ? `${lots} 張` : '', odd > 0 ? `${odd} 股` : ''].filter(Boolean).join('＋') || '0 股';
 }
 
-/** How a close goes out: futures 範圍市價; stocks 整股市價、零股限價. */
-export function closeHowText(market: 'stock' | 'futures', quantity: number): string {
+/** How a close goes out: futures 範圍市價; stocks 整股市價、零股限價;
+ * 信用了結（整張）加上「融資賣出／融券買進」. */
+export function closeHowText(market: 'stock' | 'futures', quantity: number, cond?: 'MarginTrading' | 'ShortSelling'): string {
     if (market === 'futures') return '範圍市價';
+    if (cond) return `${cond === 'ShortSelling' ? '融券買進' : '融資賣出'}・整股市價`;
     const lots = Math.floor(quantity / 1000);
     const odd = quantity % 1000;
     return lots > 0 && odd > 0 ? '整股市價、零股限價' : odd > 0 ? '零股限價' : '整股市價';

@@ -2,6 +2,14 @@ import { isEsunBroker, mergeSettlementSlot, useEsunEnvironment } from '../lib/es
 import { esunEnvKey } from '../lib/order-route';
 import { EsunAccountOverview, EsunPnlCostTotal, EsunPnlRowDetail, useEsunAccountPane } from './esun-account-overview';
 import { canTrade } from '../lib/account-tradable';
+import {
+    isPriorTaipeiDay,
+    pendingSettlementAmount,
+    settlementsOlderThanPositions,
+    stockPositionsSignature,
+    sumStockMarketValue,
+    useStockLiquidationValue,
+} from '../lib/position-value';
 // src/components/bottom-dock-account.tsx — 帳務/交割 tab。
 // 報表風卡片牆＋donut 改成交易工具：資金狀態緊湊數字列（含風險指標色條）、
 // 交割行事曆（T+0/T+1/T+2）、今日已實現損益（可展開明細）、交易額度、
@@ -85,6 +93,14 @@ function Row({
 
 // ---- 資金狀態 ----
 
+function positionKindLabel(p: { cond?: string; direction: string }): string {
+    const cond = p.cond || 'Cash';
+    if (cond === 'Cash') return p.direction === 'Buy' ? '現股' : '現股賣';
+    if (cond === 'MarginTrading') return '融資';
+    if (cond === 'ShortSelling') return '融券';
+    return cond;
+}
+
 function FundsSection({
     incomplete = false,
     balance,
@@ -95,6 +111,10 @@ function FundsSection({
     sim,
     stockSim = sim,
     privMoney,
+    settlements,
+    settlementsAt = null,
+    settlementsStale = false,
+    balanceAt = null,
 }: {
     balance?: AccountBalance;
     margin?: Margin;
@@ -105,19 +125,27 @@ function FundsSection({
     stockSim?: boolean;
     privMoney: boolean;
     incomplete?: boolean;
+    settlements?: Settlement[];
+    /** 交割款快照時間 */
+    settlementsAt?: number | null;
+    /** 交割款快照取得後持倉已變動（成交或重讀），未交割款可能過期 */
+    settlementsStale?: boolean;
+    /** 範圍內股票帳戶交割戶餘額最早的快照時間；未知為 null */
+    balanceAt?: number | null;
 }) {
+    const [showBreakdown, setShowBreakdown] = useState(false);
     const money = (n: number) => maskMoney(fmtMoney(Math.round(n)), privMoney);
     const signed = (n: number) => maskMoney(fmtSigned(n, 0), privMoney);
 
-    // 股票市值（扣賣出方稅費估）— 沿用原帳務 tab 的估算
-    const stockValue = positions
-        .filter(isStockPosition)
-        .reduce((s, p) => {
-            const sign = p.direction === 'Sell' ? -1 : 1;
-            const gross = p.last_price * p.quantity;
-            const taxRate = p.code.startsWith('00') ? 0.001 : 0.003;
-            return s + sign * gross * (1 - 0.001425 - taxRate);
-        }, 0);
+    // 股票市值＝Σ|股數|×現價；資產改以清算價值＋未交割款計（src/lib/position-value.ts）
+    const stockRows = positions.filter(isStockPosition);
+    const stockValue = sumStockMarketValue(stockRows).value;
+    const equity = useStockLiquidationValue(stockRows);
+    // 未交割款以交割戶餘額快照當天判斷「今天」；快照跨日（餘額或交割款不是今日資料）時合計待確認
+    const pending = balanceAt === null ? null : pendingSettlementAmount(settlements, balanceAt);
+    const nowMs = Date.now();
+    const priorDay = (balanceAt !== null && isPriorTaipeiDay(balanceAt, nowMs))
+        || (settlements !== undefined && isPriorTaipeiDay(settlementsAt, nowMs));
 
     const cash = balance?.acc_balance ?? 0;
     const futEquity = margin?.equity ?? 0;
@@ -143,11 +171,17 @@ function FundsSection({
             ? vars.color.amber
             : vars.color.success; // 綠 = 安全（狀態色固定，不隨漲跌配色翻轉）
 
+    const unknownReasons = !showStock ? [] : [
+        settlementsStale && '成交後交割款尚未更新，請按更新帳務',
+        priorDay && '交割戶餘額或交割款為前一日資料，請按更新帳務',
+        (equity.incomplete || pending === null) && '部分部位清算價值或未交割款尚未取得',
+    ].filter((r): r is string => !!r);
+    const stockUnknown = unknownReasons.length > 0;
     const totalAssets =
-        (showStock ? stockValue + cash : 0) + (showFut ? futEquity : 0);
+        (showStock ? equity.value + (pending ?? 0) + cash : 0) + (showFut ? futEquity : 0);
     const showTotal =
-        !incomplete && totalAssets > 0 &&
-        ((showStock && stockValue > 0) || cash > 0 || futEquity > 0);
+        !incomplete && !stockUnknown && totalAssets > 0 &&
+        ((showStock && equity.value > 0) || cash > 0 || futEquity > 0);
 
     const hasAny = showStock || showFut;
     return (
@@ -173,7 +207,7 @@ function FundsSection({
                     )}
                     {stockValue !== 0 && (
                         <Row
-                            label='股票市值（扣稅費估）'
+                            label='股票市值 Market Value'
                             value={money(stockValue)}
                         />
                     )}
@@ -244,6 +278,37 @@ function FundsSection({
                 <>
                     <div className={styles.fundRule} />
                     <Row label='資產市值 Total Assets' value={money(totalAssets)} />
+                    {showStock && <span className={styles.acctHint}>含未交割款；信用部位以清算價值計</span>}
+                </>
+            )}
+            {!incomplete && stockUnknown && <span className={styles.acctHint} role='status'>{unknownReasons.join('；')}；合計待確認</span>}
+            {showStock && (
+                <>
+                    <button
+                        className={styles.pnlToggle}
+                        title={showBreakdown ? '收合組成' : '展開組成'}
+                        onClick={() => setShowBreakdown((v) => !v)}
+                    >
+                        {showBreakdown ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                        <span className={styles.acctHint}>資產組成（核對用）</span>
+                    </button>
+                    {showBreakdown && (
+                        <>
+                            <Row label='交割戶餘額' value={balance ? money(cash) : '—'} />
+                            <Row label='未交割款' value={pending === null ? '待確認' : signed(pending)} />
+                            {stockRows.map((p, i) => {
+                                const v = equity.values[i];
+                                return (
+                                    <Row
+                                        key={`${i}-${p.code}-${p.cond}-${p.direction}`}
+                                        label={`${p.code} ${positionKindLabel(p)} ${maskMoney(`${Math.abs(p.quantity).toLocaleString()}股`, privMoney)} 清算價值`}
+                                        value={v === null || v === undefined ? '待確認' : money(v)}
+                                    />
+                                );
+                            })}
+                            {showFut && !!margin && <Row label='期貨權益數' value={money(futEquity)} />}
+                        </>
+                    )}
                 </>
             )}
         </section>
@@ -722,8 +787,18 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
         [positions, showStock, showFut],
     );
 
+    // 交割戶餘額快照時間：範圍內股票帳戶 funds 最早的 updatedAt（未交割款以該日判斷「今天」）；
+    // 沒有股票帳戶時不需要；任一帳戶時間未知視為未知（合計待確認）
+    const stockFundTimes = (selectedFunds ?? []).filter(row => row.account.account_type === 'S').map(row => row.updatedAt);
+    const balanceAt = !stockAccounts.length
+        ? Date.now()
+        : funds && stockFundTimes.length === stockAccounts.length && stockFundTimes.every((t): t is number => typeof t === 'number' && Number.isFinite(t))
+            ? Math.min(...(stockFundTimes as number[]))
+            : null;
+
     // 交割行事曆（證券）
-    const { data: settlements, refresh: refreshSettle, loading: loadingSettle, error: errorSettle } = useQuery<
+    const settleKey = `settlements:${selKey}:${showStock}${esunEnvKey(stockAccounts, esunEnv.environment)}`;
+    const { data: settlements, updatedAt: settlementsAt, refresh: refreshSettle, loading: loadingSettle, error: errorSettle } = useQuery<
         Settlement[]
     >(
         useCallback(
@@ -739,8 +814,12 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
                 }),
             [showStock, selKey],
         ),
-        `settlements:${selKey}:${showStock}${esunEnvKey(stockAccounts, esunEnv.environment)}`,
+        settleKey,
         true, stockAccounts,
+    );
+    // 交割款快照取得後持倉變動（成交投影、重讀持倉）→ 未交割款過期；不自動重查（玉山每分鐘限 3 次）
+    const settlementsStale = settlementsOlderThanPositions(
+        settleKey, settlementsAt, loadingSettle, stockPositionsSignature(scopedPositions.filter(isStockPosition)),
     );
 
     // 今日已實現損益：profit_loss 給列表/筆數；profitloss_sum 給權威總額。
@@ -843,6 +922,10 @@ function AccountPaneContent({ positions, balance, margin, funds, market, scopeAc
                 sim={sim}
                 stockSim={stockSim}
                 privMoney={privMoney}
+                settlements={settlements}
+                settlementsAt={settlementsAt}
+                settlementsStale={settlementsStale}
+                balanceAt={balanceAt}
             />
             {showStock && (
                 <SettleSection

@@ -11,7 +11,7 @@ import * as styles from './flash-order.css';
 const CREDIT_ITEMS: [FlashCond, string, string][] = [
     ['Cash', '現股', '預設'],
     ['MarginTrading', '融資', '買／賣'],
-    ['ShortSelling', '融券', '只能賣'],
+    ['ShortSelling', '融券', '買（回補）／賣'],
     ['SBLShort', '借券', '只能賣'],
     ['SBLShortPriceExempt', '借券豁免', '只能賣'],
 ];

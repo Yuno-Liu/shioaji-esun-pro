@@ -122,6 +122,28 @@ def mask_identifier(value: any) -> str:
     return s[:1] + "*" * (len(s) - 3) + s[-2:]
 
 
+# Report keys never logged (account, identity, user tags); order numbers keep their last 2 characters.
+_REPORT_LOG_DROP_KEY_RE = re.compile(
+    r"acc|account|cust|person|identity|id_?no|user|name|token|cert|pass|pwd|branch|broker|phone|mail", re.I
+)
+_REPORT_LOG_ORDER_KEYS = frozenset({"ord_no", "ordNo", "pre_ord_no", "preOrdNo"})
+
+
+def report_log_fields(data: dict) -> str:
+    """A WebSocket report's raw fields for an INFO diagnostic, without account / identity fields."""
+    out: dict[str, any] = {}
+    for key, value in (data or {}).items():
+        name = str(key)
+        if _REPORT_LOG_DROP_KEY_RE.search(name):
+            continue
+        if name in _REPORT_LOG_ORDER_KEYS:
+            text = str(value or "")
+            out[name] = ("*" * max(len(text) - 2, 0) + text[-2:]) if text else text
+            continue
+        out[name] = value if isinstance(value, (int, float, bool)) or value is None else str(value)
+    return redact(json.dumps(out, ensure_ascii=False, sort_keys=True))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Headless Keyring Injection & WebSocket Keep-alive Patch
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1330,6 +1352,9 @@ class OrderBookCache:
         target["fills"] = old_fills + [f for f in target.get("fills") or () if f["mkt_seq_num"] not in old_seqs]
         for key in ("event_mat_shares", "event_cel_shares"):
             target[key] = max(target.get(key) or 0, old.get(key) or 0)
+        logged = set(old.get("conflicts_logged") or ())
+        if logged:
+            target["conflicts_logged"] = set(target.get("conflicts_logged") or ()) | logged
 
     def _effective_row_locked(self, internal_id: str) -> dict:
         """
@@ -1337,6 +1362,10 @@ class OrderBookCache:
         back as mat_qty / cel_qty (lots; fractional lots for odd-lot classes) and *_qty_share
         (shares). Lot rows get their bridge-only status re-derived from the effective quantities.
         `esun_fills` lists the MATs applied in this cache generation (receive order).
+        Report totals never exceed the order quantity (org shares): a total above it reads as
+        `esun_quantity_conflict` {mat|cel: {reason "exceeds_order", report_shares, org_shares,
+        raw_shares (the row's own snapshot / ACK value)}} (logged once), until the row's own value
+        reaches the order quantity (the broker's figure then settles the capped reports).
         """
         row = dict(self._orders[internal_id])
         meta = self._meta.get(internal_id) or {}
@@ -1348,13 +1377,36 @@ class OrderBookCache:
             row["esun_snapshot_missing"] = True
         ap_code = _row_ap_code(row)
         changed = False
+        org_shares = esun_quantity_shares(row, "org", ap_code)
+        conflicts: dict[str, dict] = {}
         for base in ("mat", "cel"):
             event_shares = meta.get(f"event_{base}_shares") or 0
             current = esun_quantity_shares(row, base, ap_code) or 0
-            if event_shares > current:
-                row[f"{base}_qty"] = _num_out(event_shares / SHARES_PER_LOT)
-                row[f"{base}_qty_share"] = _num_out(event_shares)
-                changed = True
+            if event_shares <= current:
+                continue
+            if org_shares and event_shares > org_shares:
+                if current == org_shares:
+                    continue  # the row's own value caught up with the capped reports: no contradiction left
+                conflicts[base] = {"reason": "exceeds_order", "report_shares": event_shares,
+                                   "org_shares": org_shares, "raw_shares": current}
+                event_shares = org_shares
+                if event_shares <= current:
+                    continue
+            row[f"{base}_qty"] = _num_out(event_shares / SHARES_PER_LOT)
+            row[f"{base}_qty_share"] = _num_out(event_shares)
+            changed = True
+        if conflicts:
+            row["esun_quantity_conflict"] = {base: dict(info) for base, info in conflicts.items()}
+            logged = meta.setdefault("conflicts_logged", set())
+            for base, info in conflicts.items():
+                key = (base, info["reason"], info["report_shares"], info["org_shares"], info["raw_shares"])
+                if key not in logged:
+                    logged.add(key)
+                    ord_no = str(row.get("ord_no") or row.get("ordNo") or "")
+                    logger.warning(
+                        f"委託數量矛盾（委託書號末碼 {ord_no[-2:]}，{base}）：回報累計 {info['report_shares']} 股，"
+                        f"超過委託 {info['org_shares']} 股，以委託量為上限（委託列本身為 {info['raw_shares']} 股）"
+                    )
         if (changed or "status" in row) and ap_code not in _SHARE_UNIT_AP_CODES:
             org = esun_quantity_from_fields(row, "org", ap_code)
             mat = esun_quantity_from_fields(row, "mat", ap_code) or 0
@@ -1390,6 +1442,15 @@ class OrderBookCache:
     def report_mark(self) -> int:
         """Taken right before a get_order_results() call; pass it as `since` when applying the result."""
         with self.lock:
+            return self._failure_seq
+
+    def advance_report_mark(self) -> int:
+        """
+        Numbers an outcome only a later snapshot settles (a rejected order: no row, no failed ACK)
+        without recording a failure: report_mark() + 1, covered by queries started after this call.
+        """
+        with self.lock:
+            self._failure_seq += 1
             return self._failure_seq
 
     def begin_snapshot(self) -> tuple[int, int]:
@@ -1521,6 +1582,18 @@ class OrderBookCache:
             state = self._ack_state_in_result_units(
                 {k: v for k, v in ack_data.items() if k not in self.REPORT_ONLY_KEYS}, ap_code
             )
+            old_org = esun_quantity_shares(previous, "org", ap_code) if previous else None
+            new_org = esun_quantity_shares(state, "org", ap_code)
+            if old_org is not None and new_org is not None and new_org < old_org:
+                # The order quantity never shrinks (a reduction is cel_qty); keep the row's org until
+                # E.SUN's ACK org_qty semantics (original or remaining after a modify) are confirmed.
+                for key in ("org_qty", "orgQty", "org_qty_share", "orgQtyShare"):
+                    state.pop(key, None)
+                logger.warning(
+                    f"[WebSocket] 委託回報的 org_qty 小於快取委託量，保留原委託量（委託書號末碼 {ord_no[-2:] or pre_ord_no[-2:]}，"
+                    f"ap_code {ap_code}，快取 {old_org} 股，回報 {new_org} 股，cel_qty={ack_data.get('cel_qty')!r}，"
+                    f"before_qty={ack_data.get('before_qty')!r}，after_qty={ack_data.get('after_qty')!r}）"
+                )
             new_id = self._upsert_locked(state, "event")
             if new_id is not None:
                 # ACK cel_qty is the cumulative cancelled quantity of the order (never in a guessed unit).
@@ -1532,7 +1605,7 @@ class OrderBookCache:
                 meta.pop("unresolved_failure", None)
             return True, previous
 
-    def update_from_mat(self, mat_data: dict, generation: int | None = None) -> bool:
+    def update_from_mat(self, mat_data: dict, generation: int | None = None, info: dict | None = None) -> bool:
         """
         Applies a MAT deal. Returns False when dropped (other session, or a duplicate of an
         already-applied mkt_seq_num). Quantity fields of the row are never overwritten here; the
@@ -1540,6 +1613,10 @@ class OrderBookCache:
         row's fills, applied on read. Bridge-only deal_qty/status are kept. A MAT without
         mkt_seq_num cannot be deduplicated: it is published (True) but never counted. Neither is an
         emerging (ap_code 4) MAT without mat_qty_share (unit unknown; deduplicated, published, logged).
+        A deal is covered_by_snapshot when the row's snapshot filled quantity already includes it
+        (counted MATs before it + its shares <= the row's mat shares); its fill then carries
+        `esun_covered_by_snapshot: true`. `info` (when given) receives, for a MAT of a cached order:
+        covered_by_snapshot and order_mat_qty_share (the order's effective filled shares after it).
         """
         if not isinstance(mat_data, dict):
             return False
@@ -1564,8 +1641,11 @@ class OrderBookCache:
                 return False
             meta["source"] = "event"
             meta["updated"] = time.monotonic()
+            if info is not None:
+                info["covered_by_snapshot"] = False
             if not seq:
                 logger.warning(f"[WebSocket] 成交回報缺少 mkt_seq_num，無法去重，不計入快取成交量（ord_no={ord_no}）")
+                self._mat_order_info_locked(internal_id, info)
                 return True
             meta["seen_mat"].add(seq)
             target = self._orders[internal_id]
@@ -1576,15 +1656,24 @@ class OrderBookCache:
                     f"[WebSocket] 興櫃成交回報缺少 mat_qty_share，數量單位未知，不計入快取成交量（ord_no={ord_no}, "
                     f"mkt_seq_num={seq}）"
                 )
+                self._mat_order_info_locked(internal_id, info)
                 return True
             if mat_shares:
-                meta["event_mat_shares"] = (meta.get("event_mat_shares") or 0) + mat_shares
+                counted = meta.get("event_mat_shares") or 0
+                row_shares = esun_quantity_shares(target, "mat", _row_ap_code(target)) or 0
+                covered = counted + mat_shares <= row_shares
+                if info is not None:
+                    info["covered_by_snapshot"] = covered
+                meta["event_mat_shares"] = counted + mat_shares
                 price = _js_finite_number(_first_present(mat_data, "mat_price", "matPrice"))
-                meta["fills"].append({
+                fill = {
                     "mkt_seq_num": seq,
                     "mat_qty_share": mat_shares,
                     "mat_price": _num_out(price) if price is not None and price > 0 else None,
-                })
+                }
+                if covered:
+                    fill["esun_covered_by_snapshot"] = True  # the client folds it into the row's aggregate
+                meta["fills"].append(fill)
             qty = _to_number(
                 mat_data.get("mat_qty") or mat_data.get("matQty") or mat_data.get("deal_qty")
                 or mat_data.get("dealQty") or mat_data.get("qty")
@@ -1600,7 +1689,19 @@ class OrderBookCache:
                 deal_qty = _to_number(target.get("deal_qty"))
                 if org_qty and deal_qty is not None:
                     target["status"] = "Filled" if deal_qty >= org_qty else "PartFilled"
+            self._mat_order_info_locked(internal_id, info)
             return True
+
+    def _mat_order_info_locked(self, internal_id: str, info: dict | None) -> None:
+        """info["order_mat_qty_share"]: the order's effective filled shares (never above the order's)."""
+        if info is None:
+            return
+        row = self._effective_row_locked(internal_id)
+        ap_code = _row_ap_code(row)
+        shares = esun_quantity_shares(row, "mat", ap_code)
+        org_shares = esun_quantity_shares(row, "org", ap_code)
+        if shares is not None:
+            info["order_mat_qty_share"] = min(shares, org_shares) if org_shares else shares
 
     def mark_event(self, order_id: any, generation: int | None = None) -> None:
         """
@@ -2368,6 +2469,46 @@ def remaining_quantity(order: dict, unit: str) -> float | None:
 # esun_trade core input checks (O00001-O00021) are raised before any request is sent.
 _SDK_LOCAL_VALIDATION_RE = re.compile(r"\bO000(0[1-9]|1[0-9]|2[01])\b")
 
+# An SDK exception that is the broker's own business error ("code: message", observed 2026-10-27 /
+# 10-29: "000013: 後台錯誤ODR0239 ...", "AG00005: This order cannot be deleted"). Only an allowlisted
+# code of the operation, with nothing in the text hinting at a transport / timing problem, counts as
+# rejected; everything else stays an unknown outcome.
+_SDK_SERVER_ERROR_RE = re.compile(r"^\s*(?P<code>\d{6}|AG\d{4,5})\s*:\s*(?P<msg>\S.*)\Z", re.S)
+_SDK_CORE_ERROR_CODE_RE = re.compile(r"^[ACO]\d{5}$")  # the SDK core's own codes (A/C/O0000x)
+_SDK_REJECTION_UNCERTAIN_WORDS = (
+    "逾時", "超時", "timeout", "timed out", "稍後", "忙碌", "連線", "斷線", "中斷", "異常", "未知",
+    "unknown", "retry", "重試", "response",
+)
+# "後台錯誤ODR0239": \b does not separate 誤 and O in Python (both are word characters).
+_PLACE_REJECTION_SUBCODE_RE = re.compile(r"後台錯誤\s*(?<![A-Z0-9])(ODR\d{4})(?![0-9])")
+_PLACE_REJECTION_SUBCODES = frozenset({"ODR0239"})  # 000013 subcodes (ODR0239: 警示股預收)
+_ORDER_CHANGE_REJECTION_CODES = frozenset({"AG00005", "AG00004"})
+_ORDER_CHANGE_LABELS = frozenset({"刪單", "改價", "改量"})
+
+
+def sdk_rejection_of(label: str, message: str) -> tuple[str, str, str] | None:
+    """
+    (code, subcode, detail) when an SDK exception text is the broker's explicit rejection of the
+    `label` mutation (see _SDK_SERVER_ERROR_RE); None otherwise (the outcome stays unknown).
+    """
+    match = _SDK_SERVER_ERROR_RE.match(str(message or ""))
+    if not match:
+        return None
+    code, detail = match.group("code"), match.group("msg").strip()
+    if _SDK_CORE_ERROR_CODE_RE.match(code):
+        return None
+    low = detail.lower()
+    if any(word in low for word in _SDK_REJECTION_UNCERTAIN_WORDS):
+        return None
+    if label == "下單":
+        sub = _PLACE_REJECTION_SUBCODE_RE.search(detail) if code == "000013" else None
+        if sub and sub.group(1) in _PLACE_REJECTION_SUBCODES:
+            return code, sub.group(1), detail
+        return None
+    if label in _ORDER_CHANGE_LABELS and code in _ORDER_CHANGE_REJECTION_CODES:
+        return code, code, detail
+    return None
+
 # Keys the SDK core reads from an order result (Node OrderResultObject): a missing one panics in
 # the Rust core (pyo3 PanicException, a BaseException) instead of raising a Python error.
 SDK_ORDER_CORE_FIELDS = (
@@ -2544,8 +2685,8 @@ class _FailedAckRefresh:
     """
 
     generation: int
-    wanted: int  # report_mark() after the latest failed ACK
-    covered: int = 0  # report_mark() before the latest applied snapshot query
+    wanted: int  # report_mark() after the latest failed ACK (or forced advance_report_mark())
+    covered: int = 0  # report_mark() before the latest applied snapshot query (-1: forced, none yet)
 
 
 @dataclasses.dataclass
@@ -3852,6 +3993,7 @@ class EsunTradeBridge:
             return None
         if not isinstance(data, dict):
             return None
+        logger.info(f"[WebSocket] 委託回報原始欄位（去識別化）：{report_log_fields(data)}")
         accepted, previous = self.order_book_cache.update_from_ack(data, generation=session.generation)
         if not accepted:
             return None
@@ -3864,22 +4006,25 @@ class EsunTradeBridge:
             self._schedule_failed_ack_refresh(session)  # the snapshot decides what the failure did
         return event_id
 
-    def _schedule_failed_ack_refresh(self, session: EsunSession) -> None:
+    def _schedule_failed_ack_refresh(self, session: EsunSession, force: bool = False) -> None:
         """
         A failed ACK asks for one authoritative orders query in the background (shared with the
         refresh=true coordinator: 5 s interval, 10/min limiter, merged with user refreshes). At
         most one is pending per session: failed ACKs arriving before it starts share it; one
-        arriving after it started gets one more query.
+        arriving after it started gets one more query. `force` (an explicit broker rejection, which
+        records no failed ACK) always gets a query started after this call: the mark is advanced
+        (wanted = previous mark + 1) and a new state starts uncovered (covered -1).
         """
         if not self._session_usable(session) or self._shutdown_event.is_set():
             return
-        wanted = self.order_book_cache.report_mark()
+        cache = self.order_book_cache
+        wanted = cache.advance_report_mark() if force else cache.report_mark()
         with self._failed_ack_refresh_lock:
             state = self._failed_ack_refresh
             if state is not None and state.generation == session.generation:
                 state.wanted = max(state.wanted, wanted)  # the running worker covers it
                 return
-            state = _FailedAckRefresh(generation=session.generation, wanted=wanted)
+            state = _FailedAckRefresh(generation=session.generation, wanted=wanted, covered=-1 if force else 0)
             self._failed_ack_refresh = state
         threading.Thread(
             target=self._failed_ack_refresh_worker,
@@ -3975,13 +4120,22 @@ class EsunTradeBridge:
             return None
         if not isinstance(data, dict):
             return None
-        if not self.order_book_cache.update_from_mat(data, generation=session.generation):
+        info: dict = {}
+        accepted = self.order_book_cache.update_from_mat(data, generation=session.generation, info=info)
+        logger.info(
+            f"[WebSocket] 成交回報原始欄位（去識別化）：{report_log_fields(data)}；快取：已含於快照="
+            f"{info.get('covered_by_snapshot')}，委託累計成交 {info.get('order_mat_qty_share')} 股，套用={accepted}"
+        )
+        if not accepted:
             logger.info(
                 f"[WebSocket] 略過重複的成交回報（ord_no={data.get('ord_no')}, mkt_seq_num={data.get('mkt_seq_num')}）"
             )
             return None
         self.positions_cache.mark_dirty()
         payload = self._report_payload(session, data, "Deal")
+        payload["esun_covered_by_snapshot"] = bool(info.get("covered_by_snapshot"))
+        if info.get("order_mat_qty_share") is not None:
+            payload["esun_order_mat_qty_share"] = info["order_mat_qty_share"]
         ord_no, pre_ord_no = _order_keys(data)
         if ord_no and not pre_ord_no:
             # A converted reservation keeps pre_ord_no as its client id; MAT only carries ord_no.
@@ -4285,6 +4439,7 @@ class EsunTradeBridge:
     # Bridge-side bookkeeping fields that are not part of the SDK's order result.
     _BRIDGE_ONLY_ORDER_KEYS = frozenset({
         "deal_qty", "status", "mat_time", "esun_fills", "esun_unresolved_failure", "esun_snapshot_missing",
+        "esun_quantity_conflict",
     })
 
     def _mutation_prelude(self, body: any) -> tuple[EsunSession | None, tuple[dict, int] | None]:
@@ -4401,6 +4556,26 @@ class EsunTradeBridge:
                 # O000xx are the SDK core's own input checks, raised before any request is built.
                 logger.warning(f"{label}未送出（SDK 本地驗證）：{message}")
                 return not_sent(400, "ESUN_SDK_VALIDATION", f"{label}未送出：{message}")
+            rejection = sdk_rejection_of(label, message)
+            if rejection is not None:
+                code, sub, detail = rejection
+                tag = code if sub == code else f"{code}/{sub}"
+                logger.warning(f"{label}遭玉山證券拒絕 [{tag}]：{detail}")
+                if label == "下單":
+                    try:
+                        self._schedule_failed_ack_refresh(session, force=True)  # the snapshot settles a contradiction
+                    except Exception:  # never replaces the rejection answer
+                        logger.error(f"拒絕後的委託查詢排程失敗：\n{redact(traceback.format_exc())}")
+                return {
+                    "ok": False,
+                    "outcome": "rejected",
+                    "code": sub,
+                    "error": f"玉山證券拒絕{label} [{tag}]：{detail}",
+                    "environment": session.environment,
+                    "sessionGeneration": session.generation,
+                }, 422
+            if _SDK_SERVER_ERROR_RE.match(message):
+                logger.warning(f"{label}：玉山錯誤代碼不在明確拒絕清單內（或內容可能是暫時性問題），維持結果未知")
             low = message.lower()
             timed_out = isinstance(e, TimeoutError) or "timed out" in low or "timeout" in low
             logger.error(f"{label}結果未知（SDK 呼叫期間或之後拋出例外）：{message}")

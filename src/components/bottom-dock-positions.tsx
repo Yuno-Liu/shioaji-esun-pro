@@ -27,6 +27,7 @@ import { AsyncStatus } from './async-status';
 import * as panel from './panel.css';
 import * as styles from './bottom-dock.css';
 import { useEsunPositionDetails } from './esun-position-details';
+import { creditExitLabel, stockExitFor } from '../lib/stock-exit-cond';
 import {
     accountRefLabel,
     ArmLockButton,
@@ -44,6 +45,9 @@ import {
 } from './bottom-dock-shared';
 
 type SortMode = 'default' | 'value' | 'pnl' | 'code';
+
+// 送出前就拒絕：確定沒有送出任何委託（不對帳、照實說未送出）
+const refused = (message: string) => Object.assign(new Error(message), { mutationNotStarted: true as const, refusedBeforeSend: true as const });
 
 function posKey(p: AccountedPosition): string {
     const acc = p.account ? `${p.account.broker_id}-${p.account.account_id}` : '';
@@ -194,25 +198,34 @@ export function PositionsPane({
     const closeOne = async (p: AccountedPosition, mode2: 'close' | 'reverse') => {
         const account = p.account;
         if (!account || !canTrade(account) || !account.broker_id || !account.account_id || !['S', 'F'].includes(account.account_type)) {
-            throw new Error('持倉帳戶歸屬不明，未送出委託');
+            throw refused('持倉帳戶歸屬不明，未送出委託');
         }
-        if ((isStockPosition(p) ? 'S' : 'F') !== account.account_type) throw new Error('持倉單位與帳戶市場不符，未送出委託');
+        if ((isStockPosition(p) ? 'S' : 'F') !== account.account_type) throw refused('持倉單位與帳戶市場不符，未送出委託');
         if (!Number.isInteger(p.quantity) || p.quantity <= 0 || !['Buy', 'Sell'].includes(p.direction)) {
-            throw new Error('持倉數量或方向不明，未送出委託');
+            throw refused('持倉數量或方向不明，未送出委託');
         }
-        if (isStockPosition(p) && (mode2 === 'reverse' || !('cond' in p) || p.cond !== 'Cash')) {
-            throw new Error('股票反手或信用持倉請分開確認交易條件，未送出委託');
+        if (isStockPosition(p) && mode2 === 'reverse') throw refused('股票不支援一鍵反手（現股與信用部位都請分開確認交易條件），未送出委託');
+        // 現股反向；融資多單＝融資賣出、融券空單＝融券買進（只送整張）；其他拒絕
+        const stockExit = isStockPosition(p) ? stockExitFor(p.direction, 'cond' in p ? p.cond : undefined, p.quantity) : null;
+        if (typeof stockExit === 'string') throw refused(stockExit);
+        // 商品資料讀取（快取未命中時走網路）在任何送單之前：失敗即確定未送出，不觸發對帳
+        let contract: Awaited<ReturnType<typeof ensureContract>>;
+        try {
+            contract = await ensureContract(p.code);
+        } catch (e) {
+            throw refused(`商品資料讀取失敗，未送出委託：${e instanceof Error ? e.message : String(e)}`);
         }
-        const contract = await ensureContract(p.code);
-        if ((contract.security_type === 'STK' ? 'S' : 'F') !== account.account_type) throw new Error('商品與持倉帳戶市場不符，未送出委託');
+        if ((contract.security_type === 'STK' ? 'S' : 'F') !== account.account_type) throw refused('商品與持倉帳戶市場不符，未送出委託');
         const exit = p.direction === 'Buy' ? 'Sell' : 'Buy';
-        if (isStockPosition(p)) {
-            await placeStockExitByShares(contract, exit, p.quantity, account);
+        if (stockExit) {
+            if (stockExit.orderCond) await placeStockExitByShares(contract, stockExit.exit, p.quantity, account, { orderCond: stockExit.orderCond });
+            else await placeStockExitByShares(contract, stockExit.exit, p.quantity, account);
+            return { exit: stockExit.exit, qty: p.quantity, credit: creditExitLabel(stockExit.orderCond) };
         } else {
             await placeQuickOrder(contract, exit, null, mode2 === 'reverse' ? p.quantity * 2 : p.quantity,
                 { account, ocType: mode2 === 'reverse' ? 'Auto' : 'Cover' });
         }
-        return { exit, qty: mode2 === 'reverse' ? p.quantity * 2 : p.quantity };
+        return { exit, qty: mode2 === 'reverse' ? p.quantity * 2 : p.quantity, credit: '' };
     };
 
     // 平/反 are one-click market orders on the whole position — locked by
@@ -221,12 +234,12 @@ export function PositionsPane({
         if (busyCode || busy) return;
         setBusyCode(p.code);
         try {
-            const { exit, qty } = await closeOne(p, mode2);
+            const { exit, qty, credit } = await closeOne(p, mode2);
             notify({
                 kind: 'ok',
                 title: mode2 === 'close' ? '⏹ 平倉單已送出' : '🔄 反手單已送出',
                 // 平倉／反手量＝持倉數量：遮金額時不露，之後才開也會重遮（#268）
-                body: `${p.code} 市價${exit === 'Buy' ? '買' : '賣'} ${secretMoney(
+                body: `${p.code} ${credit}市價${exit === 'Buy' ? '買' : '賣'} ${secretMoney(
                     isStockPosition(p) ? fmtStockLots(qty) : `${qty} 口`,
                 )}`,
             });
@@ -234,9 +247,10 @@ export function PositionsPane({
         } catch (e) {
             // 確定一筆都沒送出（mutationNotStarted）就照實說未送出
             const notSent = (e as { mutationNotStarted?: boolean } | null)?.mutationNotStarted === true;
+            const how = (e as { refusedBeforeSend?: boolean } | null)?.refusedBeforeSend === true ? '（未送出）' : '（未送出或被券商拒絕）';
             notify({
                 kind: 'err',
-                title: mode2 === 'close' ? (notSent ? '平倉未成立（未送出或被券商拒絕）' : '平倉未完整確認') : (notSent ? '反手未成立（未送出或被券商拒絕）' : '反手未完整確認'),
+                title: mode2 === 'close' ? (notSent ? `平倉未成立${how}` : '平倉未完整確認') : (notSent ? `反手未成立${how}` : '反手未完整確認'),
                 body: notSent ? (e instanceof Error ? e.message : String(e)) : `可能已有部分委託送出或結果未知，請手動核對，勿直接重送。${e instanceof Error ? e.message : String(e)}`,
             });
             if (!notSent) reconcileAfterUnknownOutcome();
@@ -251,12 +265,14 @@ export function PositionsPane({
         if (targets.length === 0 || busy || busyCode) return;
         setBusy({ done: 0, total: targets.length });
         let ok = 0;
+        let notSent = 0;
         let firstErr = '';
         for (const p of targets) {
             try {
                 await closeOne(p, 'close');
                 ok++;
             } catch (e) {
+                if ((e as { mutationNotStarted?: boolean } | null)?.mutationNotStarted === true) notSent++;
                 if (!firstErr) {
                     firstErr = `${p.code}: ${e instanceof Error ? e.message : String(e)}`;
                 }
@@ -265,11 +281,11 @@ export function PositionsPane({
         }
         setBusy(null);
         setSelected(new Set());
-        const fail = targets.length - ok;
+        const fail = targets.length - ok - notSent;
         notify({
-            kind: fail > 0 ? 'err' : 'ok',
+            kind: fail + notSent > 0 ? 'err' : 'ok',
             title: '批次平倉請核對委託',
-            body: `已送出 ${ok} 筆 / 未完整確認 ${fail} 筆；可能部分送出，勿直接重送${firstErr ? `｜${firstErr}` : ''}`,
+            body: `已送出 ${ok} 筆 / ${notSent > 0 ? `未成立 ${notSent} 筆 / ` : ''}未完整確認 ${fail} 筆${fail > 0 ? '；可能部分送出，勿直接重送' : ''}${firstErr ? `｜${firstErr}` : ''}`,
         });
         if (fail > 0) reconcileAfterUnknownOutcome();
         onChanged();
@@ -552,18 +568,12 @@ export function PositionsPane({
 
     const groupSubtotal = (g: PosGroup) => {
         const pnl = g.rows.reduce((s, p) => s + p.pnl, 0);
-        const stockValue = g.rows
-            .filter(isStockPosition)
-            .reduce(
-                (s, p) =>
-                    s +
-                    (p.direction === 'Sell' ? -1 : 1) *
-                        p.last_price *
-                        p.quantity,
-                0,
-            );
+        // 市值＝Σ|股數×現價|（融券也是正的市值）；缺現價的列略過並標示不完整
+        const priced = g.rows.filter(isStockPosition).map((p) => Math.abs(p.last_price * p.quantity));
+        const stockValue = priced.filter(Number.isFinite).reduce((s, v) => s + v, 0);
+        const valueIncomplete = priced.some((v) => !Number.isFinite(v));
         const hasStock = g.rows.some(isStockPosition);
-        return { pnl, stockValue, hasStock };
+        return { pnl, stockValue, hasStock, valueIncomplete };
     };
 
     return (
@@ -624,6 +634,7 @@ export function PositionsPane({
                                                   privMoney,
                                               )
                                             : '—'}
+                                        {sub.valueIncomplete ? '（部分缺價未計）' : ''}
                                     </span>
                                     <span className={panel.dirText[dir]}>
                                         {maskMoney(

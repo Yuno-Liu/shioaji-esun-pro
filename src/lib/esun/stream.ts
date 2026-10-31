@@ -26,13 +26,16 @@ export type EsunStreamSignal =
      *  股數欄位、單位未知；bridge 快取也沒套用）表示快取重建不能解除，只有權威讀取能對帳 */
     | { kind: 'untrackable'; deal: boolean; authoritativeOnly?: { orderId: string } }
     /** 失敗回報推不出操作別（新單或刪改單被拒都有可能）：本地委託不變，需要權威讀取 */
-    | { kind: 'unresolved-failure'; orderId: string; opCode: string };
+    | { kind: 'unresolved-failure'; orderId: string; opCode: string }
+    /** bridge 標示已含在委託快照內的成交（以彙總 seq 投影）：持倉的即時估算可能少計或重複，需要對帳 */
+    | { kind: 'covered-deal'; orderId: string };
 
 const STATUS_EVENT = 'esun_status';
 const SESSION_EVENT = 'esun_session';
 const RESYNC_EVENT = 'esun_resync';
 const UNTRACKABLE_EVENT = 'esun_untrackable';
 const UNRESOLVED_FAILURE_EVENT = 'esun_unresolved_failure';
+const COVERED_DEAL_EVENT = 'esun_covered_deal';
 /** bridge 每 25 秒送心跳；超過兩個週期加寬限沒有任何訊息就視為停滯 */
 export const ESUN_STREAM_STALE_MS = 80_000;
 const RETRY_MAX_MS = 30_000;
@@ -138,6 +141,7 @@ function onReport(event: string, raw: string) {
     if (result.unresolvedFailure) {
         publishStreamEvent(UNRESOLVED_FAILURE_EVENT, JSON.stringify({ orderId: result.orderId, opCode: result.unresolvedFailure.opCode }));
     }
+    if (result.coveredBySnapshot) publishStreamEvent(COVERED_DEAL_EVENT, JSON.stringify({ orderId: result.orderId }));
 }
 
 function scheduleRetry() {
@@ -265,6 +269,12 @@ export function ensureEsunOrderStream(): void {
             try {
                 const { orderId, opCode } = JSON.parse(raw) as { orderId?: unknown; opCode?: unknown };
                 if (typeof orderId === 'string' && orderId) signal({ kind: 'unresolved-failure', orderId, opCode: typeof opCode === 'string' ? opCode : '' });
+            } catch { /* malformed */ }
+        }),
+        onStreamEvent(COVERED_DEAL_EVENT, raw => {
+            try {
+                const { orderId } = JSON.parse(raw) as { orderId?: unknown };
+                if (typeof orderId === 'string' && orderId) signal({ kind: 'covered-deal', orderId });
             } catch { /* malformed */ }
         }),
         subscribeStreamOwner(() => {

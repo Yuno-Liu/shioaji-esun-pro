@@ -46,7 +46,7 @@ export function positionFill(report: OrderEventReport, accounts: Account[], trad
     if (type === 'S' && !['Common', 'Odd', 'IntradayOdd', 'Fixing', 'BlockTrade'].includes(lot)) return null;
     const condition = type === 'S' ? text(body.order_cond) : '';
     const openClose = type === 'F' ? trade?.order.octype ?? '' : '';
-    if (type === 'S' && condition !== 'Cash') return null;
+    if (type === 'S' && !['Cash', 'MarginTrading', 'ShortSelling'].includes(condition)) return null;
     if (type === 'F' && !['New', 'Cover', 'Auto'].includes(openClose)) return null;
     const code = trade?.contract.target_code || trade?.contract.code || text(body.full_code) || report.code;
     if (type === 'F' && (text(body.full_code) || text(body.code)) !== code) return null;
@@ -98,10 +98,14 @@ export function applyPositionFill(rows: AccountedPosition[], fill: PositionFill,
     if (!positive(multiplier)) return null;
     const futures = fill.account.account_type === 'F';
     const matches = rows.filter(p => sameAccount(p, fill) && p.code === fill.code
-        && (futures || !('cond' in p) || (p.cond ?? 'Cash') === fill.condition));
+        && (futures || (('cond' in p ? p.cond : undefined) ?? 'Cash') === fill.condition));
     const same = matches.filter(p => p.direction === fill.action);
     const opposite = matches.filter(p => p.direction !== fill.action);
     if (same.length > 1 || opposite.length > 1 || (same.length && opposite.length && fill.openClose === 'Auto')) return null;
+    // 信用：融資買進開倉、賣出了結；融券賣出開倉、買進回補。方向不合的列不猜
+    const credit = !futures && fill.condition !== 'Cash';
+    const opens = fill.condition === 'ShortSelling' ? 'Sell' : 'Buy';
+    if (credit && (fill.action === opens ? opposite.length : same.length)) return null;
     // Another account's row may carry an older mark: only this account's rows
     // (their own last_price) or the caller's fresh tick are trusted.
     const known = positive(mark) ? mark
@@ -144,7 +148,9 @@ export function applyPositionFill(rows: AccountedPosition[], fill: PositionFill,
     if (remaining && fill.openClose === 'Cover') return null;
     // Cash sells beyond known holdings may be day-trade shorts or settlement
     // corrections: do not invent a short holding without that contract.
-    if (remaining && !futures && fill.action === 'Sell') return null;
+    if (remaining && !futures && fill.action === 'Sell' && fill.condition !== 'ShortSelling') return null;
+    // 回補或了結超出已知信用部位：不猜
+    if (remaining && credit && fill.action !== opens) return null;
     if (!remaining) return next;
     if (same.length) {
         const old = same[0]!;

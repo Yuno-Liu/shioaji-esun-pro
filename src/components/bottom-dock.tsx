@@ -1,3 +1,4 @@
+import { sumStockMarketValue } from '../lib/position-value';
 import { canTrade } from '../lib/account-tradable';
 import { remainingWorkingOrderQuantity } from '../lib/working-order-quantity';
 // src/components/bottom-dock.tsx — positions / orders / account tabs.
@@ -167,11 +168,7 @@ export function BottomDock({
     const totalPnl = sumRows.reduce((s, p) => s + p.pnl, 0);
     const stockRows = sumRows.filter(isStockPosition);
     const hasFutRows = sumRows.length !== stockRows.length;
-    const stockValue = stockRows.reduce(
-        (s, p) =>
-            s + (p.direction === 'Sell' ? -1 : 1) * p.last_price * p.quantity,
-        0,
-    );
+    const stockValue = sumStockMarketValue(stockRows);
     const stockCost = stockRows.reduce(
         (s, p) => s + p.price * p.quantity,
         0,
@@ -319,9 +316,10 @@ export function BottomDock({
                         <span className={styles.sumLabel}>總市值</span>
                         <span className={styles.sumValue}>
                             {positionsStatus === 'ready' ? maskMoney(
-                                fmtMoney(Math.round(stockValue)),
+                                fmtMoney(Math.round(stockValue.value)),
                                 privMoney,
                             ) : '—'}
+                            {positionsStatus === 'ready' && stockValue.incomplete && <span className={styles.sumSub}> （部分缺價）</span>}
                         </span>
                     </span>
                 )}

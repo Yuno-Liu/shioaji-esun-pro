@@ -26,8 +26,10 @@ import { useFlashLadder } from '../hooks/use-flash-ladder';
 import { dayEnd, sessionEnd } from '../lib/conditional/session';
 import { getConditionalSettings } from '../lib/conditional/settings';
 import { clickCondition, DEFAULT_PROTECT, DEFAULT_TRIGGER_SEND, dragProblem, flashProtectPlan, flashProtectText, positionEffect,
-    protectConditionProblem, protectEffect, triggerConditionProblem, triggerIntent, triggerKind, triggerSendOf, triggerSendText, type LadderMark } from '../lib/flash-trigger';
+    protectConditionProblem, protectEffect, triggerConditionProblem, triggerIntent, triggerKind, triggerSendOf, triggerSendText, type LadderMark,
+    CASH_BUY_NO_COVER_TEXT, sameCondRows, stockCondName, stockPositionGroups } from '../lib/flash-trigger';
 import type { TriggerValidity } from '../lib/trigger-engine';
+import { CASH_SELL_NO_CLOSE_TEXT, NO_SHORT_TO_COVER_NOTE } from '../lib/stock-exit-cond';
 import { flashAddTrigger, flashEnvIs, flashLastPrice, flashModifyTrigger, flashPlaceBracket, flashReadClose, flashReadHeld, flashRemoveTrigger, flashRestoreProtection, flashStopProtections } from '../lib/flash-conditional';
 import { restoreAfterUnfilledClose, restoreTriggers, warnIfStillHeld, withFlattenLock } from '../lib/flash-flatten-restore';
 import { FlashProtectStrip } from './flash-protect';
@@ -605,8 +607,9 @@ export function FlashOrder({
     const { sellOnly, creditBlocked, dayTradeBlocked } = sides;
     const buyBlock = sides.buy;
     const sellBlock = sides.sell;
-    // 融券面板的買邊停用，市價鈕仍寫「市價買」（不會出現「融券買」）
+    // 借券面板的買邊停用，市價鈕仍寫「市價買」；融券面板的買邊是融券買進（回補，fork）
     const buyCredit = sellOnly ? '' : creditLabel('Buy', credit.cond, credit.daytradeShort) ?? '';
+    const buyCover = credit.cond === 'ShortSelling' ? '（回補）' : '';
     const sellCredit = creditLabel('Sell', credit.cond, credit.daytradeShort) ?? '';
     const creditTag = creditApplies ? (credit.cond !== 'Cash' ? creditName : credit.daytradeShort ? '現沖' : '') : '';
     const creditBad = !!creditBlocked || !!dayTradeBlocked;
@@ -983,13 +986,16 @@ export function FlashOrder({
     }, [trades, contract.code, lotShown]);
 
     // net position for this symbol (alias-aware for continuous contracts)
+    // fork：股票的持有量只算和面板信用條件相同的列（融券空單不抵現股多單）
+    const posCond = market === 'S' ? credit.cond : null;
     const pos = useMemo(() => {
-        const matches = positions.filter(
+        const rows = positions.filter(
             (p) =>
                 p.code === contract.code ||
                 getAliasFor(p.code) === contract.code,
         );
-        if (matches.length === 0) return null;
+        if (rows.length === 0) return null;
+        const matches = posCond !== null ? sameCondRows(rows as { cond?: string }[], posCond) as typeof rows : rows;
         let net = 0;
         let cost = 0;
         let qtySum = 0;
@@ -1002,7 +1008,10 @@ export function FlashOrder({
             rowPnl += p.pnl || 0;
             sideQty[p.direction === 'Sell' ? 'Sell' : 'Buy'] += p.quantity;
         }
-        if (net === 0) return null;
+        if (posCond === null && net === 0) return null;
+        // 平倉鈕沿用全部列（信用列存在就停用，由持倉面板處理）
+        let exitNet = 0;
+        for (const p of rows) exitNet += p.direction === 'Sell' ? -p.quantity : p.quantity;
         // Futures only (stock margin longs and short sales are real separate
         // positions). Intra-session the broker — and the live projection of
         // New fills — keeps separate Buy and Sell rows for one contract, and
@@ -1025,11 +1034,20 @@ export function FlashOrder({
         const avg = fifoOk ? fifo.avg : rowAvg;
         const pnl = fifoOk ? fifo.pnl : rowPnl;
         const stale = futures && reconcilePending;
-        const safeExit = matches.every(p => Number.isInteger(p.quantity) && p.quantity > 0)
-            && new Set(matches.map(p => p.direction)).size === 1
-            && (market !== 'S' || matches.every(p => 'cond' in p && p.cond === 'Cash'));
-        return { net, avg, avgKey: keyOf(roundToTick(contract, avg)), pnl, safeExit, mixed, twoWay, stale, fifo: fifoOk };
-    }, [positions, trades, contract, reconcilePending, lotLast]);
+        const safeExit = rows.every(p => Number.isInteger(p.quantity) && p.quantity > 0)
+            && new Set(rows.map(p => p.direction)).size === 1
+            && (market !== 'S' || rows.every(p => 'cond' in p && p.cond === 'Cash'));
+        const groups = posCond !== null ? stockPositionGroups(rows as Parameters<typeof stockPositionGroups>[0]) : null;
+        return { net, exitNet, avg, avgKey: qtySum > 0 ? keyOf(roundToTick(contract, avg)) : null, pnl, safeExit, mixed, twoWay, stale, fifo: fifoOk, groups };
+    }, [positions, trades, contract, reconcilePending, lotLast, posCond]);
+    // 依條件分開顯示：只有一列且是面板條件的現股時，照原本的「多 2 張」
+    const posGroups = pos?.groups && !(pos.groups.length === 1 && pos.groups[0]!.cond === 'Cash' && posCond === 'Cash') ? pos.groups : null;
+    const coverWarn = posCond === 'Cash' && !!pos?.groups?.some(g => g.cond === 'ShortSelling' && g.direction === 'Sell');
+    // fork：與 coverWarn 對稱的賣邊提示 — 現股賣出不會了結融資（只提示、不改條件）
+    const marginWarn = posCond === 'Cash' && !!pos?.groups?.some(g => g.cond === 'MarginTrading' && g.direction === 'Buy');
+    // fork：融券面板買進＝回補；查無此碼融券空單時只在確認視窗提示（不擋，由券商端決定）
+    const noShortRef = useRef(false);
+    noShortRef.current = posCond === 'ShortSelling' && !pos?.groups?.some(g => g.cond === 'ShortSelling' && g.direction === 'Sell');
 
     // #216 持倉換成下單單位（整股：張；零股：股；期貨：口），判斷進場／減倉／反手
     const heldRef = useRef({ held: 0, exitSafe: false });
@@ -1180,7 +1198,8 @@ export function FlashOrder({
                     account: capturedAccount,
                     isAccountCurrent: stillPanelAccount(capturedAccount),
                     serverMode,
-                    confirmNote: routeConfirmNote(capturedAccount),
+                    confirmNote: [creditOn && clickCredit.cond === 'ShortSelling' && action === 'Buy' && noShortRef.current ? NO_SHORT_TO_COVER_NOTE : null,
+                        routeConfirmNote(capturedAccount)].filter(Boolean).join('・'),
                     // 確認之後重新查可否融資券（不用快取）：確認期間變成 0 就不送；
                     // 查詢失敗照樣不擋（由券商端決定）
                     ...(gate?.afterConfirm ? { afterConfirm: gate.afterConfirm } : {}),
@@ -1487,11 +1506,11 @@ export function FlashOrder({
             if (pausedRef.current) throw new Error(ORDER_CONTEXT_CHANGED_MESSAGE);
             if (!accountMatches(accountRef.current, account)) throw new Error('帳戶已變更，已停止後續下單');
         };
-        const action = pos.net > 0 ? 'Sell' : 'Buy';
+        const action = pos.exitNet > 0 ? 'Sell' : 'Buy';
         const stock = account.account_type === 'S';
         const unit = stock ? '張' : '口';
         const codes = [contract.code, contract.target_code].filter((x): x is string => !!x);
-        const net = pos.net;
+        const net = pos.exitNet;
         // one 平倉 of this account + product at a time (also across windows),
         // held until its unfilled-close check has finished
         // keyed by the tradable contract (TXFR1 → TXFJ6): an alias panel and a direct one share it
@@ -1829,27 +1848,27 @@ export function FlashOrder({
                     // 可否融資券的 0 只讓按鈕變淡、仍可點（點下去會重新查）；固定規則才停用
                     disabled={odd || !!ruleBlockRef.current.Buy}
                     data-blocked={buyBlock ? true : undefined}
-                    title={odd ? ODD_LOT_TEXT.priceType : buyBlock ?? undefined}
+                    title={odd ? ODD_LOT_TEXT.priceType : buyBlock ?? (coverWarn ? CASH_BUY_NO_COVER_TEXT : undefined)}
                     onClick={() => void send('Buy', null)}
                 >
-                    {mktLabel}{buyCredit}買
+                    {mktLabel}{buyCredit}買{buyCover}
                 </button>
                 <button
                     className={`${styles.mktBtn.sell} ${armedView && !odd && !sellBlock ? '' : styles.disabledCell}`}
                     disabled={odd || !!ruleBlockRef.current.Sell}
                     data-blocked={sellBlock ? true : undefined}
-                    title={odd ? ODD_LOT_TEXT.priceType : sellBlock ?? undefined}
+                    title={odd ? ODD_LOT_TEXT.priceType : sellBlock ?? (marginWarn ? CASH_SELL_NO_CLOSE_TEXT : undefined)}
                     onClick={() => void send('Sell', null)}
                 >
                     {mktLabel}{sellCredit}賣
                 </button>
-                {pos && !paused && (
+                {pos && pos.exitNet !== 0 && !paused && (
                     <button
                         className={`${styles.flatBtn} ${armedView ? '' : styles.disabledCell}`}
                         title={pos.safeExit
                             ? market === 'S'
-                                ? `平倉 ${maskMoney(fmtStockLots(Math.abs(pos.net)), privMoney)}（整張市價、零股以漲跌停價限價）`
-                                : `市價平倉 ${maskMoney(String(Math.abs(pos.net)), privMoney)}`
+                                ? `平倉 ${maskMoney(fmtStockLots(Math.abs(pos.exitNet)), privMoney)}（整張市價、零股以漲跌停價限價）`
+                                : `市價平倉 ${maskMoney(String(Math.abs(pos.exitNet)), privMoney)}`
                             : '持倉方向或交易條件不明，請使用持倉面板確認'}
                         disabled={!pos.safeExit || !armedView || !activeAccount}
                         onClick={() => void flatten()}
@@ -1878,7 +1897,21 @@ export function FlashOrder({
                     />
                 )}
             </div>
-            {pos && !paused && (
+            {posGroups && !paused && (
+                <div className={styles.posBar} data-testid='flash-pos-groups'>
+                    {posGroups.map(g => (
+                        <span key={`${g.cond}:${g.direction}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                            <span className={g.direction === 'Buy' ? styles.posLong : styles.posShort}
+                                title={!privMoney ? `${g.quantity.toLocaleString()} 股` : undefined}>
+                                {stockCondName(g.cond)}{g.direction === 'Buy' ? '多' : '空'} {maskMoney(fmtStockLots(g.quantity), privMoney)}
+                            </span>
+                            <span>@ {maskMoney(fmtPrice(g.avg), privMoney)}</span>
+                            <span className={g.pnl >= 0 ? styles.posLong : styles.posShort}>{maskMoney(fmtSigned(g.pnl), privMoney)}</span>
+                        </span>
+                    ))}
+                </div>
+            )}
+            {pos && !posGroups && pos.net !== 0 && !paused && (
                 <div className={styles.posBar}>
                     <span className={pos.net > 0 ? styles.posLong : styles.posShort}
                         title={market === 'S' && !privMoney ? `${Math.abs(pos.net).toLocaleString()} 股（含零股）` : undefined}>
@@ -1912,12 +1945,26 @@ export function FlashOrder({
                     <span>
                         {creditBlocked ?? dayTradeBlocked ?? (credit.cond === 'MarginTrading'
                             ? '融資：點買＝融資買進，點賣＝融資賣出'
-                            : sellOnly
+                            : credit.cond === 'ShortSelling'
+                              ? '融券：點買＝融券買進（回補），點賣＝融券賣出'
+                              : sellOnly
                               ? `${creditName}：只能點賣（${creditName}賣出）；買進請改現股或融資`
                               : '現股當沖先賣：點賣為現沖賣出，當日需回補')}
                         {creditCheck === 'unknown' && ' · 無法確認可否融資券（不擋單，由券商端決定）'}
                         {creditCheck === 'loading' && ' · 確認可否融資券中…'}
                     </span>
+                </div>
+            )}
+            {coverWarn && !paused && (
+                <div className={styles.creditBanner.bad} data-testid='flash-cover-warning'>
+                    <Ban size={10} aria-hidden />
+                    <span>{CASH_BUY_NO_COVER_TEXT}</span>
+                </div>
+            )}
+            {marginWarn && !paused && (
+                <div className={styles.creditBanner.bad} data-testid='flash-margin-warning'>
+                    <Ban size={10} aria-hidden />
+                    <span>{CASH_SELL_NO_CLOSE_TEXT}</span>
                 </div>
             )}
             <div className={`${styles.headRow} ${triggerLayout === 'columns' ? styles.cols7 : ''}`}>
@@ -2030,7 +2077,7 @@ export function FlashOrder({
                 {armedView
                     ? odd
                         ? `點買量=零股限價買 ${qty} 股 · 點賣量=零股限價賣 · ${trigWord} · 點單量=刪單 · Esc 鎖定`
-                        : `點買量=${buyBlock ? '停用' : `${buyCredit}限價買${orderSuffix}`} · 點賣量=${sellBlock ? '停用' : `${sellCredit}限價賣${orderSuffix}`}${
+                        : `點買量=${buyBlock ? '停用' : `${buyCredit}限價買${buyCover}${orderSuffix}`} · 點賣量=${sellBlock ? '停用' : `${sellCredit}限價賣${orderSuffix}`}${
                             protect.on ? (protectBlock ? ' · 自動停損停利條件不符，進場不送' : ' · 進場附停損停利') : ''} · ${trigWord} · 點單量=刪單 · Esc 鎖定`
                     : '安全鎖定中 — 點「啟用閃電下單」解鎖 · 滾輪捲動 · 雙擊置中'}
             </div>
