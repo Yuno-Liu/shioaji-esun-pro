@@ -2204,6 +2204,79 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         res, status = self._place()
         self.assertEqual((status, res["outcome"], res["code"]), (400, "not_sent", "ESUN_SDK_VALIDATION"))
 
+    # Shape of the broker rejection observed 2026-10-27 (amount synthetic).
+    _ODR0239 = "000013: 後台錯誤ODR0239 警示股已達預收條件，須預收 123456 元，圈存 0 股"
+
+    def test_explicit_broker_rejection_exception_is_422_rejected(self):
+        # RC5: an allowlisted "code: message" business error is a rejection, not an unknown outcome.
+        self.core.order_response = RuntimeError(self._ODR0239)
+        res, status = self._place()
+        self.assertEqual((status, res["ok"], res["outcome"], res["code"]), (422, False, "rejected", "ODR0239"))
+        self.assertTrue(res["error"].startswith("玉山證券拒絕下單 [000013/ODR0239]："), res["error"])
+        self.assertIn("警示股已達預收條件", res["error"])
+        self.assertEqual((res["environment"], res["sessionGeneration"]), ("SIMULATION", self.bridge.session.generation))
+        self.assertEqual(self.scheduled.call_args_list, [mock.call(self.bridge.session, force=True)])  # one forced read
+        self.assertEqual(self.bridge.order_book_cache.get_all(), [])
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 1)
+
+    def test_unlisted_or_uncertain_sdk_errors_stay_unknown(self):
+        cases = [
+            (RuntimeError("000013: 後台錯誤 系統逾時"), 502),
+            (RuntimeError("000013: 後台錯誤ODR0001 其他原因"), 502),  # subcode not allowlisted
+            (RuntimeError("000013: 後台錯誤ODR0239 系統忙碌請稍後"), 502),
+            (RuntimeError("000013: 後台錯誤XODR0239 警示股"), 502),
+            (RuntimeError("000013: 後台錯誤ODR02391 警示股"), 502),
+            (RuntimeError("000014: 後台錯誤ODR0239 警示股"), 502),
+            (RuntimeError("AG00005: This order cannot be deleted"), 502),  # not a place rejection code
+            (RuntimeError("A00002: response parse Error"), 502),
+            (RuntimeError("error sending request for url (https://example.invalid/order): operation timed out"), 504),
+            (RuntimeError("prefix " + self._ODR0239), 502),  # must match from the start
+            (KeyError("data"), 502),
+            (FakePanicException("called `Result::unwrap()` on an `Err` value"), 502),
+        ]
+        for error, expected in cases:
+            self.core.order_response = error
+            res, status = self._place()
+            self.assertEqual((status, res["outcome"], res["code"]), (expected, "unknown", "ESUN_OUTCOME_UNKNOWN"), error)
+        self.scheduled.assert_not_called()
+
+    def test_order_change_rejections_are_422_rejected(self):
+        self._snapshot(self._lot_order(mat_qty=0))
+        calls = [
+            ("刪單", lambda: self.bridge.cancel_order({"order_no": "A0101", **self.env})),
+            ("改量", lambda: self.bridge.replace_qty({"order_no": "A0101", "cancel_quantity": 1,
+                                                    "quantity_unit": "lot", **self.env})),
+            ("改價", lambda: self.bridge.replace_price({"order_no": "A0101", "price": 955.0, **self.env})),
+        ]
+        for label, call in calls:
+            for code in ("AG00005", "AG00004"):
+                self.core.modify_response = RuntimeError(f"{code}: This order cannot be changed")
+                res, status = call()
+                self.assertEqual((status, res["outcome"], res["code"]), (422, "rejected", code), label)
+                self.assertEqual(res["error"], f"玉山證券拒絕{label} [{code}]：This order cannot be changed")
+            for message in ("AG00006: This order cannot be deleted", "AG00005: request timeout",
+                            "AG00005: 連線中斷", "000013: 後台錯誤ODR0239 警示股"):
+                self.core.modify_response = RuntimeError(message)
+                res, status = call()
+                self.assertEqual((res["outcome"], res["code"]), ("unknown", "ESUN_OUTCOME_UNKNOWN"), (label, message))
+                self.assertIn(status, (502, 504))
+        self.scheduled.assert_not_called()  # only a place rejection asks for a background read
+
+    def test_sdk_rejection_of_rules(self):
+        rejection_of = bridge_module.sdk_rejection_of
+        self.assertEqual(rejection_of("下單", self._ODR0239)[:2], ("000013", "ODR0239"))
+        self.assertEqual(rejection_of("下單", "  000013 : 後台錯誤 ODR0239 警示股")[:2], ("000013", "ODR0239"))
+        self.assertEqual(rejection_of("刪單", "AG00005: This order cannot be deleted"),
+                         ("AG00005", "AG00005", "This order cannot be deleted"))
+        for label, message in [
+            ("下單", "000013:"), ("下單", "000013: "), ("下單", "000013: 後台錯誤ODR0239 unknown"),
+            ("下單", "000013: 後台錯誤ODR0239 Response error"), ("下單", "000013: 後台錯誤ODR0239 retry"),
+            ("刪單", "AG00005: timed out"), ("刪單", "AG00005: 異常"), ("刪單", "AG00005: 未知"),
+            ("刪單", "AG0005: x"), ("刪單", "AG00005x: x"), ("查詢", "AG00005: This order cannot be deleted"),
+            ("下單", "O00008: quantity must <= 499"), ("下單", ""), ("下單", None),
+        ]:
+            self.assertIsNone(rejection_of(label, message), (label, message))
+
     def test_invalid_parameters_are_not_sent_and_not_counted(self):
         cases = [
             dict(apCode="intraday_odd"), dict(apCode=None), dict(buySell="long"), dict(trade="MarginTrading"),
@@ -3256,6 +3329,48 @@ class TestReportEvents(_BridgeCase):
         self.assertTrue(deals[0]["data"]["ts"].endswith("10:35:12.345+08:00"))
         self.assertEqual(self.bridge.order_book_cache.get("A0002")["deal_qty"], 1)
 
+    def test_deal_payload_says_whether_the_snapshot_already_counted_it(self):
+        # RC1: esun_covered_by_snapshot + esun_order_mat_qty_share (effective cumulative shares).
+        since, start = self.bridge.order_book_cache.begin_snapshot()
+        self.bridge.order_book_cache.update_from_order_results(
+            [{"ord_no": "A0003", "stock_no": "2884", "ap_code": "1", "org_qty": 3, "mat_qty": 1, "cel_qty": 0,
+              "work_date": taipei_today_str()}],
+            generation=self.bridge.session.generation, since=since, start=start,
+        )
+        mat = {"kind": "MAT", "ord_no": "A0003", "stock_no": "2884", "ap_code": "1", "buy_sell": "B", "trade": "0",
+               "mat_price": 26.0, "mat_qty": 1}
+        for seq in ("S1", "S2"):
+            self.assertIsNotNone(self.bridge._handle_mat({**mat, "mkt_seq_num": seq}))
+        self.bridge._handle_mat({**mat, "ord_no": "Z0003", "mkt_seq_num": "S3"})  # unknown order
+        deals = [e["data"] for e in _drain(self.events, timeout=0.5) if e["event"] == "deal"]
+        self.assertEqual([(d["esun_covered_by_snapshot"], d.get("esun_order_mat_qty_share")) for d in deals],
+                         [(True, 1000), (False, 2000), (False, None)])
+        self.assertEqual(self.bridge.order_book_cache.get("A0003")["mat_qty"], 2)
+
+    def test_report_diagnostics_are_logged_without_identity(self):
+        # Raw MAT / ACK fields at INFO, order numbers reduced to their last 2 characters, no account / ID.
+        today = taipei_today_str()
+        self.bridge.order_book_cache.update_from_order_results(
+            [{"ord_no": "Q7731", "stock_no": "2884", "ap_code": "1", "org_qty": 2, "work_date": today}],
+            generation=self.bridge.session.generation,
+        )
+        identity = {"account": "88401234567", "acc_no": "1234567", "id_no": "A123456789", "user_def": "u-9876543"}
+        with self.assertLogs("esun_trade_server", level="INFO") as logs:
+            self.bridge._handle_ack({"kind": "ACK", "ord_no": "Q7731", "pre_ord_no": "R5520", "stock_no": "2884",
+                                     "ap_code": "1", "org_qty": "2", "cel_qty": "0", "err_code": "00000000",
+                                     **identity})
+            self.bridge._handle_mat({"kind": "MAT", "ord_no": "Q7731", "stock_no": "2884", "ap_code": "1",
+                                     "mat_qty": "1", "mat_price": "26.0", "mkt_seq_num": "000555", **identity})
+        text = "\n".join(logs.output)
+        self.assertIn("委託回報原始欄位", text)
+        self.assertIn("成交回報原始欄位", text)
+        self.assertIn('"mat_qty": "1"', text)
+        self.assertIn('"org_qty": "2"', text)
+        self.assertIn('"ord_no": "***31"', text)
+        self.assertIn('"pre_ord_no": "***20"', text)
+        for secret in ("Q7731", "R5520", "1234567", "A123456789", "9876543"):
+            self.assertNotIn(secret, text)
+
     def test_mat_without_pre_ord_no_gets_it_from_cached_order(self):
         # R3-07: a converted reservation is identified by pre_ord_no on the client; MAT only carries ord_no.
         self.bridge.order_book_cache.update_from_ack({"ord_no": "A0700", "pre_ord_no": "R0700", "stock_no": "2330",
@@ -3684,6 +3799,38 @@ class TestFailedAckBackgroundRefresh(_BridgeCase):
         self.assertEqual([r["reason"] for r in self._resyncs()], ["failed_ack_refreshed"] * 2)
         self.assertIsNone(self._failure())
 
+    def _reject_place(self):
+        def call():
+            raise RuntimeError("000013: 後台錯誤ODR0239 警示股已達預收條件，須預收 123456 元，圈存 0 股")
+        with self.assertLogs("esun_trade_server", level="WARNING"):
+            return self.bridge._call_sdk_mutation_now(self.bridge.session, "下單", call)
+
+    def test_explicit_place_rejection_forces_one_authoritative_query_without_failed_acks(self):
+        # Order-lifecycle [2]: no failed ACK recorded yet (report_mark() 0), the scheduling is not mocked:
+        # the rejection still runs get_order_results once and publishes the resync.
+        self.assertEqual(self.bridge.order_book_cache.report_mark(), 0)
+        res, status = self._reject_place()
+        self.assertEqual((status, res["outcome"], res["code"]), (422, "rejected", "ODR0239"))
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 1, timeout=5))
+        self.assertTrue(self._idle())
+        resyncs = self._resyncs()
+        self.assertEqual([{k: r[k] for k in ("reason", "generation", "cacheRefreshed")} for r in resyncs],
+                         [{"reason": "failed_ack_refreshed", "generation": self.generation, "cacheRefreshed": True}])
+        time.sleep(0.3)
+        self.assertEqual(self.sdk.orders_calls, self.calls + 1)
+        self.assertNotIn("esun_unresolved_failure", self.bridge.get_orders(refresh=False)[0])  # no failure recorded
+
+    def test_place_rejection_during_a_scheduled_query_runs_it_once_more(self):
+        # A query already in flight started before the rejection: one more query follows it.
+        self.sdk.gate = threading.Event()
+        self._fail()
+        self.assertTrue(_wait_until(lambda: self.sdk.orders_calls == self.calls + 1))  # in flight
+        self.assertEqual(self._reject_place()[1], 422)
+        self.sdk.gate.set()
+        self.assertTrue(self._idle())
+        self.assertEqual(self.sdk.orders_calls, self.calls + 2)
+        self.assertEqual([r["reason"] for r in self._resyncs()], ["failed_ack_refreshed"] * 2)
+
     def test_background_query_merges_with_a_user_refresh(self):
         self.bridge.last_orders_refresh_time = time.monotonic()
         self._fail()
@@ -4000,6 +4147,152 @@ class TestOrderBookCacheEventQuantities(unittest.TestCase):
         self._mat("002", ap_code="5", mat_qty=0.02, mat_price=101.5)
         fills = self.cache.get("A0001")["esun_fills"]
         self.assertEqual([(f["mkt_seq_num"], f["mat_qty_share"]) for f in fills], [("001", 30), ("002", 20)])
+
+    def _mat_info(self, seq, **overrides):
+        info: dict = {}
+        mat = {"kind": "MAT", "ord_no": "A0001", "stock_no": "2330", "ap_code": "1", "mat_qty": 1,
+               "mat_price": 950.0, "mkt_seq_num": seq}
+        mat.update(overrides)
+        self.assertTrue(self.cache.update_from_mat(mat, generation=7, info=info))
+        return info
+
+    def _started_snapshot(self, *rows):
+        """A snapshot whose query starts now (begin_snapshot) and is applied right away."""
+        since, start = self.cache.begin_snapshot()
+        self.assertTrue(self.cache.update_from_order_results([dict(r) for r in rows], generation=7,
+                                                             since=since, start=start))
+
+    def test_mat_already_in_the_snapshot_is_reported_as_covered(self):
+        # RC1: the snapshot already counted S1; its late MAT is covered, S2 is not. Totals stay 1, 2 lots.
+        self._started_snapshot(self._row(org_qty=3, mat_qty=1))
+        self.assertEqual(self._mat_info("S1"), {"covered_by_snapshot": True, "order_mat_qty_share": 1000})
+        self.assertEqual(self.cache.get("A0001")["mat_qty"], 1)
+        self.assertEqual(self._mat_info("S2"), {"covered_by_snapshot": False, "order_mat_qty_share": 2000})
+        view = self.cache.get("A0001")
+        self.assertEqual((view["mat_qty"], view["status"]), (2, "PartFilled"))
+        self.assertNotIn("esun_quantity_conflict", view)
+        self.assertEqual([(f["mkt_seq_num"], f.get("esun_covered_by_snapshot")) for f in view["esun_fills"]],
+                         [("S1", True), ("S2", None)])
+        # odd lot (ap_code 5): snapshot 100 of 300 shares, then MATs of 100 + 100
+        self._started_snapshot(self._row(ord_no="A0002", ap_code="5", org_qty=0.3, org_qty_share=300,
+                                         mat_qty=0.1, mat_qty_share=100))
+        self.assertEqual(self._mat_info("S3", ord_no="A0002", ap_code="5", mat_qty=100),
+                         {"covered_by_snapshot": True, "order_mat_qty_share": 100})
+        self.assertEqual(self._mat_info("S4", ord_no="A0002", ap_code="5", mat_qty=100),
+                         {"covered_by_snapshot": False, "order_mat_qty_share": 200})
+        # no mkt_seq_num: never counted, never covered
+        with self.assertLogs("esun_trade_server", level="WARNING"):
+            self.assertEqual(self._mat_info(""), {"covered_by_snapshot": False, "order_mat_qty_share": 2000})
+        info: dict = {}
+        self.assertTrue(self.cache.update_from_mat({"ord_no": "Z0001", "mat_qty": 1, "mkt_seq_num": "S9"},
+                                                   generation=7, info=info))
+        self.assertEqual(info, {})  # unknown order: nothing to report
+
+    def test_covered_fills_are_flagged_in_esun_fills_without_info(self):
+        # Order-lifecycle [0]: the row's esun_fills marks a deal the snapshot already counted, whether or
+        # not the caller asked for info, so the client folds it into the row aggregate (no double count).
+        self._started_snapshot(self._row(org_qty=2, mat_qty=1))
+        self.assertTrue(self._mat("S1", mat_qty=1))  # no info
+        self.assertTrue(self._mat("S2", mat_qty=1))
+        self._started_snapshot(self._row(org_qty=2, mat_qty=1))  # REST lags: S2 still missing
+        for view in self._views():
+            self.assertEqual(view["esun_fills"], [
+                {"mkt_seq_num": "S1", "mat_qty_share": 1000, "mat_price": 950, "esun_covered_by_snapshot": True},
+                {"mkt_seq_num": "S2", "mat_qty_share": 1000, "mat_price": 950},
+            ])
+            self.assertEqual((view["mat_qty"], view["status"]), (2, "Filled"))
+        self.assertEqual(self.cache.get_all()[0]["esun_fills"][0]["esun_covered_by_snapshot"], True)
+
+    def test_mat_totals_never_exceed_the_order_quantity(self):
+        # RC2: reports adding up beyond the order (e.g. cumulative mat_qty) are capped and flagged once.
+        self._started_snapshot(self._row(org_qty=3))
+        self._mat_info("S1", mat_qty=1)
+        with self.assertLogs("esun_trade_server", level="WARNING") as logs:
+            self.assertEqual(self._mat_info("S2", mat_qty=3)["order_mat_qty_share"], 3000)
+            for view in self._views():
+                self.assertEqual((view["mat_qty"], view["mat_qty_share"], view["status"]), (3, 3000, "Filled"))
+                self.assertEqual(view["esun_quantity_conflict"],
+                                 {"mat": {"reason": "exceeds_order", "report_shares": 4000, "org_shares": 3000,
+                                          "raw_shares": 0}})
+        self.assertEqual(len([line for line in logs.output if "委託數量矛盾" in line]), 1)  # logged once
+        self.assertNotIn("A0001", "\n".join(logs.output))
+        raw, _, _ = self.cache.get_for_mutation("A0001")
+        self.assertNotIn("esun_quantity_conflict", raw)
+        self.assertIn("esun_quantity_conflict", EsunTradeBridge._BRIDGE_ONLY_ORDER_KEYS)
+        # odd lot: 300 shares ordered, 200 + 200 reported
+        self._started_snapshot(self._row(ord_no="A0003", ap_code="5", org_qty=0.3, org_qty_share=300,
+                                         mat_qty=0.0, mat_qty_share=0))
+        self._mat_info("S3", ord_no="A0003", ap_code="5", mat_qty=200)
+        with self.assertLogs("esun_trade_server", level="WARNING"):
+            self.assertEqual(self._mat_info("S4", ord_no="A0003", ap_code="5", mat_qty=200)["order_mat_qty_share"], 300)
+        self.assertEqual(self.cache.get("A0003")["mat_qty_share"], 300)
+
+    def test_smaller_snapshot_after_the_mats_never_lowers_the_filled_quantity(self):
+        # The row's filled quantity is max(snapshot, MAT total) even for a snapshot that started after
+        # the MATs (E.SUN REST can lag the WebSocket): a smaller one is neither applied nor flagged.
+        self._started_snapshot(self._row(org_qty=3))
+        self._mat_info("S1", mat_qty=1)
+        self._mat_info("S2", mat_qty=2)
+        self._started_snapshot(self._row(org_qty=3, mat_qty=2))  # started after S2 was counted
+        for view in self._views():
+            self.assertEqual((view["mat_qty"], view["mat_qty_share"], view["status"]), (3, 3000, "Filled"))
+            self.assertNotIn("esun_quantity_conflict", view)
+            self.assertEqual([f["mkt_seq_num"] for f in view["esun_fills"]], ["S1", "S2"])
+
+    def test_exceeds_order_conflict_carries_the_row_quantity_until_the_snapshot_catches_up(self):
+        # The conflict reports the row's own (snapshot / ACK) filled shares as raw_shares, so the client
+        # can still show a working remainder; a snapshot reaching the order quantity clears it.
+        self._started_snapshot(self._row(org_qty=3))
+        self._mat_info("S1", mat_qty=1)
+        self._mat_info("S2", mat_qty=2)
+        self._started_snapshot(self._row(org_qty=3, mat_qty=2))
+        with self.assertLogs("esun_trade_server", level="WARNING") as logs:
+            self._mat_info("S4", mat_qty=1)  # 4 lots reported for a 3-lot order
+            for view in self._views():
+                self.assertEqual((view["mat_qty"], view["status"]), (3, "Filled"))  # capped at the order
+                self.assertEqual(view["esun_quantity_conflict"],
+                                 {"mat": {"reason": "exceeds_order", "report_shares": 4000, "org_shares": 3000,
+                                          "raw_shares": 2000}})
+        self.assertEqual(len([line for line in logs.output if "委託數量矛盾" in line]), 1)
+        self._started_snapshot(self._row(org_qty=3, mat_qty=3))  # the broker's own figure reached the order
+        for view in self._views():
+            self.assertEqual(view["mat_qty"], 3)  # the snapshot row as is
+            self.assertNotIn("esun_quantity_conflict", view)
+        # cancelled quantity: same cap, raw value and catch-up
+        self._started_snapshot(self._row(ord_no="A0004", org_qty=2))
+        with self.assertLogs("esun_trade_server", level="WARNING"):
+            self.cache.update_from_ack({"ord_no": "A0004", "ap_code": "1", "org_qty": 2, "cel_qty": 3},
+                                       generation=7)
+            self._started_snapshot(self._row(ord_no="A0004", org_qty=2, cel_qty=1))
+            view = self.cache.get("A0004")
+        self.assertEqual((view["cel_qty"], view["status"]), (2, "Cancelled"))
+        self.assertEqual(view["esun_quantity_conflict"],
+                         {"cel": {"reason": "exceeds_order", "report_shares": 3000, "org_shares": 2000,
+                                  "raw_shares": 1000}})
+        self._started_snapshot(self._row(ord_no="A0004", org_qty=2, cel_qty=2))
+        self.assertNotIn("esun_quantity_conflict", self.cache.get("A0004"))
+
+    def test_ack_never_lowers_the_order_quantity(self):
+        # A modify ACK whose org_qty is below the cached order (remaining?) keeps the order quantity.
+        self._snapshot(self._row(org_qty=3, mat_qty=1))
+        with self.assertLogs("esun_trade_server", level="WARNING") as logs:
+            accepted, _ = self.cache.update_from_ack({"ord_no": "A0001", "ap_code": "1", "org_qty": "2", "cel_qty": "0",
+                                                      "od_price": "951", "err_code": "00000000"}, generation=7)
+        self.assertTrue(accepted)
+        self.assertIn("org_qty", "\n".join(logs.output))
+        self.assertNotIn("A0001", "\n".join(logs.output))
+        view = self.cache.get("A0001")
+        self.assertEqual((view["org_qty"], view["mat_qty"], view["od_price"]), (3, 1, 951))
+        self.assertEqual(self.cache.get_for_mutation("A0001")[0]["org_qty"], 3)
+        self.cache.update_from_ack({"ord_no": "A0001", "ap_code": "1", "org_qty": "4", "err_code": ""}, generation=7)
+        self.assertEqual(self.cache.get("A0001")["org_qty"], 4)  # the larger one
+        # odd lot (shares)
+        self._snapshot(self._row(ord_no="A0004", ap_code="5", org_qty=0.3, org_qty_share=300, mat_qty_share=100))
+        with self.assertLogs("esun_trade_server", level="WARNING"):
+            self.cache.update_from_ack({"ord_no": "A0004", "ap_code": "5", "org_qty": "200", "err_code": ""},
+                                       generation=7)
+        view = self.cache.get("A0004")
+        self.assertEqual((view["org_qty"], view["org_qty_share"]), (0.3, 300))
 
     def test_refresh_false_serves_event_quantities(self):
         with tempfile.TemporaryDirectory() as tmp, \

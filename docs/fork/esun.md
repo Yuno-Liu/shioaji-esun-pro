@@ -218,6 +218,20 @@ Linux 主機請確認設定檔與 `certs/esun_cert.p12` 對其他使用者可讀
 改量的語意固定為「**減少量**」（與上游 `updateOrderQty` 及 SDK `cancel_order(cel_qty=…)` 一致），委託 mutation 的請求／回應
 信封與結果未知的處理方式見 [context-esun.md](context-esun.md)。
 
+SDK 例外一律視為結果未知，只有「整段訊息為 `代碼: 內容`、內容不含逾時／連線／重試等字、且代碼在該操作的允許清單內」才回
+422 `rejected`（`code` 為子碼）：下單只認 `000013` 且「後台錯誤」後接 `ODR0239`（警示股預收），之後一定在背景跑一次
+權威委託查詢（與失敗 ACK 共用排程；即使本行程還沒收過失敗 ACK，或已有查詢在途，也會再跑一次在拒絕之後才開始的查詢），
+完成後發 `resync`（`failed_ack_refreshed`、`cacheRefreshed: true`）；刪單、改價、改量只認 `AG00005`、`AG00004`。清單外的代碼
+維持 502／504 `unknown` 並記 log。
+
+成交回報（SSE `deal`）另帶 `esun_covered_by_snapshot`（這筆成交已含在列上的快照成交量內）與 `esun_order_mat_qty_share`
+（套用後的委託累計成交股數，不超過委託量）；列上 `esun_fills` 的同一筆也帶 `esun_covered_by_snapshot: true`。橋接列的成交、
+取消量為 max(快照／ACK, 回報累計)，快照較小時不會往下修（玉山 REST 可能落後 WebSocket）；回報累計超過委託量時以委託量為上限，
+並在列上加 `esun_quantity_conflict`（`reason: exceeds_order`、`report_shares`、`org_shares`、`raw_shares` 為列本身的快照／ACK
+股數）並記 warning，直到列本身的數量達到委託量才清除。成功的 ACK 不會讓 `org_qty`
+變小（減量以 `cel_qty` 表示，差異記 warning）。每筆 ACK、MAT 以 INFO 記錄去識別化的原始欄位（委託書號只留末 2 碼，不記帳號、
+身分證），用來確認 `mat_qty` 是單筆或累計，以及 ACK `org_qty` 的語意。
+
 ## 常用管理與排錯指令
 
 ```bash
