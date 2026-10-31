@@ -4,8 +4,9 @@
 // 2. cancel the working orders (authoritative order listing) and wait for
 //    every cancel to be confirmed;
 // 3. read the positions again (fills that happened meanwhile count) and close
-//    exactly what is held: futures with 範圍市價 + 平倉 (Cover), stocks (現股
-//    only) with market lots and a limit-price odd remainder.
+//    exactly what is held: futures with 範圍市價 + 平倉 (Cover), stocks (現股)
+//    with market lots and a limit-price odd remainder; 融資／融券 with
+//    融資賣出／融券買進 whole lots only (else skipped, never sent as 現股).
 // It never opens a position: every order closes a position that was just
 // read, never more; a product whose cancel is not confirmed is not closed.
 
@@ -17,6 +18,7 @@ import { ensureContract } from '../contracts-cache';
 import { cancelVerifiedOrder, fetchPositions, fetchTrades } from '../shioaji';
 import { captureServerMode, type ServerModeGuard } from '../server-info-store';
 import { placeQuickOrder } from '../trade';
+import { stockExitFor, type CreditExitCond } from '../stock-exit-cond';
 import type { AccountedPosition, Account } from '../types/portfolio';
 import type { Trade } from '../types/order';
 import { remainingWorkingOrderQuantity } from '../working-order-quantity';
@@ -35,6 +37,8 @@ export interface FlattenOrder {
     /** contracts (futures) or shares (stocks) */
     quantity: number;
     market: 'stock' | 'futures';
+    /** stocks: 信用了結（融資賣出／融券買進，整張）；absent = 現股 */
+    cond?: CreditExitCond;
 }
 
 export interface FlattenPlan {
@@ -55,7 +59,7 @@ export function inScope(scope: FlattenScope, account: AccountRef | null | undefi
  * position, the exact held quantity, the opposite side. */
 export function planFlatten(positions: readonly AccountedPosition[], scope: FlattenScope): FlattenPlan {
     const plan: FlattenPlan = { orders: [], skipped: [] };
-    const groups = new Map<string, { account: AccountRef; code: string; market: 'stock' | 'futures'; buy: number; sell: number; credit: boolean; bad: boolean }>();
+    const groups = new Map<string, { account: AccountRef; code: string; market: 'stock' | 'futures'; buy: number; sell: number; conds: Set<string>; bad: boolean }>();
     for (const p of positions) {
         const a = p.account;
         if (!a || (a.account_type !== 'S' && a.account_type !== 'F') || !a.broker_id || !a.account_id) continue;
@@ -63,20 +67,24 @@ export function planFlatten(positions: readonly AccountedPosition[], scope: Flat
         if (!inScope(scope, account, p.code)) continue;
         const key = `${a.account_type}:${a.broker_id}:${a.account_id}:${p.code}`;
         const g = groups.get(key) ?? { account, code: p.code, market: a.account_type === 'S' ? 'stock' as const : 'futures' as const,
-            buy: 0, sell: 0, credit: false, bad: false };
+            buy: 0, sell: 0, conds: new Set<string>(), bad: false };
         if (!Number.isSafeInteger(p.quantity) || p.quantity < 0 || (p.direction !== 'Buy' && p.direction !== 'Sell')) g.bad = true;
         else if (p.direction === 'Buy') g.buy += p.quantity;
         else g.sell += p.quantity;
-        if (g.market === 'stock' && 'cond' in p && p.cond && p.cond !== 'Cash') g.credit = true;
+        if (g.market === 'stock') g.conds.add(('cond' in p && p.cond) || 'Cash');
         groups.set(key, g);
     }
     for (const g of groups.values()) {
         if (g.bad) { plan.skipped.push({ code: g.code, account: g.account, reason: '持倉數量或方向不明，未平倉' }); continue; }
-        if (g.credit) { plan.skipped.push({ code: g.code, account: g.account, reason: '信用部位（融資券）請在持倉分開處理' }); continue; }
+        if (g.conds.size > 1) { plan.skipped.push({ code: g.code, account: g.account, reason: '同商品同時有現股與信用部位（或多種信用條件），請在持倉分開處理' }); continue; }
         if (g.buy > 0 && g.sell > 0) { plan.skipped.push({ code: g.code, account: g.account, reason: '同商品同時有多空部位，請手動處理' }); continue; }
         const held = g.buy || g.sell;
         if (held <= 0) continue;
-        plan.orders.push({ account: g.account, code: g.code, action: g.buy > 0 ? 'Sell' : 'Buy', quantity: held, market: g.market });
+        // 信用部位以正確條件了結（融資賣出／融券買進，只送整張），不支援就略過；絕不改送現股
+        const exit = g.market === 'stock' ? stockExitFor(g.buy > 0 ? 'Buy' : 'Sell', [...g.conds][0], held) : null;
+        if (typeof exit === 'string') { plan.skipped.push({ code: g.code, account: g.account, reason: exit.replace('，未送出委託', '，未平倉') }); continue; }
+        plan.orders.push({ account: g.account, code: g.code, action: g.buy > 0 ? 'Sell' : 'Buy', quantity: held, market: g.market,
+            ...(exit?.orderCond ? { cond: exit.orderCond } : {}) });
     }
     return plan;
 }
@@ -305,7 +313,13 @@ async function readBack(sentFor: { account: Account; order: FlattenOrder }[], qu
 }
 
 async function sendClose(o: FlattenOrder, account: Account, serverMode: ServerModeGuard) {
-    const contract = await ensureContract(o.code) as Awaited<ReturnType<typeof ensureContract>> & { limit_up?: number; limit_down?: number };
+    // 商品資料讀取在任何送單之前：失敗即確定未送出（不列入 readBack）
+    let contract: Awaited<ReturnType<typeof ensureContract>> & { limit_up?: number; limit_down?: number };
+    try {
+        contract = await ensureContract(o.code);
+    } catch (e) {
+        throw Object.assign(new Error(`商品資料讀取失敗，未送出委託：${e instanceof Error ? e.message : String(e)}`), { mutationNotStarted: true });
+    }
     if (o.market === 'futures') {
         // 範圍市價 + 平倉: the broker refuses closing more than is open
         await placeQuickOrder(contract, o.action, null, o.quantity, {
@@ -318,7 +332,9 @@ async function sendClose(o: FlattenOrder, account: Account, serverMode: ServerMo
     // IntradayOdd limit at the price limit (零股沒有市價)
     const lots = Math.floor(o.quantity / 1000);
     const odd = o.quantity % 1000;
-    if (lots > 0) await placeQuickOrder(contract, o.action, null, lots, { source: 'auto', bypassRisk: true, account, serverMode });
+    // 信用了結只送整張（零股不能信用交易）：不拆零股腳、不改送現股
+    if (o.cond && (odd > 0 || lots <= 0)) throw Object.assign(new Error('信用部位只能整張了結，未送出'), { mutationNotStarted: true });
+    if (lots > 0) await placeQuickOrder(contract, o.action, null, lots, { source: 'auto', bypassRisk: true, account, serverMode, ...(o.cond ? { orderCond: o.cond } : {}) });
     if (odd > 0) {
         // the whole lots already went out: say so (they are read back)
         const partial = lots > 0 ? { partialSent: lots * 1000 } : {};

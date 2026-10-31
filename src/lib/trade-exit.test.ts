@@ -200,3 +200,34 @@ it('an odd leg that fails after dispatch is reported as unknown, not as unsent',
     expect(String(err.message)).toContain('零股分單結果未知');
     expect(String(err.message)).not.toContain('零股分單未成立');
 });
+// 信用部位了結（實盤 bug 3）：融券空單回補＝Buy＋ShortSelling、融資多單＝Sell＋MarginTrading，只送整張
+it('covers a short with ONE whole-lot Buy + ShortSelling and confirms it as 融券買進', async () => {
+    await placeStockExitByShares(contract, 'Buy', 2000, account, { orderCond: 'ShortSelling' });
+    expect(m.stock).toHaveBeenCalledOnce();
+    expect(m.stock.mock.calls[0]![1]).toMatchObject({ action: 'Buy', quantity: 2, order_lot: 'Common', price_type: 'MKT', order_type: 'IOC', order_cond: 'ShortSelling' });
+    expect(m.confirm.mock.calls[0]![0]).toMatchObject({ action: 'Buy', quantity: 2000, credit: '融券' });
+});
+it('closes a margin long with Sell + MarginTrading', async () => {
+    await placeStockExitByShares(contract, 'Sell', 3000, account, { orderCond: 'MarginTrading' });
+    expect(m.stock.mock.calls.map(c => c[1])).toEqual([expect.objectContaining({ action: 'Sell', quantity: 3, order_cond: 'MarginTrading' })]);
+    expect(m.confirm.mock.calls[0]![0]).toMatchObject({ credit: '融資' });
+});
+it.each(['ShortSelling', 'MarginTrading'] as const)('refuses a %s exit with an odd remainder before confirming (never splits an odd 現股 leg)', async cond => {
+    await expect(placeStockExitByShares(contract, cond === 'ShortSelling' ? 'Buy' : 'Sell', 1500, account, { orderCond: cond }))
+        .rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('整張') });
+    expect(m.confirm).not.toHaveBeenCalled();
+    expect(m.stock).not.toHaveBeenCalled();
+});
+it.each([
+    ['Sell', 'ShortSelling'], ['Buy', 'MarginTrading'], ['Sell', 'SBLShort'], ['Buy', 'SBLShort'], ['Buy', 'SBLShortPriceExempt'],
+] as const)('refuses %s + %s before confirming: an exit never opens a new credit position (review)', async (action, cond) => {
+    await expect(placeStockExitByShares(contract, action, 2000, account, { orderCond: cond }))
+        .rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('未送出') });
+    expect(m.confirm).not.toHaveBeenCalled();
+    expect(m.stock).not.toHaveBeenCalled();
+});
+it('a cash exit keeps sending without order_cond', async () => {
+    await placeStockExitByShares(contract, 'Sell', 1000, account);
+    expect(m.stock.mock.calls[0]![1]).not.toHaveProperty('order_cond');
+    expect(m.confirm.mock.calls[0]![0]).not.toHaveProperty('credit');
+});

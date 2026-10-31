@@ -1,5 +1,6 @@
 import '../test/mock-order-reconciliation';
 import { operationNotice } from '../test/operation-notice';
+import { reconcileOrdersOnce } from '../test/mock-order-reconciliation';
 // #204 K 線圖下單設定：工具列一顆按鈕（數量＋單位）、彈出面板只列適用選項、
 // 點價與停損停利實際使用這組設定（帳號、單位、數量、委託、開平倉）
 import { createElement, useState } from 'react';
@@ -31,6 +32,8 @@ const m = vi.hoisted(() => ({
     lines: [] as { options: () => { price: number }; applyOptions: (p: { price: number }) => void }[],
     // 主窗格那一列的範圍（host 另含副圖與時間軸）；預設與 host 相同
     paneRect: { left: 0, top: 0, right: 800, bottom: 400 },
+    // 點價下單信用提醒讀的持倉（只在設定的測試內提供 getTradingState）
+    tradingState: null as unknown,
 }));
 vi.mock('../hooks/use-chart-drawings', async (importOriginal) => {
     const real = await importOriginal<typeof import('../hooks/use-chart-drawings')>();
@@ -1185,6 +1188,47 @@ describe('chart order credit conditions', () => {
         // 融資賣出（償還）不查可否融資
         expect(m.place.mock.calls[1]![4]).toMatchObject({ orderCond: 'MarginTrading' });
         expect(m.place.mock.calls[1]![4].afterConfirm).toBeUndefined();
+    });
+
+    // 共用的 mock-order-reconciliation 把交易狀態換成只有 reconcileOrdersOnce；
+    // 這兩個測試另外提供持倉，結束後換回原本的形狀
+    const withTradingState = () => {
+        vi.doMock('../lib/trading-state', () => ({ reconcileOrdersOnce, getTradingState: () => m.tradingState }));
+        onTestFinished(() => { m.tradingState = null; vi.doMock('../lib/trading-state', () => ({ reconcileOrdersOnce })); });
+    };
+    // fork：現股點價買／賣遇到同帳戶同碼的融券空單／融資多單：只寫進確認與通知，不改條件、不擋單
+    it('現股 point orders with a 融券 short / 融資 long held: hinted in the confirmation, still sent as 現股', async () => {
+        const rows = [
+            { account: S1, id: 1, code: '2330', direction: 'Sell', quantity: 2000, price: 100, last_price: 100, pnl: 0, cond: 'ShortSelling' },
+            { account: S1, id: 2, code: '2330', direction: 'Buy', quantity: 1000, price: 100, last_price: 100, pnl: 0, cond: 'MarginTrading' },
+        ];
+        m.tradingState = { positions: rows, queries: { positions: { updatedAt: 1 } } };
+        withTradingState();
+        await mount({ contract: stkDT });
+        await act(async () => { modeBtn('點價買').props.onClick(); });
+        await clickChart();
+        await vi.waitFor(() => expect(m.notify).toHaveBeenCalled());
+        expect(m.place).toHaveBeenCalledOnce();
+        expect(m.place.mock.calls[0]![4].orderCond).toBeUndefined();
+        expect(m.place.mock.calls[0]![4].confirmNote).toContain('現股買進不會回補融券');
+        expect(operationNotice(m.notify, '📈 圖表買進已送出').body).toContain('現股買進不會回補融券');
+        await act(async () => { modeBtn('點價賣').props.onClick(); });
+        await clickChart();
+        await vi.waitFor(() => expect(m.place).toHaveBeenCalledTimes(2));
+        expect(m.place.mock.calls[1]![4].orderCond).toBeUndefined();
+        expect(m.place.mock.calls[1]![4].confirmNote).toContain('現股賣出不會了結融資');
+        expect(m.place.mock.calls[1]![4].confirmNote).not.toContain('回補融券');
+    });
+
+    it('融券 點價買 without a short of this stock: a 查無融券空單 hint, still sent', async () => {
+        m.tradingState = { positions: [], queries: { positions: { updatedAt: 1 } } };
+        withTradingState();
+        await mount({ contract: stkDT, orderSettings: { S: { qty: 1, lot: 'Common', orderType: 'ROD', octype: 'Auto', credit: { cond: 'ShortSelling', daytradeShort: false } } }, onOrderSettingsChange: vi.fn() });
+        await act(async () => { modeBtn('點價買').props.onClick(); });
+        await clickChart();
+        await vi.waitFor(() => expect(m.place).toHaveBeenCalledOnce());
+        expect(m.place.mock.calls[0]![4]).toMatchObject({ orderCond: 'ShortSelling' });
+        expect(m.place.mock.calls[0]![4].confirmNote).toContain('查無此商品的融券空單，券商可能拒絕');
     });
 
     it('融券／借券 only sell: 點價買 is disabled and says why; sell sends the condition', async () => {

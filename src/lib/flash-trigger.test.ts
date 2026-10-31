@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
     clickCondition, dragProblem, flashProtectProblem, flashProtectText, ladderMarks, normalizeFlashProtect, normalizeTriggerSend,
     positionEffect, protectConditionProblem, protectEffect, protectedQuantity, triggerConditionProblem, triggerIntent, triggerKind, triggerSendOf,
-    type MarkScope, type ProtectionView,
+    type MarkScope, type ProtectionView, sameCondRows, stockCondName, stockPositionGroups,
 } from './flash-trigger';
 import { normalizeFlashOrderOpts } from './flash-account';
 import type { TriggerOrder } from './trigger-engine';
@@ -172,5 +172,33 @@ describe('drag', () => {
         expect(dragProblem(m, 100, 100)).toContain('立刻觸發');
         expect(dragProblem(m, 108, null)).toContain('尚未收到成交價');
         expect(dragProblem({ ...m, editable: false }, 108, 100)).toContain('條件單面板');
+    });
+});
+
+// fork：融券空單與現股多單是兩筆獨立部位（合成資料）
+describe('stock positions by credit condition', () => {
+    const shortRow = { cond: 'ShortSelling', direction: 'Sell', quantity: 2000, price: 400, pnl: -1000 };
+    const cashRow = { cond: 'Cash', direction: 'Buy', quantity: 2000, price: 410, pnl: 500 };
+    it('only rows of the panel condition count as held', () => {
+        expect(sameCondRows([shortRow, cashRow], 'Cash')).toEqual([cashRow]);
+        expect(sameCondRows([shortRow, cashRow], 'ShortSelling')).toEqual([shortRow]);
+        expect(sameCondRows([shortRow], 'MarginTrading')).toEqual([]);
+        // a row without a condition is never treated as held
+        expect(sameCondRows<{ cond?: string; direction: string }>([{ direction: 'Buy' }], 'Cash')).toEqual([]);
+    });
+    it('a cash buy with only a short held is an entry, not a reduce', () => {
+        const held = sameCondRows([shortRow], 'Cash').reduce((n, p) => n + (p.direction === 'Sell' ? -p.quantity : p.quantity), 0) / 1000;
+        expect(positionEffect(held, 'Buy', 2)).toBe('open');
+        // on the 融券 panel the same buy covers the short
+        expect(positionEffect(-2, 'Buy', 2)).toBe('reduce');
+    });
+    it('groups by condition and side, kept even when they net to zero', () => {
+        const groups = stockPositionGroups([shortRow, cashRow, { ...cashRow, quantity: 1000, price: 440, pnl: 0 }]);
+        expect(groups).toEqual([
+            { cond: 'ShortSelling', direction: 'Sell', quantity: 2000, avg: 400, pnl: -1000 },
+            { cond: 'Cash', direction: 'Buy', quantity: 3000, avg: 420, pnl: 500 },
+        ]);
+        expect(groups.map(g => stockCondName(g.cond))).toEqual(['融券', '現股']);
+        expect(stockCondName(undefined)).toBe('條件不明');
     });
 });

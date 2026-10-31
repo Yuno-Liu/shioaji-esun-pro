@@ -44,7 +44,7 @@ import {
     isSelectedAccountUnchanged,
 } from '../lib/order-account';
 import { checkOrderAllowed, getRiskSettings } from '../lib/risk';
-import { clampLotQuantity, isOddLot, lotLabel, ODD_LOT_MAX_SHARES, ODD_LOT_TEXT, ODD_LOT_WAITING, oddLotReferencePrice, orderQtyUnit, stockOrderProblem, CREDIT_TEXT } from '../lib/odd-lot';
+import { clampLotQuantity, isOddLot, lotLabel, ODD_LOT_MAX_SHARES, ODD_LOT_TEXT, ODD_LOT_WAITING, oddLotReferencePrice, orderQtyUnit, stockOrderProblem, CREDIT_TEXT, creditLabel } from '../lib/odd-lot';
 import { currentProtectionEnv } from '../lib/protection-env';
 import { captureServerMode, SERVER_MODE_CHANGED_MESSAGE } from '../lib/server-info-store';
 import { loadOrderLotPreference, saveOrderLotPreference, TICKET_LOTS } from '../lib/order-lot-preference';
@@ -52,7 +52,8 @@ import { defaultOrderTypeFor, FUTURES_OCTYPES, futuresOrderProblem, ORDER_TYPES,
 import { fetchInfo, placeFuturesOrder, placeStockOrder } from '../lib/shioaji';
 import { notify } from '../lib/trade';
 import type { ContractInfo } from '../lib/types/contract';
-import type { Account } from '../lib/types/portfolio';
+import type { Account, AccountedPosition } from '../lib/types/portfolio';
+import { manualStockCreditHint } from '../lib/stock-exit-cond';
 import type {
     Action,
     FuturesOCType,
@@ -77,6 +78,29 @@ import { orderStatusWithNumber } from '../lib/order-status-label';
 const acctKey = (a: Account) => `${a.broker_id}-${a.account_id}`;
 
 const UNIT_CHANGED_MESSAGE = '確認期間單位已變更（整股／零股），未送出，請重新確認';
+
+// fork：信用提醒（現股買進不會回補融券等）用的持倉。動態載入（同 CashCreditWarning）：
+// 下單票不把交易狀態拉進模組相依；讀不到就不提醒（只提示、不擋單、不改條件）。
+// loaded＝持倉查詢至少成功過一次，才可說「查無融券空單」。
+function useHoldingRows(enabled: boolean): { rows: readonly AccountedPosition[]; loaded: boolean } {
+    const [snap, setSnap] = useState<{ rows: readonly AccountedPosition[]; loaded: boolean }>({ rows: [], loaded: false });
+    useEffect(() => {
+        if (!enabled) return;
+        let alive = true;
+        let off = () => {};
+        void import('../lib/trading-state').then(ts => {
+            if (!alive) return;
+            const read = () => {
+                const s = ts.getTradingState();
+                setSnap({ rows: s.positions ?? [], loaded: s.queries?.positions?.updatedAt != null });
+            };
+            read();
+            off = ts.subscribeTradingState(read);
+        }).catch(() => { /* 讀不到持倉：不提醒 */ });
+        return () => { alive = false; off(); };
+    }, [enabled]);
+    return snap;
+}
 
 export function OrderTicket({
     contract,
@@ -226,16 +250,8 @@ export function OrderTicket({
         return () => window.removeEventListener(TICKET_ACTION_EVENT, onAction);
     }, []);
 
-    // 融券/借券類條件為賣出限定 — 切回買進時歸位
-    useEffect(() => {
-        if (
-            action === 'Buy' &&
-            orderCond !== 'Cash' &&
-            orderCond !== 'MarginTrading'
-        ) {
-            setOrderCond('Cash');
-        }
-    }, [action, orderCond]);
+    // fork：切回買進時不再把信用條件靜默改成現股 — 融券買進＝回補照送；
+    // 借券類買進由 stockOrderProblem 明確擋下並在信用列說明
 
     // autofill price from live quote until user edits it
     const liveClose = lastClose;
@@ -351,15 +367,17 @@ export function OrderTicket({
                     code: contract.code,
                     name: contract.name,
                     action,
+                    credit: !isFutures && orderCond !== 'Cash' ? creditLabel(action, orderCond) : undefined, // fork：融券買進／融資賣出寫進動作名稱
                     price: priceType === 'LMT' ? p : null,
                     quantity: qty,
                     unit: orderQtyUnit(isFutures, orderLot),
                     note: `${orderType}${!isFutures && orderLot !== 'Common' ? `・${lotLabel(orderLot)}` : ''}${
                         !isFutures && orderCond !== 'Cash'
-                            ? `・${orderCond === 'MarginTrading' ? '融資' : '融券'}`
+                            ? `・${creditLabel(action, orderCond) ?? ''}`
                             : ''
                     }${!isFutures && daytradeShort && action === 'Sell' ? '・現股當沖' : ''}${
-                        bracketOwner === 'background' ? '・括號單由背景執行保護（成交後才盯停損停利，只平倉已成交口數）' : ''}・${routeConfirmNote(orderAccount)}`,
+                        bracketOwner === 'background' ? '・括號單由背景執行保護（成交後才盯停損停利，只平倉已成交口數）' : ''}${
+                        (() => { const hint = creditHintFor(orderAccount); return hint ? `・${hint.text}` : ''; })()}・${routeConfirmNote(orderAccount)}`,
                     accountLabel: accountConfirmLabel(orderAccount),
                 }, { serverMode: sameServerMode });
                 if (!approved) throw new Error('已取消下單');
@@ -536,6 +554,15 @@ export function OrderTicket({
     const pickable = multi && !headerAccountLocked();
     const esunEnv = useEsunEnvironment();
     const production = activeAccount && isEsunBroker(activeAccount.broker_id) ? !esunEnv.isSimulation : simulation === false;
+    // fork：整股手動下單的信用提醒 — 現股買進不會回補融券、現股賣出不會了結融資、
+    // 融券買進查無空單；只提示並寫進確認，不擋單，條件只在使用者按一鍵改用時才改
+    const holdings = useHoldingRows(!isFutures);
+    const creditHintFor = (account: Account | null | undefined) => {
+        if (isFutures || orderLot !== 'Common') return null;
+        const hint = manualStockCreditHint(holdings.rows, account, contract.code, action, orderCond);
+        return hint && (hint.suggest !== null || holdings.loaded) ? hint : null;
+    };
+    const creditHint = creditHintFor(activeAccount);
 
     // ---- split allocation（比例＝largest remainder；固定＝直接數量）----
     const ratioSum = routable.reduce(
@@ -632,10 +659,13 @@ export function OrderTicket({
                     code: contract.code,
                     name: contract.name,
                     action,
+                    credit: !isFutures && orderCond !== 'Cash' ? creditLabel(action, orderCond) : undefined, // fork：分倉也寫信用條件
                     price: priceType === 'LMT' ? p : null,
                     quantity: splitTotal,
                     unit: qtyUnit,
-                    note: `分倉送出 ${allocation.length} 個帳戶${odd ? `・${lotLabel(orderLot)}` : ''}・${[...new Set(allocation.map((e) => routeConfirmNote(e.account)))].join('、')}`,
+                    note: `分倉送出 ${allocation.length} 個帳戶${odd ? `・${lotLabel(orderLot)}` : ''}${
+                        !isFutures && orderCond !== 'Cash' ? `・${creditLabel(action, orderCond) ?? ''}` : ''}${
+                        [...new Set(allocation.map((e) => creditHintFor(e.account)?.text).filter(Boolean))].map((t) => `・${t}`).join('')}・${[...new Set(allocation.map((e) => routeConfirmNote(e.account)))].join('、')}`,
                     accountLabel: `分倉 ${allocation.length} 戶：${allocation
                         .map((e) => `${accountConfirmLabel(e.account)}×${e.qty}`)
                         .join('、')}`,
@@ -1105,7 +1135,9 @@ export function OrderTicket({
                                     (item) =>
                                         action === 'Sell' ||
                                         item.value === 'Cash' ||
-                                        item.value === 'MarginTrading',
+                                        item.value === 'MarginTrading' ||
+                                        item.value === 'ShortSelling' || // fork：融券買進＝回補
+                                        item.value === orderCond, // fork：借券類買進留著顯示（送出會被擋並說明）
                                 )
                                 .map((item) => (
                                     <button
@@ -1133,10 +1165,32 @@ export function OrderTicket({
                                             setArmed(false);
                                         }}
                                     >
-                                        {item.label}
+                                        {action === 'Buy' && item.value === 'ShortSelling' ? '融券（回補）' : item.label}
                                     </button>
                                 ))}
                         </div>
+                    </div>
+                )}
+                {!isFutures && orderLot === 'Common' && action === 'Buy' && (orderCond === 'SBLShort' || orderCond === 'SBLShortPriceExempt') && (
+                    <span className={styles.costRow}>{CREDIT_TEXT.shortBuy}</span>
+                )}
+                {creditHint && (
+                    <div className={styles.fieldRow} role='note' data-testid='ticket-credit-hint'>
+                        <span className={styles.splitError}>{creditHint.text}</span>
+                        {creditHint.suggest && (
+                            <button
+                                type='button'
+                                className={styles.presetBtn}
+                                onClick={() => {
+                                    // 使用者按了才改條件（絕不自動改）
+                                    setOrderCond(creditHint.suggest!);
+                                    setDaytradeShort(false);
+                                    setArmed(false);
+                                }}
+                            >
+                                {creditHint.suggest === 'ShortSelling' ? '改用融券（回補）' : '改用融資（賣出）'}
+                            </button>
+                        )}
                     </div>
                 )}
 

@@ -381,7 +381,8 @@ export async function placeStockExitByShares(
     action: Action,
     shares: number,
     account?: Account,
-    opts?: { isAccountCurrent?: () => boolean; beforeSend?: () => void },
+    // orderCond：信用部位了結（融資賣出／融券買進）只送整張，零股腳一律拒絕
+    opts?: { isAccountCurrent?: () => boolean; beforeSend?: () => void; orderCond?: StockOrderCond },
 ): Promise<Trade[]> {
     const capturedAccount = account ?? getAccountState().selectedStock ?? undefined;
     const base = getApiBase();
@@ -393,6 +394,12 @@ export async function placeStockExitByShares(
     if (!Number.isSafeInteger(shares) || shares <= 0) throw mutationNotStartedError('平倉股數必須是正整數');
     const lots = Math.floor(shares / 1000);
     const odd = shares % 1000;
+    const orderCond = opts?.orderCond && opts.orderCond !== 'Cash' ? opts.orderCond : undefined;
+    // 「出場」只能了結信用部位：融券買進（回補）或融資賣出；其他組合會開新信用部位，確認前就拒絕
+    if (orderCond && !((action === 'Buy' && orderCond === 'ShortSelling') || (action === 'Sell' && orderCond === 'MarginTrading'))) {
+        throw mutationNotStartedError(`信用了結只允許融券買進或融資賣出（${action}＋${orderCond} 不是了結），未送出委託`);
+    }
+    if (orderCond && odd) throw mutationNotStartedError('信用部位只能整張了結；零股不能以融資券條件送出，未送出委託');
     const limitPrice = action === 'Sell' ? contract.limit_down : contract.limit_up;
     if (odd && (!Number.isFinite(limitPrice) || !limitPrice || limitPrice <= 0)) throw mutationNotStartedError('零股需要有效漲跌停價，尚未送出任何分單');
     // 拆單前先做一次合併的手動確認（整張市價＋零股限價兩腳只問一次，
@@ -408,7 +415,7 @@ export async function placeStockExitByShares(
             : undefined,
         capturedAccount,
         undefined,
-        undefined,
+        creditLabel(action, orderCond),
         serverMode,
     );
     assertTradingLive();
@@ -424,6 +431,7 @@ export async function placeStockExitByShares(
                 isAccountCurrent: opts?.isAccountCurrent,
                 beforeSend: opts?.beforeSend,
                 serverMode,
+                ...(orderCond ? { orderCond } : {}),
             }),
         );
     }

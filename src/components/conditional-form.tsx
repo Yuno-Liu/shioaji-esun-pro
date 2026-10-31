@@ -22,6 +22,7 @@ import { Dialog, useLastPrice } from './conditional-ui';
 import * as styles from './conditional-panel.css';
 import { HEADER_LOCK_TITLE, headerAccountLocked } from '../lib/order-route';
 import { OrderRoutingBadge } from './order-routing-badge';
+import { CashCreditWarning } from './conditional-credit-warning';
 
 export type CondFormType = 'trigger' | 'oco' | 'bracket' | 'time';
 const QUICK_QTY = [1, 5, 10];
@@ -378,6 +379,7 @@ function TriggerForm({ target, onClose, defaults }: { target: Target; onClose: (
                     options={[{ id: 'Buy', label: '買進' }, { id: 'Sell', label: '賣出' }]} />
                 <QtyInput qty={qty} setQty={setQty} unit={unitOf(target)} quick={defaults.quickQty} />
             </div>
+            <CashCreditWarning account={target.account} code={target.contract?.code} actions={[action]} />
             {!odd && <SendControl value={send} onChange={setSend} futures={target.futures} />}
             <ValidityControl value={validity} onChange={setValidity} market={market} />
             <Summary>
@@ -450,6 +452,7 @@ function OcoForm({ target, onClose, defaults }: { target: Target; onClose: () =>
         <>
             {side('上方', '≥', up, setUp, up.action === 'Buy' ? '突破' : '停利')}
             {side('下方', '≤', down, setDown, down.action === 'Sell' ? '跌破' : '拉回')}
+            <CashCreditWarning account={target.account} code={target.contract?.code} actions={[up.action, down.action]} />
             {!odd && <SendControl value={send} onChange={setSend} futures={target.futures} />}
             <div className={styles.formRow}>
                 <span className={styles.label}>另一邊</span>
@@ -573,6 +576,7 @@ function BracketForm({ target, onClose, defaults }: { target: Target; onClose: (
                         placeholder={entryType === 'LMT' ? '限價' : '觸發價'} onChange={e => setPrice(e.target.value)} />
                 )}
             </div>
+            <CashCreditWarning account={target.account} code={target.contract?.code} actions={[action]} />
             <div className={styles.subhead}>
                 <Shield size={13} aria-hidden />成交後自動保護
                 <span className={styles.muted} style={{ fontWeight: 400 }}>以實際成交價計算，每成交一口就補上</span>
@@ -771,6 +775,7 @@ function TimeForm({ target, onClose, defaults }: { target: Target; onClose: () =
                         <QtyInput qty={qty} setQty={setQty} unit={unit} quick={defaults.quickQty} />
                     </div>
                     {!odd && <SendControl value={send} onChange={setSend} futures={target.futures} label='送出方式' />}
+                    <CashCreditWarning account={target.account} code={target.contract?.code} actions={[action]} />
                 </>
             ) : (
                 <>

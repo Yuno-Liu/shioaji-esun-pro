@@ -250,7 +250,7 @@ export function FlattenDialog({ contract: given, rows, onClose }: { contract: Co
                         {preview.byKind.size > 0 && `（${[...preview.byKind].map(([k, n]) => `${KIND_WORD[k] ?? k} ${n}`).join('、')}）`}<br />
                         ② 刪除 <b>{preview.working.length}</b> 張未成交委託<br />
                         ③ 平倉 {closes.length ? closes.map((o, i) => (
-                            <span key={`${o.account.account_id}:${o.code}`}>{i > 0 && '、'}<b className={styles.up}>{o.code} {o.action === 'Sell' ? '多單' : '空單'} {quantityText(o.market, o.quantity)}</b>（{closeHowText(o.market, o.quantity)}）</span>
+                            <span key={`${o.account.account_id}:${o.code}`}>{i > 0 && '、'}<b className={styles.up}>{o.code} {o.action === 'Sell' ? '多單' : '空單'} {quantityText(o.market, o.quantity)}</b>（{closeHowText(o.market, o.quantity, o.cond)}）</span>
                         )) : <b>目前沒有部位</b>}（只平掉持有的口數，不會反手開倉）
                         {preview.plan.skipped.length > 0 && <><br /><span className={styles.tone.warn}>不會平倉：{preview.plan.skipped.map(s => `${s.code}（${s.reason}）`).join('、')}</span></>}
                     </span>

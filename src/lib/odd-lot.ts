@@ -57,7 +57,7 @@ export interface StockOrderShape {
     order_lot?: StockOrderLot | string;
     order_cond?: StockOrderCond | string;
     daytrade_short?: boolean;
-    /** 委託方向（信用規則：融券／借券只能賣、當沖先賣只能賣） */
+    /** 委託方向（信用規則：借券類只能賣、當沖先賣只能賣；融券可買（回補）可賣） */
     action?: 'Buy' | 'Sell' | string;
     /** 合約的可當沖別（contract.day_trade）；當沖先賣只限 'Yes' */
     day_trade?: string;
@@ -72,10 +72,10 @@ export const ODD_LOT_TEXT = {
 } as const;
 
 // 整股信用規則（照下單面板現行規則，閃電下單共用）：
-// - 買進只能現股或融資；融券、借券、借券豁免只在賣出。
+// - 融券可買可賣（融券買進＝回補，fork 修正）；借券、借券豁免只在賣出。
 // - 現股當沖先賣只限「賣出＋整股＋現股＋contract.day_trade === 'Yes'」。
 export const CREDIT_TEXT = {
-    shortBuy: '融券、借券只能賣出；買進請改用現股或融資',
+    shortBuy: '借券、借券豁免只能賣出；回補融券空單請用「融券」買進，其他買進請改用現股或融資',
     daytradeSide: '現股當沖先賣只能用在賣出',
     daytradeCond: '現股當沖先賣只限現股；請把信用條件改回現股，或取消當沖',
     daytradeStock: '此股票不能現股當沖先賣（只能先買後賣或不可當沖）；請取消當沖',
@@ -93,7 +93,7 @@ export function creditLabel(action: 'Buy' | 'Sell', orderCond?: StockOrderCond |
     return undefined;
 }
 
-const SELL_ONLY_CONDS: ReadonlySet<string> = new Set(['ShortSelling', 'SBLShort', 'SBLShortPriceExempt']);
+const SELL_ONLY_CONDS: ReadonlySet<string> = new Set(['SBLShort', 'SBLShortPriceExempt']);
 
 function creditProblem(o: StockOrderShape): string | null {
     if (o.action === 'Buy' && o.order_cond && SELL_ONLY_CONDS.has(o.order_cond)) return CREDIT_TEXT.shortBuy;

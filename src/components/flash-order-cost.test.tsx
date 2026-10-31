@@ -185,16 +185,19 @@ it('options (market F) use the same FIFO with the option multiplier and live las
     expect(label).toBe('多空並存');
 });
 
-it('stock margin long and short sale on the same stock keep main\'s gross blend and no label', async () => {
+it('stock margin long and short sale on the same stock are shown apart (fork: never netted), no label', async () => {
     const stock = { code: '2330', security_type: 'STK', reference: 1000 } as unknown as ContractInfo;
     const srow = (id: number, direction: Action, quantity: number, price: number, pnl: number, cond: string): AccountedPosition =>
         ({ account: stockAccount, id, code: '2330', direction, quantity, price, last_price: 1010, pnl, yd_quantity: quantity, cond });
     const { bar, label } = await render([srow(0, 'Buy', 3, 1000, 3000, 'MarginTrading'), srow(1, 'Sell', 1, 1030, 1000, 'ShortSelling')], stock, [], true);
-    // Same as main: net 2, (3×1000 + 1×1030) / 4, P&L 3000 + 1000; no label even while reconciling.
-    // stock rows are in shares (#204): net 2 shares reads 2股
-    expect(bar).toContain('"多"," ","2股"');
-    expect(bar).toContain('1,007.5');
-    expect(bar).toContain('+4,000.00');
+    // fork：融資多單與融券空單是兩筆獨立部位，依條件分開顯示（不再混成淨 2 股、均價 1,007.5）；
+    // no label even while reconciling. stock rows are in shares (#204)
+    expect(bar).toContain('"融資","多"," ","3股"');
+    expect(bar).toContain('"融券","空"," ","1股"');
+    expect(bar).toContain('1,030');
+    expect(bar).toContain('+3,000.00');
+    expect(bar).toContain('+1,000.00');
+    expect(bar).not.toContain('1,007.5');
     expect(label).toBeNull();
 });
 

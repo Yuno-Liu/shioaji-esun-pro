@@ -123,6 +123,45 @@ export function positionEffect(held: number, action: Action, qty: number): Posit
     return qty <= Math.abs(held) ? 'reduce' : 'reverse';
 }
 
+// ---- stock positions by credit condition (fork) ----
+// 融券空單、融資多單與現股是券商端各自獨立的部位，不會互相沖銷：現股買進
+// 不會回補融券。進場／減倉只看和面板信用條件相同的列，條件不明的列不算。
+
+interface StockPositionRow { cond?: string; direction: string; quantity: number; price: number; pnl?: number }
+
+/** 與面板信用條件相同的股票持倉列（cond 缺漏或不同的列不算持有） */
+export function sameCondRows<T extends { cond?: string }>(rows: readonly T[], panelCond: string): T[] {
+    return rows.filter(p => p.cond === panelCond);
+}
+
+/** 持倉列條件名稱（顯示用） */
+export function stockCondName(cond?: string): string {
+    return cond === 'Cash' ? '現股' : cond === 'MarginTrading' ? '融資' : cond === 'ShortSelling' ? '融券'
+        : cond === 'SBLShort' ? '借券' : cond === 'SBLShortPriceExempt' ? '借券豁免' : '條件不明';
+}
+
+export interface StockPositionGroup { cond: string; direction: 'Buy' | 'Sell'; quantity: number; avg: number; pnl: number }
+
+/** 依信用條件＋方向分開的股票持倉（股數加總、加權均價）；淨額為 0 也照列 */
+export function stockPositionGroups(rows: readonly StockPositionRow[]): StockPositionGroup[] {
+    const groups = new Map<string, StockPositionGroup & { cost: number }>();
+    for (const p of rows) {
+        if (!(p.quantity > 0)) continue;
+        const cond = p.cond ?? '';
+        const direction = p.direction === 'Sell' ? 'Sell' : 'Buy';
+        const key = `${cond}:${direction}`;
+        const g = groups.get(key) ?? { cond, direction, quantity: 0, avg: 0, pnl: 0, cost: 0 };
+        g.quantity += p.quantity;
+        g.cost += p.price * p.quantity;
+        g.pnl += p.pnl || 0;
+        groups.set(key, g);
+    }
+    return [...groups.values()].map(({ cost, ...g }) => ({ ...g, avg: g.quantity > 0 ? cost / g.quantity : 0 }));
+}
+
+/** 現股面板（或零股）且同碼有融券空單時，買邊的警示 */
+export const CASH_BUY_NO_COVER_TEXT = '現股買進不會回補融券：此股票有融券空單，回補請把信用條件切到「融券」';
+
 /** The trigger condition of a ladder click at `price`, from the price the
  * trigger watches; a string when it cannot be placed there. */
 export function clickCondition(price: number, ref: number | null): 'above' | 'below' | string {

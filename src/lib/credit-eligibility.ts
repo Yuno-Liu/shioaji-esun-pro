@@ -124,7 +124,8 @@ export function useCreditEnquire(contract: ContractKey, enabled: boolean): Credi
 export interface PanelCredit { cond: string; daytradeShort: boolean }
 export type CreditCheck = CreditStatus | 'loading';
 
-const SELL_ONLY_CONDS: ReadonlySet<string> = new Set(['ShortSelling', 'SBLShort', 'SBLShortPriceExempt']);
+// 融券買進（回補）是標準委託，只有借券類限賣出（fork 修正，同 odd-lot.ts）
+const SELL_ONLY_CONDS: ReadonlySet<string> = new Set(['SBLShort', 'SBLShortPriceExempt']);
 
 /** 面板要查 credit_enquire 的條件：只有融資／融券；借券類由券源決定，不查 */
 export function creditEnquireCond(credit: PanelCredit): CreditCond | null {
@@ -142,7 +143,7 @@ export const creditRefusedText = (code: string, cond: CreditCond) => `${code} �
 
 /**
  * 每一邊不能送的原因（null＝可送）。信用了結不受暫停限制（證交所）：可否融資
- * 只擋「融資買進」，可否融券只擋「融券賣出」；融資賣出償還照常。查詢中或
+ * 只擋「融資買進」，可否融券只擋「融券賣出」；融資賣出償還、融券買進回補照常。查詢中或
  * 無法確認一律不擋（由券商端決定）。
  */
 export function creditSideBlocks(contract: { code: string; day_trade?: string }, credit: PanelCredit, check: CreditCheck) {
@@ -150,7 +151,7 @@ export function creditSideBlocks(contract: { code: string; day_trade?: string },
     const creditBlocked = check === 'blocked' && creditEnquireCond(credit)
         ? (credit.cond === 'MarginTrading'
             ? `${contract.code} 目前不能融資買進，已停止融資買進；融資賣出（償還）照常`
-            : `${contract.code} 目前不能融券賣出，已停止送單；改回現股或換股票`)
+            : `${contract.code} 目前不能融券賣出，已停止融券賣出；融券買進（回補）照常`)
         : null;
     const dayTradeBlocked = credit.daytradeShort && contract.day_trade !== 'Yes'
         ? (contract.day_trade === 'OnlyBuy' ? '此股票只能先買後賣，不能現沖先賣；點賣已停用' : '此股票不可當沖，不能現沖先賣；點賣已停用')

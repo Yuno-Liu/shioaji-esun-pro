@@ -137,23 +137,25 @@ it('融資: the panel saves it, shows the tag, the 張·融資 button and 市價
     expect(mocks.notify.mock.calls.map(c => c[0].title)).toEqual(['⚡ 融資買進已送出', '⚡ 融資賣出已送出']);
 });
 
-it('融券 can only sell: the buy side is faded and never sends', async () => {
+it('融券 buys back (融券買進＝回補, fork fix) and sells, both with the 融券 condition', async () => {
     const owner = owned({ cond: 'ShortSelling', daytradeShort: false });
     const r = await mount(stk, owner.extra());
     expect(text(tag(r)!)).toBe('融券');
     expect(button(r, '市價融券賣')).toBeDefined();
-    expect(button(r, '市價買')!.props.disabled).toBe(true);
+    expect(button(r, '市價融券買（回補）')!.props.disabled).toBe(false);
+    expect(button(r, '市價買')).toBeUndefined();
     await arm(r);
-    expect(cell(r, 'buy').props['data-blocked']).toBe(true);
-    await act(async () => { cell(r, 'buy').props.onClick(); });
-    await act(async () => { button(r, '市價買')!.props.onClick(); });
-    await flush();
-    expect(mocks.place).not.toHaveBeenCalled();
+    expect(cell(r, 'buy').props['data-blocked']).toBeUndefined();
     await act(async () => { cell(r, 'sell').props.onClick(); });
     await flush();
     expect(mocks.place.mock.calls[0]![1]).toBe('Sell');
     expect(mocks.place.mock.calls[0]![4]).toMatchObject({ orderCond: 'ShortSelling' });
     expect(operationNotice(mocks.notify, '⚡ 融券賣出已送出').title).toBe('⚡ 融券賣出已送出');
+    await act(async () => { cell(r, 'buy').props.onClick(); });
+    await flush();
+    expect(mocks.place.mock.calls[1]![1]).toBe('Buy');
+    expect(mocks.place.mock.calls[1]![4]).toMatchObject({ orderCond: 'ShortSelling' });
+    expect(operationNotice(mocks.notify, '⚡ 融券買進已送出').title).toBe('⚡ 融券買進已送出');
 });
 
 it('現股當沖先賣: sell is a 現沖 sell, buy stays a cash buy; 市價現沖賣', async () => {
@@ -192,7 +194,7 @@ it('現沖 on a stock that cannot day-trade blocks only the sell side, never sen
     expect(mocks.place.mock.calls[0]![1]).toBe('Buy');
 });
 
-it('a stock that definitely cannot 融券 (unit 0) stops both sides and says why', async () => {
+it('a stock that definitely cannot 融券 (unit 0) stops 融券賣出 and says why; 融券買進（回補）still goes out', async () => {
     mocks.post.mockImplementation(async () => enquire('2330', { short_unit: 0 }));
     const r = await mount(stk, owned({ cond: 'ShortSelling', daytradeShort: false }).extra());
     expect(tag(r)!.props['data-bad']).toBe(true);
@@ -203,6 +205,13 @@ it('a stock that definitely cannot 融券 (unit 0) stops both sides and says why
     await act(async () => { cell(r, 'sell').props.onClick(); });
     await flush();
     expect(mocks.place).not.toHaveBeenCalled();
+    // 信用了結不受暫停限制
+    expect(cell(r, 'buy').props['data-blocked']).toBeUndefined();
+    await act(async () => { cell(r, 'buy').props.onClick(); });
+    await flush();
+    expect(mocks.place).toHaveBeenCalledOnce();
+    expect(mocks.place.mock.calls[0]![1]).toBe('Buy');
+    expect(mocks.place.mock.calls[0]![4]).toMatchObject({ orderCond: 'ShortSelling' });
 });
 
 it('融資 on a stock whose margin ratio is 0 stops only 融資買進; 融資賣出 (repaying) still goes out', async () => {
