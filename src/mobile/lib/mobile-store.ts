@@ -5,8 +5,14 @@
 // 也不放送單用的帳戶——送單帳戶一律在送出時由 src/lib 擷取與重驗（規格 §7.1）。
 
 import { useSyncExternalStore } from 'react';
-import type { Action } from '../../lib/types/order';
+import type { Action, StockOrderCond } from '../../lib/types/order';
 import type { MobileTab } from './hash-router';
+
+/** 下單面板可帶入的股票單位：整股、盤中零股、盤後零股 */
+export type TicketLot = 'Common' | 'IntradayOdd' | 'Odd';
+
+/** 下單面板可帶入的股票信用條件（借券類不在手機提供，規格 §12） */
+export type TicketCond = Extract<StockOrderCond, 'Cash' | 'MarginTrading' | 'ShortSelling'>;
 
 /** 下單面板（order-ticket-sheet.tsx，T4）的開啟要求 */
 export interface TicketRequest {
@@ -20,6 +26,13 @@ export interface TicketRequest {
     source: 'button' | 'chart' | 'depth' | 'position' | 'other';
     /** 每次開啟遞增；面板以此判斷「這是一次新的開啟」並重新初始化欄位 */
     seq: number;
+    /**
+     * 只在開啟時帶入一次的股票預設（持倉「加碼」用）；缺省＝面板自己的預設（整股、現股、不當沖）。
+     * 面板仍須依規則驗證（例如融券／當沖先賣只限整股、當沖先賣只限賣出＋現股＋可當沖），不合規則時不得送出。
+     */
+    lot?: TicketLot;
+    cond?: TicketCond;
+    daytradeShort?: boolean;
 }
 
 /** 委託操作面板（order-action-sheet.tsx，T6）要開啟的動作 */
@@ -96,16 +109,26 @@ export function setActiveTab(tab: MobileTab): void {
  * 開啟下單面板並帶入方向／價格。只開面板，**不會送單**；
  * 面板內仍需「預覽 → 確認面板滑動確認」才會送出。
  */
-export function openTicket(req: { code: string; action?: Action | null; price?: number | null; source?: TicketRequest['source'] }): void {
-    set({
-        ticket: {
-            code: req.code,
-            action: req.action ?? null,
-            price: req.price ?? null,
-            source: req.source ?? 'other',
-            seq: ++seq,
-        },
-    });
+export function openTicket(req: {
+    code: string;
+    action?: Action | null;
+    price?: number | null;
+    source?: TicketRequest['source'];
+    lot?: TicketLot;
+    cond?: TicketCond;
+    daytradeShort?: boolean;
+}): void {
+    const ticket: TicketRequest = {
+        code: req.code,
+        action: req.action ?? null,
+        price: req.price ?? null,
+        source: req.source ?? 'other',
+        seq: ++seq,
+    };
+    if (req.lot) ticket.lot = req.lot;
+    if (req.cond) ticket.cond = req.cond;
+    if (req.daytradeShort) ticket.daytradeShort = true;
+    set({ ticket });
 }
 
 export function closeTicket(): void {

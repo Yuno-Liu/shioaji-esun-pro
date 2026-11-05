@@ -48,7 +48,22 @@ function priceTone(price: number, reference: number | undefined): 'up' | 'down' 
     return price > reference ? 'up' : price < reference ? 'down' : 'flat';
 }
 
-export function DepthLadder({ code, contract, trades }: { code: string; contract: ContractInfo | undefined; trades: readonly AccountedTrade[] }) {
+export interface DepthLadderProps {
+    code: string;
+    contract: ContractInfo | undefined;
+    trades: readonly AccountedTrade[];
+    /**
+     * 點價位時的處理；缺省＝開啟下單面板並帶入價格（交易頁）。
+     * 下單面板內嵌五檔時傳入，只把價格帶進面板（不決定買賣、不送單）。
+     */
+    onPick?: (price: number, side: 'bid' | 'ask') => void;
+    /** 'ticket'＝內嵌在下單面板（較精簡、不顯示整股／零股切換，由面板的單位決定） */
+    variant?: 'page' | 'ticket';
+    /** variant 'ticket' 時由面板指定是否看盤中零股五檔 */
+    oddLot?: boolean;
+}
+
+export function DepthLadder({ code, contract, trades, onPick }: DepthLadderProps) {
     // 盤中零股只對股票（整股與零股分開撮合、量以股計）
     const oddCapable = contract?.security_type === 'STK';
     const [oddPref, setOddPref] = useState(false);
@@ -84,7 +99,7 @@ export function DepthLadder({ code, contract, trades }: { code: string; contract
                         key={`${l.side}${l.level}`}
                         type='button'
                         className={styles.ladderRow}
-                        onClick={() => openTicket({ code, price: l.price, source: 'depth' })}
+                        onClick={() => (onPick ? onPick(l.price, l.side) : openTicket({ code, price: l.price, source: 'depth' }))}
                         aria-label={`${l.side === 'ask' ? '委賣' : '委買'}第${l.level}檔 ${price}，量 ${vol}${mine ? `，${mine}` : ''}。帶入下單面板`}
                         data-testid={`depth-${l.side}-${l.level}`}
                     >
