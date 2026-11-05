@@ -24,6 +24,7 @@
 14. [測試計畫與驗收標準](#14--測試計畫與驗收標準)
 15. [給 AI 代理的工作分解](#15--給-ai-代理的工作分解)
 16. [待驗證事項與風險](#16--待驗證事項與風險)
+17. [v1 實作備註（與本文的差異）](#17--v1-實作備註與本文的差異)
 
 ---
 
@@ -1191,3 +1192,22 @@ K 線端點只回 1 分 K，資料量與天數成正比（股票每日約 270 �
 | Q7 | 日 K 由 1 分 K 聚合的正確性（交易日歸屬、除權息） | 圖表誤差 | 已在畫面標註；正式日線依 `docs/design/daily-kbar-data-plan.md` 另案 |
 | Q8 | 手機與桌面同時操作同一帳戶 | 兩邊對帳時間差 | 兩邊都以回報＋手動對帳為準；不需額外機制 |
 | Q9 | 永豐下單／刪單 3 秒逾時在行動網路（或 Tailscale 中繼）下較易觸發 | 「結果未知」變多，需手動對帳 | 實機量測下單往返時間；若常觸發，另案評估調整逾時（需修改 `src/lib/api.ts`，超出本期） |
+
+---
+
+## 17. 📝 v1 實作備註（與本文的差異）
+
+MVP（Phase 0＋Phase 1）實作時發現的規格範例錯誤，以及經獨立審查後刻意比本文更嚴格的地方。以程式碼為準。
+
+| 項目 | 本文寫法 | 實作 | 理由 |
+|---|---|---|---|
+| §7.1 取消確認 | `new OrderConfirmCancelled('已取消下單')` | `new OrderConfirmCancelled()` | 建構子不接受參數；它自帶 `mutationNotStarted`，UI 先以 `instanceof` 判斷「已取消」 |
+| §7.1 credit／note | 範例把當沖先賣併入 credit | 比照桌面 `order-ticket.tsx`：`daytrade_short` 不進 credit，note 加「現股當沖」 | 與桌面確認內容一致 |
+| §6.6 股票平倉 | `placeStockExitByShares(contract, exit, …)` | 第 2 個參數是 `exit.exit`（Action），信用條件放在 `opts.orderCond` | 實際簽章 `src/lib/trade.ts:379` |
+| §6.4 即時價 | 比照桌面 `usePendingPrices()` | 手機不載入 `trigger-engine`；請求帶 `livePriceCode` 時一律顯示「行情中斷」並停用 | 載入即啟動觸價執行器，違反 R7；只有觸價單會帶 `livePriceCode`，fail-closed |
+| §7.4 ② 串流活動 | 回前景後有活動，或連線世代與**隱藏前**不同 | 只算**回前景之後**的重連，或回前景後至少 1 秒才收到的 tick／bidask／heartbeat | 回前景時派送的排隊事件、隱藏期間的舊重連都不能證明串流此刻仍活著；休市時下一次心跳（30 秒）仍在 45 秒逾時內 |
+| §7.4 ③ 重新讀取 | `refreshTradingState('orders'／'positions')` | 委託用 `reconcileOrdersOnce()`；兩者讀完都以 `queries[scope].updatedAt` 確認晚於本週期開始，否則冷卻後重讀一次（每週期每範圍最多 2 次），仍不符合 → `stale-data` | `refreshTradingState` 可能回傳其他範圍進行中的讀取，或在冷卻內直接 resolve |
+| §7.4 bfcache | `pageshow(persisted)` 視同回前景 | 先進入 `resyncing` 擋下送單，再重新載入頁面 | `src/lib/quote-ownership.ts` 在 `pagehide` 永久拆除訂閱狀態，還原後報價可能凍結（Q5，仍待實機確認） |
+| §7.4 stale-data | 新單勾選「我了解」後可送 | 新單、改價、減量、平倉都要勾選；持倉頁、平倉面板與狀態列也提供勾選與重試；回前景前帶入的價格須重新確認 | 降低以過期資料操作的風險；刪單與全部刪單不受限制 |
+| §6.2／§6.3 價格來源 | 標頭與下單面板以 `tick.close` 為最新價 | 排除試撮（`simtrade`）tick 並標示「試撮」；沒有真實成交時用市場快照，連快照都沒有才用參考價並標示「參考價」；百分比一律由 `price_chg` 與參考價計算 | 盤前試撮揭示價不是成交價；串流 `pct_chg` 的單位因商品而異 |
+| §9.4 效能 | ≤ 400 KB | 首次載入 19 個 JS、347.1 KiB gzip（桌面 `index.html` 27 個、764.0 KiB） | 量測方式同 §9.4 |
