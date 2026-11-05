@@ -381,19 +381,21 @@ createRoot(document.getElementById('root')!).render(
 | 持倉 | `#/positions` | 各帳戶持倉、未實現損益、平倉 |
 | 帳戶 | `#/account` | 資金、損益、帳號切換、連線、風控、設定 |
 
-### 5.2 全域狀態列（每頁頂端，sticky）
+### 5.2 全域狀態列（每頁頂端，位於捲動容器之外）
 
 ```text
 ┌──────────────────────────────────────────────┐
-│ ● LIVE │ 永豐 正式 · 證 ****4567 ▾  │ 🔓 風控 │
+│ (● LIVE) │ 永豐 [正式] · ****4567 ⌄ │ 🔓 風控 │
 └──────────────────────────────────────────────┘
 ```
 
 | 區塊 | 資料來源 | 規則 |
 |---|---|---|
-| 連線燈號 | `useStreamStatus()`、ResumeGate | 綠「LIVE」／黃「連線中」／紅「中斷」／藍「同步中」（ResumeGate 非 ready）；點擊展開連線詳情 |
-| 券商＋環境＋帳戶 | `useAccounts()`、`orderRouteOf()`（`src/lib/order-route.ts:56-68`）、`useEsunEnvironment()` | 依目前商品顯示對應市場槽位（股票 `selectedStock`／期貨 `selectedFutures`）；「正式」用醒目的 `danger` 色框，「模擬」用 `accent` 色；環境未知顯示「環境未確認」 |
-| 風控鎖 | `useRiskSettings()` | 鎖定時顯示紅色「🔒 已鎖單」；點擊可立即鎖定（解鎖需確認） |
+| 連線燈號 | `useStreamStatus()`、ResumeGate | 狀態色圓點＋文字膠囊：「LIVE」／「連線中」／「中斷」／「同步中」（ResumeGate 非 ready 時優先顯示同步中／資料過期／未恢復）；點擊展開連線詳情 |
+| 券商＋環境＋帳戶 | `useAccounts()`、`orderRouteOf()`（`src/lib/order-route.ts:56-68`）、`useEsunEnvironment()` | 依目前商品顯示對應市場槽位（股票 `selectedStock`／期貨 `selectedFutures`；該槽位未選擇時顯示「未選擇證券帳戶」／「未選擇期貨帳戶」）；環境為實心小膠囊：「正式」`danger`、「模擬」`accent`、「環境未確認」`amber`；點擊開啟帳戶切換面板 |
+| 風控鎖 | `useRiskSettings()` | 鎖定時 `danger` 實心「已鎖單」；未鎖時點擊立即鎖定，解鎖需滑動確認 |
+
+介面現代化後（實作見 `docs/fork/mobile-design.md` §6.5）：狀態列不透明、不再 sticky（殼層的捲動容器在它下方）；非 LIVE 或 ResumeGate 非 ready 時整條淡染狀態色；正式環境時下緣 2px `danger`；三段點擊區各 ≥ 44px；鎖單改變與持續 2 秒以上的連線狀態以視覺隱藏的 `aria-live` 宣告。
 
 ### 5.3 RouteBadge（送單路由徽章）
 
@@ -413,10 +415,13 @@ createRoot(document.getElementById('root')!).render(
 - 訂閱 `onOrderEvent()`，以 `describeOrderReport()`（`src/lib/order-report.ts:261`）產生成交／委託回報文字。
 - 成交通知可附音效（P1，需手勢解鎖）與 Android 震動（10 ms）。
 - 遮蔽金額模式（`usePrivacyMoney()`，`src/lib/privacy.ts:80`）下不顯示金額。
+- 位置（雙錨點，實作見 `docs/fork/mobile-design.md` §6.4）：沒有面板時在底部 chrome（分頁列＋交易鍵列或選取工具列）上方 8px，不遮頁首、狀態列與交易鍵列；有面板開啟時改為狀態列區域內的單行膠囊，只顯示前景一則，其餘以「+N」計數，不壓到面板把手與標題。最多 3 則，「結果未知」最後才被淘汰；可往下滑走，按住時暫停計時。
 
 ---
 
 ## 6. 📲 畫面規格
+
+> 介面現代化（第一、二階段）後，各畫面的版面、樣式與互動以 `docs/fork/mobile-design.md` §7 為準（含各節「第二階段實作差異」）；本章的示意圖保留功能、資料來源與交易規則，不代表目前外觀。共通改變：頁首改 PageHeader、清單改 GroupedSection／髮絲線列、分頁與篩選改 Segmented、確認類操作一律在面板 footer 用滑動確認。
 
 ### 6.1 自選（`#/watchlist`）
 
@@ -436,6 +441,7 @@ createRoot(document.getElementById('root')!).render(
 - 點一列 → `#/trade/:code`；長按 → 刪除／移動。
 - 搜尋：`searchProducts(query, 10)`，結果可「加入自選」或直接開啟交易頁。
 - 顏色：漲 `vars.color.up`、跌 `vars.color.down`（隨使用者的台灣／國際配色設定）。
+- 現況（mobile-design.md §7.2）：「自選｜排行」分頁；列右側為價格＋漲跌膠囊，表頭切換鍵在「漲跌幅／漲跌／總量」間循環；長按開操作面板（開啟交易頁、買進…／賣出…、移動、從自選移除），「買進…／賣出…」只開下單面板，指數與組合商品不顯示；不做逐列迷你走勢。
 
 ### 6.2 交易（`#/trade/:code`）— 以下單為中心的重新設計
 
@@ -546,6 +552,8 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 
 **逐筆明細（`tick-list.tsx`）**：先以 `fetchLastTicks(contract, 50)` 取得最近 50 筆，再接 `onAnyTick()`；最多保留 200 筆；內外盤以 `tick_type`（1 外盤、2 內盤）著色。
 
+**現況**（mobile-design.md §7.3）：買進／賣出鍵列不再 sticky 在頁內，而是放進殼層底部 chrome（分頁列上方的配件槽，與分頁列同一片材質）；主價列捲出畫面時頂端顯示精簡標頭；五檔每格有量條、內嵌（下單面板）五檔也顯示內外盤比；長按圖表後的選價列從圖表底部升起，出現時會捲到底部 chrome 之上；全螢幕與選價列的買賣鍵高度 ≥ 56px。標頭沒有 ☆／⋯（列入第二輪候選）。
+
 ### 6.3 下單面板（`order-ticket-sheet.tsx`，底部面板）
 
 股票版：
@@ -599,6 +607,8 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 6. 連線：`useTradingLive()` 為 true 且 ResumeGate 為 `ready`；ResumeGate 為 `stale-data` 時需勾選「我了解委託／持倉資料可能過期」。
 7. 環境：RouteBadge 不是「環境未確認」。
 
+**現況**（mobile-design.md §7.4）：面板為 large 高度，依買賣方向整面著色並有 3px 方向色條；方向改為兩顆 ≥ 56px 的方向鍵；單位與條件同列、條件收在可展開的摘要鈕內；價格與數量用步進器，快捷價 6 欄兩行、數量 4 個快捷鍵；狀態行與「預覽」鍵固定在面板 footer，不隨內容捲動；限價偏離成交價過大時只提醒、不阻擋。上述驗證規則與停用條件不變。
+
 ### 6.4 確認面板（`order-confirm-sheet.tsx`）
 
 - 綁定既有確認佇列：`subscribeOrderConfirm()`、`getPendingOrderConfirm()`、`resolveOrderConfirm()`（`src/lib/order-confirm.ts:76-90`）。**必須掛在 App 根層**，否則 `requestOrderConfirm()` 的 promise 永遠不會結束。
@@ -607,6 +617,7 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 - 滑動元件停用條件與桌面相同（`src/components/order-confirm-dialog.tsx:113`）：`awaitingMode`、`simulation === null`、`serverChanged`、有 `livePriceCode` 但尚無即時價。
 - `serverChanged` 時顯示「伺服器或模式已變更，這筆不會送出，請取消後重新下單」。
 - ResumeGate 離開 `ready`（例如確認中切到背景）時，自動 `resolveOrderConfirm(false)`。
+- 現況（mobile-design.md §7.5）：環境大字改為全寬實心環境橫幅，放在面板的固定區（BottomSheet `pinned`），內容捲動時仍在標題下方；滑塊與取消在 footer；核准後面板立即沿原路退場，送出結果回到下單面板與通知。
 
 ### 6.5 委託（`#/orders`）
 
@@ -643,6 +654,7 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 
 - 每個動作都先開確認面板（`order-action-sheet.tsx`，滑動確認）；全部刪單需列出筆數與涉及帳戶。
 - 結果訊息一律用 `mutationErrorNotice(err, verb)`（`src/components/esun-order-meta.tsx:91-97`），確保「未送出」與「失敗或結果未知、勿自動重送」用語與桌面一致。
+- 現況（mobile-design.md §7.6；與該節的差異列在 §7.7 末的「第二階段實作差異」）：分頁加「成交」；列上改價／減量／刪單為小型 Chip，點列開委託明細面板（成交時間軸）；可進入選取模式批次刪單，選取工具列與「刪除已選（N 筆）」放在分頁列上方，批次刪單仍需滑動確認；全部刪單在列表尾端。
 
 ### 6.6 持倉（`#/positions`）
 
@@ -667,6 +679,7 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
   - 股票不提供反手；信用部位非整張時依 `stockExitFor()` 拒絕。
 - **加碼**：開啟下單面板並帶入同方向、同帳戶。
 - 未實現損益標示「（估）」：來源是券商持倉＋即時價推估。
+- 現況（mobile-design.md §7.7）：頁首摘要卡（未實現損益合計、股票市值、期貨權益數與風險指標）；市場篩選、帳戶與排序；依帳戶分組；「平倉」為中性外框鍵，避免與新單的紅綠鍵混淆；平倉與加碼流程不變。
 
 ### 6.7 帳戶（`#/account`）
 
@@ -682,6 +695,8 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 | 風控 | 一鍵鎖單、單筆上限、當日虧損上限；「手動下單確認」顯示為**鎖定開啟** | `useRiskSettings()`、`setRiskSettings()` |
 | 顯示 | 深／淺色、台灣（紅漲綠跌）／國際配色、字級、遮蔽金額 | `useThemeSettings()`、`usePrivacyMoney()` |
 | 診斷 | secure context、Web Locks、BroadcastChannel、User Agent、建置版本 `__SHIOAJI_BUILD_VERSION__` | — |
+
+現況（mobile-design.md §7.8）：區塊順序與讀取、刷新時機不變，外觀改為分組卡片；顯示區新增「降低透明度：跟隨系統／開／關」，本裝置區新增「介面觸覺回饋（Android）」開關。
 
 ---
 
@@ -1059,13 +1074,16 @@ K 線端點只回 1 分 K，資料量與天數成正比（股票每日約 270 �
 |---|---|
 | 版面 | 以 390×844（iPhone 14／15）設計，支援 360–430 寬；高度用 `100dvh`，不用 `100vh` |
 | 安全區 | `viewport-fit=cover`；底部分頁與買賣按鈕加 `env(safe-area-inset-bottom)` |
-| 觸控目標 | ≥ 44×44 pt；買進／賣出按鈕高度 ≥ 56 px，兩鍵間距 ≥ 12 px |
+| 觸控目標 | ≥ 44×44 pt，實作為 `TOUCH_MIN = max(44px, 2.75rem)`，隨字級放大；買進／賣出按鈕高度 ≥ 56 px，兩鍵間距 ≥ 12 px |
 | 輸入 | 價格 `inputmode="decimal"`、數量 `inputmode="numeric"`；字級 ≥ 16 px（避免 iOS 自動放大） |
-| 顏色 | 漲跌與買賣用 `vars.color.up`／`down`（依使用者配色）；狀態（成功、錯誤、正式環境）用 `success`／`danger`（`src/theme.css.ts:95-122`）；**買賣一律有文字**，不只靠顏色 |
+| 顏色 | 漲跌與買賣用 `vars.color.up`／`down`（依使用者配色）；狀態（成功、錯誤、正式環境）用 `success`／`danger`（`src/theme.css.ts:95-122`）；**買賣一律有文字**，不只靠顏色。實心填色上的文字對比與小字用色規則見 mobile-design.md §4.8 |
 | 主題 | 沿用 `initTheme()`：深／淺色、台灣／國際配色、字級 |
+| 設計 token | 手機專用 token 在 `src/mobile/styles/`：`tokens.ts`（間距、尺寸、圓角、陰影、Z、彈簧、手勢、時長、緩動）、`theme-vars.css.ts`（深淺色語意變數，只讀 theme，不改色票）、`typography.css.ts`（rem 字級與 tabular 數字）、`material.css.ts`（半透明材質與後備）、`primitives.css.ts`（按壓、焦點環、實心填色）。詳見 mobile-design.md §4 |
 | 方向 | 直向為主；橫向時交易頁圖表全螢幕（P1） |
 | 語系 | 正體中文 |
-| 動態 | 遵守 `prefers-reduced-motion` |
+| 動態 | 只動畫 transform／opacity；面板、通知、滑塊用解析解彈簧（`src/mobile/motion/`，不引入 motion／framer-motion），拖曳 1:1 跟手、放手承接速度；遵守 `prefers-reduced-motion`（改淡入淡出或不動畫）。詳見 mobile-design.md §4.9、§5、§9 |
+| 透明度與對比 | 底部 chrome 與通知為半透明材質；遵守 `prefers-reduced-transparency`，帳戶頁可另設「降低透明度」；面板開啟時 chrome 改實心；`prefers-contrast: more` 加強框線。狀態列、選價列、全螢幕上下列一律實心（mobile-design.md §4.6、§9） |
+| 觸覺 | 帳戶頁「介面觸覺回饋（Android）」開啟時，長按成立、滑塊越過門檻、步進撞界會短震；iOS 不震（`src/mobile/motion/haptics.ts`） |
 | 瀏覽器 | iOS／iPadOS 15.4+ Safari、Android Chrome 最新兩版 |
 
 ---
@@ -1213,3 +1231,14 @@ MVP（Phase 0＋Phase 1）實作時發現的規格範例錯誤，以及經獨立
 | §6.2／§6.3 價格來源 | 標頭與下單面板以 `tick.close` 為最新價 | 排除試撮（`simtrade`）tick 並標示「試撮」；沒有真實成交時用市場快照，連快照都沒有才用參考價並標示「參考價」；百分比一律由 `price_chg` 與參考價計算 | 盤前試撮揭示價不是成交價；串流 `pct_chg` 的單位因商品而異 |
 | §9.4 效能 | ≤ 400 KB | 首次載入 19 個 JS、347.1 KiB gzip（桌面 `index.html` 27 個、764.0 KiB） | 量測方式同 §9.4 |
 | §3.3 nginx 轉送永豐 | `/api/` 保留原始 `Host` | nginx 完成 Host 白名單、Origin＝Host、Sec-Fetch-Site 檢查後，轉給 sidecar 一律用 `Host: 127.0.0.1` 並移除 `Origin` | Shioaji sidecar 1.7.10 只接受本機 Host／Origin（否則 403），且沒有放寬的設定；玉山 `/esun/` 不變 |
+
+**介面現代化（第一、二階段）**
+
+依使用者「介面與操作更現代化」的需求，在不改交易邏輯（`src/lib/**`）、不改 theme 色票與 `mobile.html` 的前提下，重做手機版的外觀與互動。完整設計、與設計的差異及待實機確認項目見 `docs/fork/mobile-design.md`。
+
+- 第一階段（基礎與交易確認流程）：手機專用 design token 與材質（§11）；解析解彈簧與手勢模組；BottomSheet v2（退場凍結、堆疊後退、焦點陷阱、portal 到殼層、固定區 `pinned`）、SlideToConfirm v2（只看放手位置、進場保護）、ToastHost v2（雙錨點，§5.5）；殼層插槽（交易鍵列與選取工具列放進底部 chrome）、狀態列 v2（§5.2）；確認面板與下單面板改版。
+- 第二階段（各頁）：交易頁、自選／排行／搜尋、委託與持倉、帳戶與 HTTPS 說明頁（§6 各節的「現況」）。之後修正切換分頁時舊頁 portal 殘留、圖表選價列被底部 chrome 擋住、自選指標切換鍵與「未成交」連結的點擊區問題。
+- 交易安全不變：新單、改價、減量、刪單、全部刪單、批次刪單、平倉、解除鎖單都仍需滑動確認；新入口（自選「買進…／賣出…」、五檔點價、選價列）只開下單面板；沒有新增網路請求或逐列查詢。
+- 測試：既有斷言只在設計規格 §14 列出的「刻意更新」處修改（其中第二階段刪除 `depth-ladder.test.tsx`「ticket 變體不顯示內外盤比」，B4 刪除 `primitives.test.ts` 對已刪除的舊 `routeBadge` 樣式的斷言）。
+- 體積：首次載入 JS（gzip，量測方式同 §9.4）第二階段後為 226.3 KiB，在 400 KB 上限內，但超出設計目標 ≤ 218 KiB 約 8 KiB，列為待辦（設計規格 §13）。上表 §9.4 列的 347.1 KiB 是 MVP 當時的數字，之後延遲載入分頁曾降到約 208 KiB。
+- 未完成：實機驗收（§14.3，含 E2 的面板與全螢幕圖表遮擋檢查）；gesture-guard 只在 WebKit 掛 touchmove 的調整，等實機確認 Android 遵守 `user-scalable=no` 後才改（設計規格 §16 第 8 項）。

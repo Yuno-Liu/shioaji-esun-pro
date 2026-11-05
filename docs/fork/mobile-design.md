@@ -406,6 +406,7 @@ export interface BottomSheetProps {
   ariaLabel?: string; testId?: string; tone?: 'buy' | 'sell' | null;
   detent?: 'fit' | 'large';            // 新增，預設 'fit'
   footer?: ReactNode;                  // 新增，固定在底部、不隨內容捲動
+  pinned?: ReactNode;                  // 新增（第一階段實作時補上），固定在標題列下方、不隨內容捲動、不在拖曳區
   initialFocus?: 'title' | 'panel';    // 新增，預設 'title'（沒有 title 時 panel）
   onExited?(): void;                   // 新增，退場結束或同步卸載後呼叫
 }
@@ -425,12 +426,13 @@ backdrop  data-testid=`${testId}-backdrop`（退場中 `${testId}-closing-backdr
           退場中 inert＋aria-hidden＋pointer-events:none
   ├ toneLayer×2（aria-hidden，buy／sell 各一，opacity 交叉淡化 200ms）
   ├ grabArea data-testid=`${testId}-grab`：把手 36×5＋標題列（h2 sheetTitle＋關閉 IconButton，aria-label「關閉」，只在 dismissible 時出現）
+  ├ pinned（data-sheet-pinned；只在 pinned prop 不為 null／undefined 時出現）
   ├ body（唯一捲動區，data-sheet-body）
   └ footer（data-sheet-footer；footer prop 與 SheetFooter portal 的目標）
 ```
 
 - **Portal**：`SheetRootContext` 為元素時 `createPortal` 到殼層的 `#sj-sheet-root`；為 `'inline'`（預設、測試、無 provider）時原地渲染；為 `null`（provider 已存在但節點尚未掛上）時該幀不渲染。backdrop 根節點對 React 的 `onClick`、`onPointerDown` 呼叫 `stopPropagation()`，避免 portal 事件冒泡到頁面中的 React 祖先；keydown 不攔。
-- **生命週期**（可動畫時）：`closed →（open=true）註冊 sheet-stack、記住觸發元素、entering（從面板高度以 spring.sheet 到 0）→ open（settled=true）→（open=false）立即解除註冊、還原焦點、exiting（凍結最後一次的 children、title、tone、footer、dismissible；從目前位置以 spring.sheet 帶當下速度到面板高度；暗化幕同步淡出）→ closed（render null、onExited）`。退場中又 open=true：從目前位置反向進場並重新註冊、`shownAt` 重設。
+- **生命週期**（可動畫時）：`closed →（open=true）註冊 sheet-stack、記住觸發元素、entering（從面板高度以 spring.sheet 到 0）→ open（settled=true）→（open=false）立即解除註冊、還原焦點、exiting（凍結最後一次的 children、title、tone、footer、pinned、dismissible；從目前位置以 spring.sheet 帶當下速度到面板高度；暗化幕同步淡出）→ closed（render null、onExited）`。退場中又 open=true：從目前位置反向進場並重新註冊、`shownAt` 重設。
 - **同步模式**（§5.1）：open 立即為 open（settled=true）、關閉立即卸載（既有 `toHaveLength(0)` 斷言不變）。
 - **暗化幕**：`opacity = 1 − y / height`（夾 0–1），背景 `rgba(0,0,0,var(sj.scrim))`；`data-stacked="true"`（下面還有面板）時用 `sj.scrimStack`。
 - **堆疊後退**：本面板已註冊但不是最上層 → 以 spring.sheet 驅動 p∈[0,1]：`transform: translateY(y − 6p px) scale(1 − .06p)`、`transform-origin: top center`；減少動態時不縮放、只靠上層暗化幕。z-index＝層級基準＋10×堆疊序（寫在 backdrop 的 React style，非動畫屬性）。
@@ -453,6 +455,7 @@ backdrop  data-testid=`${testId}-backdrop`（退場中 `${testId}-closing-backdr
 - **鍵盤**：`hooks/use-keyboard-inset.ts` 監聽 `visualViewport` resize／scroll，`inset = max(0, innerHeight − vv.height − vv.offsetTop)` 寫入 backdrop 的 `--sj-kb`；backdrop `padding-bottom: var(--sj-kb)`，panel `max-height: calc(100% − var(--sj-sheet-top) − var(--sj-kb, 0px))`。實機若 iOS 15 偏移異常，後備為 inset=0（footer 隨面板），並對聚焦輸入框 `scrollIntoView({ block: 'nearest' })`。
 - **尺寸**：`fit`＝內容高度、上限 `100% − --sj-sheet-top − --sj-kb`；`large`＝固定該上限高度。所有面板頂端都不進入狀態列區域（取代 `sheet.css.ts:27` 的 `calc(100% - 24px)`）。寬度上限 640px 置中（沿用）。
 - **外觀**：panel 背景 `vars.color.panel`、上緣圓角 16、e3；toneLayer 各自 `border-radius: inherit`、`background-image` 兩層 upDim（或 downDim）`linear-gradient`、`box-shadow: inset 0 3px 0 0 <up|down>`（3px 方向色條跟著圓角）；`data-tone` 切換時兩層 opacity 交叉淡化 200ms；`prefers-contrast: more` 只疊一層並加 1px borderBright 上框。
+- **pinned（固定區）**：第一階段實作時新增，本規格原本沒有寫到。放在標題列下方、body 之上，`flex: 0 0 auto`（`styles/sheet.css.ts` 的 `pinned`，左右內距同 body），視窗變矮時 body 先縮到 0，固定區不縮、不捲動；不在 grabArea 內，從這裡往下拖不會關閉面板。用途限於必須一直看得到的安全資訊，目前只有確認面板的環境橫幅（`order-confirm-sheet.tsx`，§7.5、§10 S6）。退場時與 children、footer 一起凍結。
 - **SheetLoadError**（`route-error-boundary.tsx:120-124`）自動使用 v2。
 
 ### 6.2 SheetFooter
@@ -518,7 +521,7 @@ backdrop  data-testid=`${testId}-backdrop`（退場中 `${testId}-closing-backdr
 - 中：路由膠囊（flex 1、可省略號截斷）＝`永豐`＋環境實心小膠囊（正式：danger＋inkStrong 白字；模擬：accent＋inkStrong 白字；未確認：amber 實心黑字）＋` · `＋帳號（`mobileAccountLabel`）＋ChevronDown 14px；沒有帳戶時 amber 1px 框＋foreground「未選擇證券帳戶」。
 - 右：未鎖＝LockOpen 16px＋「風控」（mutedForeground，對 panel 5.41）；已鎖＝danger 實心膠囊（inkStrong）＋Lock＋白字「已鎖單」。視覺隱藏的 `aria-live="polite"` 在鎖單狀態**改變**時宣告「已鎖單（只對本裝置有效）」／「已解除鎖單」；連線狀態維持 2 秒以上才宣告。
 - 三段點擊區各 ≥ TOUCH_MIN；行為不變（連線詳情、帳戶切換、未鎖立即鎖、已鎖開解除鎖單面板）。
-- RouteBadge：樣式移到新檔 `styles/route-badge.css.ts`（`controls.css.ts` 的舊匯出暫留，B4 清理）；外框膠囊（borderBright）＋foreground「送往 永豐 」＋環境實心小膠囊；可見文字串接後仍為 `routeBadgeText` 的「送往 {券商} {環境}」。
+- RouteBadge：樣式移到新檔 `styles/route-badge.css.ts`（`controls.css.ts` 的舊 `routeBadge`／`routeBadgeLarge` 已在 B4 刪除）；外框膠囊（borderBright）＋foreground「送往 永豐 」＋環境實心小膠囊；可見文字串接後仍為 `routeBadgeText` 的「送往 {券商} {環境}」。
 
 ### 6.6 殼層：ShellSlot、TabBar、捲動記憶、HTML 屬性（`app.tsx`、`styles/layout.css.ts`）
 
@@ -541,6 +544,7 @@ backdrop  data-testid=`${testId}-backdrop`（退場中 `${testId}-closing-backdr
 - `ui/shell-slots.tsx`：`ShellSlotsContext`（`{ top, bottom } | 'inline'`）與 `ShellSlot({ slot: 'top' | 'bottom', children })`：有目標時 portal，否則原地渲染（測試維持原地，testId 不變）。
 - TabBar：lucide 24px（strokeWidth 1.75，active 2.25）＋caption 標籤；active 用 accent；未成交徽章 danger＋inkStrong 白字、>99 顯示 99+；待對帳 amber 點；點擊立即切換、無轉場；**再點目前分頁**：`preventDefault` 並 `main.scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' })`。
 - 捲動記憶（`lib/scroll-memory.ts`，Map<routeKey, top>；routeKey＝`formatRoute(route)`，交易頁依代碼分開）：main 上被動 scroll 監聽（rAF 合併）記錄目前 routeKey 的 scrollTop；routeKey 改變時於殼層 layout effect 標記 `pending = newKey`，pending 期間不記錄；`<ScrollRestorer routeKey>` 放在 Suspense 內、RoutePage 之後，於 layout effect 還原（沒有紀錄則 0）並清除 pending。
+- 頁面的 `Suspense` 以分頁名為 key（`<Suspense key={route.name}>`，第二階段後修正）：第一次切到延遲載入的分頁時，React 會把舊頁以隱藏的 Offscreen 保留，但隱藏不及於 portal，舊交易頁的交易鍵列（ShellSlot bottom）與精簡標頭（ShellSlot top）會留在殼層、仍可點擊。改用 key 後換分頁會卸載整個頁面樹；同一分頁內換商品（`#/trade/2330` → `#/trade/2317`）key 不變，不重掛。由 `app-shell.test.tsx` 覆蓋。
 - `hooks/use-html-attributes.ts`：在 `<html>` 寫入 `data-sj-font-scale`（`useThemeSettings().fontScale`）與 `data-sj-transparency`（`ui-settings.transparency` 為 system 時移除屬性）；殼層 `data-sheet-open` 由 sheet-stack depth 決定。
 - 選做：依主題於執行期更新 `meta[name=theme-color]` 為狀態列色（不改 mobile.html）。
 - 選做：main 內容尾端哨兵（IntersectionObserver）可見時 `.bottomStack[data-edge="true"]`，`::before` 150ms 淡為 0、隱藏髮絲線（scroll edge）。
@@ -641,6 +645,18 @@ Stepper({ value: string; onChange(text: string): void; onStep(delta: 1 | -1): vo
 - 自選列不顯示迷你走勢（不新增任何 K 線請求）；日內區間條列入第二輪。
 - 搜尋面板：large；搜尋框為 body 內 `position: sticky; top: 0` 的 `islandBg` 欄（不模糊）；結果列與自選列同樣式，尾端「加入／已加入」Chip。選做：開啟鍵 handler 內以 `flushSync` 掛載面板後同步 `focus()` 輸入框（iOS 只允許手勢同一呼叫堆疊叫出鍵盤，需實機確認）。
 
+**第二階段實作差異**（以程式碼為準）：
+
+- 排行更新鍵不是純圖示 IconButton，而是 compact 文字鍵，可見文字仍為「⟳ 更新（N）」（`ranking-list.test` 精確比對，§14）。
+- 搜尋結果列尾的鍵是原生 button 套用 `ui/chip.css` 的 chip class，不是 `ui/Chip` 元件；文字維持「加入自選／已在自選」，不是上文的「加入／已加入」（`search-sheet.test` 斷言 children 為字串）。
+- 操作面板的「從自選移除」用自訂 danger 列按鈕，不是 ListRow（測試以 `data-testid="watch-remove"` 取得 onClick，ListRow 的 testId 掛在外層）。
+- 排行列不接表頭的指標切換，固定顯示：漲跌在價格下方、漲跌% 用膠囊（測試要求 `ranking-change` 與 `ranking-pct` 同時存在）。
+- 操作面板的「買進…／賣出…」對指數（IND）與組合商品不顯示，比照交易頁的 tradable 判斷（上文沒寫到的防呆）。
+- 頁面不套用 `layout.page` 的 16px 內距，改由各區塊自帶左右 16px（PageHeader 已有內距），清單列可延伸到螢幕邊緣。
+- 指標切換鍵設 `zIndex: 1`（第二階段後修正）：原本 `::before` 擴張的點擊區下半部被第一列（`position: relative`、DOM 在後）蓋住，實際可點高度不足 44px，點偏下會進入第一檔商品。由 `styles/watchlist-hit-area.test.ts` 覆蓋。
+- 未做：選做的 `flushSync` 同步聚焦搜尋框（面板以 transform 進場時聚焦 input，iOS 可能捲動或位移，需實機確認後再加）；開啟後焦點仍在面板標題。
+- 待實機確認：iOS／Android 長按觸發與 Android 震動；pressableRow 80ms 延遲加深在快速捲動時不閃；200 列捲動時 PriceFlash 效能；iOS 15.4 面板內 sticky 搜尋框；字級「大」配 360 寬長名稱的列寬；淺色主題捲到底時 main 底部內距區的底色差。總量膠囊的單位沿用桌面（股票視為張、期權為口），需以實際資料確認。
+
 ### 7.3 交易頁（含選價列、全螢幕）
 
 ```
@@ -668,6 +684,17 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 - 選價列（`trade.css.ts:231-264`）：圖表底部、**實心** panel（不模糊）、圓角 12、e2、內距 8：［以 1,080 買進］［以 1,080 賣出］（CONTROL_LARGE、實心＋inkLarge、間距 12）＋「取消」文字鍵 44px；以 translateY(100%→0) 220ms `EASE.sheet` 升起、沿原路收回（減少動態淡入淡出）；文字與 `chart-pick` 不變；只開下單面板。長按進入追蹤時 `haptic('longPress')`。
 - 全螢幕（`chart.css.ts:128-219`）：上下列實心 panel（canvas 上方不模糊）；買賣鍵升到 CONTROL_LARGE、間距 12；進出不加動畫（沿用）。
 - 明細（`tick-list.tsx`）：列高 2rem、num 樣式、最新一列 150ms 淡入。
+
+**第二階段實作差異**（以程式碼為準）：
+
+- 內嵌五檔顯示內外盤比後，`depth-ladder.test.tsx` 原本「ticket 變體不顯示內外盤比」的斷言與本節衝突，已刪除，改由新增案例驗證「ticket 變體顯示內外盤比」與「沒有內外盤量（或試撮）時仍隱藏」（§14 刻意更新 3）。
+- 長按（圖表與自選列）呼叫 `haptic('longPress')`：只在 Android 且使用者開啟「介面觸覺回饋」時震動，iOS 不震（`motion/haptics.ts`）。
+- 選價列收回：另渲染一個 `chart-pick-closing` 殘影節點（`aria-hidden`＋`inert`）播放沿原路收回的動畫，`chart-pick` 本身在選完或取消時立即移除，測試與輔助技術不會看到兩份選價列。
+- 精簡標頭（`trade-compact`）設 `aria-hidden`：內容與頁面 h1、主價重複，且沒有互動。
+- 整股／盤中零股切換仍在五檔區塊內，沒有與「五檔｜明細」同列（與上方示意圖不同）。
+- 未做：字級「大」時五檔表頭改縮寫（§4.7）。
+- 選價列出現時（非全螢幕）以沒有 transform 的外層 `scrollIntoView({ block: 'nearest' })`，靠 main 的 `scroll-padding-bottom` 停在交易鍵列與分頁列之上（第二階段後修正：小螢幕或開副圖時原本會落在底部 chrome 後面）；減少動態時不平滑。
+- 持倉摘要卡的「未成交：N 筆 ›」連結外包一層 `workingLinkRow`（第二階段後修正）：GroupedSection 的列間髮絲線（`card > * + *::after`）與連結 pressableRow 的按壓層原本共用同一個 `::after`，兩者都失效；現在髮絲線落在外層，`::after` 只當按壓層。
 
 ### 7.4 下單面板（`order-ticket-sheet.tsx`、`ticket/*`、`order-ticket.css.ts`）
 
@@ -736,7 +763,7 @@ y=99 ┌ 把手 36×5                                                   ┐ 17
 [                         取消                        ]  44
 ```
 
-- 環境橫幅（`confirm-env`，文字仍為 `confirmEnvText()`）：正式 danger＋inkLarge 白字＋ShieldAlert；模擬 accent＋inkLarge 白字；未確認 amber 實心＋黑字。取代原本 1.5rem/800 外框字。
+- 環境橫幅（`confirm-env`，文字仍為 `confirmEnvText()`）放在 BottomSheet 的 `pinned` 固定區（§6.1），body 捲動時仍在標題下方：正式 danger＋inkLarge 白字＋ShieldAlert；模擬 accent＋inkLarge 白字；未確認 amber 實心＋黑字。取代原本 1.5rem/800 外框字。
 - 不另外計算任何數值，只呈現 `OrderConfirmRequest` 既有欄位（沿用）；`confirmBlockReason`、`confirmActionText`、`CONFIRM_TEXT`、ResumeGate 自動取消與通知全部不變。
 - **退場**：host 以 `lastEntryRef` 快取最後一筆，`shown = current ?? lastEntryRef.current`；`<BottomSheet open={current !== null}>` 用 `shown` 的內容；`open` 為假時滑塊 `disabled`。`onExited` 後清空快取。`approve()`、`cancel()` 的 entry id 與 `approvedIds` 檢查原封不動（第二道防線）。同步模式下關閉即卸載，既有 `sheetOpen()` 類斷言不變。
 - 核准後立即沿原路退場（lib 已清空 pending）；送出進度與結果回到下單面板 CTA 與通知，不讓確認面板停留等待 lib。
@@ -774,11 +801,37 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 平倉流程不變（說明面板 → lib 確認面板 → 滑動確認）；加碼跨帳戶先開切換說明面板（沿用）。
 - 測試：`positions-page.test.tsx:450-451` 由 `style.width === '50%'` 改為 `style.transform === 'scaleX(0.5)'`（唯一必要的斷言更新之一，§14）。
 
+**第二階段實作差異**（§7.6、§7.7，以程式碼為準）：
+
+- 列上 Chip 的 testid 仍是 `order-price-button`、`order-qty-button`、`order-cancel-button`，不是上文的 `order-row-*`（所有 testid 不變，既有測試依賴）。
+- 委託列「三行版型」：OrderLines 的結構屬於 `order-action-sheet.tsx`（B3a），不改結構，只用 `orders.css.ts` 的 class 調整外觀（方向膠囊以 CSS `order` 排最前、狀態膠囊靠右）。有券商訊息、已取消量或路由時仍會多出第 4、5 行；同一份樣式也套用到委託操作面板的摘要。
+- 「刪除已選」用 danger 外框而非實心，避免在台灣配色下與紅色買進鍵混淆。
+- 委託頁的更新鍵保留文字「⟳ 更新（N）」（精確文字測試）；持倉頁的 ⟳ 改用 IconButton（RotateCw），aria-label、testid 與「請按「⟳」」說明文字不變。
+- 兩頁都改用自己的 page class（左右內距 0，邊距由 PageHeader、GroupedSection 與各區塊自帶 16px＋安全區），不再用 `layout.page`，避免邊距疊成兩倍。
+- 持倉風險指標用 ProgressBar（滿格 300%，100% 危險線約在三分之一），不是 RatioBar：只有一個數值、沒有左右兩段。等級文字保留，數值文字改為 foreground。
+- 持倉組標頭的損益小計改 foreground 加正負號，不用漲跌色（§4.8 規則 9：頁面底色上不放漲跌色小字）。
+- 平倉說明與切換帳戶面板仍是 `{closeKey !== null && <CloseSheet open />}` 條件掛載，沒有退場動畫；改成常駐 `open={…}` 會在退場期間凍結內容，屬於行為變更，本階段只改樣式。
+- 平倉、全部刪單、批次刪單面板的版面改為滑塊與取消放 SheetFooter、回饋改 InlineNote；送出函式、閘門、busy／resetKey 與結果未知處理不變。
+- 委託明細面板依上文設為 `detent="large"`，內容少時面板也撐到最大高度。
+- `orders.css.ts` 中舊委託操作面板的樣式（改用 `order-action.css.ts` 後已無引用）與未使用的 `warn` 已在 B4 刪除。
+- 待實機確認：選取工具列在 bar 材質上的可讀性與 `--sj-accessory-h` 讓出的空間、面板開啟時材質轉實心、iOS 15.4 的 `accent-color` 勾選框（更舊版本顯示預設樣式）、三種字級下時間軸圓點對齊、字級「大」時持倉列與摘要卡改欄、持倉損益合計 PriceFlash 不過度閃爍。
+
 ### 7.8 帳戶與 HTTPS 說明頁
 
 - 帳戶頁維持同一頁的區塊順序（`account-page.tsx:45-57`），不改讀取與刷新時機；`account-ui.tsx` 的 `Card`、`CollapsibleCard`、`Item`、`Switch`、`Segmented` 改為 GroupedSection 外觀（標題移到卡片外 footnote、資訊列 ≥44px、髮絲分隔），props 與 testId 不變；CollapsibleCard 展開立即、內容 150ms 淡入、chevron 旋轉；Switch 拇指改 `transform: translateX`（取代 `account.css.ts:189` 的 left 轉場）。
 - 顯示區（`display-card.tsx`）新增「降低透明度：跟隨系統／開／關」Segmented（寫 `ui-settings.transparency`，立即改寫 html 屬性）。本裝置區（`device-settings-section.tsx`）新增「介面觸覺回饋（Android）」Switch（`ui-settings.uiHaptics`）。風控區註腳「此鎖定只對本裝置有效」沿用。
 - HTTPS 說明頁（`secure-context-gate.tsx`、`gate.css.ts`）：仍不建立任何連線；頁面 `overflow-x: hidden`、`overflow-wrap: anywhere`；診斷表 `grid-template-columns: auto minmax(0, 1fr)`；網址與診斷值保留 `SELECTABLE`（已用於 `secure-context-gate.tsx` 與 `diagnostics-card.tsx`）；步驟改編號卡；靜態、無材質、無動畫。裁切原因以 390 寬行動模擬 @2x 重拍確認。
+
+**第二階段實作差異**（以程式碼為準）：
+
+- CollapsibleCard 的標題放在卡片內第一列（整列可點、≥44px、headline 字級、chevron 在右側旋轉），不是移到卡片外的 footnote：已實現損益、玉山帳務概覽、預收／圈存預設收合，標題在卡片外時收合後只剩一行孤立的灰色小字。Card 的標題仍依上文放在卡片外 footnote。
+- Switch 開啟色由 success（綠）改為 accent（§4.8 規則 5：accent 用於開關，綠色留給 LIVE 等狀態）。
+- Item 的 warn 色調改為 foreground 文字＋amber 圖示，不再用 amber 文字（§4.8 規則 4、§6.11）；warning、badgeWarn、confirmWarn 同樣改為 foreground 文字，amber 只留給左側條與框線。
+- 期貨風險指標條與流量條改用 ProgressBar（scaleX，§6.12）；上文沒有列出，但原本的 width 轉場違反「只動畫 transform／opacity」。
+- 展開鍵所在列（持倉明細、玉山明細等）文字色由 mutedForeground 改為 accent，提示可點（§4.8 規則 5）。
+- HTTPS 說明頁診斷表的值改為靠左對齊（UA、來源等長值換行後較好讀）；區網提示文字與 SELECTABLE 不變。
+- `account-page.tsx` 未改：區塊順序與讀取時機原本就符合本節。
+- 待實機確認：390 寬 @2x 有無水平溢出；字級「大」時漲跌配色分段（「台灣（紅漲綠跌）」「國際（綠漲紅跌）」）可能放不下（`ui/segmented` 為 nowrap 且不裁切）；淺色主題 smallButton 只靠 e1 陰影分界的對比；dt／dd 固定行高後多行值與標籤頂端對齊的觀感。
 
 ---
 
@@ -874,6 +927,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 低階 Android 預設降低透明度；Chrome DevTools 4× CPU 降速下面板拖曳、滑塊、自選 200 列捲動 p95 幀時間 ≤16.7ms、無 >50ms long task；實機 30 分鐘記憶體不持續成長。
 - 首屏 JS（gzip）增量估計：spring＋tween 0.9、gesture 0.9、prefs／haptics／ui-settings 0.5、sheet-stack＋sheet-context 0.5、BottomSheet v2 增量 2.0、SlideToConfirm v2 增量 0.6、ToastHost v2 增量 0.9、殼層（slots、捲動記憶、html 屬性、狀態列）0.9、Segmented＋IconButton＋PageHeader 0.7、新增 lucide 圖示約 9 個 1.5 → **合計約 9.4 KiB**（目標首屏 ≤218 KiB，上限增量 10 KiB）。Stepper、DirectionToggle、QuickChips、PopUpButton、Grouped、InlineNote 等落在既有 lazy chunk。CSS（gzip）增量 ≤12 KiB。
 - 量測：`pnpm exec vite build --config vite.fork.config.ts` 後依規格 §9.4 加總 `dist/mobile.html` 引用的 script 與 modulepreload gzip 大小，PR 附前後數字。
+- **實測（第二階段後）**：手機首屏 JS（gzip）**226.3 KiB**，超出本節目標 ≤218 KiB 約 8 KiB；仍在硬性上限 400 KB 內（規格 §9.4）。**待辦**：找出超出目標的增量來源（逐 chunk 比對第一階段前後的建置），能延後載入的移到 lazy chunk；若確認無法壓回，需由使用者決定是否放寬目標。
 
 ---
 
@@ -891,6 +945,8 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 | `app.test.tsx` | `mobile-shell`、`mobile-tab-bar` 等存在；mock BottomSheet | 結構可改、testid 保留；ResizeObserver 等需守衛 |
 | **刻意更新 1** `toast-host.test.tsx:24` | 以 `button` 找通知 | 改為 `n.props['data-testid'] === 'toast-item'`；className、role、第一個 span 為標題、內文、DOM 順序斷言不變 |
 | **刻意更新 2** `positions-page.test.tsx:451` | `style.width === '50%'` | 改 `style.transform === 'scaleX(0.5)'` |
+| **刻意更新 3** `depth-ladder.test.tsx`（第二階段） | 「ticket 變體不顯示內外盤比」 | 與 §7.3「ticket 變體也顯示內外盤比」衝突，刪除該斷言；改由新增案例驗證 ticket 變體顯示內外盤比（aria-label 文字標示內盤／外盤）、沒有內外盤量或試撮時仍隱藏 |
+| **刻意更新 4** `styles/primitives.test.ts`（B4） | `controls.routeBadge` 的鍵為 production／simulation／unknown | 舊 `routeBadge` 匯出已無引用並刪除（樣式在 `route-badge.css.ts`，§6.5），刪除該斷言；button、tradeButton、滑塊的斷言不變 |
 
 其他測試不得降低斷言；新增測試見 §10 與各區塊。
 
@@ -927,6 +983,8 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
 9. 淺色綠對白 4.34（theme 層級，另案）。
 10. 通知雙錨點的使用者接受度（G1）。
 11. 面板退場期間 TicketForm 多存活約 0.3–0.5 秒仍訂閱行情：無副作用，但 `onBusyChange(false)` 須在真正卸載時呼叫（沿用 `order-ticket-sheet.tsx:116`）。
+12. 首屏 JS（gzip）第二階段後為 226.3 KiB，超出目標 ≤218 KiB 約 8 KiB（§13 待辦）。
+13. 第二階段各畫面的實機項目（§7.2、§7.7、§7.8 的「待實機確認」，以及 §7.3 的長按震動與選價列捲動）尚未驗收；實機驗收清單見規格 §14.3。
 
 ---
 
