@@ -204,6 +204,45 @@ export function lastMovingAverage(candles: readonly Pick<Candle, 'time' | 'close
     return { time: candles[candles.length - 1]!.time, value: Number((sum / period).toFixed(4)) };
 }
 
+// ---- 走勢：均價線、當日最高最低 ----
+
+/**
+ * 走勢的均價線（由 1 分 K 估算）：累計（典型價 (H+L+C)/3 × 量）／累計量，與桌面 intraday-chart 相同。
+ * 1 分 K 歷史沒有逐筆成交金額，所以是估算；即時成交有 avg_price 時由圖表改用交易所均價。
+ * 量為 0 的開頭幾根沒有均價（不畫）。
+ */
+export function intradayAverage(candles: readonly Candle[]): LinePoint[] {
+    const out: LinePoint[] = [];
+    let cumV = 0;
+    let cumPV = 0;
+    for (const c of candles) {
+        if (c.volume > 0) {
+            cumV += c.volume;
+            cumPV += ((c.high + c.low + c.close) / 3) * c.volume;
+        }
+        if (cumV > 0) out.push({ time: c.time, value: Number((cumPV / cumV).toFixed(4)) });
+    }
+    return out;
+}
+
+/** 走勢的當日最高、最低（K 棒的 high／low；沒有資料回傳 null） */
+export function dayHighLow(candles: readonly Pick<Candle, 'high' | 'low'>[]): { high: number; low: number } | null {
+    let high = -Infinity;
+    let low = Infinity;
+    for (const c of candles) {
+        if (Number.isFinite(c.high) && c.high > 0) high = Math.max(high, c.high);
+        if (Number.isFinite(c.low) && c.low > 0) low = Math.min(low, c.low);
+    }
+    return Number.isFinite(high) && Number.isFinite(low) ? { high, low } : null;
+}
+
+/** 圖例上的指標數值：千分位、固定小數位；沒有值顯示「—」 */
+export function formatIndicatorValue(value: number | undefined | null, decimals: number): string {
+    if (value === undefined || value === null || !Number.isFinite(value)) return '—';
+    const d = Math.max(0, Math.min(6, Math.floor(decimals)));
+    return value.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
 // ---- K 棒資料整形 ----
 
 /**

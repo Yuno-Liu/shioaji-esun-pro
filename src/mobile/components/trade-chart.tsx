@@ -1,17 +1,25 @@
-// src/mobile/components/trade-chart.tsx — 手機交易圖表（lightweight-charts v5；規格 §6.2、§9.3）
+// src/mobile/components/trade-chart.tsx — 手機交易圖表（lightweight-charts v5；規格 §6.2、§9.3、Phase 2／3）
 //
-// - 週期：走勢（BaselineSeries，以參考價為基準線）或 K 線（1／5／15／60 分、日）＋成交量＋MA(5／20)。
+// - 週期：走勢（BaselineSeries，以參考價為基準線＋均價線＋當日最高最低＋成交量）或
+//   K 線（1／5／15／60 分、日）＋成交量＋使用者自訂的技術指標（lib/mobile-indicators.ts；預設 MA5／MA20）。
+// - 指標：定義與計算重用 src/lib/indicator-defs.ts；主圖疊加用 LineSeries，副圖各自一個 pane，
+//   副圖畫參考線（levels）。左上角圖例顯示指標名稱與最新值；長按追蹤時顯示該根的值。
+//   即時更新：K 棒每 CHART_FLUSH_MS 合併重畫，指標另以 INDICATOR_FLUSH_MS 節流、只 update 變動的尾端點
+//   （不會每筆成交全部重算）；歷史重抓、裁切才整段 setData。
 // - 資料：fetchChartHistory() → kbarsToCandles() → aggregate()（走勢改挑當日時段）；最多 5,000 根；
-//   最後一根由即時成交（onAnyTick；指數用 quote_idx）更新，每 CHART_FLUSH_MS 合併重畫一次。
-//   試撮（simtrade）揭示價不入圖（與桌面相同），只用來偵測換時段。
+//   最後一根由即時成交（onAnyTick；指數用 quote_idx）更新。試撮（simtrade）揭示價不入圖（與桌面相同），只用來偵測換時段。
 // - 歷史新鮮度：chart-history-freshness.ts 依 (code, period) 決定沿用快取、先顯示快取再背景重抓、或換新 revision；
 //   ResumeGate 的 resumeSeq 改變（回前景）時背景重抓；走勢與 K 線都有缺口偵測（累計量顯示真的漏量才重抓）。
-// - 圖表實例只在商品、週期、配色改變時重建；重抓歷史沿用既有 chart／series 以 setData 更新，
+// - 圖表實例只在商品、週期、配色改變時重建；重抓歷史、改指標設定都沿用既有 chart（不重建），
 //   保留可見範圍（以距離最新一根的位置）與長按選價列。
 // - 水平線：由 chart-model.ts 的 PriceLineSpec 畫出（委託、成本、漲跌停、參考價）。
 // - 互動：單指拖曳平移、雙指縮放；長按進入追蹤模式（trackingMode），十字線價以 roundToTick 取整，
 //   放開後浮出「以 X 買進／賣出」→ openTicket({ source: 'chart' })。**只開下單面板，絕不直接送單**。
-//   點委託線標籤 → openOrderAction(tradeId, 'menu')。不支援拖曳委託線改價（規格 R7）。
+//   副圖上的十字線不拿來選價（座標不是價格）。點委託線標籤 → openOrderAction(tradeId, 'menu')。
+//   不支援拖曳委託線改價（規格 R7）。可互動區加 data-allow-pinch="true"（平台手勢防護略過這一區）。
+// - 橫向全螢幕：手機轉橫向（lib/chart-fullscreen.ts）或按「全螢幕」→ CSS 固定定位覆蓋全畫面（留安全區），
+//   上方週期＋指標＋「退出」，下方買進／賣出（只開下單面板）。iPhone Safari 沒有元素 Fullscreen API，
+//   手動進入時若支援才另對 <html> 呼叫 requestFullscreen（底部面板才仍看得到），不依賴它。
 
 import {
     BaselineSeries,
@@ -33,6 +41,8 @@ import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointer
 import { useQuote } from '../../hooks/use-stream';
 import { useResumeGate } from '../hooks/use-resume-gate';
 import { fetchChartHistory, nextChartHistoryRevision } from '../../lib/chart-history';
+import { DEF_BY_TYPE, type IndicatorDef, type OutputDef } from '../../lib/indicator-defs';
+import type { IndicatorPoint } from '../../lib/indicators';
 import { CLOSE_GRACE, pickIntradayWindow, sessionWindowFor, tickBucket, type SessionWindow } from '../../lib/intraday-session';
 import { onAnyTick } from '../../lib/stream';
 import { getChartColors, themeKey, useThemeSettings, type ChartColors } from '../../lib/theme-store';
@@ -40,14 +50,29 @@ import type { ContractInfo } from '../../lib/types/contract';
 import type { Candle } from '../../lib/types/market';
 import { aggregate, kbarsToCandles, nowWallClockUtc, wallClockToUtc } from '../../lib/utils/kbars';
 import { formatToTick, roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
+import { currentOrientationEnv, shouldAutoFullscreen } from '../lib/chart-fullscreen';
 import { getHistoryEntry, planHistory, setHistoryEntry } from '../lib/chart-history-freshness';
-import { intradayBars, lastMovingAverage, liveBarTime, movingAverage, priceLinesKey, type PriceLineSpec } from '../lib/chart-model';
-import { capBars, chartQueryRange, MAX_CHART_BARS, periodDef, type ChartPeriod } from '../lib/chart-ranges';
+import { dayHighLow, formatIndicatorValue, intradayAverage, intradayBars, liveBarTime, priceLinesKey, type PriceLineSpec } from '../lib/chart-model';
+import { capBars, CHART_PERIODS, chartQueryRange, MAX_CHART_BARS, periodDef, type ChartPeriod } from '../lib/chart-ranges';
+import {
+    indicatorLabel,
+    indicatorSettingsKey,
+    INDICATOR_PALETTE,
+    paletteColor,
+    useMobileIndicators,
+    usesPaletteColor,
+    type MobileIndicator,
+    type MobileIndicatorSettings,
+} from '../lib/mobile-indicators';
 import { openOrderAction, openTicket } from '../lib/mobile-store';
+import * as cs from '../styles/chart.css';
 import * as styles from '../styles/trade.css';
+import { IndicatorSheet } from './indicator-sheet';
 
 /** 即時成交合併重畫的間隔（行情 store 的 QUOTE_FLUSH_MS 未匯出，自行節流） */
 export const CHART_FLUSH_MS = 100;
+/** 指標的即時重算間隔（≥ 250 ms；只 update 變動的尾端點） */
+export const INDICATOR_FLUSH_MS = 500;
 /** 長按進入追蹤模式的時間與容許位移 */
 export const LONG_PRESS_MS = 450;
 export const LONG_PRESS_SLOP_PX = 10;
@@ -57,8 +82,8 @@ export const GAP_RELOAD_MIN_MS = 120_000;
 export const LINE_GAP_SECONDS = 180;
 /** K 線模式初次顯示的根數（手機寬度） */
 const INITIAL_VISIBLE_BARS = 80;
-const MA_PERIODS = [5, 20] as const;
-const MA_COLORS = ['#e0a43c', '#8e7cf0'] as const;
+/** 走勢均價線顏色 */
+const AVG_COLOR = INDICATOR_PALETTE[0]!;
 
 type Status = 'loading' | 'ready' | 'empty' | 'error';
 
@@ -68,6 +93,16 @@ interface OrderLabel {
     label: string;
     buy: boolean;
     y: number;
+}
+
+/** 圖例的一組（一個指標，或走勢的均價／最高／最低） */
+export interface LegendEntry {
+    id: string;
+    name: string;
+    color: string;
+    /** 0＝主圖；≥1＝副圖 */
+    pane: number;
+    values: { label: string; color: string; text: string }[];
 }
 
 const LINE_STYLE: Record<PriceLineSpec['kind'], { lineStyle: LineStyle; lineWidth: 1 | 2 }> = {
@@ -94,9 +129,51 @@ function lineColor(kind: PriceLineSpec['kind'], c: ChartColors): string {
     }
 }
 
+/**
+ * 指標輸出的顏色：多空方向的輸出（SuperTrend 多頭／空頭、DMI +DI／-DI）跟著使用者的漲跌配色；
+ * 單一輸出的指標用調色盤；近白色（VWAP、ADX 預設）改用圖表文字色，淺色主題才看得見。
+ */
+export function indicatorOutputColor(item: Pick<MobileIndicator, 'color'>, def: IndicatorDef, o: OutputDef, c: ChartColors): string {
+    if (def.type === 'supertrend' || def.type === 'dmi') {
+        if (o.key === 'up' || o.key === 'plus') return c.up;
+        if (o.key === 'down' || o.key === 'minus') return c.down;
+    }
+    if (usesPaletteColor(def)) return paletteColor(item.color);
+    if (o.color.toLowerCase() === '#f5f7fa') return c.text;
+    return o.color;
+}
+
 const t = (time: number) => time as UTCTimestamp;
 
-export function TradeChart({ code, contract, period, lines }: { code: string; contract: ContractInfo; period: ChartPeriod; lines: readonly PriceLineSpec[] }) {
+interface IndOutput {
+    key: string;
+    label: string;
+    series: ISeriesApi<SeriesType>;
+    color: string;
+    histogram: boolean;
+    signed: boolean;
+    last: number | undefined;
+}
+
+interface IndRuntime {
+    item: MobileIndicator;
+    def: IndicatorDef;
+    params: Record<string, number>;
+    pane: number;
+    decimals: number;
+    outputs: IndOutput[];
+}
+
+export interface TradeChartProps {
+    code: string;
+    contract: ContractInfo;
+    period: ChartPeriod;
+    lines: readonly PriceLineSpec[];
+    /** 全螢幕上方的週期列切換；未提供時全螢幕只顯示目前週期 */
+    onPeriodChange?: (p: ChartPeriod) => void;
+}
+
+export function TradeChart({ code, contract, period, lines, onPeriodChange }: TradeChartProps) {
     const theme = useThemeSettings();
     const themeK = themeKey(theme);
     const colors = useMemo(() => getChartColors(theme), [themeK]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -106,13 +183,20 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
     contractRef.current = contract;
     const linesRef = useRef(lines);
     linesRef.current = lines;
+    const indicators = useMobileIndicators();
+    const settings = indicators.settings;
+    const settingsRef = useRef<MobileIndicatorSettings>(settings);
+    settingsRef.current = settings;
+    const settingsKey = indicatorSettingsKey(settings);
 
     const hostRef = useRef<HTMLDivElement | null>(null);
     const chartRef = useRef<IChartApi | null>(null);
     const mainRef = useRef<ISeriesApi<SeriesType> | null>(null);
-    const ingestRef = useRef<((price: number, tickTime: number, volume: number, total: number | null, sim: boolean) => void) | null>(null);
+    const ingestRef = useRef<((price: number, tickTime: number, volume: number, total: number | null, sim: boolean, avg?: number) => void) | null>(null);
     const lastReloadAt = useRef(0);
     const layoutRef = useRef<() => void>(() => undefined);
+    /** 指標設定改變：在既有圖表上重建指標 series（不重建圖表） */
+    const rebuildRef = useRef<(key: string) => void>(() => undefined);
     /** 載入失敗後「重新載入」：以新 revision 重抓（不重建圖表） */
     const retryRef = useRef<() => void>(() => undefined);
     /** ResumeGate 的 resumeSeq 改變時背景重抓 */
@@ -120,6 +204,8 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
     const resumeSeq = useResumeGate().resumeSeq;
     const resumeSeqRef = useRef(resumeSeq);
     resumeSeqRef.current = resumeSeq;
+    /** 主圖（pane 0）的高度：長按落在副圖時不選價 */
+    const mainPaneHeightRef = useRef<number | null>(null);
     // 長按追蹤狀態
     const trackingRef = useRef(false);
     const crossPriceRef = useRef<number | null>(null);
@@ -129,6 +215,17 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
     const [chartGen, setChartGen] = useState(0);
     const [orderLabels, setOrderLabels] = useState<OrderLabel[]>([]);
     const [pick, setPick] = useState<number | null>(null);
+    const [legend, setLegend] = useState<LegendEntry[]>([]);
+    const [paneCount, setPaneCount] = useState(0);
+    const [paneTops, setPaneTops] = useState<number[]>([]);
+    const [sheetOpen, setSheetOpen] = useState(false);
+
+    // ---- 全螢幕 ----
+    const [manualFs, setManualFs] = useState(false);
+    const [autoFs, setAutoFs] = useState(() => shouldAutoFullscreen(currentOrientationEnv()));
+    const [autoDismissed, setAutoDismissed] = useState(false);
+    const apiFsRef = useRef(false);
+    const fullscreen = manualFs || (autoFs && !autoDismissed);
 
     const isLine = period === 'line';
     const secType = contract.security_type;
@@ -144,6 +241,7 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
         const tick = tickSizeFor(ct, ct.reference > 0 ? ct.reference : 1);
         const precision = tickDecimals(tick);
         const priceFormat = { type: 'price' as const, precision, minMove: Number((10 ** -precision).toFixed(precision)) };
+        const isIndex = ct.security_type === 'IND';
 
         const chart = createChart(host, {
             autoSize: true,
@@ -192,18 +290,20 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
             });
         const vol = chart.addSeries(HistogramSeries, { priceFormat: { type: 'volume' }, priceScaleId: 'vol', lastValueVisible: false, priceLineVisible: false });
         chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
-        const maSeries = isLine
-            ? []
-            : MA_PERIODS.map((_, i) => chart.addSeries(LineSeries, {
-                color: MA_COLORS[i],
+        // 走勢：均價線（指數沒有成交量，不畫）
+        const avgSeries = isLine && !isIndex
+            ? chart.addSeries(LineSeries, {
+                color: AVG_COLOR,
                 lineWidth: 1,
                 priceLineVisible: false,
                 lastValueVisible: false,
                 crosshairMarkerVisible: false,
                 priceFormat,
-            }));
+            })
+            : null;
         chartRef.current = chart;
         mainRef.current = main;
+        mainPaneHeightRef.current = null;
 
         let cancelled = false;
         let loaded = false;
@@ -224,24 +324,89 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
         let flushTimer: ReturnType<typeof setTimeout> | null = null;
         let raf1: number | null = null;
         let raf2: number | null = null;
+        // 走勢：均價（與 bars 同索引；NaN＝沒有）、估算用的累計值、當日最高最低
+        let avgs: number[] = [];
+        let avgCumV = 0;
+        let avgCumPV = 0;
+        let hiLo: { high: number; low: number } | null = null;
+        let hiLine: IPriceLine | null = null;
+        let loLine: IPriceLine | null = null;
+        // K 線：指標
+        let inds: IndRuntime[] = [];
+        let builtKey: string | null = null;
+        let subPanes = 0;
+        let indDirtyTime = Infinity;
+        let indTimer: ReturnType<typeof setTimeout> | null = null;
+        /** 目前追蹤中的十字線資料（null＝顯示最新值） */
+        let crossData: Map<unknown, unknown> | null = null;
 
         const volPoint = (b: Candle) => ({ time: t(b.time), value: b.volume, color: b.close >= b.open ? c.upVol : c.downVol });
         const mainPoint = (b: Candle) => (isLine ? { time: t(b.time), value: b.close } : { time: t(b.time), open: b.open, high: b.high, low: b.low, close: b.close });
 
-        // 委託線標籤（HTML 按鈕）跟著價格座標走：資料或可見範圍變動後的下一個畫面重新定位
+        // ---- 圖例 ----
+        const seriesValue = (s: ISeriesApi<SeriesType>, fallback: number | undefined): number | undefined => {
+            if (!crossData) return fallback;
+            const d = crossData.get(s) as { value?: unknown } | undefined;
+            return typeof d?.value === 'number' ? d.value : undefined;
+        };
+        const publishLegend = () => {
+            if (cancelled) return;
+            const next: LegendEntry[] = [];
+            if (isLine) {
+                if (avgSeries) {
+                    const lastAvg = [...avgs].reverse().find(v => Number.isFinite(v));
+                    next.push({ id: 'avg', name: '均價', color: AVG_COLOR, pane: 0, values: [{ label: '', color: AVG_COLOR, text: formatIndicatorValue(seriesValue(avgSeries, lastAvg), precision) }] });
+                }
+                if (hiLo) {
+                    next.push({ id: 'high', name: '最高', color: c.text, pane: 0, values: [{ label: '', color: c.text, text: formatIndicatorValue(hiLo.high, precision) }] });
+                    next.push({ id: 'low', name: '最低', color: c.text, pane: 0, values: [{ label: '', color: c.text, text: formatIndicatorValue(hiLo.low, precision) }] });
+                }
+            } else {
+                for (const r of inds) {
+                    const single = r.outputs.length === 1;
+                    next.push({
+                        id: r.item.id,
+                        name: indicatorLabel(r.item),
+                        color: r.outputs[0]?.color ?? c.text,
+                        pane: r.pane,
+                        values: r.outputs.map(o => ({ label: single ? '' : o.label, color: o.color, text: formatIndicatorValue(seriesValue(o.series, o.last), r.decimals) })),
+                    });
+                }
+            }
+            setLegend(prev => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+        };
+
+        // 委託線標籤（HTML 按鈕）跟著價格座標走；副圖圖例跟著自己的 pane：資料或可見範圍變動後的下一個畫面重新定位
         const layoutLabels = () => {
             raf1 = raf2 = null;
             if (cancelled) return;
             const height = host.clientHeight;
+            let mainH = height - 24; // 底部留給時間軸
+            const tops: number[] = [];
+            if (subPanes > 0) {
+                try {
+                    const panes = chart.panes();
+                    let acc = 0;
+                    for (let i = 0; i < panes.length; i++) {
+                        tops.push(acc);
+                        acc += (panes[i]!.getHeight() || 0) + 1; // pane 分隔線 1px
+                    }
+                    const h0 = panes[0]?.getHeight();
+                    if (h0 && h0 > 0) mainH = h0;
+                } catch {
+                    // pane API 差異不能讓圖表掛掉
+                }
+            }
+            mainPaneHeightRef.current = subPanes > 0 ? mainH : null;
             const next: OrderLabel[] = [];
             for (const l of linesRef.current) {
                 if (!l.tradeId) continue;
                 const y = main.priceToCoordinate(l.price);
-                // 底部留給時間軸
-                if (y === null || y < 0 || y > height - 24) continue;
+                if (y === null || y < 0 || y > mainH) continue;
                 next.push({ key: l.key, tradeId: l.tradeId, label: l.label, buy: l.kind === 'order-buy', y: Math.round(y) });
             }
             setOrderLabels(prev => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+            setPaneTops(prev => (JSON.stringify(prev) === JSON.stringify(tops) ? prev : tops));
         };
         const scheduleLayout = () => {
             if (raf1 !== null || raf2 !== null || typeof requestAnimationFrame !== 'function') return;
@@ -252,10 +417,175 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
         };
         layoutRef.current = scheduleLayout;
 
+        // ---- 指標（K 線） ----
+        const indPoint = (o: IndOutput, p: IndicatorPoint) => (o.histogram
+            ? { time: t(p.time), value: p.value!, color: o.signed ? (p.value! >= 0 ? c.upVol : c.downVol) : o.color }
+            : { time: t(p.time), value: p.value! });
+        const lastDefined = (pts: IndicatorPoint[]) => {
+            for (let i = pts.length - 1; i >= 0; i--) if (pts[i]!.value !== undefined && Number.isFinite(pts[i]!.value)) return pts[i]!.value;
+            return undefined;
+        };
+        /** full：整段 setData；否則只 update 時間 ≥ indDirtyTime 的點 */
+        const computeIndicators = (full: boolean) => {
+            if (indTimer !== null && full) {
+                clearTimeout(indTimer);
+                indTimer = null;
+            }
+            const from = indDirtyTime;
+            indDirtyTime = Infinity;
+            for (const r of inds) {
+                let out: Record<string, IndicatorPoint[]>;
+                try {
+                    out = r.def.compute(bars, r.params);
+                } catch {
+                    continue; // 參數組合有問題不能讓圖表掛掉
+                }
+                for (const o of r.outputs) {
+                    const pts = out[o.key] ?? [];
+                    o.last = lastDefined(pts);
+                    try {
+                        if (full) {
+                            o.series.setData(pts.map(p => (p.value === undefined || !Number.isFinite(p.value) ? { time: t(p.time) } : indPoint(o, p))));
+                        } else {
+                            let i = pts.length;
+                            while (i > 0 && pts[i - 1]!.time >= from) i--;
+                            for (; i < pts.length; i++) {
+                                const p = pts[i]!;
+                                if (p.value !== undefined && Number.isFinite(p.value)) o.series.update(indPoint(o, p));
+                            }
+                        }
+                    } catch {
+                        // 早於序列尾端的更新會被拒絕：下次重新載入時重建
+                    }
+                }
+            }
+            publishLegend();
+        };
+        const flushIndicators = () => {
+            indTimer = null;
+            if (cancelled || indDirtyTime === Infinity) return;
+            computeIndicators(false);
+        };
+        const removeIndicators = () => {
+            for (const r of inds) {
+                for (const o of r.outputs) {
+                    try { chart.removeSeries(o.series); } catch { /* 已隨圖表移除 */ }
+                }
+            }
+            inds = [];
+            try {
+                for (let i = chart.panes().length - 1; i >= 1; i--) chart.removePane(i);
+            } catch {
+                // pane API 差異不能讓圖表掛掉
+            }
+        };
+        const buildIndicators = (key: string) => {
+            if (cancelled || builtKey === key) return;
+            builtKey = key;
+            const s = settingsRef.current;
+            try { vol.applyOptions({ visible: isLine || s.volume }); } catch { /* 舊版選項 */ }
+            removeIndicators();
+            subPanes = 0;
+            if (!isLine) {
+                let paneIdx = 1;
+                for (const item of s.items) {
+                    const def = DEF_BY_TYPE.get(item.type);
+                    if (!def) continue;
+                    const pane = def.category === 'pane' ? paneIdx++ : 0;
+                    const params: Record<string, number> = {};
+                    for (const p of def.params) params[p.key] = item.params[p.key] ?? p.def;
+                    const r: IndRuntime = {
+                        item,
+                        def,
+                        params,
+                        pane,
+                        decimals: pane === 0 ? precision : def.type === 'obv' ? 0 : 2,
+                        outputs: [],
+                    };
+                    const fmt = pane === 0 ? priceFormat : def.type === 'obv' ? { type: 'volume' as const } : { type: 'price' as const, precision: 2, minMove: 0.01 };
+                    for (const o of def.outputs) {
+                        const color = indicatorOutputColor(item, def, o, c);
+                        const common = { priceLineVisible: false, lastValueVisible: false, priceFormat: fmt };
+                        let series: ISeriesApi<SeriesType>;
+                        if (o.kind === 'histogram') {
+                            series = chart.addSeries(HistogramSeries, { ...common, color }, pane);
+                        } else {
+                            series = chart.addSeries(LineSeries, {
+                                ...common,
+                                color,
+                                lineWidth: o.width ?? 1,
+                                lineStyle: o.kind === 'dashed' ? LineStyle.Dashed : LineStyle.Solid,
+                                crosshairMarkerVisible: false,
+                                ...(o.kind === 'points' ? { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 1.5 } : {}),
+                            }, pane);
+                        }
+                        r.outputs.push({ key: o.key, label: o.label, series, color, histogram: o.kind === 'histogram', signed: !!o.signed, last: undefined });
+                    }
+                    // 副圖參考線（RSI 30／70、KD 20／80…）
+                    const first = r.outputs[0]?.series;
+                    if (pane > 0 && first && def.levels) {
+                        for (const lv of def.levels) {
+                            first.createPriceLine({ price: lv, color: c.grid, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: '' });
+                        }
+                    }
+                    inds.push(r);
+                }
+                subPanes = paneIdx - 1;
+                try {
+                    const panes = chart.panes();
+                    for (let i = 1; i < panes.length; i++) panes[i]!.setHeight(cs.PANE_HEIGHT_PX);
+                } catch {
+                    // pane API 差異不能讓圖表掛掉
+                }
+            }
+            setPaneCount(subPanes);
+            computeIndicators(true);
+            scheduleLayout();
+        };
+        rebuildRef.current = buildIndicators;
+
+        // ---- 走勢：均價、最高最低 ----
+        const recomputeLineExtras = () => {
+            if (!isLine) return;
+            const pts = intradayAverage(bars);
+            const byTime = new Map(pts.map(p => [p.time, p.value]));
+            avgs = bars.map(b => byTime.get(b.time) ?? NaN);
+            avgCumV = 0;
+            avgCumPV = 0;
+            for (const b of bars) {
+                if (b.volume > 0) {
+                    avgCumV += b.volume;
+                    avgCumPV += ((b.high + b.low + b.close) / 3) * b.volume;
+                }
+            }
+            hiLo = dayHighLow(bars);
+        };
+        const applyHiLoLines = () => {
+            if (!isLine) return;
+            if (!hiLo) {
+                for (const pl of [hiLine, loLine]) if (pl) try { main.removePriceLine(pl); } catch { /* 已移除 */ }
+                hiLine = loLine = null;
+                return;
+            }
+            const opts = (price: number, title: string) => ({ price, color: c.text, lineWidth: 1 as const, lineStyle: LineStyle.Dotted, lineVisible: false, axisLabelVisible: true, title });
+            if (hiLine) hiLine.applyOptions({ price: hiLo.high });
+            else hiLine = main.createPriceLine(opts(hiLo.high, '最高'));
+            if (loLine) loLine.applyOptions({ price: hiLo.low });
+            else loLine = main.createPriceLine(opts(hiLo.low, '最低'));
+        };
+
         const applyAll = () => {
             main.setData(bars.map(mainPoint));
             vol.setData(bars.map(volPoint));
-            maSeries.forEach((s, i) => s.setData(movingAverage(bars, MA_PERIODS[i]!).map(p => ({ time: t(p.time), value: p.value }))));
+            if (isLine) {
+                recomputeLineExtras();
+                avgSeries?.setData(bars.map((b, i) => (Number.isFinite(avgs[i]) ? { time: t(b.time), value: avgs[i]! } : { time: t(b.time) })));
+                applyHiLoLines();
+                publishLegend();
+            } else {
+                indDirtyTime = Infinity;
+                computeIndicators(true);
+            }
             scheduleLayout();
         };
 
@@ -268,21 +598,31 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
                 applyAll();
                 return;
             }
+            const from = dirtyFrom;
             try {
-                for (let i = dirtyFrom; i < bars.length; i++) {
+                for (let i = from; i < bars.length; i++) {
                     const b = bars[i]!;
                     main.update(mainPoint(b));
                     vol.update(volPoint(b));
-                    maSeries.forEach((s, k) => {
-                        const n = MA_PERIODS[k]!;
-                        const ma = lastMovingAverage(bars.slice(Math.max(0, i + 1 - n), i + 1), n);
-                        if (ma) s.update({ time: t(ma.time), value: ma.value });
-                    });
+                    if (avgSeries && Number.isFinite(avgs[i])) avgSeries.update({ time: t(b.time), value: avgs[i]! });
                 }
             } catch {
                 // 早於序列尾端的更新會被拒絕：不讓畫面掛掉，下次重新載入時重建
             }
             dirtyFrom = -1;
+            if (isLine) {
+                const prev = hiLo ? `${hiLo.high}|${hiLo.low}` : '';
+                for (let i = from; i < bars.length; i++) {
+                    const b = bars[i]!;
+                    hiLo = hiLo ? { high: Math.max(hiLo.high, b.high), low: Math.min(hiLo.low, b.low) } : { high: b.high, low: b.low };
+                }
+                if ((hiLo ? `${hiLo.high}|${hiLo.low}` : '') !== prev) applyHiLoLines();
+                publishLegend();
+            } else if (inds.length > 0) {
+                // 指標節流：不每筆成交全部重算
+                indDirtyTime = Math.min(indDirtyTime, bars[from]?.time ?? Infinity);
+                if (indTimer === null) indTimer = setTimeout(flushIndicators, INDICATOR_FLUSH_MS);
+            }
             scheduleLayout();
         };
 
@@ -380,7 +720,7 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
             else void load(nextChartHistoryRevision(), 'refresh');
         };
 
-        const ingest = (price: number, tickTime: number, volume: number, total: number | null, sim: boolean) => {
+        const ingest = (price: number, tickTime: number, volume: number, total: number | null, sim: boolean, tickAvg?: number) => {
             if (!loaded || cancelled || !Number.isFinite(tickTime)) return;
             let time: number;
             if (isLine) {
@@ -418,6 +758,15 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
                 return; // 比最後一根還舊的成交不回頭改
             }
             cumV += volume;
+            if (isLine && avgSeries) {
+                // 均價：成交帶交易所均價就用它，否則以累計成交金額／量估算
+                if (volume > 0) {
+                    avgCumV += volume;
+                    avgCumPV += price * volume;
+                }
+                const v = tickAvg !== undefined && Number.isFinite(tickAvg) && tickAvg > 0 ? tickAvg : avgCumV > 0 ? avgCumPV / avgCumV : NaN;
+                avgs[bars.length - 1] = v;
+            }
             if (!shownReady) {
                 shownReady = true;
                 setStatus('ready');
@@ -429,23 +778,34 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
         chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleLayout);
         chart.timeScale().subscribeSizeChange(scheduleLayout);
 
-        // 長按追蹤：只在追蹤中記錄十字線價格
+        // 十字線：長按追蹤時記錄價格（只在主圖）；圖例顯示該根的值
         chart.subscribeCrosshairMove(param => {
-            if (!trackingRef.current || !param.point) return;
-            const p = main.coordinateToPrice(param.point.y);
-            if (p !== null && Number.isFinite(p)) crossPriceRef.current = p;
+            if (trackingRef.current && param.point) {
+                if (param.paneIndex !== undefined && param.paneIndex > 0) crossPriceRef.current = null;
+                else {
+                    const p = main.coordinateToPrice(param.point.y);
+                    if (p !== null && Number.isFinite(p)) crossPriceRef.current = p;
+                }
+            }
+            const next = param.time !== undefined && param.seriesData ? (param.seriesData as Map<unknown, unknown>) : null;
+            if (next === null && crossData === null) return;
+            crossData = next;
+            publishLegend();
         });
 
         // 即時成交（只取目前商品；連續月別名由 stream 以別名代碼再送一次）
-        const offTick = ct.security_type === 'IND' ? () => undefined : onAnyTick(tk => {
+        const offTick = isIndex ? () => undefined : onAnyTick(tk => {
             if (tk.code !== code || tk.intraday_odd) return;
             const total = Number(tk.total_volume);
-            ingest(Number(tk.close), wallClockToUtc(`${tk.date}T${tk.time}`), tk.volume, Number.isFinite(total) ? total : null, tk.simtrade === true);
+            const avg = tk.avg_price === undefined ? undefined : Number(tk.avg_price);
+            ingest(Number(tk.close), wallClockToUtc(`${tk.date}T${tk.time}`), tk.volume, Number.isFinite(total) ? total : null, tk.simtrade === true, avg);
         });
 
         setStatus('loading');
         setPick(null);
         setOrderLabels([]);
+        setLegend([]);
+        setPaneCount(0);
         setChartGen(g => g + 1);
         const plan = planHistory(getHistoryEntry(code, period), Date.now(), resumeSeqRef.current);
         if (plan.kind === 'fetch') void load(nextChartHistoryRevision(), 'initial');
@@ -461,20 +821,26 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
             offTick();
             ingestRef.current = null;
             layoutRef.current = () => undefined;
+            rebuildRef.current = () => undefined;
             retryRef.current = () => undefined;
             resumeRefreshRef.current = () => undefined;
             if (flushTimer !== null) clearTimeout(flushTimer);
+            if (indTimer !== null) clearTimeout(indTimer);
             if (typeof cancelAnimationFrame === 'function') {
                 if (raf1 !== null) cancelAnimationFrame(raf1);
                 if (raf2 !== null) cancelAnimationFrame(raf2);
             }
             chartRef.current = null;
             mainRef.current = null;
+            mainPaneHeightRef.current = null;
             chart.remove();
         };
-        // 合約、配色、resumeSeq 以 ref 讀取；只有商品、週期、配色鍵才重建
+        // 合約、配色、resumeSeq、指標設定以 ref 讀取；只有商品、週期、配色鍵才重建
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [code, secType, period, themeK, isLine]);
+
+    // 指標設定改變（或圖表重建後）：在既有圖表上重建指標 series
+    useEffect(() => { rebuildRef.current(settingsKey); }, [settingsKey, chartGen]);
 
     // 回前景（resumeSeq 改變）：背景重抓歷史，補上背景期間缺的一段
     useEffect(() => { resumeRefreshRef.current(resumeSeq); }, [resumeSeq]);
@@ -517,6 +883,74 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
         };
     }, [linesKey, chartGen]);
 
+    // ---- 全螢幕 ----
+
+    // 手機轉橫向自動進入；轉回直向時清掉「這次橫向已退出」
+    useEffect(() => {
+        if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+        const onChange = () => {
+            const a = shouldAutoFullscreen(currentOrientationEnv());
+            setAutoFs(a);
+            if (!a) setAutoDismissed(false);
+        };
+        window.addEventListener('resize', onChange);
+        window.addEventListener('orientationchange', onChange);
+        const so = typeof screen !== 'undefined' ? (screen as { orientation?: EventTarget }).orientation : undefined;
+        try { so?.addEventListener?.('change', onChange); } catch { /* 舊瀏覽器 */ }
+        return () => {
+            window.removeEventListener('resize', onChange);
+            window.removeEventListener('orientationchange', onChange);
+            try { so?.removeEventListener?.('change', onChange); } catch { /* 舊瀏覽器 */ }
+        };
+    }, []);
+
+    // 使用者從系統（返回鍵）離開 Fullscreen API 時，一併離開 CSS 全螢幕
+    useEffect(() => {
+        if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+        const onFsChange = () => {
+            if (apiFsRef.current && !document.fullscreenElement) {
+                apiFsRef.current = false;
+                setManualFs(false);
+            }
+        };
+        document.addEventListener('fullscreenchange', onFsChange);
+        return () => {
+            document.removeEventListener('fullscreenchange', onFsChange);
+            if (apiFsRef.current && document.fullscreenElement) {
+                apiFsRef.current = false;
+                void document.exitFullscreen?.().catch(() => undefined);
+            }
+        };
+    }, []);
+
+    // 尺寸改變：autoSize 會跟著容器 resize；委託線標籤與副圖圖例重新定位
+    useEffect(() => { layoutRef.current(); }, [fullscreen, paneCount]);
+
+    const enterFullscreen = () => {
+        setManualFs(true);
+        setAutoDismissed(false);
+        // 對 <html> 而不是圖表元素：下單、指標等底部面板在圖表之外，仍要看得到
+        try {
+            const root = typeof document !== 'undefined' ? document.documentElement : null;
+            if (root && document.fullscreenEnabled && !document.fullscreenElement && typeof root.requestFullscreen === 'function') {
+                apiFsRef.current = true;
+                void root.requestFullscreen().catch(() => { apiFsRef.current = false; });
+            }
+        } catch {
+            apiFsRef.current = false;
+        }
+    };
+    const exitFullscreen = () => {
+        setManualFs(false);
+        if (autoFs) setAutoDismissed(true);
+        if (apiFsRef.current) {
+            apiFsRef.current = false;
+            try {
+                if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+            } catch { /* 不支援 */ }
+        }
+    };
+
     // ---- 長按 → 追蹤模式 → 放開後浮出「以 X 買進／賣出」 ----
 
     const clearPress = () => {
@@ -538,7 +972,9 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
             if (!host || !series) return;
             trackingRef.current = true;
             const rect = host.getBoundingClientRect();
-            const p = series.coordinateToPrice(y - rect.top);
+            const mainH = mainPaneHeightRef.current;
+            // 落在副圖：座標不是價格，不選價
+            const p = mainH !== null && y - rect.top > mainH ? null : series.coordinateToPrice(y - rect.top);
             crossPriceRef.current = p !== null && Number.isFinite(p) ? p : null;
             setPick(null);
             try { navigator.vibrate?.(10); } catch { /* iOS 不支援 */ }
@@ -568,18 +1004,66 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
         setPick(null);
     };
 
+    const tradable = secType !== 'IND' && !contract.combo;
+    const mainLegend = legend.filter(l => l.pane === 0 || paneTops[l.pane] === undefined);
+    const paneLegends = legend.filter(l => l.pane > 0 && paneTops[l.pane] !== undefined);
+    const frameClass = fullscreen ? cs.frameFullscreen : cs.frame[(Math.min(paneCount, 2)) as 0 | 1 | 2];
+    const periodLabel = CHART_PERIODS.find(p => p.key === period)?.label ?? '';
+
+    const renderLegend = (entries: LegendEntry[], top?: number) => (
+        <div className={cs.legend} style={top !== undefined ? { top: `${top + 4}px` } : undefined} data-testid='chart-legend' aria-live='off'>
+            {entries.map(l => (
+                <span key={l.id} className={cs.legendItem}>
+                    <span className={cs.legendName} style={{ color: l.color }}>{l.name}</span>
+                    {l.values.map((v, i) => (
+                        <span key={i}>
+                            {' '}
+                            {v.label && <span style={{ color: v.color }}>{v.label} </span>}
+                            <span className={cs.legendValue}>{v.text}</span>
+                        </span>
+                    ))}
+                </span>
+            ))}
+        </div>
+    );
+
     return (
-        <div>
+        <div
+            className={fullscreen ? cs.rootFullscreen : cs.root}
+            data-testid='trade-chart-root'
+            data-fullscreen={fullscreen ? 'true' : 'false'}
+            role={fullscreen ? 'dialog' : undefined}
+            aria-label={fullscreen ? `${contract.name || code} 全螢幕圖表` : undefined}
+        >
+            {fullscreen && (
+                <div className={cs.fsBar} data-testid='chart-fs-bar'>
+                    <span className={cs.fsTitle}>{contract.name || code}</span>
+                    <div className={cs.fsPeriods} role='group' aria-label='圖表週期'>
+                        {onPeriodChange
+                            ? CHART_PERIODS.map(p => (
+                                <button key={p.key} type='button' className={cs.fsPeriod} aria-pressed={period === p.key} onClick={() => onPeriodChange(p.key)}>
+                                    {p.label}
+                                </button>
+                            ))
+                            : <span className={cs.fsTitle}>{periodLabel}</span>}
+                    </div>
+                    <button type='button' className={cs.toolButton} onClick={() => setSheetOpen(true)} data-testid='chart-indicators'>指標</button>
+                    <button type='button' className={cs.exitButton} onClick={exitFullscreen} data-testid='chart-fs-exit'>退出全螢幕</button>
+                </div>
+            )}
             <div
-                className={styles.chartWrap}
+                className={frameClass}
                 onPointerDown={onPointerDown}
                 onPointerMove={onPointerMove}
                 onPointerUp={onPointerEnd}
                 onPointerCancel={onPointerEnd}
                 onContextMenu={e => e.preventDefault()}
+                data-allow-pinch='true'
                 data-testid='trade-chart'
             >
                 <div ref={hostRef} className={styles.chartHost} />
+                {mainLegend.length > 0 && renderLegend(mainLegend)}
+                {paneLegends.map(l => <div key={l.id}>{renderLegend([l], paneTops[l.pane])}</div>)}
                 {orderLabels.map(l => (
                     <button
                         key={l.key}
@@ -620,13 +1104,22 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
                     </div>
                 )}
             </div>
-            {!isLine && (
-                <p className={styles.chartNote}>
-                    <span style={{ color: MA_COLORS[0] }}>MA5</span>　<span style={{ color: MA_COLORS[1] }}>MA20</span>
-                    {period === '1D' && '　日 K 由 1 分 K 聚合，未含除權息調整'}
-                </p>
+            {!fullscreen && (
+                <div className={cs.toolRow}>
+                    <p className={cs.toolNote}>
+                        {isLine ? '長按圖表選價位，放開後可帶價開啟下單面板' : period === '1D' ? '日 K 由 1 分 K 聚合，未含除權息調整' : '長按圖表選價位'}
+                    </p>
+                    <button type='button' className={cs.toolButton} onClick={() => setSheetOpen(true)} data-testid='chart-indicators'>指標</button>
+                    <button type='button' className={cs.toolButton} onClick={enterFullscreen} data-testid='chart-fs-enter'>全螢幕</button>
+                </div>
             )}
-            {isLine && <p className={styles.chartNote}>長按圖表選價位，放開後可帶價開啟下單面板</p>}
+            {fullscreen && tradable && (
+                <div className={cs.fsTradeRow}>
+                    <button type='button' className={cs.fsTradeButton.buy} onClick={() => openTicket({ code, action: 'Buy', source: 'button' })} data-testid='chart-fs-buy'>買 進</button>
+                    <button type='button' className={cs.fsTradeButton.sell} onClick={() => openTicket({ code, action: 'Sell', source: 'button' })} data-testid='chart-fs-sell'>賣 出</button>
+                </div>
+            )}
+            <IndicatorSheet open={sheetOpen} onClose={() => setSheetOpen(false)} lineMode={isLine} />
         </div>
     );
 }

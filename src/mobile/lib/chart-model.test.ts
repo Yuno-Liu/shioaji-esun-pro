@@ -7,8 +7,11 @@ import type { AccountedTrade, OrderStatusName } from '../../lib/types/order';
 import type { AccountedPosition } from '../../lib/types/portfolio';
 import {
     chartPriceLines,
+    dayHighLow,
     depthMarkText,
     depthOrderMarks,
+    formatIndicatorValue,
+    intradayAverage,
     intradayBars,
     lastMovingAverage,
     limitLines,
@@ -265,5 +268,29 @@ describe('liveBarTime', () => {
         expect(liveBarTime(5, t)).toBe(9 * 3600 + 300);
         expect(liveBarTime(60, t)).toBe(10 * 3600);
         expect(liveBarTime(1440, 86400 * 3 + t)).toBe(86400 * 3);
+    });
+});
+
+describe('走勢均價線、當日最高最低、圖例數值（W2）', () => {
+    const bar = (time: number, high: number, low: number, close: number, volume: number): Candle => ({ time, open: close, high, low, close, volume });
+
+    it('intradayAverage：累計典型價×量／累計量；開頭量為 0 的 K 棒沒有均價', () => {
+        const pts = intradayAverage([bar(60, 10, 10, 10, 0), bar(120, 12, 9, 9, 10), bar(180, 13, 11, 12, 30)]);
+        expect(pts.map(p => p.time)).toEqual([120, 180]);
+        expect(pts[0]!.value).toBeCloseTo(10, 4);
+        expect(pts[1]!.value).toBeCloseTo((10 * 10 + 12 * 30) / 40, 4);
+        expect(intradayAverage([])).toEqual([]);
+    });
+
+    it('dayHighLow：最高／最低；忽略 0 與非數字；沒有資料回傳 null', () => {
+        expect(dayHighLow([bar(1, 12, 9, 10, 1), bar(2, 15, 0, 11, 1), bar(3, NaN, 8, 9, 1)])).toEqual({ high: 15, low: 8 });
+        expect(dayHighLow([])).toBeNull();
+    });
+
+    it('formatIndicatorValue：千分位、固定小數位；沒有值顯示「—」', () => {
+        expect(formatIndicatorValue(1234.5678, 2)).toBe('1,234.57');
+        expect(formatIndicatorValue(70, 0)).toBe('70');
+        expect(formatIndicatorValue(undefined, 2)).toBe('—');
+        expect(formatIndicatorValue(NaN, 2)).toBe('—');
     });
 });
