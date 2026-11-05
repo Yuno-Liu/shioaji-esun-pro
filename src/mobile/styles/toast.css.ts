@@ -38,10 +38,14 @@ export const toast = styleVariants({
     deal: [toastBase, { borderColor: vars.color.accent }],
     ok: [toastBase, { borderColor: vars.color.success }],
     err: [toastBase, { borderColor: vars.color.danger }],
+    /** 結果未知：琥珀色（theme 的 amber 警示色），與確定未送出的紅色區分 */
+    warn: [toastBase, { borderColor: vars.color.amber }],
     info: [toastBase, { borderColor: vars.color.borderBright }],
 });
 
 export const title = style({ display: 'block', fontWeight: 700, marginBottom: '2px' });
+/** 結果未知的標題也用琥珀色（不只靠邊框顏色） */
+export const titleWarn = style([title, { color: vars.color.amber }]);
 
 export const line = styleVariants({
     plain: { display: 'block', color: vars.color.foreground },
