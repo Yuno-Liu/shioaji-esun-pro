@@ -292,16 +292,6 @@ export const deviceOnly = style({
     color: vars.color.foreground,
 });
 
-export const comingSoon = style({
-    flex: '0 0 auto',
-    padding: '2px 8px',
-    borderRadius: vars.radius.md,
-    border: `1px dashed ${vars.color.borderBright}`,
-    color: vars.color.mutedForeground,
-    fontSize: '0.8125rem',
-    whiteSpace: 'nowrap',
-});
-
 export const meter = style({
     position: 'relative',
     height: '6px',
@@ -325,4 +315,199 @@ export const ua = style({
     fontFamily: vars.font.mono,
     color: vars.color.mutedForeground,
     wordBreak: 'break-all',
+});
+
+// ---- 共用：漲跌方向文字色（買進／正值用 up、賣出／負值用 down；文字另帶正負號，不只靠顏色） ----
+
+export const dir = styleVariants({
+    up: { color: vars.color.up },
+    down: { color: vars.color.down },
+    flat: {},
+});
+
+/** 可展開區塊的標題鍵（整列皆可點，≥ 44px） */
+export const disclosure = style({
+    flex: '1 1 auto',
+    display: 'flex',
+    width: '100%',
+    alignItems: 'center',
+    gap: vars.space.xs,
+    minHeight: TOUCH_MIN,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    color: vars.color.foreground,
+    fontSize: '1.0625rem',
+    fontWeight: 700,
+    textAlign: 'left',
+    selectors: {
+        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '2px', borderRadius: vars.radius.md },
+    },
+});
+
+export const badge = style({
+    display: 'inline-block',
+    marginLeft: vars.space.xs,
+    padding: '0 6px',
+    borderRadius: vars.radius.sm,
+    border: `1px solid ${vars.color.borderBright}`,
+    color: vars.color.mutedForeground,
+    fontSize: '0.75rem',
+    fontWeight: 600,
+    whiteSpace: 'nowrap',
+    verticalAlign: 'middle',
+});
+
+export const badgeWarn = style({ borderColor: vars.color.amber, color: vars.color.amber });
+
+export const toggleRow = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: vars.space.xs,
+    width: '100%',
+    minHeight: TOUCH_MIN,
+    marginTop: vars.space.xs,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    color: vars.color.mutedForeground,
+    fontSize: '0.875rem',
+    textAlign: 'left',
+    selectors: {
+        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '2px', borderRadius: vars.radius.md },
+    },
+});
+
+// ---- 期貨風險指標色條 ----
+
+export const riskTrack = style({
+    position: 'relative',
+    height: '8px',
+    margin: `${vars.space.xs} 0 0`,
+    borderRadius: '4px',
+    background: vars.color.muted,
+    overflow: 'hidden',
+});
+
+const riskFillBase = {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: 0,
+    borderRadius: '4px',
+    transition: 'width 200ms ease-out',
+    '@media': { '(prefers-reduced-motion: reduce)': { transition: 'none' } },
+} as const;
+
+export const riskFill = styleVariants({
+    danger: { ...riskFillBase, background: vars.color.danger },
+    warn: { ...riskFillBase, background: vars.color.amber },
+    safe: { ...riskFillBase, background: vars.color.success },
+    none: { ...riskFillBase, background: 'transparent' },
+});
+
+// ---- 交割行事曆 ----
+
+export const settleRow = style({
+    display: 'grid',
+    gridTemplateColumns: '3.25rem 1fr auto',
+    alignItems: 'center',
+    columnGap: vars.space.sm,
+    minHeight: '2.25rem',
+    borderBottom: `1px solid ${vars.color.border}`,
+    fontVariantNumeric: 'tabular-nums',
+    selectors: { '&:last-of-type': { borderBottom: 'none' } },
+});
+
+export const settleTag = style({
+    fontWeight: 700,
+    fontSize: '0.875rem',
+});
+
+export const settleDate = style({
+    color: vars.color.mutedForeground,
+    fontSize: '0.875rem',
+});
+
+export const settleAmount = style({
+    textAlign: 'right',
+    fontWeight: 600,
+});
+
+// ---- 已實現損益 ----
+
+export const totalLine = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: vars.space.sm,
+    margin: `${vars.space.sm} 0 0`,
+    fontVariantNumeric: 'tabular-nums',
+});
+
+export const totalValue = style({
+    fontSize: '1.25rem',
+    fontWeight: 700,
+});
+
+export const pnlItem = style({
+    borderBottom: `1px solid ${vars.color.border}`,
+    selectors: { '&:last-child': { borderBottom: 'none' } },
+});
+
+export const pnlRow = style({
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) auto auto',
+    alignItems: 'center',
+    columnGap: vars.space.sm,
+    minHeight: TOUCH_MIN,
+    fontVariantNumeric: 'tabular-nums',
+});
+
+export const pnlCode = style({
+    display: 'flex',
+    flexDirection: 'column',
+    minWidth: 0,
+    overflow: 'hidden',
+});
+
+export const pnlMeta = style({
+    fontSize: '0.75rem',
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+});
+
+export const pnlQty = style({
+    fontSize: '0.875rem',
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+});
+
+export const pnlValue = style({
+    textAlign: 'right',
+    fontWeight: 600,
+    whiteSpace: 'nowrap',
+});
+
+export const detailBox = style({
+    margin: `0 0 ${vars.space.sm}`,
+    padding: vars.space.sm,
+    borderRadius: vars.radius.md,
+    background: vars.color.inset,
+});
+
+export const fillCard = style({
+    padding: `${vars.space.xs} 0`,
+    borderTop: `1px dashed ${vars.color.border}`,
+    fontSize: '0.8125rem',
+});
+
+export const fillHead = style({
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: vars.space.sm,
+    fontWeight: 600,
 });
