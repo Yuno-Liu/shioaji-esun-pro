@@ -4,7 +4,10 @@
 // - 分頁：[未成交 N]（ACTIVE_ORDER_STATUSES 且剩餘量 > 0，部分成交仍有剩餘也在這裡）［已成交］（同桌面：status Filled）［全部］；
 //   帳戶篩選「全部」或單一帳戶。最新在前；「全部」時未成交置頂。
 // - 對帳 banner：queries.orders.needsReconcile／reasons 以 RECONCILE_REASON_LABELS 顯示，附「對帳」鍵（＝更新）。
-// - 「⟳ 更新」：refreshTradingState('orders')，按下後 6 秒冷卻（玉山 refresh 5 秒間隔、10 次／分）；冷卻跨分頁切換保留。
+// - 「⟳ 更新」：reconcileOrdersOnce()（lib 的 refreshTradingState('orders') 可能回傳其他範圍進行中的讀取，
+//   或在 1.5 秒冷卻內直接 resolve 而沒有讀委託；reconcileOrdersOnce 會等兩者結束後真的讀一次，絕不送出任何委託），
+//   按下後 6 秒冷卻（玉山 refresh 5 秒間隔、10 次／分）；冷卻跨分頁切換保留。
+// - 委託尚未讀到（queries.orders.updatedAt 為 null 且沒有任何委託）時顯示「委託載入中…」，不顯示「沒有委託」。
 // - 每列的改價／減量／刪單只開委託操作面板（order-action-sheet.tsx，滑動確認後才呼叫 lib）；顯示規則同面板。
 // - 全部刪單：有未成交時顯示；先開確認面板（筆數、涉及帳戶）滑動確認才呼叫 cancelAllOrders()。
 //   cancelAllOrders() 會刪除所有可交易帳戶的未成交委託（不受帳戶篩選限制），面板照實列出全部帳戶。
@@ -14,7 +17,7 @@ import { mutationErrorNotice } from '../../components/esun-order-meta';
 import { useEsunOrderMeta } from '../../lib/esun/account-details';
 import { usePrivacyMode } from '../../lib/privacy';
 import { cancelAllOrders, notify } from '../../lib/trade';
-import { RECONCILE_REASON_LABELS, refreshTradingState, useTradingState } from '../../lib/trading-state';
+import { RECONCILE_REASON_LABELS, reconcileOrdersOnce, useTradingState } from '../../lib/trading-state';
 import type { Trade } from '../../lib/types/order';
 import { fmtInt } from '../../lib/utils/format';
 import { mobileAccountLabel } from '../components/account-switch-sheet';
@@ -38,6 +41,13 @@ import * as styles from '../styles/orders.css';
 export const ORDERS_REFRESH_COOLDOWN_MS = 6_000;
 
 export type OrdersTab = 'working' | 'filled' | 'all';
+
+export const ORDERS_TEXT = {
+    loading: '委託載入中…',
+    readFailed: '委託尚未讀取成功，請按「⟳ 更新」',
+    none: '沒有委託',
+    noneInTab: '此分頁沒有委託',
+} as const;
 
 /** 上次按「更新」的時間（模組層：切換分頁回來冷卻仍有效） */
 let lastRefreshAt = Number.NEGATIVE_INFINITY;
@@ -66,7 +76,7 @@ function useRefreshCooldown() {
         lastRefreshAt = Date.now();
         tick();
         // 讀取失敗不會 reject：原因留在 queries.orders.reasons，由對帳 banner 顯示
-        void refreshTradingState('orders').catch(() => undefined);
+        void reconcileOrdersOnce().catch(() => undefined);
     };
     return { left, refresh };
 }
@@ -116,7 +126,8 @@ export function OrdersPage() {
     ];
     const cooling = left > 0;
     const refreshLabel = cooling ? `⟳ 更新（${Math.ceil(left / 1_000)}）` : '⟳ 更新';
-    const loading = state.loading && query.updatedAt === null && trades.length === 0;
+    // 委託還沒讀到：不能說「沒有委託」（讀取失敗時原因另由對帳 banner 顯示）
+    const unread = query.updatedAt === null && trades.length === 0;
 
     return (
         <section className={layout.page} data-testid='page-orders'>
@@ -177,7 +188,7 @@ export function OrdersPage() {
 
             {rows.length === 0 ? (
                 <p className={styles.empty} data-testid='orders-empty'>
-                    {loading ? '載入委託…' : trades.length === 0 ? '沒有委託' : '此分頁沒有委託'}
+                    {unread ? (query.error ? ORDERS_TEXT.readFailed : ORDERS_TEXT.loading) : trades.length === 0 ? ORDERS_TEXT.none : ORDERS_TEXT.noneInTab}
                 </p>
             ) : (
                 <ul className={styles.list}>

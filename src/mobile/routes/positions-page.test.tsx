@@ -34,6 +34,8 @@ const m = vi.hoisted(() => {
         navigate: vi.fn(),
         selectAccount: vi.fn(),
         assertResumeReady: vi.fn(),
+        acknowledgeStaleData: vi.fn(),
+        retryResume: vi.fn(),
     };
 });
 
@@ -90,6 +92,11 @@ vi.mock('../hooks/use-mobile-ticket', () => ({
 vi.mock('../hooks/use-resume-gate', () => ({ useResumeGate: () => m.gate }));
 vi.mock('../lib/resume-gate-runtime', () => ({
     getResumeGate: () => m.gate,
+    acknowledgeStaleData: () => {
+        m.acknowledgeStaleData();
+        if (m.gate.state === 'stale-data') m.gate = { ...m.gate, staleAcknowledged: true };
+    },
+    retryResume: m.retryResume,
     assertResumeReady: (opts: { allowStale?: boolean } = {}) => {
         m.assertResumeReady(opts);
         const s = m.gate;
@@ -151,7 +158,7 @@ beforeEach(() => {
     m.privMoney = false;
     m.locked = false;
     setPositions([stockPos(), futPos()]);
-    for (const f of [m.placeStockExitByShares, m.placeQuickOrder, m.notify, m.reconcileAfterUnknownOutcome, m.openTicket, m.navigate, m.selectAccount, m.assertResumeReady]) f.mockReset();
+    for (const f of [m.placeStockExitByShares, m.placeQuickOrder, m.notify, m.reconcileAfterUnknownOutcome, m.openTicket, m.navigate, m.selectAccount, m.assertResumeReady, m.acknowledgeStaleData, m.retryResume]) f.mockReset();
     m.placeStockExitByShares.mockResolvedValue([]);
     m.placeQuickOrder.mockResolvedValue({});
     m.refreshTradingState.mockClear();
@@ -239,6 +246,20 @@ describe('PositionsPage 顯示', () => {
         expect(one('position-refresh').props.disabled).toBe(true);
         await act(async () => { vi.advanceTimersByTime(1); });
         expect(one('position-refresh').props.disabled).toBe(false);
+    });
+
+    it('Q2：持倉尚未讀到時合計顯示「—」，讀到後才顯示金額（含 0）', async () => {
+        setPositions([], { updatedAt: null });
+        await render();
+        expect(textOf(one('position-total'))).toBe('—');
+        // 首次讀取失敗、仍沒有資料：合計仍未知
+        setPositions([], { updatedAt: null, error: 'S 持倉查詢失敗', needsReconcile: true, reasons: ['query-failed'] });
+        await rerender();
+        expect(textOf(one('position-total'))).toBe('—');
+        setPositions([], { updatedAt: 5 });
+        await rerender();
+        expect(textOf(one('position-total'))).not.toBe('—');
+        expect(textOf(one('position-total'))).toMatch(/0/);
     });
 
     it('看圖導向交易頁', async () => {
@@ -349,6 +370,60 @@ describe('平倉', () => {
         m.gate = { ...m.gate, staleAcknowledged: true };
         await rerender();
         expect(inRow('2330', 'position-close').props.disabled).toBe(false);
+    });
+
+    it('A-1：stale-data 時頁面 banner 提供勾選「我了解委託／持倉資料可能過期」與「重試同步」；勾選後可平倉', async () => {
+        m.gate = { ...m.gate, state: 'stale-data', staleAcknowledged: false, message: '委託／持倉或報價資料可能過期：持倉讀取失敗' };
+        await render();
+        expect(inRow('2330', 'position-close').props.disabled).toBe(true);
+        const note = one('position-gate-stale');
+        expect(textOf(note)).toContain('持倉讀取失敗');
+        expect(textOf(note)).toContain('我了解委託／持倉資料可能過期');
+        const ack = one('position-gate-stale-ack');
+        expect(ack.props.type).toBe('checkbox');
+        expect(ack.props.checked).toBe(false);
+
+        await click(one('position-gate-stale-retry'));
+        expect(m.retryResume).toHaveBeenCalledTimes(1);
+
+        await act(async () => { ack.props.onChange(); });
+        expect(m.acknowledgeStaleData).toHaveBeenCalledTimes(1);
+        await rerender();
+        expect(one('position-gate-stale-ack').props.checked).toBe(true);
+        expect(inRow('2330', 'position-close').props.disabled).toBe(false);
+        // 勾選本身不送出任何委託
+        expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+        expect(m.placeQuickOrder).not.toHaveBeenCalled();
+    });
+
+    it('A-1：平倉說明面板開啟中轉為 stale-data → 面板內可勾選了解；勾選後「繼續」才可用，仍需確認面板', async () => {
+        await render();
+        await click(inRow('TXFL6', 'position-close'));
+        m.gate = { ...m.gate, state: 'stale-data', staleAcknowledged: false, message: '委託讀取失敗' };
+        await rerender();
+        expect(one('position-close-continue').props.disabled).toBe(true);
+        expect(textOf(one('position-close-problem'))).toContain('我了解委託／持倉資料可能過期');
+        await act(async () => { one('position-close-stale-ack').props.onChange(); });
+        await rerender();
+        expect(one('position-close-continue').props.disabled).toBe(false);
+        expect(m.placeQuickOrder).not.toHaveBeenCalled();
+        await click(one('position-close-continue'));
+        expect(m.placeQuickOrder).toHaveBeenCalledTimes(1);
+        const beforeSend = firstCall(m.placeQuickOrder)[4].beforeSend as () => void;
+        expect(() => beforeSend()).not.toThrow();
+        expect(m.assertResumeReady).toHaveBeenLastCalledWith({ allowStale: true });
+    });
+
+    it('A-1：送出中停用勾選與重試', async () => {
+        let resolve: (v: unknown) => void = () => undefined;
+        m.placeQuickOrder.mockImplementation(() => new Promise(r => { resolve = r; }));
+        m.gate = { ...m.gate, state: 'stale-data', staleAcknowledged: true, message: null };
+        await render();
+        await click(inRow('TXFL6', 'position-close'));
+        await click(one('position-close-continue'));
+        expect(one('position-gate-stale-retry').props.disabled).toBe(true);
+        expect(one('position-close-stale-retry').props.disabled).toBe(true);
+        await act(async () => { resolve({}); });
     });
 
     it('確認面板取消 → 顯示「已取消」，面板保留', async () => {

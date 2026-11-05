@@ -3,11 +3,14 @@
 // - 資料：useTradingState().positions（含帳戶；現價隨即時 tick 更新）；帳戶篩選「全部」或單一帳戶；
 //   queries.positions 的對帳原因 banner；「⟳」＝refreshTradingState('positions')，6 秒冷卻。
 // - 合計：未實現損益合計，標示「（估）」（券商持倉＋即時價推估）；金額遮蔽用 usePrivacyMoney＋maskMoney。
+//   持倉尚未讀到（queries.positions.updatedAt 為 null 且沒有任何持倉列）時顯示「—」，不顯示 0。
 // - 平倉：先開說明面板寫明行為，使用者按「繼續」才呼叫 src/lib；lib 內部會再出現一次確認面板
 //   （根層 order-confirm-sheet，手機已強制開啟 confirmManualOrders），確認只出現一次。
 //   · 股票：stockExitFor() 回傳原因時不送出；否則 placeStockExitByShares()（整張市價 IOC、零股以漲跌停價盤中零股限價）。
 //   · 期貨／選擇權：placeQuickOrder(…, null, 口數, { ocType: 'Cover', source: 'manual' })（市價 IOC）。
 //   · beforeSend 內同步呼叫 assertResumeReady()；useTradingLive() 為 false 或 ResumeGate 不允許時停用。
+//   · ResumeGate 為 stale-data：頁面 banner 與平倉說明面板都提供 ResumeGateNote（勾選「我了解委託／持倉資料可能過期」
+//     ＝acknowledgeStaleData()、「重試同步」＝retryResume()）；勾選後才可平倉。
 //   · 結果依 §7.2：已取消、未送出（顯示原因，可重試）、結果未知（不自動重送、不提供重送鍵）。股票不提供反手。
 // - 加碼：開啟下單面板並帶入同方向；下單面板以「目前選取的帳戶」下單，持倉帳戶不同時先確認切換帳戶。
 //   信用部位（融資／融券）在 MVP 下單面板沒有信用條件 → 停用並說明。
@@ -31,6 +34,7 @@ import type { Account, AccountedPosition, Position, StockPosition } from '../../
 import { fmtInt, fmtPrice, fmtSigned, fmtStockLots } from '../../lib/utils/format';
 import { mobileAccountLabel, useAccountSwitchLocked } from '../components/account-switch-sheet';
 import { BottomSheet } from '../components/bottom-sheet';
+import { ResumeGateNote } from '../components/resume-gate-note';
 import { RouteBadge } from '../components/route-badge';
 import { classifyTicketOutcome, OUTCOME_UNKNOWN_TITLE } from '../hooks/use-mobile-ticket';
 import { useResumeGate } from '../hooks/use-resume-gate';
@@ -50,7 +54,7 @@ export const POSITIONS_TEXT = {
     empty: '目前沒有持倉',
     notLive: '行情／交易連線未就緒，暫停平倉',
     resyncing: '回到前景後正在重新同步行情與委託，暫停平倉',
-    staleData: '委託／持倉資料可能過期：請在狀態列按「重試」，或勾選「我了解資料可能過期」後再平倉',
+    staleData: '委託／持倉資料可能過期：請按「重試同步」，或勾選「我了解委託／持倉資料可能過期」後再平倉',
     resumeFailed: '連線未恢復，暫停平倉；請重新整理頁面',
     creditAddOn: '信用交易加碼將於後續版本提供',
     shortCashAddOn: '現股空單（當沖先賣）加碼將於後續版本提供',
@@ -243,6 +247,7 @@ function PositionRow({ p, priv, privMoney, closeDisabled, addOnReason, onClose, 
 
 interface CloseSheetProps {
     position: AccountedPosition | undefined;
+    gate: ResumeGateSnapshot;
     gateProblem: string | null;
     busy: boolean;
     feedback: { kind: 'cancelled' | 'notSent'; text: string } | null;
@@ -251,7 +256,7 @@ interface CloseSheetProps {
     onContinue: (plan: ClosePlan) => void;
 }
 
-function CloseSheet({ position, gateProblem, busy, feedback, privMoney, onCancel, onContinue }: CloseSheetProps) {
+function CloseSheet({ position, gate, gateProblem, busy, feedback, privMoney, onCancel, onContinue }: CloseSheetProps) {
     const contract = useContract(position?.code ?? null);
     const plan = position ? closePlanFor(position, contract) : POSITIONS_TEXT.gone;
     const problem = typeof plan === 'string' ? plan : gateProblem;
@@ -281,6 +286,7 @@ function CloseSheet({ position, gateProblem, busy, feedback, privMoney, onCancel
             )}
             <p className={styles.sheetText}>按「繼續」後會出現確認面板，滑動確認後才會送出；確認只出現一次。</p>
             {problem && <p className={styles.sheetProblem} role='alert' data-testid='position-close-problem'>{problem}</p>}
+            <ResumeGateNote gate={gate} disabled={busy} showReason={false} testId='position-close-stale' />
             {feedback && (
                 <p className={styles.sheetFeedback[feedback.kind]} role='status' data-testid='position-close-feedback'>{feedback.text}</p>
             )}
@@ -363,6 +369,8 @@ export function PositionsPage() {
         [positions, activeFilter],
     );
     const totalPnl = rows.reduce((sum, p) => sum + (p.pnl || 0), 0);
+    // 持倉還沒讀到時合計未知：顯示「—」而不是 0
+    const totalKnown = query.updatedAt !== null || positions.length > 0;
 
     // 商品資料（名稱、漲跌停價）預先載入快取；失敗時該列平倉停用並說明
     const codesKey = [...new Set(positions.map(p => p.code))].sort().join(',');
@@ -501,12 +509,16 @@ export function PositionsPage() {
             </div>
 
             {reconcile && <p className={styles.banner.warn} role='status' data-testid='position-reconcile'>{reconcile}</p>}
-            {gateProblem && rows.length > 0 && <p className={styles.banner.info} role='status' data-testid='position-gate-note'>{gateProblem}</p>}
+            {gateProblem && gateProblem !== POSITIONS_TEXT.staleData && rows.length > 0 && (
+                <p className={styles.banner.info} role='status' data-testid='position-gate-note'>{gateProblem}</p>
+            )}
+            {/* stale-data：原因＋勾選了解＋重試同步（勾選後仍顯示，讓使用者可隨時重試） */}
+            <ResumeGateNote gate={gate} disabled={closing} testId='position-gate-stale' />
 
             <div className={styles.summary}>
                 <span>未實現損益合計</span>
-                <span className={`${styles.summaryValue} ${styles.tone[pnlTone(totalPnl)]}`} data-testid='position-total'>
-                    {maskMoney(fmtSigned(totalPnl, 0), privMoney)}
+                <span className={`${styles.summaryValue} ${styles.tone[totalKnown ? pnlTone(totalPnl) : 'flat']}`} data-testid='position-total'>
+                    {totalKnown ? maskMoney(fmtSigned(totalPnl, 0), privMoney) : '—'}
                 </span>
                 <span className={styles.estimate}>（估）</span>
             </div>
@@ -535,6 +547,7 @@ export function PositionsPage() {
             {closeKey !== null && (
                 <CloseSheet
                     position={closeTarget}
+                    gate={gate}
                     gateProblem={gateProblem}
                     busy={closing}
                     feedback={closeFeedback}

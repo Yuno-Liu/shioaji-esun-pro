@@ -1,14 +1,20 @@
 // src/mobile/lib/resume-gate-runtime.ts — ResumeGate 執行期單例（規格 §7.4）
 //
 // - 監聽 visibilitychange／pagehide／pageshow（iOS 與 Android 皆支援；不依賴 Chromium 才有的 freeze／resume）。
-//   隱藏 ≥ HIDDEN_THRESHOLD_MS 後回前景，或 pageshow(persisted)（bfcache 還原）→ resyncing。
+//   隱藏 ≥ HIDDEN_THRESHOLD_MS 後回前景 → resyncing。
+// - pageshow(persisted)（bfcache 還原）：先進入 resyncing 擋下送單，再**重新載入頁面**。src/lib/quote-ownership.ts
+//   在 pagehide 時已永久拆除報價訂閱狀態（{ once: true }，還原後不會重建），畫面報價可能全部凍結，
+//   但串流心跳仍在、ResumeGate 會判 ready；在頁面內無法可靠修復，所以直接重新載入。
 // - 進入 resyncing：resumeSeq 遞增（下單面板據此標示「價格可能過期」）、resolveOrderConfirm(false) 關閉進行中的確認面板；
 //   新單／改價／減量由 assertResumeReady() 擋下（刪單與全部刪單不呼叫它）。
-// - ① getStreamStatus() === 'live'；② 回前景後 onAnyTick／onAnyBidAsk／onStreamEvent('heartbeat') 有活動，
-//   或 streamConnectionEpoch() 與隱藏前不同；①② 成立後才發出 ③ refreshTradingState('orders') → ('positions')
+// - ① getStreamStatus() === 'live'；② 回前景之後的串流活動：回前景後發生的重新連線（streamConnectionEpoch()
+//   與回前景當下不同），或回前景 ACTIVITY_SETTLE_MS 之後才收到的 tick／bidask／heartbeat（理由見 resume-gate.ts）；
+//   ①② 成立後才發出 ③ 委託 reconcileOrdersOnce() → 持倉 refreshTradingState('positions')
 //   與 ④ 目前商品（mobile-store 的 currentCode，經 contracts 快取取得合約）的 fetchSnapshots；
 //   以 nextResumeState() 推進，RESYNC_TIMEOUT_MS 逾時 → failed；③④ 失敗 → stale-data。
-// - 每個同步週期 ③④ 各最多發出一次；活動監聽在第一筆活動後立即解除；refreshTradingState() 自身也有節流，
+// - ③ 必須確認真的讀過：lib 的 refreshTradingState() 可能回傳其他範圍進行中的讀取，或在 1.5 秒冷卻內直接 resolve。
+//   讀完後以 queries[scope].updatedAt 確認完成時間不早於本週期開始，否則冷卻後重讀一次；仍不符合 → stale-data。
+// - 每個同步週期 ③ 每個範圍最多讀 MAX_READS_PER_SCOPE 次、④ 最多一次；活動監聽在第一筆算數的活動後立即解除，
 //   所以頻繁切換 App 不會造成查詢風暴。
 // - 時鐘、事件來源與 src/lib 呼叫都經 ResumeGateDeps 注入（單元測試用）；預設值在 startResumeGate() 呼叫時才取用。
 
@@ -23,11 +29,16 @@ import {
     streamConnectionEpoch as libStreamConnectionEpoch,
     subscribeStatusStore as libSubscribeStatusStore,
 } from '../../lib/stream';
-import { getTradingState as libGetTradingState, refreshTradingState as libRefreshTradingState } from '../../lib/trading-state';
+import {
+    getTradingState as libGetTradingState,
+    reconcileOrdersOnce as libReconcileOrdersOnce,
+    refreshTradingState as libRefreshTradingState,
+} from '../../lib/trading-state';
 import type { ContractBase } from '../../lib/types/contract';
 import { notStarted } from './errors';
 import { getMobileUi } from './mobile-store';
 import {
+    countsAsResumeActivity,
     INITIAL_RESUME_CHECKS,
     nextResumeState,
     readsMayStart,
@@ -67,6 +78,11 @@ export const RESUME_POLL_MS = 1_000;
 /** 讀取失敗的判定：refreshTradingState() 失敗時不 reject，而是在 queries[scope].reasons 留下這些原因 */
 const READ_FAILURE_REASONS: readonly string[] = ['query-failed', 'not-subscribed'];
 
+/** ③ 每個同步週期每個範圍最多讀幾次（第一次＋冷卻後重讀一次） */
+export const MAX_READS_PER_SCOPE = 2;
+/** 持倉重讀前的等待：src/lib/trading-state.ts 每範圍讀完後冷卻 1.5 秒，加一點餘裕 */
+export const READ_RETRY_DELAY_MS = 1_600;
+
 /** ResumeGate 的外部依賴（全部可注入；未提供者使用 src/lib 與瀏覽器的預設值） */
 export interface ResumeGateDeps {
     now(): number;
@@ -83,13 +99,20 @@ export interface ResumeGateDeps {
     onAnyTick(listener: () => void): () => void;
     onAnyBidAsk(listener: () => void): () => void;
     onHeartbeat(listener: () => void): () => void;
-    refreshTradingState(scope: 'orders' | 'positions'): Promise<void>;
-    /** refreshTradingState 完成後：該範圍讀取失敗時回傳原因，成功回傳 null */
+    /** 委託：一次真正的讀取（等進行中的讀取與冷卻結束；src/lib 的 reconcileOrdersOnce） */
+    readOrders(): Promise<void>;
+    /** 持倉：refreshTradingState('positions')（可能被冷卻或其他讀取吸收，讀完以 tradingUpdatedAt 確認） */
+    readPositions(): Promise<void>;
+    /** 讀取完成後：該範圍讀取失敗時回傳原因，成功回傳 null */
     tradingReadFailed(scope: 'orders' | 'positions'): string | null;
+    /** 該範圍最後一次完整讀取的完成時間（queries[scope].updatedAt；與 now() 同一時鐘） */
+    tradingUpdatedAt(scope: 'orders' | 'positions'): number | null;
     getCurrentCode(): string | null;
     getCachedContract(code: string): ContractBase | undefined;
     fetchSnapshots(contracts: ContractBase[]): Promise<unknown>;
     resolveOrderConfirm(approved: boolean): void;
+    /** bfcache 還原時重新載入頁面 */
+    reload(): void;
 }
 
 const SCOPE_LABEL = { orders: '委託', positions: '持倉' } as const;
@@ -108,16 +131,19 @@ function defaultDeps(): ResumeGateDeps {
         onAnyTick: listener => libOnAnyTick(() => listener()),
         onAnyBidAsk: listener => libOnAnyBidAsk(() => listener()),
         onHeartbeat: listener => libOnStreamEvent('heartbeat', () => listener()),
-        refreshTradingState: scope => libRefreshTradingState(scope),
+        readOrders: () => libReconcileOrdersOnce(),
+        readPositions: () => libRefreshTradingState('positions'),
         tradingReadFailed: scope => {
             const query = libGetTradingState().queries[scope];
             if (!query.reasons.some(r => READ_FAILURE_REASONS.includes(r))) return null;
             return `${SCOPE_LABEL[scope]}讀取失敗${query.error ? `（${query.error}）` : ''}`;
         },
+        tradingUpdatedAt: scope => libGetTradingState().queries[scope].updatedAt,
         getCurrentCode: () => getMobileUi().currentCode,
         getCachedContract: code => libGetCachedContract(code),
         fetchSnapshots: contracts => libFetchSnapshots(contracts),
         resolveOrderConfirm: approved => libResolveOrderConfirm(approved),
+        reload: () => { if (typeof location !== 'undefined') location.reload(); },
     };
 }
 
@@ -155,9 +181,10 @@ export function acknowledgeStaleData(): void {
 
 /** 一次同步週期（進入 resyncing 到離開） */
 interface Cycle {
+    /** 回前景（或按重試）的時間；② 的活動與 ③ 的讀取完成時間都以此為基準 */
     startedAt: number;
     checks: ResumeChecks;
-    /** 隱藏前（或重試時）的連線世代；回前景後不同＝重新連上 */
+    /** 回前景當下（或重試時）的連線世代；之後不同＝回前景後重新連上（隱藏期間的重連不算） */
     baselineEpoch: number;
     readsStarted: boolean;
     readErrors: string[];
@@ -169,8 +196,6 @@ interface Runtime {
     deps: ResumeGateDeps;
     /** 進入背景的時間；null＝目前在前景 */
     hiddenAt: number | null;
-    /** 進入背景時的連線世代 */
-    epochAtHide: number;
     cycle: Cycle | null;
     /** ② 成立時的連線世代（stale-data 重試時若同一條連線仍 live，沿用已觀察到的活動） */
     activeEpoch: number | null;
@@ -190,7 +215,7 @@ function endCycle(rt: Runtime) {
 
 function staleMessage(errors: string[]): string {
     const detail = [...new Set(errors)].join('；');
-    return `委託／持倉或報價資料可能過期${detail ? `：${detail}` : ''}；請按「重試同步」，或勾選「我了解資料可能過期」後再下新單`;
+    return `委託／持倉或報價資料可能過期${detail ? `：${detail}` : ''}；請按「重試同步」，或勾選「我了解委託／持倉資料可能過期」後再下新單`;
 }
 
 /** 依目前檢查推進狀態；離開 resyncing 時結束週期 */
@@ -201,7 +226,8 @@ function evaluate(rt: Runtime) {
     const live = deps.getStreamStatus() === 'live';
     let { activitySinceResume } = cycle.checks;
     if (!activitySinceResume && live) {
-        // 重新連上（看門狗 stale→live 或 EventSource 重連）時連線世代會遞增
+        // 回前景後重新連上（看門狗 stale→live 或 EventSource 重連）時連線世代會遞增；
+        // 基準是回前景當下的世代，隱藏期間的重連不算（那條連線可能在背景中又已中斷）
         const epoch = deps.streamConnectionEpoch();
         if (epoch >= 0 && epoch !== cycle.baselineEpoch) activitySinceResume = true;
     }
@@ -238,22 +264,53 @@ function errorText(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
+/** 週期內的等待；週期結束時計時器一併清除（promise 不再 resolve，呼叫端也不再推進） */
+function cycleDelay(rt: Runtime, cycle: Cycle, ms: number): Promise<void> {
+    return new Promise(resolve => {
+        const handle = rt.deps.setTimeout(resolve, ms);
+        cycle.cleanup.push(() => rt.deps.clearTimeout(handle));
+    });
+}
+
+/**
+ * ③ 讀一個範圍，並確認真的讀過：完成後 queries[scope].updatedAt 不早於本週期開始。
+ * 不符合（被冷卻吸收、共用了只讀其他範圍的讀取，或讀取期間有回報／串流中斷而 lib 未標記完成）→ 冷卻後重讀一次；
+ * 仍不符合 → 視為讀取失敗（stale-data）。每個範圍最多 MAX_READS_PER_SCOPE 次。回傳錯誤文字或 null。
+ */
+async function readScope(rt: Runtime, cycle: Cycle, scope: 'orders' | 'positions'): Promise<string | null> {
+    const { deps } = rt;
+    for (let attempt = 1; ; attempt += 1) {
+        try {
+            await (scope === 'orders' ? deps.readOrders() : deps.readPositions());
+        } catch (err) {
+            return `${SCOPE_LABEL[scope]}讀取失敗：${errorText(err)}`;
+        }
+        if (rt.cycle !== cycle) return null;
+        const failed = deps.tradingReadFailed(scope);
+        if (failed) return failed;
+        const updatedAt = deps.tradingUpdatedAt(scope);
+        if (updatedAt !== null && updatedAt >= cycle.startedAt) return null;
+        if (attempt >= MAX_READS_PER_SCOPE) return `${SCOPE_LABEL[scope]}未能確認已重新讀取（讀取期間可能有回報或連線中斷）`;
+        // 委託的 reconcileOrdersOnce() 自己會等冷卻；持倉在這裡等冷卻結束再讀
+        if (scope === 'positions') {
+            await cycleDelay(rt, cycle, READ_RETRY_DELAY_MS);
+            if (rt.cycle !== cycle) return null;
+        }
+    }
+}
+
 /** ①② 成立後發出 ③④（每個週期各一次） */
 function startReads(rt: Runtime, cycle: Cycle) {
     cycle.readsStarted = true;
     const { deps } = rt;
-    // ③ 委託 → 持倉依序讀：refreshTradingState() 執行中再呼叫會共用進行中的那一次讀取，同時發出會漏讀持倉
+    // ③ 委託 → 持倉依序讀：refreshTradingState() 執行中再呼叫會共用進行中的那一次讀取，同時發出會漏讀持倉；
+    // 委託先用 reconcileOrdersOnce() 等完回前景前就在跑的讀取，持倉才不會共用到舊的那一次
     void (async () => {
         const errors: string[] = [];
         for (const scope of ['orders', 'positions'] as const) {
-            try {
-                await deps.refreshTradingState(scope);
-                const failed = deps.tradingReadFailed(scope);
-                if (failed) errors.push(failed);
-            } catch (err) {
-                errors.push(`${SCOPE_LABEL[scope]}讀取失敗：${errorText(err)}`);
-            }
+            const failed = await readScope(rt, cycle, scope);
             if (rt.cycle !== cycle) return;
+            if (failed) errors.push(failed);
         }
         if (errors.length) settle(rt, cycle, 'tradingReadSettled', 'failed', errors.join('；'));
         else settle(rt, cycle, 'tradingReadSettled', 'ok');
@@ -299,11 +356,13 @@ function beginResync(rt: Runtime, baselineEpoch: number, opts: { carryActivity?:
     try { deps.resolveOrderConfirm(false); } catch { /* 取消失敗不影響閘門：送單仍會被 assertResumeReady 擋下 */ }
     if (rt.cycle !== cycle) return;
 
-    // ② 活動：第一筆就解除全部活動監聽，tick 洪流不會反覆觸發
+    // ② 活動：回前景 ACTIVITY_SETTLE_MS 內派送的事件可能是背景期間排隊的舊事件，不算（見 resume-gate.ts）；
+    // 第一筆算數的活動就解除全部活動監聽，tick 洪流不會反覆觸發
     if (!carry) {
         const activityOff: Array<() => void> = [];
         const onActivity = () => {
             if (rt.cycle !== cycle || cycle.checks.activitySinceResume) return;
+            if (!countsAsResumeActivity(deps.now() - cycle.startedAt)) return;
             cycle.checks = { ...cycle.checks, activitySinceResume: true };
             activityOff.splice(0).forEach(fn => fn());
             evaluate(rt);
@@ -326,7 +385,6 @@ function beginResync(rt: Runtime, baselineEpoch: number, opts: { carryActivity?:
 function markHidden(rt: Runtime) {
     if (rt.hiddenAt !== null) return;
     rt.hiddenAt = rt.deps.now();
-    rt.epochAtHide = rt.deps.streamConnectionEpoch();
 }
 
 function markVisible(rt: Runtime, opts: { persisted?: boolean } = {}) {
@@ -338,7 +396,8 @@ function markVisible(rt: Runtime, opts: { persisted?: boolean } = {}) {
         beginResync(rt, rt.deps.streamConnectionEpoch());
         return;
     }
-    if (shouldResync(rt.deps.now() - hiddenAt, opts)) beginResync(rt, rt.epochAtHide);
+    // ② 的重連基準＝回前景當下的連線世代（不是隱藏時的）
+    if (shouldResync(rt.deps.now() - hiddenAt, opts)) beginResync(rt, rt.deps.streamConnectionEpoch());
 }
 
 /**
@@ -368,7 +427,7 @@ export function assertResumeReady(opts: { allowStale?: boolean } = {}): void {
     if (s.state === 'ready') return;
     if (opts.allowStale === true && resumeAllowsNewOrders(s.state, s.staleAcknowledged)) return;
     if (s.state === 'resyncing') throw notStarted('回到前景後正在重新同步行情與委託，這筆沒有送出，請稍候再試');
-    if (s.state === 'stale-data') throw notStarted('委託／持倉資料可能過期，這筆沒有送出；請按「重試」或勾選「我了解資料可能過期」後重新下單');
+    if (s.state === 'stale-data') throw notStarted('委託／持倉資料可能過期，這筆沒有送出；請按「重試」或勾選「我了解委託／持倉資料可能過期」後重新下單');
     throw notStarted('連線未恢復，這筆沒有送出，請重新整理頁面');
 }
 
@@ -380,7 +439,7 @@ export function assertResumeReady(opts: { allowStale?: boolean } = {}): void {
 export function startResumeGate(deps?: Partial<ResumeGateDeps>): () => void {
     if (runtime) return () => undefined;
     const merged: ResumeGateDeps = { ...defaultDeps(), ...deps };
-    const rt: Runtime = { deps: merged, hiddenAt: null, epochAtHide: -1, cycle: null, activeEpoch: null, detach: () => undefined };
+    const rt: Runtime = { deps: merged, hiddenAt: null, cycle: null, activeEpoch: null, detach: () => undefined };
     runtime = rt;
 
     const onVisibility = () => {
@@ -390,7 +449,14 @@ export function startResumeGate(deps?: Partial<ResumeGateDeps>): () => void {
     };
     const onPageHide = () => { if (runtime === rt) markHidden(rt); };
     const onPageShow = (ev: Event) => {
-        if (runtime === rt) markVisible(rt, { persisted: (ev as { persisted?: boolean }).persisted === true });
+        if (runtime !== rt) return;
+        const persisted = (ev as { persisted?: boolean }).persisted === true;
+        markVisible(rt, { persisted });
+        // bfcache 還原：quote-ownership 已在 pagehide 永久拆除報價訂閱，畫面報價可能凍結而閘門仍會判 ready。
+        // 上面已進入 resyncing（擋下送單、關閉確認面板），這裡直接重新載入頁面重建全部狀態。
+        if (persisted) {
+            try { merged.reload(); } catch { /* 重新載入失敗：閘門停在 resyncing，45 秒後 failed（請使用者重新整理） */ }
+        }
     };
     merged.document?.addEventListener('visibilitychange', onVisibility);
     merged.window?.addEventListener('pagehide', onPageHide);

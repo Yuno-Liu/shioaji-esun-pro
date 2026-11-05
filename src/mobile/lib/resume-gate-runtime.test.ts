@@ -12,6 +12,7 @@ const lib = vi.hoisted(() => ({
     onAnyBidAsk: vi.fn(() => () => undefined),
     onStreamEvent: vi.fn(() => () => undefined),
     refreshTradingState: vi.fn(async () => undefined),
+    reconcileOrdersOnce: vi.fn(async () => undefined),
     getTradingState: vi.fn(),
 }));
 vi.mock('../../lib/order-confirm', () => ({ resolveOrderConfirm: lib.resolveOrderConfirm }));
@@ -25,15 +26,21 @@ vi.mock('../../lib/stream', () => ({
     onAnyBidAsk: lib.onAnyBidAsk,
     onStreamEvent: lib.onStreamEvent,
 }));
-vi.mock('../../lib/trading-state', () => ({ refreshTradingState: lib.refreshTradingState, getTradingState: lib.getTradingState }));
+vi.mock('../../lib/trading-state', () => ({
+    refreshTradingState: lib.refreshTradingState,
+    reconcileOrdersOnce: lib.reconcileOrdersOnce,
+    getTradingState: lib.getTradingState,
+}));
 
 import type { ContractBase } from '../../lib/types/contract';
 import { resetMobileUiForTest, setCurrentCode } from './mobile-store';
-import { HIDDEN_THRESHOLD_MS, RESYNC_TIMEOUT_MS } from './resume-gate';
+import { ACTIVITY_SETTLE_MS, HIDDEN_THRESHOLD_MS, RESYNC_TIMEOUT_MS } from './resume-gate';
 import {
     acknowledgeStaleData,
     assertResumeReady,
     getResumeGate,
+    MAX_READS_PER_SCOPE,
+    READ_RETRY_DELAY_MS,
     retryResume,
     setResumeGateForTest,
     startResumeGate,
@@ -60,6 +67,10 @@ function harness(over: Partial<ResumeGateDeps> = {}) {
     const heartbeat = new Set<() => void>();
     const status = new Set<() => void>();
     const readFailed: Record<Scope, string | null> = { orders: null, positions: null };
+    /** queries[scope].updatedAt；'now'＝剛讀完（目前時鐘） */
+    const updatedAt: Record<Scope, number | null | 'now'> = { orders: 'now', positions: 'now' };
+    /** ③ 的讀取（readOrders → 'orders'、readPositions → 'positions'） */
+    const read = vi.fn(async (_scope: Scope): Promise<void> => undefined);
     const contract = { code: '2330', security_type: 'STK', exchange: 'TSE' } as ContractBase;
     const sub = (set: Set<() => void>) => (l: () => void) => { set.add(l); return () => { set.delete(l); }; };
     const base = {
@@ -74,12 +85,15 @@ function harness(over: Partial<ResumeGateDeps> = {}) {
         onAnyTick: vi.fn(sub(tick)),
         onAnyBidAsk: vi.fn(sub(bidask)),
         onHeartbeat: vi.fn(sub(heartbeat)),
-        refreshTradingState: vi.fn(async (_scope: Scope) => undefined),
+        readOrders: () => read('orders'),
+        readPositions: () => read('positions'),
         tradingReadFailed: (scope: Scope) => readFailed[scope],
+        tradingUpdatedAt: (scope: Scope) => (updatedAt[scope] === 'now' ? now : updatedAt[scope]),
         getCurrentCode: vi.fn((): string | null => '2330'),
         getCachedContract: vi.fn((code: string) => (code === '2330' ? contract : undefined)),
         fetchSnapshots: vi.fn(async (_c: ContractBase[]): Promise<unknown> => []),
         resolveOrderConfirm: vi.fn(),
+        reload: vi.fn(),
     };
     // 覆寫只用於測試個別來源；保留 base 的 mock 型別
     const deps = Object.assign(base, over) as typeof base;
@@ -89,8 +103,13 @@ function harness(over: Partial<ResumeGateDeps> = {}) {
         win,
         stream,
         tick,
+        bidask,
+        heartbeat,
         readFailed,
+        updatedAt,
+        read,
         contract,
+        now: () => now,
         /** 推進時鐘並依序執行到期的計時器 */
         advance(ms: number) {
             const end = now + ms;
@@ -107,6 +126,8 @@ function harness(over: Partial<ResumeGateDeps> = {}) {
         show() { doc.visibilityState = 'visible'; doc.dispatchEvent(new Event('visibilitychange')); },
         /** 隱藏 ms 後回前景 */
         away(ms: number) { h.hide(); h.advance(ms); h.show(); },
+        /** 回前景後等過 ② 的排隊事件窗（之後收到的 tick／bidask／heartbeat 才算活動） */
+        settle() { h.advance(ACTIVITY_SETTLE_MS); },
         pageshow(persisted: boolean) { win.dispatchEvent(Object.assign(new Event('pageshow'), { persisted })); },
         pagehide() { win.dispatchEvent(new Event('pagehide')); },
         emit(set: Set<() => void>) { [...set].forEach(l => l()); },
@@ -147,7 +168,7 @@ describe('觸發（§14.1）', () => {
         expect(getResumeGate().state).toBe('ready');
         expect(getResumeGate().resumeSeq).toBe(0);
         expect(h.deps.resolveOrderConfirm).not.toHaveBeenCalled();
-        expect(h.deps.refreshTradingState).not.toHaveBeenCalled();
+        expect(h.read).not.toHaveBeenCalled();
         expect(h.pendingTimers()).toBe(0);
     });
 
@@ -172,6 +193,7 @@ describe('觸發（§14.1）', () => {
         h.advance(HIDDEN_THRESHOLD_MS);
         h.pageshow(false);
         expect(getResumeGate().state).toBe('resyncing');
+        expect(h.deps.reload).not.toHaveBeenCalled();
     });
 
     it('pageshow(persisted) 視同回前景（bfcache 還原），即使沒有記到隱藏時間', () => {
@@ -179,9 +201,32 @@ describe('觸發（§14.1）', () => {
         stop = h.start();
         h.pageshow(false);
         expect(getResumeGate().state).toBe('ready');
+        expect(h.deps.reload).not.toHaveBeenCalled();
         h.pageshow(true);
         expect(getResumeGate().state).toBe('resyncing');
         expect(getResumeGate().resumeSeq).toBe(1);
+    });
+
+    it('B5：pageshow(persisted)（bfcache 還原）先擋下送單再重新載入頁面（quote-ownership 已在 pagehide 拆除報價訂閱）', () => {
+        const h = harness();
+        stop = h.start();
+        const order: string[] = [];
+        h.deps.resolveOrderConfirm.mockImplementation(() => { order.push('confirm-cancelled'); });
+        h.deps.reload.mockImplementation(() => { order.push(`reload@${getResumeGate().state}`); });
+        h.pagehide();
+        h.advance(60_000);
+        h.pageshow(true);
+        expect(h.deps.reload).toHaveBeenCalledTimes(1);
+        expect(order).toEqual(['confirm-cancelled', 'reload@resyncing']);
+        expect(notStartedOrPass(() => assertResumeReady({ allowStale: true }))).toBe('not-started');
+    });
+
+    it('B5：reload 丟錯時閘門仍停在 resyncing（fail-closed）', () => {
+        const h = harness();
+        stop = h.start();
+        h.deps.reload.mockImplementation(() => { throw new Error('blocked'); });
+        expect(() => h.pageshow(true)).not.toThrow();
+        expect(getResumeGate().state).toBe('resyncing');
     });
 
     it('同一次還原的 visibilitychange 與 pageshow(persisted) 只觸發一次', () => {
@@ -226,12 +271,12 @@ describe('四個條件（§14.1）', () => {
         await flush();
         // 串流仍是 live（看門狗寬限期內），但回前景後沒有任何活動 → 不讀、不放行
         expect(getResumeGate().state).toBe('resyncing');
-        expect(h.deps.refreshTradingState).not.toHaveBeenCalled();
+        expect(h.read).not.toHaveBeenCalled();
         expect(h.deps.fetchSnapshots).not.toHaveBeenCalled();
 
         let finishOrders!: () => void;
         let finishPositions!: () => void;
-        h.deps.refreshTradingState.mockImplementation((scope: Scope) => new Promise<undefined>(r => {
+        h.read.mockImplementation((scope: Scope) => new Promise<undefined>(r => {
             if (scope === 'orders') finishOrders = () => r(undefined);
             else finishPositions = () => r(undefined);
         }));
@@ -241,13 +286,13 @@ describe('四個條件（§14.1）', () => {
         h.emit(h.tick); // ② 回前景後第一筆 tick
         expect(getResumeGate().checks).toMatchObject({ streamLive: true, activitySinceResume: true });
         // ③ 委託先讀，完成後才讀持倉；④ 目前商品的快照經合約快取取得
-        expect(h.deps.refreshTradingState.mock.calls).toEqual([['orders']]);
+        expect(h.read.mock.calls).toEqual([['orders']]);
         expect(h.deps.getCachedContract).toHaveBeenCalledWith('2330');
         expect(h.deps.fetchSnapshots).toHaveBeenCalledWith([h.contract]);
 
         finishOrders();
         await flush();
-        expect(h.deps.refreshTradingState.mock.calls).toEqual([['orders'], ['positions']]);
+        expect(h.read.mock.calls).toEqual([['orders'], ['positions']]);
         expect(getResumeGate().state).toBe('resyncing');
 
         finishSnapshot();
@@ -272,17 +317,18 @@ describe('四個條件（§14.1）', () => {
         h.advance(6_000);
         h.stream.status = 'stale';
         h.show();
+        h.settle();
         h.emit(h.tick);
         await flush();
         expect(getResumeGate().checks).toMatchObject({ streamLive: false, activitySinceResume: true });
-        expect(h.deps.refreshTradingState).not.toHaveBeenCalled();
+        expect(h.read).not.toHaveBeenCalled();
         h.setStatus('live', 7);
         await flush();
-        expect(h.deps.refreshTradingState).toHaveBeenCalled();
+        expect(h.read).toHaveBeenCalled();
         expect(getResumeGate().state).toBe('ready');
     });
 
-    it('連線世代與隱藏前不同（重新連上）視為已有活動', async () => {
+    it('回前景後重新連上（連線世代與回前景當下不同）視為已有活動', async () => {
         const h = harness();
         stop = h.start();
         h.hide();
@@ -305,6 +351,7 @@ describe('四個條件（§14.1）', () => {
             const h = harness(kind === 'bidask' ? { onAnyBidAsk: vi.fn(listen) } : { onHeartbeat: vi.fn(listen) });
             stop = h.start();
             h.away(6_000);
+            h.settle();
             fire();
             await flush();
             expect(getResumeGate().state).toBe('ready');
@@ -315,6 +362,7 @@ describe('四個條件（§14.1）', () => {
         const h = harness({ getCurrentCode: vi.fn(() => null) });
         stop = h.start();
         h.away(6_000);
+        h.settle();
         h.emit(h.tick);
         await flush();
         expect(h.deps.fetchSnapshots).not.toHaveBeenCalled();
@@ -325,6 +373,7 @@ describe('四個條件（§14.1）', () => {
         const h2 = harness({ getCurrentCode: vi.fn(() => '9999') });
         stop = h2.start();
         h2.away(6_000);
+        h2.settle();
         h2.emit(h2.tick);
         await flush();
         expect(h2.deps.fetchSnapshots).not.toHaveBeenCalled();
@@ -335,12 +384,156 @@ describe('四個條件（§14.1）', () => {
         const h = harness();
         stop = h.start();
         h.away(6_000);
+        h.settle();
         for (let i = 0; i < 100; i++) h.emit(h.tick);
         await flush();
         h.advance(10_000);
         expect(h.tick.size).toBe(0);
-        expect(h.deps.refreshTradingState).toHaveBeenCalledTimes(2);
+        expect(h.read).toHaveBeenCalledTimes(2);
         expect(h.deps.fetchSnapshots).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('A-3：② 只認回前景之後的活動（比 §7.4 字面更嚴格）', () => {
+    it('回前景後立即派送的排隊事件（tick／bidask／heartbeat）不算；1 秒後的新事件才算', async () => {
+        const h = harness();
+        stop = h.start();
+        h.away(6_000);
+        // 背景期間排隊、回前景時才派送的舊事件
+        h.emit(h.tick);
+        h.emit(h.bidask);
+        h.emit(h.heartbeat);
+        h.advance(ACTIVITY_SETTLE_MS - 1);
+        h.emit(h.tick);
+        await flush();
+        expect(getResumeGate().state).toBe('resyncing');
+        expect(getResumeGate().checks?.activitySinceResume).toBe(false);
+        expect(h.read).not.toHaveBeenCalled();
+        expect(h.deps.fetchSnapshots).not.toHaveBeenCalled();
+        // 監聽仍在：之後的新事件會算
+        expect(h.tick.size).toBe(1);
+        h.advance(1);
+        h.emit(h.tick);
+        await flush();
+        expect(getResumeGate().state).toBe('ready');
+        expect(h.tick.size).toBe(0);
+    });
+
+    it('隱藏期間的重新連線不算（基準是回前景當下的連線世代）；回前景後的重連才算', async () => {
+        const h = harness();
+        stop = h.start();
+        h.hide();
+        h.advance(10_000);
+        h.setStatus('stale');
+        h.setStatus('live', 8); // 背景中重連：之後這條連線可能又已中斷
+        h.advance(10_000);
+        h.show();
+        h.advance(20_000);
+        await flush();
+        expect(getResumeGate().state).toBe('resyncing');
+        expect(getResumeGate().checks).toMatchObject({ streamLive: true, activitySinceResume: false });
+        expect(h.read).not.toHaveBeenCalled();
+        // 回前景後看門狗判 stale 並重連 → 新世代
+        h.setStatus('stale');
+        h.setStatus('live', 9);
+        await flush();
+        expect(getResumeGate().state).toBe('ready');
+    });
+
+    it('回前景後立刻重連（世代改變）不必等 1 秒', async () => {
+        const h = harness();
+        stop = h.start();
+        h.away(6_000);
+        h.setStatus('live', 8);
+        await flush();
+        expect(getResumeGate().state).toBe('ready');
+    });
+
+    it('休市只有心跳：第一秒內的心跳不算，下一次心跳（約 30 秒後）在 45 秒內 ready', async () => {
+        const h = harness();
+        stop = h.start();
+        h.away(6_000);
+        h.advance(500);
+        h.emit(h.heartbeat);
+        await flush();
+        expect(getResumeGate().state).toBe('resyncing');
+        h.advance(30_000);
+        h.emit(h.heartbeat);
+        await flush();
+        expect(getResumeGate().state).toBe('ready');
+    });
+});
+
+describe('A-4：③ 確認真的重新讀取（updatedAt 晚於週期開始）', () => {
+    const resume = async (h: ReturnType<typeof harness>) => {
+        stop = h.start();
+        h.away(6_000);
+        h.settle();
+        h.emit(h.tick);
+        await flush();
+    };
+
+    it('持倉讀取被冷卻吸收（updatedAt 仍是舊的）→ 等冷卻後重讀一次，讀到才 ready', async () => {
+        const h = harness();
+        h.updatedAt.positions = 1; // 回前景前的讀取
+        h.read.mockImplementation(async (scope: Scope) => {
+            if (scope === 'positions' && h.read.mock.calls.filter(c => c[0] === 'positions').length === 2) h.updatedAt.positions = 'now';
+        });
+        await resume(h);
+        expect(h.read.mock.calls).toEqual([['orders'], ['positions']]);
+        expect(getResumeGate().state).toBe('resyncing');
+        h.advance(READ_RETRY_DELAY_MS - 1);
+        await flush();
+        expect(h.read.mock.calls).toEqual([['orders'], ['positions']]);
+        h.advance(1);
+        await flush();
+        expect(h.read.mock.calls).toEqual([['orders'], ['positions'], ['positions']]);
+        expect(getResumeGate().state).toBe('ready');
+        expect(h.pendingTimers()).toBe(0);
+    });
+
+    it('兩次都沒讀到 → stale-data；每個範圍最多讀 2 次（不造成查詢風暴）', async () => {
+        const h = harness();
+        h.updatedAt.positions = null;
+        await resume(h);
+        h.advance(READ_RETRY_DELAY_MS);
+        await flush();
+        expect(getResumeGate().state).toBe('stale-data');
+        expect(getResumeGate().message).toContain('持倉未能確認已重新讀取');
+        h.advance(30_000);
+        await flush();
+        expect(h.read.mock.calls.filter(c => c[0] === 'positions')).toHaveLength(MAX_READS_PER_SCOPE);
+        expect(h.read.mock.calls.filter(c => c[0] === 'orders')).toHaveLength(1);
+    });
+
+    it('委託：updatedAt 早於週期開始 → 立刻再 reconcile 一次（reconcileOrdersOnce 自己等冷卻），仍舊 → stale-data', async () => {
+        const h = harness();
+        h.updatedAt.orders = 5;
+        await resume(h);
+        expect(h.read.mock.calls).toEqual([['orders'], ['orders'], ['positions']]);
+        expect(getResumeGate().state).toBe('stale-data');
+        expect(getResumeGate().message).toContain('委託未能確認已重新讀取');
+    });
+
+    it('讀取失敗原因優先，不重讀', async () => {
+        const h = harness();
+        h.readFailed.positions = '持倉讀取失敗';
+        h.updatedAt.positions = null;
+        await resume(h);
+        expect(h.read.mock.calls.filter(c => c[0] === 'positions')).toHaveLength(1);
+        expect(getResumeGate().state).toBe('stale-data');
+    });
+
+    it('等待重讀時週期結束（再次進入背景）：計時器清除、不再讀', async () => {
+        const h = harness();
+        h.updatedAt.positions = 1;
+        await resume(h);
+        stop!();
+        stop = null;
+        expect(h.pendingTimers()).toBe(0);
+        h.advance(READ_RETRY_DELAY_MS);
+        await flush();
+        expect(h.read.mock.calls.filter(c => c[0] === 'positions')).toHaveLength(1);
     });
 });
 
@@ -350,6 +543,7 @@ describe('讀取失敗 → stale-data（§14.1）', () => {
         setup(h);
         stop = h.start();
         h.away(6_000);
+        h.settle();
         h.emit(h.tick);
         await flush();
         return h;
@@ -364,7 +558,7 @@ describe('讀取失敗 → stale-data（§14.1）', () => {
     });
 
     it('refreshTradingState reject', async () => {
-        await toStale(h => { h.deps.refreshTradingState.mockRejectedValueOnce(new Error('boom')); });
+        await toStale(h => { h.read.mockRejectedValueOnce(new Error('boom')); });
         expect(getResumeGate().state).toBe('stale-data');
         expect(getResumeGate().message).toContain('boom');
     });
@@ -407,15 +601,16 @@ describe('45 秒逾時 → failed（§14.1）', () => {
         h.emit(h.tick);
         await flush();
         expect(getResumeGate().state).toBe('failed');
-        expect(h.deps.refreshTradingState).not.toHaveBeenCalled();
+        expect(h.read).not.toHaveBeenCalled();
     });
 
     it('讀取卡住超過 45 秒也是 failed；遲到的結果被忽略', async () => {
         let finish!: () => void;
         const h = harness();
-        h.deps.refreshTradingState.mockImplementation(() => new Promise<undefined>(r => { finish = () => r(undefined); }));
+        h.read.mockImplementation(() => new Promise<undefined>(r => { finish = () => r(undefined); }));
         stop = h.start();
         h.away(6_000);
+        h.settle();
         h.emit(h.tick);
         h.advance(RESYNC_TIMEOUT_MS);
         expect(getResumeGate().state).toBe('failed');
@@ -423,7 +618,7 @@ describe('45 秒逾時 → failed（§14.1）', () => {
         finish();
         await flush();
         expect(getResumeGate().state).toBe('failed');
-        expect(h.deps.refreshTradingState).toHaveBeenCalledTimes(1);
+        expect(h.read).toHaveBeenCalledTimes(1);
     });
 });
 
@@ -433,6 +628,7 @@ describe('重試與生命週期', () => {
         h.readFailed.orders = '委託讀取失敗';
         stop = h.start();
         h.away(6_000);
+        h.settle();
         h.emit(h.tick);
         await flush();
         expect(getResumeGate().state).toBe('stale-data');
@@ -445,7 +641,7 @@ describe('重試與生命週期', () => {
         expect(getResumeGate().staleAcknowledged).toBe(false);
         expect(h.deps.resolveOrderConfirm).toHaveBeenCalledTimes(2);
         await flush();
-        expect(h.deps.refreshTradingState).toHaveBeenCalledTimes(4);
+        expect(h.read).toHaveBeenCalledTimes(4);
         expect(getResumeGate().state).toBe('ready');
     });
 
@@ -469,7 +665,8 @@ describe('重試與生命週期', () => {
         expect(getResumeGate().state).toBe('resyncing');
         expect(getResumeGate().resumeSeq).toBe(2);
         await flush();
-        expect(h.deps.refreshTradingState).not.toHaveBeenCalled();
+        expect(h.read).not.toHaveBeenCalled();
+        h.settle();
         h.emit(h.tick);
         await flush();
         expect(getResumeGate().state).toBe('ready');
@@ -513,7 +710,7 @@ describe('重試與生命週期', () => {
 });
 
 describe('預設依賴接到 src/lib（vi.mock）', () => {
-    it('resolveOrderConfirm(false)、refreshTradingState 依序、經合約快取讀目前商品快照、query-failed 判為讀取失敗', async () => {
+    it('resolveOrderConfirm(false)、委託 reconcileOrdersOnce → 持倉 refreshTradingState(positions)、經合約快取讀目前商品快照、query-failed 判為讀取失敗', async () => {
         const doc = new FakeDocument();
         const win = new EventTarget();
         let now = 0;
@@ -524,8 +721,8 @@ describe('預設依賴接到 src/lib（vi.mock）', () => {
         lib.fetchSnapshots.mockResolvedValue([]);
         lib.getTradingState.mockReturnValue({
             queries: {
-                orders: { reasons: [], error: null },
-                positions: { reasons: ['query-failed'], error: 'S 持倉查詢失敗，保留上次資料' },
+                orders: { reasons: [], error: null, updatedAt: 7_000 },
+                positions: { reasons: ['query-failed'], error: 'S 持倉查詢失敗，保留上次資料', updatedAt: 1 },
             },
         });
         setCurrentCode('2330');
@@ -539,9 +736,12 @@ describe('預設依賴接到 src/lib（vi.mock）', () => {
         expect(lib.resolveOrderConfirm).toHaveBeenCalledWith(false);
         expect(lib.onStreamEvent).toHaveBeenCalledWith('heartbeat', expect.any(Function));
 
+        now += 1_000; // 回前景 1 秒後的 tick 才算活動
         [...ticks].forEach(l => l());
         await flush();
-        expect(lib.refreshTradingState.mock.calls).toEqual([['orders'], ['positions']]);
+        // A-4：委託走 reconcileOrdersOnce（等進行中讀取與冷卻後真的讀一次），不直接呼叫 refreshTradingState('orders')
+        expect(lib.reconcileOrdersOnce).toHaveBeenCalledTimes(1);
+        expect(lib.refreshTradingState.mock.calls).toEqual([['positions']]);
         expect(lib.fetchSnapshots).toHaveBeenCalledWith([contract]);
         expect(getResumeGate().state).toBe('stale-data');
         expect(getResumeGate().message).toContain('S 持倉查詢失敗');

@@ -14,6 +14,7 @@ const h = vi.hoisted(() => ({
 }));
 const m = vi.hoisted(() => ({
     refresh: vi.fn(async () => undefined),
+    reconcile: vi.fn(async () => undefined),
     notify: vi.fn(),
     assertLive: vi.fn(),
     cancelAll: vi.fn(),
@@ -25,6 +26,7 @@ const m = vi.hoisted(() => ({
 vi.mock('../../lib/trading-state', () => ({
     useTradingState: () => h.state,
     refreshTradingState: m.refresh,
+    reconcileOrdersOnce: m.reconcile,
     RECONCILE_REASON_LABELS: { disconnect: '串流中斷', 'mutation-outcome': '改刪待確認', 'query-failed': '查詢失敗' },
 }));
 vi.mock('../../lib/trade', () => ({ notify: m.notify, assertTradingLive: m.assertLive, cancelAllOrders: m.cancelAll }));
@@ -77,7 +79,7 @@ function trade(id: string, over: Over = {}): AccountedTrade {
     } as unknown as AccountedTrade;
 }
 
-function setState(trades: AccountedTrade[], orders: Partial<{ needsReconcile: boolean; reasons: string[]; updatedAt: number | null }> = {}) {
+function setState(trades: AccountedTrade[], orders: Partial<{ needsReconcile: boolean; reasons: string[]; updatedAt: number | null; error: string | null }> = {}) {
     h.state = {
         trades,
         positions: [],
@@ -347,13 +349,15 @@ describe('OrdersPage — 更新與對帳', () => {
         await render();
         const refreshButton = () => byTestId('orders-refresh')[0]!;
         await press(refreshButton());
-        expect(m.refresh).toHaveBeenCalledTimes(1);
-        expect(m.refresh).toHaveBeenCalledWith('orders');
+        // A-4：用 reconcileOrdersOnce（等進行中讀取與冷卻後真的讀一次委託），不直接呼叫 refreshTradingState('orders')
+        expect(m.reconcile).toHaveBeenCalledTimes(1);
+        expect(m.reconcile).toHaveBeenCalledWith();
+        expect(m.refresh).not.toHaveBeenCalled();
         expect(refreshButton().props.disabled).toBe(true);
         expect(text(refreshButton())).toBe('⟳ 更新（6）');
 
         await press(refreshButton()); // 冷卻中：不呼叫
-        expect(m.refresh).toHaveBeenCalledTimes(1);
+        expect(m.reconcile).toHaveBeenCalledTimes(1);
 
         await act(async () => { vi.advanceTimersByTime(3_000); });
         expect(text(refreshButton())).toBe('⟳ 更新（3）');
@@ -363,7 +367,7 @@ describe('OrdersPage — 更新與對帳', () => {
         expect(refreshButton().props.disabled).toBe(false);
         expect(text(refreshButton())).toBe('⟳ 更新');
         await press(refreshButton());
-        expect(m.refresh).toHaveBeenCalledTimes(2);
+        expect(m.reconcile).toHaveBeenCalledTimes(2);
     });
 
     it('shows the reconcile banner with reason labels and 對帳 refreshes orders (sharing the cooldown)', async () => {
@@ -374,7 +378,8 @@ describe('OrdersPage — 更新與對帳', () => {
         const reconcile = banner.findAllByType('button')[0]!;
         expect(text(reconcile)).toBe('對帳');
         await press(reconcile);
-        expect(m.refresh).toHaveBeenCalledWith('orders');
+        expect(m.reconcile).toHaveBeenCalledTimes(1);
+        expect(m.refresh).not.toHaveBeenCalled();
         expect(byTestId('orders-refresh')[0]!.props.disabled).toBe(true);
     });
 
@@ -386,5 +391,29 @@ describe('OrdersPage — 更新與對帳', () => {
         await rerender();
         expect(rows()).toHaveLength(0);
         expect(text(byTestId('orders-empty')[0]!)).toBe('此分頁沒有委託');
+    });
+});
+
+describe('OrdersPage — Q1：委託尚未讀到', () => {
+    it('updatedAt 為 null 且沒有委託：顯示「委託載入中…」而不是「沒有委託」（不論 lib 的 loading 旗標）', async () => {
+        setState([], { updatedAt: null });
+        await render();
+        expect(text(byTestId('orders-empty')[0]!)).toBe('委託載入中…');
+        await press(byTestId('orders-tab-all')[0]!);
+        expect(text(byTestId('orders-empty')[0]!)).toBe('委託載入中…');
+    });
+
+    it('讀到後才顯示「沒有委託」', async () => {
+        setState([], { updatedAt: null });
+        await render();
+        setState([], { updatedAt: 2 });
+        await rerender();
+        expect(text(byTestId('orders-empty')[0]!)).toBe('沒有委託');
+    });
+
+    it('首次讀取失敗（有錯誤、未讀到）：提示尚未讀取成功', async () => {
+        setState([], { updatedAt: null, error: '委託查詢失敗' });
+        await render();
+        expect(text(byTestId('orders-empty')[0]!)).toContain('尚未讀取成功');
     });
 });

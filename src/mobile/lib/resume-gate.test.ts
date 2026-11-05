@@ -9,6 +9,8 @@ vi.mock('../../lib/contracts-cache', () => ({ getCachedContract: vi.fn() }));
 vi.mock('../../lib/stream', () => ({}));
 vi.mock('../../lib/trading-state', () => ({}));
 import {
+    ACTIVITY_SETTLE_MS,
+    countsAsResumeActivity,
     HIDDEN_THRESHOLD_MS,
     INITIAL_RESUME_CHECKS,
     nextResumeState,
@@ -54,6 +56,15 @@ describe('resume helpers', () => {
         expect(shouldResync(HIDDEN_THRESHOLD_MS)).toBe(true);
         expect(shouldResync(0, { persisted: true })).toBe(true);
         expect(shouldResync(Number.NaN)).toBe(false);
+    });
+
+    it('counts stream activity only after the settle window (queued events delivered on resume do not count)', () => {
+        expect(countsAsResumeActivity(0)).toBe(false);
+        expect(countsAsResumeActivity(ACTIVITY_SETTLE_MS - 1)).toBe(false);
+        expect(countsAsResumeActivity(ACTIVITY_SETTLE_MS)).toBe(true);
+        expect(countsAsResumeActivity(Number.NaN)).toBe(false);
+        // 休市只有心跳（30 秒一次）：第一秒內的心跳不算，下一次仍在 45 秒逾時內
+        expect(ACTIVITY_SETTLE_MS + 30_000).toBeLessThan(RESYNC_TIMEOUT_MS);
     });
 
     it('starts reads only after the stream is live and active', () => {
