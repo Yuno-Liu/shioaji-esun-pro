@@ -223,6 +223,17 @@ describe('depthOrderMarks', () => {
         expect(odd.size).toBe(1);
     });
 
+    it('盤後零股（Odd）委託不標在盤中零股五檔，也不落到整股五檔', () => {
+        const trades = [
+            trade({ id: 'after', price: 1084, qty: 10, lot: 'Odd' }),
+            trade({ id: 'intra', price: 1085, qty: 30, lot: 'IntradayOdd' }),
+        ];
+        const odd = depthOrderMarks('2330', trades, true);
+        expect([...odd.keys()]).toEqual([priceKey(1085)]);
+        expect(depthMarkText(odd.get(priceKey(1085)))).toBe('我 買30');
+        expect(depthOrderMarks('2330', trades, false).size).toBe(0);
+    });
+
     it('改價後標在新價位', () => {
         const board = depthOrderMarks('2330', [trade({ price: 1080, modified: 1083 })], false);
         expect([...board.keys()]).toEqual([priceKey(1083)]);

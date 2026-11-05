@@ -3,6 +3,8 @@
 // - 資料：fetchScanner(type, RANKING_COUNT, ascending)（POST /api/v1/data/scanner，src/lib/shioaji.ts）。
 //   伺服器的 ascending 旗標相反（sinotrade/shioaji#207，桌面 scanner-panel.tsx 同樣處理）：true＝由大到小。
 //   取回後再依各排行的指標在前端排序一次（穩定排序，同值保留伺服器順序），名次以此為準。
+//   例外：「高低價差」（DayRangeRank）依伺服器的排序依據（最高 − 最低的絕對價差），前端無法重現，
+//   一律保留伺服器名次；振幅%只當附加資訊顯示（不是振幅排行：低價大振幅的股票可能不在名單內）。
 // - 只在自選頁的「排行」分段掛載本元件時才讀取；頁面在背景（document.hidden）時不讀，回前景時若快取過期才讀。
 // - 每種排行有模組層快取 RANKING_CACHE_MS（30 秒）：切換種類、切換分頁再回來都先用快取；
 //   任何讀取（含自動、手動、錯誤後重試）距上次讀取未滿 RANKING_COOLDOWN_MS（15 秒）都不發出。
@@ -32,7 +34,7 @@ export const RANKING_DEFS: readonly RankingDef[] = [
     { kind: 'losers', label: '跌幅', type: 'ChangePercentRank', serverAscending: false },
     { kind: 'volume', label: '成交量', type: 'VolumeRank', serverAscending: true },
     { kind: 'amount', label: '成交值', type: 'AmountRank', serverAscending: true },
-    { kind: 'range', label: '振幅', type: 'DayRangeRank', serverAscending: true },
+    { kind: 'range', label: '高低價差', type: 'DayRangeRank', serverAscending: true },
 ];
 
 export const RANKING_COUNT = 30;
@@ -75,12 +77,25 @@ function metricOf(kind: RankingKind, item: ScannerItem): number | undefined {
         case 'amount':
             return Number(item.total_amount);
         case 'range':
-            return rankingRangePct(item);
+            return undefined; // 不在前端排序（見 sortRanking）
     }
 }
 
-/** 依排行指標排序（跌幅由小到大，其餘由大到小；無法計算的排最後；同值保留伺服器順序） */
+/** 高低價差（最高 − 最低）；伺服器的 price_range 無效時以最高、最低計算 */
+export function rankingPriceRange(item: ScannerItem): number | undefined {
+    const raw = item.price_range as unknown;
+    const server = raw === null || raw === undefined || raw === '' ? NaN : Number(raw);
+    if (Number.isFinite(server) && server >= 0) return server;
+    const range = Number(item.high) - Number(item.low);
+    return Number.isFinite(range) ? range : undefined;
+}
+
+/**
+ * 依排行指標排序（跌幅由小到大，其餘由大到小；無法計算的排最後；同值保留伺服器順序）。
+ * 高低價差排行保留伺服器名次（伺服器依絕對價差排序，前端不重排）。
+ */
 export function sortRanking(kind: RankingKind, items: readonly ScannerItem[]): ScannerItem[] {
+    if (kind === 'range') return [...items];
     const sign = kind === 'losers' ? 1 : -1;
     return items
         .map((item, index) => ({ item, index, v: metricOf(kind, item) }))
@@ -343,6 +358,13 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
     );
 }
 
+/** 高低價差列的附加資訊：「價差 12.5（振幅 3.20%）」；振幅%只是參考 */
+function rangeText(item: ScannerItem): string {
+    const range = rankingPriceRange(item);
+    const pct = rankingRangePct(item);
+    return `價差 ${range !== undefined ? fmtPrice(range) : '—'}${pct !== undefined ? `（振幅 ${pct.toFixed(2)}%）` : ''}`;
+}
+
 function RankingRow({ rank, kind, item, watched, canAdd, adding, onOpen, onAdd }: {
     rank: number;
     kind: RankingKind;
@@ -360,11 +382,10 @@ function RankingRow({ rank, kind, item, watched, canAdd, adding, onOpen, onAdd }
     const chgText = Number.isFinite(chg) ? `${ARROW[dir]}${fmtPrice(Math.abs(chg))}` : '—';
     const pctText = pct !== undefined ? fmtPct(pct) : '—';
     const volText = fmtCompactInt(Number(item.total_volume));
-    const range = kind === 'range' ? rankingRangePct(item) : undefined;
     const extra = kind === 'amount'
         ? `值 ${fmtAmount(Number(item.total_amount))}`
         : kind === 'range'
-            ? `振幅 ${range !== undefined ? `${range.toFixed(2)}%` : '—'}`
+            ? rangeText(item)
             : null;
     const name = item.name ?? '';
 

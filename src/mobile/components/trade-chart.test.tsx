@@ -85,7 +85,9 @@ vi.mock('lightweight-charts', () => ({
     TrackingModeExitMode: { OnTouchEnd: 0 },
     createChart: m.createChart,
 }));
-vi.mock('../../lib/chart-history', () => ({ fetchChartHistory: m.fetchChartHistory, nextChartHistoryRevision: () => ++m.rev }));
+vi.mock('../../lib/chart-history', () => ({ nextChartHistoryRevision: () => ++m.rev }));
+// 手機不經過 src/lib 的 revision 快取（F4:F9）；快取行為另見 chart-history-cache.test.ts
+vi.mock('../lib/chart-history-cache', () => ({ fetchMobileChartHistory: m.fetchChartHistory }));
 vi.mock('../../lib/stream', () => ({
     onAnyTick: (fn: (tk: unknown) => void) => { m.tickListeners.add(fn); return () => { m.tickListeners.delete(fn); }; },
 }));
@@ -464,6 +466,37 @@ describe('TradeChart 技術指標（W2）', () => {
         await tick(INDICATOR_FLUSH_MS);
         expect(ma5.update).toHaveBeenCalledTimes(1); // 只更新變動的最後一根
         expect(ma5.setData.mock.calls.length).toBe(ma5SetData); // 沒有整段重設
+    });
+
+    it('根數不足以計算指標時，圖例說明「資料不足（需 N 根，目前 M 根）」（期權日 K 約 17 根時的 MA(20)）', async () => {
+        m.fetchChartHistory.mockReset().mockResolvedValue(minuteKbars());
+        await render();
+        // 60 根 1 分 K → 12 根 5 分 K：MA(5) 有值、MA(20) 永遠沒值
+        const notes = byTestId('chart-legend-note').map(n => textOf(n));
+        expect(notes).toEqual([' 資料不足（需 20 根，目前 12 根）']);
+        expect(legendText()).toMatch(/MA\(20\).*資料不足（需 20 根，目前 12 根）/);
+        // 換成需要較少根數的參數 → 說明消失
+        await act(async () => { setIndicatorSettings(updateIndicatorParams(getIndicatorSettings(), 'sma-default-20', { period: 10 })); });
+        await tick(20);
+        expect(byTestId('chart-legend-note')).toHaveLength(0);
+    });
+
+    it('指標即時增量更新會送出空白點：SuperTrend 盤中翻轉時清掉該根的舊線段', async () => {
+        setIndicatorSettings({ version: 1, volume: true, items: [{ id: 'st', type: 'supertrend', params: { period: 3, mult: 1 }, color: 0 }] });
+        m.fetchChartHistory.mockReset().mockResolvedValue(minuteKbars());
+        await render();
+        const [up, down] = [m.allSeries[2]!, m.allSeries[3]!];
+        const lastUp = () => up.update.mock.calls.at(-1)?.[0] as { time: number; value?: number } | undefined;
+        // 新的一根先維持多頭：up 有值
+        await emit({ time: '10:05:00', close: '1062', total_volume: 601 });
+        await tick(INDICATOR_FLUSH_MS);
+        expect(typeof lastUp()?.value).toBe('number');
+        const flipTime = lastUp()!.time;
+        // 同一根盤中急跌翻空：up 這一根必須以空白點更新（刪掉舊值），down 畫出新值
+        await emit({ time: '10:06:00', close: '900', total_volume: 602 });
+        await tick(INDICATOR_FLUSH_MS);
+        expect(lastUp()).toEqual({ time: flipTime });
+        expect(down.update).toHaveBeenLastCalledWith({ time: flipTime, value: expect.any(Number) });
     });
 
     it('長按追蹤時圖例顯示該根的值，放開後回到最新值', async () => {

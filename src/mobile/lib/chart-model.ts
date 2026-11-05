@@ -152,12 +152,15 @@ export function priceKey(price: number | string): string {
 
 /**
  * 五檔上自己的未成交限價委託（依價位加總剩餘量）。
- * oddLot：五檔切到盤中零股時只算零股委託，整股五檔只算整股委託（兩個市場分開撮合）。
+ * oddLot：五檔切到盤中零股時只算盤中零股（IntradayOdd）委託，整股五檔只算整股委託。
+ * 整股、盤中零股、盤後零股是三個分開撮合的市場；盤後零股（'Odd'）沒有即時五檔，不標在任何一份五檔上。
  */
 export function depthOrderMarks(orderableCode: string, trades: readonly AccountedTrade[], oddLot: boolean): Map<string, DepthOrderMark> {
     const marks = new Map<string, DepthOrderMark>();
     for (const { trade, price, remaining } of workingLimitOrders(orderableCode, trades)) {
-        if (isOddLotOrder(trade) !== oddLot) continue;
+        const lot = trade.order.order_lot;
+        if (lot === 'Odd') continue;
+        if ((lot === 'IntradayOdd') !== oddLot) continue;
         const k = priceKey(price);
         const m = marks.get(k) ?? { buy: 0, sell: 0 };
         if (trade.order.action === 'Buy') m.buy += remaining;

@@ -6,7 +6,7 @@
 //   副圖畫參考線（levels）。左上角圖例顯示指標名稱與最新值；長按追蹤時顯示該根的值。
 //   即時更新：K 棒每 CHART_FLUSH_MS 合併重畫，指標另以 INDICATOR_FLUSH_MS 節流、只 update 變動的尾端點
 //   （不會每筆成交全部重算）；歷史重抓、裁切才整段 setData。
-// - 資料：fetchChartHistory() → kbarsToCandles() → aggregate()（走勢改挑當日時段）；最多 5,000 根；
+// - 資料：fetchMobileChartHistory()（chart-history-cache.ts；每組只留最新一份，記憶體有上限）→ kbarsToCandles() → aggregate()（走勢改挑當日時段）；最多 5,000 根；
 //   最後一根由即時成交（onAnyTick；指數用 quote_idx）更新。試撮（simtrade）揭示價不入圖（與桌面相同），只用來偵測換時段。
 // - 歷史新鮮度：chart-history-freshness.ts 依 (code, period) 決定沿用快取、先顯示快取再背景重抓、或換新 revision；
 //   ResumeGate 的 resumeSeq 改變（回前景）時背景重抓；走勢與 K 線都有缺口偵測（累計量顯示真的漏量才重抓）。
@@ -40,7 +40,7 @@ import {
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { useQuote } from '../../hooks/use-stream';
 import { useResumeGate } from '../hooks/use-resume-gate';
-import { fetchChartHistory, nextChartHistoryRevision } from '../../lib/chart-history';
+import { nextChartHistoryRevision } from '../../lib/chart-history';
 import { DEF_BY_TYPE, type IndicatorDef, type OutputDef } from '../../lib/indicator-defs';
 import type { IndicatorPoint } from '../../lib/indicators';
 import { CLOSE_GRACE, pickIntradayWindow, sessionWindowFor, tickBucket, type SessionWindow } from '../../lib/intraday-session';
@@ -51,12 +51,15 @@ import type { Candle } from '../../lib/types/market';
 import { aggregate, kbarsToCandles, nowWallClockUtc, wallClockToUtc } from '../../lib/utils/kbars';
 import { formatToTick, roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
 import { currentOrientationEnv, shouldAutoFullscreen } from '../lib/chart-fullscreen';
+import { fetchMobileChartHistory } from '../lib/chart-history-cache';
 import { getHistoryEntry, planHistory, setHistoryEntry } from '../lib/chart-history-freshness';
 import { dayHighLow, formatIndicatorValue, intradayAverage, intradayBars, liveBarTime, priceLinesKey, type PriceLineSpec } from '../lib/chart-model';
 import { capBars, CHART_PERIODS, chartQueryRange, MAX_CHART_BARS, periodDef, type ChartPeriod } from '../lib/chart-ranges';
 import {
     indicatorLabel,
     indicatorSettingsKey,
+    indicatorWarmupBars,
+    insufficientDataNote,
     INDICATOR_PALETTE,
     paletteColor,
     useMobileIndicators,
@@ -103,6 +106,8 @@ export interface LegendEntry {
     /** 0＝主圖；≥1＝副圖 */
     pane: number;
     values: { label: string; color: string; text: string }[];
+    /** 根數不足以計算時的說明（例如期權日 K：「資料不足（需 20 根，目前 17 根）」） */
+    note?: string;
 }
 
 const LINE_STYLE: Record<PriceLineSpec['kind'], { lineStyle: LineStyle; lineWidth: 1 | 2 }> = {
@@ -162,6 +167,8 @@ interface IndRuntime {
     pane: number;
     decimals: number;
     outputs: IndOutput[];
+    /** 各輸出第一個有值所需根數（indicatorWarmupBars） */
+    warmup: Record<string, number>;
 }
 
 export interface TradeChartProps {
@@ -364,12 +371,16 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             } else {
                 for (const r of inds) {
                     const single = r.outputs.length === 1;
+                    const empty: Record<string, boolean> = {};
+                    for (const o of r.outputs) empty[o.key] = o.last === undefined;
+                    const note = bars.length > 0 ? insufficientDataNote(r.warmup, empty, bars.length) : null;
                     next.push({
                         id: r.item.id,
                         name: indicatorLabel(r.item),
                         color: r.outputs[0]?.color ?? c.text,
                         pane: r.pane,
                         values: r.outputs.map(o => ({ label: single ? '' : o.label, color: o.color, text: formatIndicatorValue(seriesValue(o.series, o.last), r.decimals) })),
+                        ...(note ? { note } : {}),
                     });
                 }
             }
@@ -451,7 +462,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                             while (i > 0 && pts[i - 1]!.time >= from) i--;
                             for (; i < pts.length; i++) {
                                 const p = pts[i]!;
-                                if (p.value !== undefined && Number.isFinite(p.value)) o.series.update(indPoint(o, p));
+                                // 空白點也要送（SuperTrend 翻轉、指標斷線）：同一時間的 whitespace 會刪掉該根的舊值，
+                                // 否則翻轉那一根會同時留著翻轉前的線段（lightweight-charts v5 的 update 接受 WhitespaceData）
+                                o.series.update(p.value !== undefined && Number.isFinite(p.value) ? indPoint(o, p) : { time: t(p.time) });
                             }
                         }
                     } catch {
@@ -501,6 +514,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                         pane,
                         decimals: pane === 0 ? precision : def.type === 'obv' ? 0 : 2,
                         outputs: [],
+                        warmup: indicatorWarmupBars(def, params),
                     };
                     const fmt = pane === 0 ? priceFormat : def.type === 'obv' ? { type: 'volume' as const } : { type: 'price' as const, precision: 2, minMove: 0.01 };
                     for (const o of def.outputs) {
@@ -673,7 +687,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             if (mode !== 'cache') setHistoryEntry(code, period, { revision, at: Date.now(), resumeSeq: resumeSeqRef.current, failed: false });
             if (mode === 'initial') setStatus('loading');
             const { start, end } = chartQueryRange(period, ct.security_type);
-            return fetchChartHistory(ct, start, end, { timeoutMs: 30_000, revision })
+            return fetchMobileChartHistory(ct, start, end, { timeoutMs: 30_000, revision })
                 .then(
                     k => {
                         if (cancelled) return false;
@@ -1022,6 +1036,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                             <span className={cs.legendValue}>{v.text}</span>
                         </span>
                     ))}
+                    {l.note && <span data-testid='chart-legend-note'> {l.note}</span>}
                 </span>
             ))}
         </div>

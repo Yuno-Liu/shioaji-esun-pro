@@ -14,7 +14,9 @@ import {
     RANKING_CACHE_MS,
     RANKING_COOLDOWN_MS,
     RANKING_COUNT,
+    RANKING_DEFS,
     rankingChangePct,
+    rankingPriceRange,
     RankingList,
     requestRanking,
     resetRankingForTest,
@@ -81,13 +83,22 @@ describe('sortRanking', () => {
         expect(sortRanking('losers', [a, bad, b, c, d]).map(i => i.code)).toEqual(['C', 'D', 'B', 'A', 'X']);
     });
 
-    it('成交量、成交值、振幅由大到小；同值保留伺服器順序', () => {
+    it('成交量、成交值由大到小；同值保留伺服器順序', () => {
         const v1 = item('V1', 100, 0, { total_volume: 500, total_amount: 1, high: 101, low: 99 });
         const v2 = item('V2', 100, 0, { total_volume: 900, total_amount: 3, high: 110, low: 95 });
         const v3 = item('V3', 100, 0, { total_volume: 500, total_amount: 2, high: 100, low: 100 });
         expect(sortRanking('volume', [v1, v2, v3]).map(i => i.code)).toEqual(['V2', 'V1', 'V3']);
         expect(sortRanking('amount', [v1, v2, v3]).map(i => i.code)).toEqual(['V2', 'V3', 'V1']);
-        expect(sortRanking('range', [v3, v1, v2]).map(i => i.code)).toEqual(['V2', 'V1', 'V3']);
+    });
+
+    it('高低價差（DayRangeRank）保留伺服器名次，不依振幅%重排；價差優先用伺服器 price_range', () => {
+        // 伺服器依絕對價差排序：高價股價差 60（振幅 3%）在前，低價股價差 3（振幅 10%）在後
+        const hi = item('HI', 2000, 0, { high: 2030, low: 1970, price_range: 60 });
+        const lo = item('LO', 30, 0, { high: 31.5, low: 28.5, price_range: 3 });
+        expect(sortRanking('range', [hi, lo]).map(i => i.code)).toEqual(['HI', 'LO']);
+        expect(rankingPriceRange(hi)).toBe(60);
+        expect(rankingPriceRange({ ...lo, price_range: undefined as unknown as number })).toBeCloseTo(3);
+        expect(RANKING_DEFS.find(d => d.kind === 'range')!.label).toBe('高低價差');
     });
 
     it('漲跌幅由漲跌與參考價計算', () => {

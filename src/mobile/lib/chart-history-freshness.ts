@@ -1,7 +1,7 @@
 // src/mobile/lib/chart-history-freshness.ts — 手機圖表歷史的新鮮度（規格 §9.3）
 //
-// fetchChartHistory() 以 revision 永久快取（連失敗也快取）。手機切分頁、切週期、回前景都會重建圖表，
-// 若一律用同一個 revision 會拿到舊歷史（走勢缺一段不補）或一直重放同一次失敗。
+// 歷史以 revision 快取（chart-history-cache.ts：同組只留最新一份成功的回應，記憶體有上限）。手機切分頁、切週期、回前景都會重建圖表，
+// 若一律用同一個 revision 會拿到舊歷史（走勢缺一段不補）。
 // 這裡依 (code, period) 記下上次取得歷史的 revision、時間與 ResumeGate 的 resumeSeq：
 //   - 沒有紀錄或上次失敗：以 nextChartHistoryRevision() 的新 revision 查詢（不重放失敗、不撿未知的舊快取）
 //   - 超過 HISTORY_STALE_MS 或 resumeSeq 已改變：先顯示快取，背景以新 revision 重抓

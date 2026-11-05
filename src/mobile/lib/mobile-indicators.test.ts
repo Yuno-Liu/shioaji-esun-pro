@@ -10,7 +10,9 @@ import {
     getIndicatorSettings,
     indicatorLabel,
     indicatorName,
+    indicatorWarmupBars,
     INDICATOR_PALETTE,
+    insufficientDataNote,
     limitReason,
     MAX_OVERLAYS,
     MAX_PANES,
@@ -199,5 +201,40 @@ describe('上限與增刪改', () => {
         s = removeIndicator(s, boll.id);
         expect(s.items.map(indicatorLabel)).toEqual(['MA(5)', 'MA(20)']);
         expect(removeIndicator(s, 'missing')).toBe(s);
+    });
+});
+
+describe('暖機根數與「資料不足」說明（F4:F4）', () => {
+    const defaults = (type: string) => Object.fromEntries(DEF_BY_TYPE.get(type)!.params.map(p => [p.key, p.def]));
+
+    it('以實測取得各輸出第一個有值的根數（MA(20)＝20、MACD DIF 26／DEA 34、DMI ±DI 15／ADX 28）', () => {
+        expect(indicatorWarmupBars(DEF_BY_TYPE.get('sma')!, { period: 20 })).toEqual({ line: 20 });
+        expect(indicatorWarmupBars(DEF_BY_TYPE.get('boll')!, defaults('boll'))).toEqual({ mid: 20, upper: 20, lower: 20 });
+        expect(indicatorWarmupBars(DEF_BY_TYPE.get('macd')!, defaults('macd'))).toEqual({ hist: 34, macd: 26, signal: 34 });
+        expect(indicatorWarmupBars(DEF_BY_TYPE.get('dmi')!, defaults('dmi'))).toEqual({ plus: 15, minus: 15, adx: 28 });
+        // 參數上限也量得到
+        expect(indicatorWarmupBars(DEF_BY_TYPE.get('sma')!, { period: 500 })).toEqual({ line: 500 });
+    });
+
+    it('只在某個方向才有值的輸出（SuperTrend 多頭／空頭）以最早有值的根數為準，不誤報', () => {
+        const w = indicatorWarmupBars(DEF_BY_TYPE.get('supertrend')!, defaults('supertrend'));
+        expect(w.up).toBe(w.down);
+        expect(insufficientDataNote(w, { up: false, down: true }, 15)).toBeNull();
+    });
+
+    it('全部內建指標都量得到（沒有值的輸出不會被誤判）', () => {
+        for (const def of MOBILE_INDICATOR_DEFS) {
+            const w = indicatorWarmupBars(def, defaults(def.type));
+            for (const o of def.outputs) expect(w[o.key], `${def.type}.${o.key}`).toBeGreaterThan(0);
+        }
+    });
+
+    it('說明只在沒有值且根數不足時出現，取需要最多根的輸出', () => {
+        const dmi = { plus: 15, minus: 15, adx: 28 };
+        expect(insufficientDataNote(dmi, { plus: false, minus: false, adx: true }, 17)).toBe('資料不足（需 28 根，目前 17 根）');
+        expect(insufficientDataNote(dmi, { plus: true, minus: true, adx: true }, 10)).toBe('資料不足（需 28 根，目前 10 根）');
+        expect(insufficientDataNote(dmi, { plus: false, minus: false, adx: false }, 30)).toBeNull();
+        // 根數夠卻沒值（其他原因）不說是資料不足
+        expect(insufficientDataNote({ line: 20 }, { line: true }, 25)).toBeNull();
     });
 });

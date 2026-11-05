@@ -139,7 +139,10 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
     const innerOuter = ticket ? null : innerOuterRatio(realTick);
     const bidAsk = splitPercent(book.bidTotal, book.askTotal);
 
-    const pick = (price: number, side: 'bid' | 'ask') => (onPick ? onPick(price, side) : openTicket({ code, price, source: 'depth' }));
+    // 盤中零股五檔的價位屬零股撮合簿：面板以盤中零股開啟（整股模式不帶 lot，沿用面板預設）
+    const pick = (price: number, side: 'bid' | 'ask') => (onPick
+        ? onPick(price, side)
+        : openTicket({ code, price, source: 'depth', ...(oddLot ? { lot: 'IntradayOdd' as const } : {}) }));
 
     const cell = (side: 'bid' | 'ask', level: number, q: DepthQuote | null) => {
         const testId = `depth-${side}-${level}`;

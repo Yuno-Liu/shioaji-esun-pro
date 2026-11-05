@@ -78,7 +78,14 @@ export interface PositionSummary {
 
 const STOCK_COND_TEXT: Record<string, string> = { Cash: '現股', MarginTrading: '融資', ShortSelling: '融券' };
 
-/** 目前商品的持倉摘要（股票依信用條件、期權依多空分列；數量加總、均價以數量加權） */
+/** 股票部位標籤：現股空單（當沖先賣＝Cash＋Sell）獨立一列，不與現股多單合併 */
+function stockSummaryLabel(cond: string | undefined, direction: string): string {
+    const c = cond || 'Cash';
+    if (c === 'Cash') return direction === 'Sell' ? '現股空（當沖）' : '現股';
+    return STOCK_COND_TEXT[c] ?? (direction === 'Sell' ? '空' : '多');
+}
+
+/** 目前商品的持倉摘要（股票依信用條件＋多空、期權依多空分列；數量加總、均價以數量加權） */
 export function positionSummaries(orderableCode: string, displayCode: string, positions: readonly AccountedPosition[], isStock: boolean): PositionSummary[] {
     const groups = new Map<string, { qty: number; cost: number; pnl: number }>();
     for (const p of positions) {
@@ -86,7 +93,7 @@ export function positionSummaries(orderableCode: string, displayCode: string, po
         if (!(p.quantity > 0)) continue;
         const cond = 'cond' in p && typeof p.cond === 'string' ? p.cond : undefined;
         const label = isStock
-            ? STOCK_COND_TEXT[cond ?? 'Cash'] ?? (p.direction === 'Sell' ? '空' : '多')
+            ? stockSummaryLabel(cond, p.direction)
             : p.direction === 'Sell' ? '空單' : '多單';
         const g = groups.get(label) ?? { qty: 0, cost: 0, pnl: 0 };
         g.qty += p.quantity;

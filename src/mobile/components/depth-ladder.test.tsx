@@ -152,6 +152,19 @@ describe('DepthLadder（page）', () => {
         expect(storeMock.openTicket.mock.calls[0]![0]).not.toHaveProperty('action');
     });
 
+    it('盤中零股模式點價：以盤中零股開下單面板（lot: IntradayOdd）；切回整股不帶 lot', async () => {
+        await render();
+        await act(async () => { byId('depth-odd-toggle').props.onClick(); });
+        await act(async () => { byId('depth-ask-1').props.onClick(); });
+        const whole = view!.root.findAll(n => n.type === 'button' && n.children.includes('整股'))[0]!;
+        await act(async () => { whole.props.onClick(); });
+        await act(async () => { byId('depth-bid-1').props.onClick(); });
+        expect(storeMock.openTicket.mock.calls).toEqual([
+            [{ code: '2330', price: 985, source: 'depth', lot: 'IntradayOdd' }],
+            [{ code: '2330', price: 984, source: 'depth' }],
+        ]);
+    });
+
     it('有 onPick 時呼叫 onPick(price, side)，不開下單面板', async () => {
         const onPick = vi.fn();
         await render([], { onPick });

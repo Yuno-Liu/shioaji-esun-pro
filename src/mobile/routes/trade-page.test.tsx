@@ -109,6 +109,20 @@ describe('positionSummaries／workingOrderCount', () => {
         expect(positionSummaries('TXFF6', 'TXFR1', [pos('TXFF6', 2, 22400, 0)], false)).toEqual([{ label: '多單', quantity: '2 口', avg: 22400, pnl: 0 }]);
     });
 
+    it('現股當沖先賣（Cash＋Sell）標「現股空（當沖）」，與現股多單分列不合併', () => {
+        expect(positionSummaries('2330', '2330', [pos('2330', 1000, 1085, 500, { cond: 'Cash', direction: 'Sell' })], true))
+            .toEqual([{ label: '現股空（當沖）', quantity: '1張', avg: 1085, pnl: 500 }]);
+        const rows = positionSummaries('2330', '2330', [
+            pos('2330', 1000, 1050, 100, { cond: 'Cash' }),
+            pos('2330', 1000, 1085, -20, { cond: 'Cash', direction: 'Sell' }),
+            pos('2330', 1000, 1060, 0, { direction: 'Sell' }),
+        ], true);
+        expect(rows).toEqual([
+            { label: '現股', quantity: '1張', avg: 1050, pnl: 100 },
+            { label: '現股空（當沖）', quantity: '2張', avg: 1072.5, pnl: -20 },
+        ]);
+    });
+
     it('未成交筆數：目前商品、剩餘量 > 0（含市價），以 target_code 比對別名', () => {
         expect(workingOrderCount('2330', [trade('a', '2330'), trade('b', '2330', { priceType: 'MKT' }), trade('c', '2317'), trade('d', '2330', { deal: 2 })])).toBe(2);
         expect(workingOrderCount('TXFF6', [trade('x', 'TXFR1', { target: 'TXFF6' })])).toBe(1);

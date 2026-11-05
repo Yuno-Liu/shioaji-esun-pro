@@ -8,6 +8,7 @@
 
 import { useSyncExternalStore } from 'react';
 import { DEF_BY_TYPE, INDICATOR_DEFS, type IndicatorDef, type ParamDef } from '../../lib/indicator-defs';
+import type { Candle } from '../../lib/types/market';
 
 export const MOBILE_INDICATORS_KEY = 'sj-mobile-indicators-v1';
 /** 主圖疊加指標上限（手機寬度下再多線條就看不清楚） */
@@ -110,6 +111,76 @@ export function usesPaletteColor(def: IndicatorDef): boolean {
 
 export function paletteColor(index: number): string {
     return INDICATOR_PALETTE[((index % INDICATOR_PALETTE.length) + INDICATOR_PALETTE.length) % INDICATOR_PALETTE.length]!;
+}
+
+// ---- 暖機根數（資料不足說明） ----
+
+/** 實測暖機根數用的合成 K 棒數（參數上限：MA 500、MACD 200+100、StochRSI 約 300） */
+const WARMUP_PROBE_BARS = 1200;
+let probeBars: Candle[] | null = null;
+const warmupCache = new Map<string, Record<string, number>>();
+
+/** 有起伏、高低不同、量不為 0 的合成 K 棒（避免除以 0 讓指標永遠沒值） */
+function warmupProbeBars(): Candle[] {
+    if (probeBars) return probeBars;
+    const out: Candle[] = [];
+    let prev = 100;
+    for (let i = 0; i < WARMUP_PROBE_BARS; i++) {
+        const close = 100 + 20 * Math.sin(i / 7) + (i % 5) - 2;
+        out.push({ time: 86_400 + i * 60, open: prev, high: Math.max(prev, close) + 1 + (i % 3), low: Math.min(prev, close) - 1 - (i % 2), close, volume: 100 + (i % 7) * 10 });
+        prev = close;
+    }
+    probeBars = out;
+    return out;
+}
+
+/**
+ * 各輸出第一個有值需要幾根 K 棒（以合成 K 棒實測，依參數快取）。
+ * - 指標輸出不一定逐根對齊（MA 從第 period 根才開始輸出），以時間換回第幾根。
+ * - 有值之後又出現空白點的輸出（SuperTrend 的多頭／空頭線，只在該方向才有值）是「看行情」而不是「看根數」：
+ *   改用同一指標所有輸出中最早有值的根數，避免在行情單邊時誤報資料不足。
+ * - 實測期間都沒有值的輸出不列入。
+ * 圖表以此判斷「沒有值」是不是根數不足（例如期權日 K 只有約 17 根，MA(20) 一定沒有值）。
+ */
+export function indicatorWarmupBars(def: IndicatorDef, params: Record<string, number>): Record<string, number> {
+    const key = `${def.type}|${JSON.stringify(params)}`;
+    const cached = warmupCache.get(key);
+    if (cached) return cached;
+    const out: Record<string, number> = {};
+    try {
+        const bars = warmupProbeBars();
+        const res = def.compute(bars, params);
+        const regime: string[] = [];
+        let earliest = Infinity;
+        for (const o of def.outputs) {
+            const pts = res[o.key] ?? [];
+            const i = pts.findIndex(p => p.value !== undefined && Number.isFinite(p.value));
+            if (i < 0) continue;
+            const n = Math.round((pts[i]!.time - bars[0]!.time) / 60) + 1;
+            out[o.key] = n;
+            earliest = Math.min(earliest, n);
+            if (pts.slice(i + 1).some(p => p.value === undefined || !Number.isFinite(p.value))) regime.push(o.key);
+        }
+        for (const k of regime) out[k] = earliest;
+    } catch {
+        // 參數組合有問題：不提供暖機根數
+    }
+    warmupCache.set(key, out);
+    if (warmupCache.size > 200) warmupCache.delete(warmupCache.keys().next().value!);
+    return out;
+}
+
+/**
+ * 指標完全沒有值、且是根數不足造成時的說明：「資料不足（需 20 根，目前 17 根）」；否則 null。
+ * empty：該輸出目前是否完全沒有值（outputKey → true）。
+ */
+export function insufficientDataNote(warmup: Record<string, number>, empty: Record<string, boolean>, barCount: number): string | null {
+    let need = 0;
+    for (const [key, isEmpty] of Object.entries(empty)) {
+        const n = warmup[key];
+        if (isEmpty && n !== undefined && n > barCount && n > need) need = n;
+    }
+    return need > 0 ? `資料不足（需 ${need} 根，目前 ${barCount} 根）` : null;
 }
 
 // ---- 上限 ----

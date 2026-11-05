@@ -68,7 +68,7 @@ export function mobileRangeDays(period: ChartPeriod, secType: SecurityType): num
     return (isFuturesLike(secType) ? FUTURES_DAYS : STOCK_DAYS)[period];
 }
 
-/** fetchChartHistory() 的起訖日（台灣日期 YYYY-MM-DD） */
+/** 歷史查詢（fetchMobileChartHistory）的起訖日（台灣日期 YYYY-MM-DD） */
 export function chartQueryRange(period: ChartPeriod, secType: SecurityType): { start: string; end: string } {
     if (period === 'line') return { start: dateStrOffset(INTRADAY_LOOKBACK_DAYS), end: dateStrOffset(-1) };
     return { start: dateStrOffset(mobileRangeDays(period, secType)), end: dateStrOffset(0) };
