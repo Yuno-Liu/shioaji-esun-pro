@@ -12,6 +12,8 @@ const m = vi.hoisted(() => ({
     setRiskSettings: vi.fn(),
     subscribeRiskSettings: vi.fn(() => () => undefined),
     watchlistMounts: 0,
+    fillSoundMounts: 0,
+    wakeLockMounts: 0,
 }));
 vi.mock('../../lib/boot', () => ({ bootstrap: m.bootstrap }));
 vi.mock('../../lib/theme-store', () => ({ initTheme: m.initTheme }));
@@ -35,6 +37,9 @@ vi.mock('../routes/orders-page', () => ({ OrdersPage: () => null }));
 vi.mock('../routes/positions-page', () => ({ PositionsPage: () => null }));
 vi.mock('../routes/account-page', () => ({ AccountPage: () => null }));
 vi.mock('../hooks/use-risk-pnl-feed', () => ({ useRiskPnlFeed: () => undefined }));
+// 成交音效（onOrderEvent、AudioContext）與螢幕常亮（navigator.wakeLock）：殼層測試只看掛載與否
+vi.mock('../hooks/use-fill-sound', () => ({ useFillSound: () => { m.fillSoundMounts++; } }));
+vi.mock('../hooks/use-wake-lock', () => ({ useWakeLock: () => { m.wakeLockMounts++; } }));
 vi.mock('../lib/resume-gate-runtime', () => ({ startResumeGate: () => () => undefined }));
 // 常駐自選狀態（殼層掛載 useWatchlist）：記錄是否被掛載，驗證非 secure context 不讀自選清單
 vi.mock('../lib/watchlist-context', () => ({
@@ -74,6 +79,8 @@ beforeEach(() => {
     m.setRiskSettings.mockClear();
     m.risk.confirmManualOrders = false;
     m.watchlistMounts = 0;
+    m.fillSoundMounts = 0;
+    m.wakeLockMounts = 0;
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
@@ -131,6 +138,8 @@ describe('SecureContextGate', () => {
         expect(m.ensureStream).not.toHaveBeenCalled();
         expect(m.useTradingState).not.toHaveBeenCalled();
         expect(m.watchlistMounts).toBe(0);
+        expect(m.fillSoundMounts).toBe(0);
+        expect(m.wakeLockMounts).toBe(0);
     });
 
     it('MobileApp in a secure context mounts the trading shell and opens the stream', async () => {
@@ -139,5 +148,7 @@ describe('SecureContextGate', () => {
         expect(view!.root.findAll(n => n.props['data-testid'] === 'mock-status-bar').length).toBeGreaterThan(0);
         expect(m.ensureStream).toHaveBeenCalled();
         expect(m.watchlistMounts).toBeGreaterThan(0);
+        expect(m.fillSoundMounts).toBeGreaterThan(0);
+        expect(m.wakeLockMounts).toBeGreaterThan(0);
     });
 });
