@@ -1,17 +1,42 @@
 // src/mobile/lib/resume-gate-runtime.ts — ResumeGate 執行期單例（規格 §7.4）
 //
-// 【目前為樁（T1）】狀態固定為 'ready'，startResumeGate() 尚未監聽任何事件。
-// T2 會在這個檔案實作：
-//   - 監聽 visibilitychange／pagehide／pageshow（不依賴 freeze／resume）；隱藏 ≥ HIDDEN_THRESHOLD_MS 或
-//     pageshow(persisted) 回前景 → resyncing；
-//   - 進入 resyncing 時 resolveOrderConfirm(false) 關閉進行中的確認面板、resumeSeq 遞增（下單面板據此標示「價格可能過期」）；
-//   - 以 getStreamStatus()、onAnyTick()、onAnyBidAsk()、onStreamEvent('heartbeat', …)、streamConnectionEpoch()
-//     判斷 ①②；之後才發出 refreshTradingState('orders'／'positions') 與目前商品（mobile-store 的 currentCode）的快照讀取；
-//   - 以 nextResumeState() 推進狀態，RESYNC_TIMEOUT_MS 逾時 → failed。
-// 對外介面（本檔匯出的函式與 ResumeGateSnapshot）是其他任務的依賴，T2 實作時不要改簽章。
+// - 監聽 visibilitychange／pagehide／pageshow（iOS 與 Android 皆支援；不依賴 Chromium 才有的 freeze／resume）。
+//   隱藏 ≥ HIDDEN_THRESHOLD_MS 後回前景，或 pageshow(persisted)（bfcache 還原）→ resyncing。
+// - 進入 resyncing：resumeSeq 遞增（下單面板據此標示「價格可能過期」）、resolveOrderConfirm(false) 關閉進行中的確認面板；
+//   新單／改價／減量由 assertResumeReady() 擋下（刪單與全部刪單不呼叫它）。
+// - ① getStreamStatus() === 'live'；② 回前景後 onAnyTick／onAnyBidAsk／onStreamEvent('heartbeat') 有活動，
+//   或 streamConnectionEpoch() 與隱藏前不同；①② 成立後才發出 ③ refreshTradingState('orders') → ('positions')
+//   與 ④ 目前商品（mobile-store 的 currentCode，經 contracts 快取取得合約）的 fetchSnapshots；
+//   以 nextResumeState() 推進，RESYNC_TIMEOUT_MS 逾時 → failed；③④ 失敗 → stale-data。
+// - 每個同步週期 ③④ 各最多發出一次；活動監聽在第一筆活動後立即解除；refreshTradingState() 自身也有節流，
+//   所以頻繁切換 App 不會造成查詢風暴。
+// - 時鐘、事件來源與 src/lib 呼叫都經 ResumeGateDeps 注入（單元測試用）；預設值在 startResumeGate() 呼叫時才取用。
 
+import { resolveOrderConfirm as libResolveOrderConfirm } from '../../lib/order-confirm';
+import { fetchSnapshots as libFetchSnapshots } from '../../lib/shioaji';
+import { getCachedContract as libGetCachedContract } from '../../lib/contracts-cache';
+import {
+    getStreamStatus as libGetStreamStatus,
+    onAnyBidAsk as libOnAnyBidAsk,
+    onAnyTick as libOnAnyTick,
+    onStreamEvent as libOnStreamEvent,
+    streamConnectionEpoch as libStreamConnectionEpoch,
+    subscribeStatusStore as libSubscribeStatusStore,
+} from '../../lib/stream';
+import { getTradingState as libGetTradingState, refreshTradingState as libRefreshTradingState } from '../../lib/trading-state';
+import type { ContractBase } from '../../lib/types/contract';
 import { notStarted } from './errors';
-import { resumeAllowsNewOrders, type ResumeChecks, type ResumeGateState } from './resume-gate';
+import { getMobileUi } from './mobile-store';
+import {
+    INITIAL_RESUME_CHECKS,
+    nextResumeState,
+    readsMayStart,
+    resumeAllowsNewOrders,
+    shouldResync,
+    type ReadSettled,
+    type ResumeChecks,
+    type ResumeGateState,
+} from './resume-gate';
 
 export interface ResumeGateSnapshot {
     state: ResumeGateState;
@@ -30,7 +55,77 @@ export interface ResumeGateSnapshot {
     message: string | null;
 }
 
+/** 最小事件目標介面（document／window 皆符合） */
+export interface ResumeEventTarget {
+    addEventListener(type: string, listener: (ev: Event) => void): void;
+    removeEventListener(type: string, listener: (ev: Event) => void): void;
+}
+
+/** resyncing 期間的輪詢間隔（只讀本地狀態、不發任何請求；事件驅動之外的保險，並負責逾時判斷） */
+export const RESUME_POLL_MS = 1_000;
+
+/** 讀取失敗的判定：refreshTradingState() 失敗時不 reject，而是在 queries[scope].reasons 留下這些原因 */
+const READ_FAILURE_REASONS: readonly string[] = ['query-failed', 'not-subscribed'];
+
+/** ResumeGate 的外部依賴（全部可注入；未提供者使用 src/lib 與瀏覽器的預設值） */
+export interface ResumeGateDeps {
+    now(): number;
+    setTimeout(fn: () => void, ms: number): unknown;
+    clearTimeout(handle: unknown): void;
+    /** visibilitychange 的目標與 visibilityState 來源；null＝不監聽 */
+    document: (ResumeEventTarget & { readonly visibilityState?: string }) | null;
+    /** pagehide／pageshow 的目標；null＝不監聽 */
+    window: ResumeEventTarget | null;
+    getStreamStatus(): string;
+    /** 串流連線世代；非 live 時為 -1 */
+    streamConnectionEpoch(): number;
+    subscribeStreamStatus(listener: () => void): () => void;
+    onAnyTick(listener: () => void): () => void;
+    onAnyBidAsk(listener: () => void): () => void;
+    onHeartbeat(listener: () => void): () => void;
+    refreshTradingState(scope: 'orders' | 'positions'): Promise<void>;
+    /** refreshTradingState 完成後：該範圍讀取失敗時回傳原因，成功回傳 null */
+    tradingReadFailed(scope: 'orders' | 'positions'): string | null;
+    getCurrentCode(): string | null;
+    getCachedContract(code: string): ContractBase | undefined;
+    fetchSnapshots(contracts: ContractBase[]): Promise<unknown>;
+    resolveOrderConfirm(approved: boolean): void;
+}
+
+const SCOPE_LABEL = { orders: '委託', positions: '持倉' } as const;
+
+function defaultDeps(): ResumeGateDeps {
+    return {
+        now: () => Date.now(),
+        setTimeout: (fn, ms) => setTimeout(fn, ms),
+        clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+        document: typeof document === 'undefined' ? null : document,
+        window: typeof window === 'undefined' ? null : window,
+        // 一律包成箭頭函式：在呼叫時才取用 src/lib 的匯出（其他測試部分 mock 這些模組時不受影響）
+        getStreamStatus: () => libGetStreamStatus(),
+        streamConnectionEpoch: () => libStreamConnectionEpoch(),
+        subscribeStreamStatus: listener => libSubscribeStatusStore(listener),
+        onAnyTick: listener => libOnAnyTick(() => listener()),
+        onAnyBidAsk: listener => libOnAnyBidAsk(() => listener()),
+        onHeartbeat: listener => libOnStreamEvent('heartbeat', () => listener()),
+        refreshTradingState: scope => libRefreshTradingState(scope),
+        tradingReadFailed: scope => {
+            const query = libGetTradingState().queries[scope];
+            if (!query.reasons.some(r => READ_FAILURE_REASONS.includes(r))) return null;
+            return `${SCOPE_LABEL[scope]}讀取失敗${query.error ? `（${query.error}）` : ''}`;
+        },
+        getCurrentCode: () => getMobileUi().currentCode,
+        getCachedContract: code => libGetCachedContract(code),
+        fetchSnapshots: contracts => libFetchSnapshots(contracts),
+        resolveOrderConfirm: approved => libResolveOrderConfirm(approved),
+    };
+}
+
 const READY: ResumeGateSnapshot = { state: 'ready', since: 0, checks: null, staleAcknowledged: false, resumeSeq: 0, message: null };
+
+const RESYNC_MESSAGE = '回到前景，正在重新同步行情、委託與持倉';
+const FAILED_STREAM_MESSAGE = '連線未恢復：回到前景後 45 秒內行情串流仍未恢復，請重新整理頁面';
+const FAILED_READ_MESSAGE = '同步逾時：委託／持倉或報價讀取 45 秒內未完成，請重新整理頁面';
 
 let snapshot: ResumeGateSnapshot = READY;
 const listeners = new Set<() => void>();
@@ -56,12 +151,208 @@ export function acknowledgeStaleData(): void {
     publish({ ...snapshot, staleAcknowledged: true });
 }
 
+// ---- 執行期 ----
+
+/** 一次同步週期（進入 resyncing 到離開） */
+interface Cycle {
+    startedAt: number;
+    checks: ResumeChecks;
+    /** 隱藏前（或重試時）的連線世代；回前景後不同＝重新連上 */
+    baselineEpoch: number;
+    readsStarted: boolean;
+    readErrors: string[];
+    cleanup: Array<() => void>;
+    pollHandle: unknown;
+}
+
+interface Runtime {
+    deps: ResumeGateDeps;
+    /** 進入背景的時間；null＝目前在前景 */
+    hiddenAt: number | null;
+    /** 進入背景時的連線世代 */
+    epochAtHide: number;
+    cycle: Cycle | null;
+    /** ② 成立時的連線世代（stale-data 重試時若同一條連線仍 live，沿用已觀察到的活動） */
+    activeEpoch: number | null;
+    detach: () => void;
+}
+
+let runtime: Runtime | null = null;
+
+function endCycle(rt: Runtime) {
+    const cycle = rt.cycle;
+    if (!cycle) return;
+    rt.cycle = null;
+    cycle.cleanup.splice(0).forEach(fn => { try { fn(); } catch { /* 解除監聽失敗不影響狀態 */ } });
+    if (cycle.pollHandle !== null) rt.deps.clearTimeout(cycle.pollHandle);
+    cycle.pollHandle = null;
+}
+
+function staleMessage(errors: string[]): string {
+    const detail = [...new Set(errors)].join('；');
+    return `委託／持倉或報價資料可能過期${detail ? `：${detail}` : ''}；請按「重試同步」，或勾選「我了解資料可能過期」後再下新單`;
+}
+
+/** 依目前檢查推進狀態；離開 resyncing 時結束週期 */
+function evaluate(rt: Runtime) {
+    const cycle = rt.cycle;
+    if (!cycle) return;
+    const { deps } = rt;
+    const live = deps.getStreamStatus() === 'live';
+    let { activitySinceResume } = cycle.checks;
+    if (!activitySinceResume && live) {
+        // 重新連上（看門狗 stale→live 或 EventSource 重連）時連線世代會遞增
+        const epoch = deps.streamConnectionEpoch();
+        if (epoch >= 0 && epoch !== cycle.baselineEpoch) activitySinceResume = true;
+    }
+    if (live !== cycle.checks.streamLive || activitySinceResume !== cycle.checks.activitySinceResume) {
+        cycle.checks = { ...cycle.checks, streamLive: live, activitySinceResume };
+    }
+    if (live && activitySinceResume && rt.activeEpoch === null) rt.activeEpoch = deps.streamConnectionEpoch();
+    if (!cycle.readsStarted && readsMayStart(cycle.checks)) startReads(rt, cycle);
+
+    const next = nextResumeState(cycle.checks, deps.now() - cycle.startedAt);
+    if (next === 'resyncing') {
+        if (snapshot.checks !== cycle.checks) publish({ ...snapshot, checks: cycle.checks });
+        return;
+    }
+    endCycle(rt);
+    const since = deps.now();
+    const base = { ...snapshot, since, staleAcknowledged: false };
+    if (next === 'ready') publish({ ...base, state: 'ready', checks: null, message: null });
+    else if (next === 'stale-data') publish({ ...base, state: 'stale-data', checks: cycle.checks, message: staleMessage(cycle.readErrors) });
+    else {
+        const streamOk = cycle.checks.streamLive && cycle.checks.activitySinceResume;
+        publish({ ...base, state: 'failed', checks: cycle.checks, message: streamOk ? FAILED_READ_MESSAGE : FAILED_STREAM_MESSAGE });
+    }
+}
+
+function settle(rt: Runtime, cycle: Cycle, key: 'tradingReadSettled' | 'snapshotSettled', value: ReadSettled, error?: string) {
+    if (rt.cycle !== cycle) return; // 週期已結束（逾時、重新觸發或停止）：結果不再影響狀態
+    if (error) cycle.readErrors.push(error);
+    cycle.checks = { ...cycle.checks, [key]: value };
+    evaluate(rt);
+}
+
+function errorText(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+}
+
+/** ①② 成立後發出 ③④（每個週期各一次） */
+function startReads(rt: Runtime, cycle: Cycle) {
+    cycle.readsStarted = true;
+    const { deps } = rt;
+    // ③ 委託 → 持倉依序讀：refreshTradingState() 執行中再呼叫會共用進行中的那一次讀取，同時發出會漏讀持倉
+    void (async () => {
+        const errors: string[] = [];
+        for (const scope of ['orders', 'positions'] as const) {
+            try {
+                await deps.refreshTradingState(scope);
+                const failed = deps.tradingReadFailed(scope);
+                if (failed) errors.push(failed);
+            } catch (err) {
+                errors.push(`${SCOPE_LABEL[scope]}讀取失敗：${errorText(err)}`);
+            }
+            if (rt.cycle !== cycle) return;
+        }
+        if (errors.length) settle(rt, cycle, 'tradingReadSettled', 'failed', errors.join('；'));
+        else settle(rt, cycle, 'tradingReadSettled', 'ok');
+    })();
+    // ④ 目前商品快照；沒有目前商品或合約尚未進快取（畫面上也還沒有它的報價）→ 視為完成
+    const code = deps.getCurrentCode();
+    const contract = code ? deps.getCachedContract(code) : undefined;
+    if (!contract) {
+        cycle.checks = { ...cycle.checks, snapshotSettled: 'ok' };
+        return;
+    }
+    let request: Promise<unknown>;
+    try {
+        request = Promise.resolve(deps.fetchSnapshots([contract]));
+    } catch (err) {
+        request = Promise.reject(err);
+    }
+    request.then(
+        () => settle(rt, cycle, 'snapshotSettled', 'ok'),
+        err => settle(rt, cycle, 'snapshotSettled', 'failed', `${code} 報價快照讀取失敗：${errorText(err)}`),
+    );
+}
+
+/** 進入 resyncing 並開始新的同步週期 */
+function beginResync(rt: Runtime, baselineEpoch: number, opts: { carryActivity?: boolean } = {}) {
+    endCycle(rt);
+    const { deps } = rt;
+    const startedAt = deps.now();
+    const carry = opts.carryActivity === true;
+    const cycle: Cycle = {
+        startedAt,
+        checks: { ...INITIAL_RESUME_CHECKS, activitySinceResume: carry },
+        baselineEpoch,
+        readsStarted: false,
+        readErrors: [],
+        cleanup: [],
+        pollHandle: null,
+    };
+    rt.cycle = cycle;
+    if (!carry) rt.activeEpoch = null;
+    publish({ state: 'resyncing', since: startedAt, checks: cycle.checks, staleAcknowledged: false, resumeSeq: snapshot.resumeSeq + 1, message: RESYNC_MESSAGE });
+    // 進行中的確認面板一律取消（確認時看到的價格與資料可能已過期）
+    try { deps.resolveOrderConfirm(false); } catch { /* 取消失敗不影響閘門：送單仍會被 assertResumeReady 擋下 */ }
+    if (rt.cycle !== cycle) return;
+
+    // ② 活動：第一筆就解除全部活動監聽，tick 洪流不會反覆觸發
+    if (!carry) {
+        const activityOff: Array<() => void> = [];
+        const onActivity = () => {
+            if (rt.cycle !== cycle || cycle.checks.activitySinceResume) return;
+            cycle.checks = { ...cycle.checks, activitySinceResume: true };
+            activityOff.splice(0).forEach(fn => fn());
+            evaluate(rt);
+        };
+        activityOff.push(deps.onAnyTick(onActivity), deps.onAnyBidAsk(onActivity), deps.onHeartbeat(onActivity));
+        cycle.cleanup.push(() => activityOff.splice(0).forEach(fn => fn()));
+    }
+    cycle.cleanup.push(deps.subscribeStreamStatus(() => evaluate(rt)));
+
+    const poll = () => {
+        if (rt.cycle !== cycle) return;
+        cycle.pollHandle = null;
+        evaluate(rt);
+        if (rt.cycle === cycle) cycle.pollHandle = deps.setTimeout(poll, RESUME_POLL_MS);
+    };
+    cycle.pollHandle = deps.setTimeout(poll, RESUME_POLL_MS);
+    evaluate(rt);
+}
+
+function markHidden(rt: Runtime) {
+    if (rt.hiddenAt !== null) return;
+    rt.hiddenAt = rt.deps.now();
+    rt.epochAtHide = rt.deps.streamConnectionEpoch();
+}
+
+function markVisible(rt: Runtime, opts: { persisted?: boolean } = {}) {
+    const hiddenAt = rt.hiddenAt;
+    rt.hiddenAt = null;
+    if (hiddenAt === null) {
+        // 同一次還原的另一個事件已處理過（例如 visibilitychange 先、pageshow(persisted) 後）
+        if (!opts.persisted || snapshot.state === 'resyncing') return;
+        beginResync(rt, rt.deps.streamConnectionEpoch());
+        return;
+    }
+    if (shouldResync(rt.deps.now() - hiddenAt, opts)) beginResync(rt, rt.epochAtHide);
+}
+
 /**
- * stale-data／failed 時使用者按「重試」：重新進入 resyncing 並重跑檢查。
- * 【樁】目前沒有同步流程，不做任何事（T2 實作）。
+ * stale-data／failed 時使用者按「重試」：重新進入 resyncing（resumeSeq 遞增）並重跑 ①–④。
+ * ready、resyncing 時不做任何事（避免連按造成重複查詢）；ResumeGate 尚未啟動時也不做任何事。
  */
 export function retryResume(): void {
-    // T2：重新進入 resyncing（resumeSeq 遞增）並重跑 ①–④
+    const rt = runtime;
+    if (!rt || (snapshot.state !== 'stale-data' && snapshot.state !== 'failed')) return;
+    const epoch = rt.deps.streamConnectionEpoch();
+    // stale-data：同一條連線仍 live 且先前已觀察到活動 → 不必再等下一次心跳（非交易時段最長 30 秒）
+    const carryActivity = snapshot.state === 'stale-data' && rt.deps.getStreamStatus() === 'live'
+        && rt.activeEpoch !== null && epoch === rt.activeEpoch;
+    beginResync(rt, epoch, { carryActivity });
 }
 
 /**
@@ -81,16 +372,44 @@ export function assertResumeReady(opts: { allowStale?: boolean } = {}): void {
     throw notStarted('連線未恢復，這筆沒有送出，請重新整理頁面');
 }
 
-let started = false;
-
 /**
- * 啟動 ResumeGate（App 根層呼叫一次；重複呼叫無副作用）。回傳停止函式（測試與 HMR 用）。
- * 【樁】目前不監聽任何事件，狀態維持 'ready'（T2 實作）。
+ * 啟動 ResumeGate（App 根層呼叫一次；已啟動時重複呼叫無副作用，回傳空的停止函式）。回傳停止函式（測試與 HMR 用）。
+ * `deps` 只供測試注入；正式環境不傳，使用 src/lib 與瀏覽器事件。
+ * 停止後狀態保留（fail-closed）；再次啟動時若仍在 resyncing 會重新開始同步週期。
  */
-export function startResumeGate(): () => void {
-    if (started) return () => undefined;
-    started = true;
-    return () => { started = false; };
+export function startResumeGate(deps?: Partial<ResumeGateDeps>): () => void {
+    if (runtime) return () => undefined;
+    const merged: ResumeGateDeps = { ...defaultDeps(), ...deps };
+    const rt: Runtime = { deps: merged, hiddenAt: null, epochAtHide: -1, cycle: null, activeEpoch: null, detach: () => undefined };
+    runtime = rt;
+
+    const onVisibility = () => {
+        if (runtime !== rt) return;
+        if (merged.document?.visibilityState === 'hidden') markHidden(rt);
+        else markVisible(rt);
+    };
+    const onPageHide = () => { if (runtime === rt) markHidden(rt); };
+    const onPageShow = (ev: Event) => {
+        if (runtime === rt) markVisible(rt, { persisted: (ev as { persisted?: boolean }).persisted === true });
+    };
+    merged.document?.addEventListener('visibilitychange', onVisibility);
+    merged.window?.addEventListener('pagehide', onPageHide);
+    merged.window?.addEventListener('pageshow', onPageShow);
+    rt.detach = () => {
+        merged.document?.removeEventListener('visibilitychange', onVisibility);
+        merged.window?.removeEventListener('pagehide', onPageHide);
+        merged.window?.removeEventListener('pageshow', onPageShow);
+    };
+
+    if (merged.document?.visibilityState === 'hidden') markHidden(rt);
+    if (snapshot.state === 'resyncing') beginResync(rt, merged.streamConnectionEpoch());
+
+    return () => {
+        if (runtime !== rt) return;
+        endCycle(rt);
+        rt.detach();
+        runtime = null;
+    };
 }
 
 /** 測試用：直接設定快照（其他任務的元件測試可用來模擬 resyncing／stale-data／failed） */

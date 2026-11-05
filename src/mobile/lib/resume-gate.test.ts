@@ -1,5 +1,13 @@
-// ResumeGate 純邏輯（T1 基本測試；完整情境由 T2 補齊）＋執行期樁的閘門行為
-import { afterEach, describe, expect, it } from 'vitest';
+// ResumeGate 純邏輯＋閘門（assertResumeReady）在各狀態的行為。
+// 事件驅動的完整情境（§14.1：隱藏門檻、四條件、stale-data、45 秒 failed、pageshow persisted）見 resume-gate-runtime.test.ts。
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// 執行期會引用 src/lib 的串流、交易狀態與確認佇列；這裡只測閘門，全部隔離
+vi.mock('../../lib/order-confirm', () => ({ resolveOrderConfirm: vi.fn() }));
+vi.mock('../../lib/shioaji', () => ({ fetchSnapshots: vi.fn() }));
+vi.mock('../../lib/contracts-cache', () => ({ getCachedContract: vi.fn() }));
+vi.mock('../../lib/stream', () => ({}));
+vi.mock('../../lib/trading-state', () => ({}));
 import {
     HIDDEN_THRESHOLD_MS,
     INITIAL_RESUME_CHECKS,
@@ -70,7 +78,7 @@ describe('assertResumeReady (runtime gate)', () => {
         return 'passed';
     };
 
-    it('passes when ready (stub default)', () => {
+    it('passes when ready (default)', () => {
         expect(getResumeGate().state).toBe('ready');
         expect(notStarted(() => assertResumeReady())).toBe('passed');
     });
@@ -89,5 +97,33 @@ describe('assertResumeReady (runtime gate)', () => {
         expect(getResumeGate().staleAcknowledged).toBe(true);
         expect(notStarted(() => assertResumeReady())).toBe(true);
         expect(notStarted(() => assertResumeReady({ allowStale: true }))).toBe('passed');
+    });
+
+    it('ready passes with or without allowStale', () => {
+        setResumeGateForTest({ state: 'ready' });
+        expect(notStarted(() => assertResumeReady())).toBe('passed');
+        expect(notStarted(() => assertResumeReady({ allowStale: true }))).toBe('passed');
+    });
+
+    it('resyncing and failed block even after a stale acknowledgement flag', () => {
+        setResumeGateForTest({ state: 'resyncing', staleAcknowledged: true });
+        expect(notStarted(() => assertResumeReady({ allowStale: true }))).toBe(true);
+        setResumeGateForTest({ state: 'failed', staleAcknowledged: true });
+        expect(notStarted(() => assertResumeReady({ allowStale: true }))).toBe(true);
+    });
+
+    it('acknowledgeStaleData is ignored outside stale-data', () => {
+        for (const state of ['ready', 'resyncing', 'failed'] as const) {
+            setResumeGateForTest({ state });
+            acknowledgeStaleData();
+            expect(getResumeGate().staleAcknowledged).toBe(false);
+        }
+    });
+
+    it('error messages tell the user the order was not sent', () => {
+        for (const state of ['resyncing', 'stale-data', 'failed'] as const) {
+            setResumeGateForTest({ state });
+            expect(() => assertResumeReady()).toThrow(/沒有送出/);
+        }
     });
 });
