@@ -24,6 +24,7 @@ const m = vi.hoisted(() => {
         contracts: {} as Record<string, unknown>,
         privMoney: false,
         locked: false,
+        ydNotice: undefined as string | undefined,
         placeStockExitByShares: vi.fn(),
         placeQuickOrder: vi.fn(),
         notify: vi.fn(),
@@ -57,7 +58,15 @@ vi.mock('../../lib/account-store', () => ({
 vi.mock('../../lib/account-tradable', () => ({ canTrade: (a?: Acc | null) => !!a && a.signed !== false }));
 vi.mock('../../lib/contracts-cache', () => ({
     useContract: (code: string | null) => (code ? m.contracts[code] : undefined),
+    getCachedContract: (code: string) => m.contracts[code],
     ensureContract: m.ensureContract,
+}));
+vi.mock('../../lib/server-info-store', () => ({
+    useServerInfo: () => null,
+    yesterdayQuantityNotice: () => m.ydNotice,
+}));
+vi.mock('../components/position-esun-details', () => ({
+    PositionEsunDetails: ({ position }: { position: { code: string } }) => createElement('div', { 'data-testid': 'stub-esun-detail' }, `明細 ${position.code}`),
 }));
 vi.mock('../../lib/esun', () => ({ isEsunAccount: (a?: { broker_id?: string } | null) => !!a?.broker_id?.startsWith('ESUN') }));
 vi.mock('../../lib/flash-account', () => ({ accountMatches: (a?: Acc | null, b?: Acc | null) => same(a, b) }));
@@ -108,7 +117,7 @@ vi.mock('../lib/resume-gate-runtime', () => ({
 vi.mock('../lib/hash-router', () => ({ navigate: m.navigate }));
 vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket }));
 
-import { addOnBlockReason, closePlanFor, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText } from './positions-page';
+import { addOnBlockReason, addOnPlanFor, closePlanFor, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
 
 const stockAcc = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '' };
 const stockAcc2 = { account_type: 'S', broker_id: 'ESUN1', account_id: '7777777', person_id: 'A', signed: true, username: '' };
@@ -126,8 +135,8 @@ const stockPos = (over: Record<string, unknown> = {}) =>
 const futPos = (over: Record<string, unknown> = {}) =>
     ({ id: 2, code: 'TXFL6', direction: 'Buy', quantity: 2, price: 22800, last_price: 22950, pnl: 30000, account: futAcc, ...over }) as AccountedPosition;
 
-function setPositions(positions: AccountedPosition[], query: Record<string, unknown> = {}) {
-    m.trading = { positions, queries: { positions: { updatedAt: 1, needsReconcile: false, error: null, reasons: [], ...query } } };
+function setPositions(positions: AccountedPosition[], query: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) {
+    m.trading = { positions, queries: { positions: { updatedAt: 1, needsReconcile: false, error: null, reasons: [], ...query } }, ...extra };
 }
 
 let view: ReactTestRenderer | undefined;
@@ -157,6 +166,7 @@ beforeEach(() => {
     m.contracts = { '2330': stk2330, TXFL6: txf };
     m.privMoney = false;
     m.locked = false;
+    m.ydNotice = undefined;
     setPositions([stockPos(), futPos()]);
     for (const f of [m.placeStockExitByShares, m.placeQuickOrder, m.notify, m.reconcileAfterUnknownOutcome, m.openTicket, m.navigate, m.selectAccount, m.assertResumeReady, m.acknowledgeStaleData, m.retryResume]) f.mockReset();
     m.placeStockExitByShares.mockResolvedValue([]);
@@ -181,12 +191,47 @@ describe('純函式', () => {
         expect(closePlanFor(futPos({ direction: 'Sell' }), txf)).toEqual({ kind: 'futures', account: futAcc, contract: txf, action: 'Buy', lots: 2 });
     });
 
-    it('addOnBlockReason：信用部位與現股空單停用；現股多單與期貨可加碼', () => {
-        expect(addOnBlockReason(stockPos({ cond: 'MarginTrading' }))).toBe('信用交易加碼將於後續版本提供');
-        expect(addOnBlockReason(stockPos({ cond: 'ShortSelling', direction: 'Sell' }))).toBe('信用交易加碼將於後續版本提供');
-        expect(addOnBlockReason(stockPos({ direction: 'Sell' }))).toMatch(/當沖先賣/);
-        expect(addOnBlockReason(stockPos())).toBeNull();
+    it('addOnPlanFor：各種部位帶入的方向、單位、信用條件與當沖先賣', () => {
+        const noDayTrade = { ...stk2330, day_trade: 'No' } as ContractInfo;
+        // 現股多單＝Buy＋Cash（整股）
+        expect(addOnPlanFor(stockPos(), stk2330)).toEqual({ request: { code: '2330', action: 'Buy', source: 'position', lot: 'Common', cond: 'Cash' }, note: null });
+        // 融資多單＝Buy＋MarginTrading；整張時只說明信用只能整張
+        const margin = addOnPlanFor(stockPos({ cond: 'MarginTrading', quantity: 2000 }), stk2330);
+        expect(margin).toMatchObject({ request: { action: 'Buy', lot: 'Common', cond: 'MarginTrading' } });
+        expect(typeof margin !== 'string' && margin.note).toMatch(/^融資加碼只能整張/);
+        expect(typeof margin !== 'string' && margin.note).not.toMatch(/含零股/);
+        // 融券空單＝Sell＋ShortSelling；含零股時另外說明
+        const short = addOnPlanFor(stockPos({ cond: 'ShortSelling', direction: 'Sell', quantity: 1500 }), stk2330);
+        expect(short).toMatchObject({ request: { action: 'Sell', lot: 'Common', cond: 'ShortSelling' } });
+        expect(typeof short !== 'string' && short.note).toMatch(/融券加碼只能整張.*含零股/);
+        expect(typeof short !== 'string' && short.request.daytradeShort).toBeUndefined();
+        // 現股空單＝當沖先賣：可當沖才可用
+        expect(addOnPlanFor(stockPos({ direction: 'Sell' }), stk2330)).toMatchObject({
+            request: { action: 'Sell', lot: 'Common', cond: 'Cash', daytradeShort: true },
+            note: expect.stringContaining('當沖先賣'),
+        });
+        expect(addOnPlanFor(stockPos({ direction: 'Sell' }), noDayTrade)).toMatch(/不可當沖先賣/);
+        expect(addOnPlanFor(stockPos({ direction: 'Sell' }), { ...stk2330, day_trade: 'OnlyBuy' } as ContractInfo)).toMatch(/不可當沖先賣/);
+        expect(addOnPlanFor(stockPos({ direction: 'Sell' }), undefined)).toMatch(/商品資料尚未載入/);
+        // 期權：只帶同方向
+        expect(addOnPlanFor(futPos({ direction: 'Sell' }), txf)).toEqual({ request: { code: 'TXFL6', action: 'Sell', source: 'position' }, note: null });
+    });
+
+    it('addOnBlockReason：帳戶不明、方向與條件不符、借券停用；現股多單與期貨可加碼', () => {
+        expect(addOnBlockReason(stockPos({ account: undefined }), stk2330)).toMatch(/帳戶歸屬不明/);
+        expect(addOnBlockReason(stockPos({ cond: 'MarginTrading', direction: 'Sell' }), stk2330)).toMatch(/方向與信用條件不符/);
+        expect(addOnBlockReason(stockPos({ cond: 'SBLShortSelling', direction: 'Sell' }), stk2330)).toMatch(/借券/);
+        expect(addOnBlockReason(stockPos({ cond: 'MarginTrading' }), stk2330)).toBeNull();
+        expect(addOnBlockReason(stockPos(), undefined)).toBeNull();
         expect(addOnBlockReason(futPos({ direction: 'Sell' }))).toBeNull();
+    });
+
+    it('yesterdayText：股票顯示張＋股；永豐昨餘單位待確認時顯示「待確認」（玉山不套用）；遮蔽金額', () => {
+        expect(yesterdayText(stockPos({ yd_quantity: 2500 }), undefined, false)).toBe('2張+500股');
+        expect(yesterdayText(stockPos(), '模擬昨餘單位待確認', false)).toBe('待確認');
+        expect(yesterdayText(stockPos({ account: stockAcc2, yd_quantity: 1000 }), '模擬昨餘單位待確認', false)).toBe('1張');
+        expect(yesterdayText(stockPos(), undefined, true)).toBe('•••••');
+        expect(yesterdayText(futPos(), undefined, false)).toBeNull();
     });
 
     it('reconcileText：列出對帳原因', () => {
@@ -266,6 +311,159 @@ describe('PositionsPage 顯示', () => {
         await render();
         await click(inRow('TXFL6', 'position-chart'));
         expect(m.navigate).toHaveBeenCalledWith({ name: 'trade', code: 'TXFL6' });
+    });
+});
+
+const margin = (over: Record<string, unknown> = {}) => ({ equity: 1_234_567, initial_margin: 300_000, risk_indicator: 350, ...over });
+const txo = { ...txf, code: 'TXO22000L6', security_type: 'OPT', name: '台指選' } as ContractInfo;
+const optPos = (over: Record<string, unknown> = {}) =>
+    ({ id: 3, code: 'TXO22000L6', direction: 'Sell', quantity: 1, price: 100, last_price: 80, pnl: 1000, account: futAcc, ...over }) as AccountedPosition;
+const rowCodes = () => all('position-row').map(n => n.props['data-code'] as string);
+async function pickMarket(key: string) {
+    await click(one(`position-market-${key}`));
+}
+async function pickSort(value: string) {
+    await act(async () => { one('position-sort').props.onChange({ target: { value } }); });
+}
+
+describe('摘要、篩選、排序與分組', () => {
+    it('摘要卡：未實現損益合計、股票總市值、期貨權益數與風險指標（附文字）', async () => {
+        setPositions([stockPos(), futPos()], {}, { margin: margin() });
+        await render();
+        expect(textOf(one('position-total'))).toBe('+127,500');
+        expect(all('position-total-pct')).toHaveLength(0); // 混合股票與期貨：不給報酬率合計
+        expect(textOf(one('position-market-value'))).toBe('3,797,500'); // 3,500 × 1,085
+        expect(textOf(one('position-equity'))).toBe('1,234,567');
+        expect(textOf(one('position-risk'))).toBe('350%（正常）');
+        expect(textOf(one('position-summary'))).toContain('***4321'); // 期貨帳戶標籤
+    });
+
+    it('摘要卡：只看股票時有報酬率合計、不顯示期貨保證金；風險指標無意義時顯示「—」並說明', async () => {
+        setPositions([stockPos(), futPos()], {}, { margin: margin({ initial_margin: 0, risk_indicator: 0 }) });
+        await render();
+        expect(textOf(one('position-risk'))).toBe('—');
+        expect(all('position-risk-note')).toHaveLength(1);
+        await pickMarket('stock');
+        expect(all('position-equity')).toHaveLength(0);
+        expect(textOf(one('position-total-pct'))).toBe('（+2.65%）'); // 97,500 ÷ (1,052.5 × 3,500)
+    });
+
+    it('摘要卡：風險指標低於 100% 標示「危險」；篩選到非目前期貨帳戶時不顯示保證金', async () => {
+        const futAcc2 = { ...futAcc, account_id: '1111111' };
+        setPositions([futPos(), futPos({ id: 9, account: futAcc2 })], {}, { margin: margin({ risk_indicator: 80 }) });
+        await render();
+        expect(textOf(one('position-risk'))).toBe('80%（危險）');
+        await act(async () => { one('position-account-filter').props.onChange({ target: { value: 'F:F002000:1111111' } }); });
+        expect(all('position-equity')).toHaveLength(0);
+        await act(async () => { one('position-account-filter').props.onChange({ target: { value: 'F:F002000:7654321' } }); });
+        expect(all('position-equity')).toHaveLength(1);
+    });
+
+    it('遮蔽金額：市值、權益數、分組小計都遮蔽；不畫損益條', async () => {
+        m.privMoney = true;
+        setPositions([stockPos(), futPos()], {}, { margin: margin() });
+        await render();
+        expect(textOf(one('position-market-value'))).toBe('•••••');
+        expect(textOf(one('position-equity'))).toBe('•••••');
+        for (const h of all('position-group-header')) expect(textOf(h)).not.toMatch(/\d{1,3},\d{3}/);
+        expect(all('position-pnl-bar')).toHaveLength(0);
+        expect(textOf(rowOf('2330'))).not.toContain('3,683,750'); // 成本
+        expect(textOf(rowOf('2330'))).not.toContain('3,797,500'); // 市值
+    });
+
+    it('市場分段：股票／期貨／選擇權；期權商品資料未載入時不歸類並說明', async () => {
+        m.contracts = { ...m.contracts, TXO22000L6: txo };
+        setPositions([stockPos(), futPos(), optPos()]);
+        await render();
+        expect(rowCodes()).toEqual(['2330', 'TXFL6', 'TXO22000L6']);
+        await pickMarket('stock');
+        expect(rowCodes()).toEqual(['2330']);
+        expect(one('position-market-stock').props['aria-pressed']).toBe(true);
+        await pickMarket('futures');
+        expect(rowCodes()).toEqual(['TXFL6']);
+        expect(textOf(one('position-total'))).toBe('+30,000');
+        await pickMarket('options');
+        expect(rowCodes()).toEqual(['TXO22000L6']);
+        expect(textOf(rowOf('TXO22000L6'))).toContain('選擇權');
+
+        m.contracts = { '2330': stk2330, TXFL6: txf };
+        await rerender();
+        expect(rowCodes()).toEqual([]);
+        expect(textOf(one('position-unclassified'))).toMatch(/^1 筆期權持倉的商品資料尚未載入/);
+        expect(pageText()).toContain('此篩選條件下沒有持倉');
+    });
+
+    it('排序：損益、報酬率、市值、代碼', async () => {
+        setPositions([
+            stockPos({ id: 1, code: '2330', price: 1000, quantity: 1000, last_price: 1100, pnl: 100_000 }), // +10%、市值 1,100,000
+            stockPos({ id: 2, code: '0050', price: 100, quantity: 2000, last_price: 130, pnl: 60_000 }), // +30%、市值 260,000
+            stockPos({ id: 3, code: '2317', price: 200, quantity: 10_000, last_price: 190, pnl: -100_000 }), // −5%、市值 1,900,000
+        ]);
+        await render();
+        expect(rowCodes()).toEqual(['2330', '0050', '2317']);
+        await pickSort('pnl');
+        expect(rowCodes()).toEqual(['2330', '0050', '2317']);
+        await pickSort('return');
+        expect(rowCodes()).toEqual(['0050', '2330', '2317']);
+        await pickSort('value');
+        expect(rowCodes()).toEqual(['2317', '2330', '0050']);
+        await pickSort('code');
+        expect(rowCodes()).toEqual(['0050', '2317', '2330']);
+    });
+
+    it('依帳戶分組：表頭顯示帳戶、筆數、市值、損益小計', async () => {
+        setPositions([
+            stockPos(),
+            stockPos({ id: 5, code: '2317', account: stockAcc2, quantity: 2000, price: 100, last_price: 110, pnl: 20_000 }),
+            stockPos({ id: 6, code: '2454', quantity: 1000, price: 1000, last_price: 990, pnl: -10_000 }),
+            futPos(),
+        ]);
+        await render();
+        const headers = all('position-group-header').map(textOf);
+        expect(headers).toHaveLength(3);
+        expect(headers[0]).toContain('永豐證券 ***4567');
+        expect(headers[0]).toContain('2 筆');
+        expect(headers[0]).toContain('市值 4,787,500'); // 3,797,500 ＋ 990,000
+        expect(headers[0]).toContain('損益 +87,500');
+        expect(headers[1]).toContain('玉山證券 ***7777');
+        expect(headers[1]).toContain('1 筆');
+        expect(headers[1]).toContain('市值 220,000');
+        expect(headers[2]).toContain('永豐期貨 ***4321');
+        expect(headers[2]).not.toContain('市值');
+        expect(headers[2]).toContain('損益 +30,000');
+    });
+
+    it('持倉列：昨餘、成本、市值、報酬率與損益條；期貨列不顯示成本市值', async () => {
+        setPositions([stockPos({ yd_quantity: 2000 }), futPos({ direction: 'Sell', last_price: 22572, pnl: -45_600 })]);
+        await render();
+        expect(textOf(inRow('2330', 'position-yd'))).toBe('2張');
+        expect(textOf(inRow('2330', 'position-cost'))).toBe('3,683,750');
+        expect(textOf(inRow('2330', 'position-value'))).toBe('3,797,500');
+        expect(textOf(inRow('2330', 'position-return'))).toBe('+2.65%');
+        expect(rowOf('TXFL6').findAll(n => n.props['data-testid'] === 'position-cost')).toHaveLength(0);
+        expect(textOf(inRow('TXFL6', 'position-return'))).toBe('+1.00%'); // 空單：(22,572 − 22,800) ÷ 22,800 × −1
+        const bar = inRow('2330', 'position-pnl-bar');
+        expect(bar.props['aria-hidden']).toBe('true');
+        const fill = bar.find(n => typeof n.type === 'string' && n.props.style !== undefined);
+        expect(fill.props.style.width).toBe('50%');
+        m.ydNotice = '模擬昨餘單位待確認';
+        await rerender();
+        expect(textOf(inRow('2330', 'position-yd'))).toBe('待確認');
+    });
+
+    it('玉山股票列可展開庫存明細；永豐與期貨列沒有展開鍵', async () => {
+        setPositions([stockPos(), stockPos({ id: 7, code: '2317', account: stockAcc2 }), futPos()]);
+        await render();
+        expect(rowOf('2330').findAll(n => n.props['data-testid'] === 'position-detail-toggle')).toHaveLength(0);
+        expect(rowOf('TXFL6').findAll(n => n.props['data-testid'] === 'position-detail-toggle')).toHaveLength(0);
+        const toggle = inRow('2317', 'position-detail-toggle');
+        expect(toggle.props['aria-expanded']).toBe(false);
+        expect(all('stub-esun-detail')).toHaveLength(0);
+        await click(toggle);
+        expect(inRow('2317', 'position-detail-toggle').props['aria-expanded']).toBe(true);
+        expect(textOf(one('stub-esun-detail'))).toBe('明細 2317');
+        await click(inRow('2317', 'position-detail-toggle'));
+        expect(all('stub-esun-detail')).toHaveLength(0);
     });
 });
 
@@ -479,6 +677,12 @@ describe('加碼', () => {
         expect(m.openTicket).toHaveBeenCalledWith({ code: 'TXFL6', action: 'Buy', source: 'position' });
     });
 
+    it('現股多單：帶入 Buy＋整股＋現股', async () => {
+        await render();
+        await click(inRow('2330', 'position-add'));
+        expect(m.openTicket).toHaveBeenCalledWith({ code: '2330', action: 'Buy', source: 'position', lot: 'Common', cond: 'Cash' });
+    });
+
     it('帳戶不同：不直接開啟面板，先說明；確認後切換帳戶再開啟', async () => {
         m.accounts = { ...m.accounts, selectedStock: stockAcc2 };
         await render();
@@ -487,8 +691,18 @@ describe('加碼', () => {
         expect(all('position-switch-sheet')).toHaveLength(1);
         await click(one('position-switch-confirm'));
         expect(m.selectAccount).toHaveBeenCalledWith(stockAcc);
-        expect(m.openTicket).toHaveBeenCalledWith({ code: '2330', action: 'Buy', source: 'position' });
+        expect(m.openTicket).toHaveBeenCalledWith({ code: '2330', action: 'Buy', source: 'position', lot: 'Common', cond: 'Cash' });
         expect(all('position-switch-sheet')).toHaveLength(0);
+    });
+
+    it('帳戶不同的融券空單：切換後帶入 Sell＋ShortSelling', async () => {
+        setPositions([stockPos({ account: stockAcc2, cond: 'ShortSelling', direction: 'Sell', quantity: 2000 })]);
+        await render();
+        await click(inRow('2330', 'position-add'));
+        expect(m.openTicket).not.toHaveBeenCalled();
+        await click(one('position-switch-confirm'));
+        expect(m.selectAccount).toHaveBeenCalledWith(stockAcc2);
+        expect(m.openTicket).toHaveBeenCalledWith({ code: '2330', action: 'Sell', source: 'position', lot: 'Common', cond: 'ShortSelling' });
     });
 
     it('帳戶切換鎖定（下單面板或確認進行中）：不可切換', async () => {
@@ -502,10 +716,41 @@ describe('加碼', () => {
         expect(m.openTicket).not.toHaveBeenCalled();
     });
 
-    it('信用部位：加碼鍵停用並說明', async () => {
-        setPositions([stockPos({ cond: 'MarginTrading', quantity: 2000 })]);
+    it('融資多單：可加碼，帶入 Buy＋MarginTrading；顯示信用只能整張的說明（含零股時另外說明）', async () => {
+        setPositions([stockPos({ cond: 'MarginTrading', quantity: 2500 })]);
+        await render();
+        expect(inRow('2330', 'position-add').props.disabled).toBe(false);
+        expect(textOf(inRow('2330', 'position-add-note'))).toMatch(/融資加碼只能整張.*含零股/);
+        expect(pageText()).not.toContain('後續版本');
+        await click(inRow('2330', 'position-add'));
+        expect(m.openTicket).toHaveBeenCalledWith({ code: '2330', action: 'Buy', source: 'position', lot: 'Common', cond: 'MarginTrading' });
+    });
+
+    it('現股空單（當沖先賣）：可當沖時帶入 daytradeShort；不可當沖時停用並說明', async () => {
+        setPositions([stockPos({ direction: 'Sell', quantity: 1000 })]);
+        await render();
+        expect(inRow('2330', 'position-add').props.disabled).toBe(false);
+        await click(inRow('2330', 'position-add'));
+        expect(m.openTicket).toHaveBeenCalledWith({ code: '2330', action: 'Sell', source: 'position', lot: 'Common', cond: 'Cash', daytradeShort: true });
+
+        m.openTicket.mockReset();
+        m.contracts = { ...m.contracts, '2330': { ...stk2330, day_trade: 'No' } };
+        await rerender();
+        expect(inRow('2330', 'position-add').props.disabled).toBe(true);
+        expect(textOf(inRow('2330', 'position-add-note'))).toMatch(/不可當沖先賣/);
+        await click(inRow('2330', 'position-add'));
+        expect(m.openTicket).not.toHaveBeenCalled();
+
+        m.contracts = { TXFL6: txf };
+        await rerender();
+        expect(inRow('2330', 'position-add').props.disabled).toBe(true);
+        expect(textOf(inRow('2330', 'position-add-note'))).toMatch(/商品資料尚未載入/);
+    });
+
+    it('持倉帳戶不可交易（未簽署）：加碼停用並說明', async () => {
+        m.accounts = { ...m.accounts, accounts: [{ ...stockAcc, signed: false }, stockAcc2, futAcc] };
         await render();
         expect(inRow('2330', 'position-add').props.disabled).toBe(true);
-        expect(textOf(inRow('2330', 'position-add-note'))).toBe('信用交易加碼將於後續版本提供');
+        expect(textOf(inRow('2330', 'position-add-note'))).toMatch(/不可交易/);
     });
 });
