@@ -189,6 +189,10 @@ nginx 透過 `host.docker.internal` 代理到宿主機。若容器連不到宿�
    ```
 4. `docker compose up -d`。Basic Auth 走明文 HTTP，跨出可信任網段時請在前面加 TLS 反向代理。
 
+> **要從其他裝置下單，必須用 HTTPS。** 瀏覽器只在 HTTPS 或本機（`localhost`／`127.0.0.1`）提供 Web Locks；
+> 以 `http://192.168.x.x`、`http://trade.lan` 這類位址開啟時，行情串流會刻意不連線（`src/lib/shared-stream.ts`），
+> 畫面能開但下單鍵永遠停用。TLS 前端的做法與條件見 [手機版交易網頁規格 §3](mobile-trading-spec.md#3--phase-0https-存取層硬性前置)。
+
 容器 healthcheck 使用免驗證的 `/healthz`，啟用 Basic Auth 不影響健康狀態。
 
 ## 非 root 與檔案權限
