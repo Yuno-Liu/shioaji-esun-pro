@@ -8,6 +8,7 @@
 // - esunMarginLotEstimates：融資金額與利息（估）；
 // - 借券費（估）＝價金 × 借券費率（shortSellingFee）。
 // 估算參數來自交易成本設定（useTradingCostSettings）；金額與股數用 maskMoney 遮蔽。
+// 版面（設計規格 §7.7）：中性島（islandBg）內呈現；持倉列按「庫存明細」立即展開、內容 150ms 淡入（只動畫 opacity，減少動態時不動畫）。
 
 import {
     esunCashCostBreakdown,
@@ -197,7 +198,7 @@ function EsunDetailBody({ detail, fetchedAt, privMoney, settings }: {
                                 <li key={idx} className={styles.lot} data-testid='esun-detail-lot'>
                                     <div className={styles.lotHead}>
                                         <span>{`${lot.tradeDate} ${lot.tradeTime}`.trim() || '日期不明'}</span>
-                                        <span className={lot.action === 'Buy' ? styles.side.long : lot.action === 'Sell' ? styles.side.short : undefined}>
+                                        <span className={lot.action === 'Buy' ? styles.lotSide.long : lot.action === 'Sell' ? styles.lotSide.short : undefined}>
                                             {lot.action === 'Buy' ? '買進' : lot.action === 'Sell' ? '賣出' : lot.buySell || '—'}
                                         </span>
                                     </div>

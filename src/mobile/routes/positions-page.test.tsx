@@ -448,7 +448,8 @@ describe('摘要、篩選、排序與分組', () => {
         const bar = inRow('2330', 'position-pnl-bar');
         expect(bar.props['aria-hidden']).toBe('true');
         const fill = bar.find(n => typeof n.type === 'string' && n.props.style !== undefined);
-        expect(fill.props.style.width).toBe('50%');
+        // 設計規格 §14 刻意更新 2：損益條改 scaleX（只動畫 transform），寬度 50% → scaleX(0.5)
+        expect(fill.props.style.transform).toBe('scaleX(0.5)');
         m.ydNotice = '模擬昨餘單位待確認';
         await rerender();
         expect(textOf(inRow('2330', 'position-yd'))).toBe('待確認');
@@ -678,6 +679,20 @@ describe('加碼', () => {
         await render();
         await click(inRow('TXFL6', 'position-add'));
         expect(m.openTicket).toHaveBeenCalledWith({ code: 'TXFL6', action: 'Buy', source: 'position' });
+    });
+
+    // 設計規格 §10 S1：持倉加碼只呼叫 openTicket；平倉鍵只開說明面板；lib 送出函式呼叫 0 次
+    it('S1：加碼只呼叫 openTicket、平倉鍵只開說明面板，lib 送出函式呼叫 0 次', async () => {
+        await render();
+        await click(inRow('2330', 'position-add'));
+        await click(inRow('TXFL6', 'position-add'));
+        expect(m.openTicket).toHaveBeenCalledTimes(2);
+        await click(inRow('2330', 'position-close'));
+        expect(all('position-close-sheet')).toHaveLength(1);
+        await click(inRow('2330', 'position-chart'));
+        expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+        expect(m.placeQuickOrder).not.toHaveBeenCalled();
+        expect(m.notify).not.toHaveBeenCalled();
     });
 
     it('現股多單：帶入 Buy＋整股＋現股', async () => {

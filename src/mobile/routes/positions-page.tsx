@@ -22,7 +22,13 @@
 //   現股空單（當沖先賣）＝Sell＋Cash＋daytradeShort，只在 contract.day_trade==='Yes' 時可用，否則停用並說明。
 //   下單面板以「目前選取的帳戶」下單，持倉帳戶不同時先確認切換帳戶；面板內仍需預覽並滑動確認才會送出。
 // - 看圖：navigate({ name: 'trade', code })。
+// - 版面（設計規格 §7.7，流程與 testid 不變）：分組型頁面；PageHeader「持倉」＋⟳；Segmented 市場、PopUpButton 帳戶與排序；
+//   對帳／連線說明用 InlineNote；依帳戶分組（footnote 組標頭＋GroupedSection）；每筆：代碼名稱、條件小膠囊、
+//   「多／空 N 張」實心膠囊、損益 numMd；均價、現價、報酬率／昨餘、成本、市值 numSm；損益條 scaleX（中線為 0）；
+//   動作列［庫存明細］…［平倉］（中性外框，避免與新單買賣鍵混淆）［加碼］［看圖 ›］。
+//   平倉說明與切換帳戶面板改 GroupedSection／InlineNote＋footer 版型（行為不變：繼續後才呼叫 lib，lib 再開確認面板）。
 
+import { ChevronRight, RotateCw, Wallet } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useTradingLive } from '../../hooks/use-stream';
 import { getAccountState, selectAccount, useAccounts } from '../../lib/account-store';
@@ -42,7 +48,7 @@ import type { Action } from '../../lib/types/order';
 import type { Account, AccountedPosition, Position, StockPosition } from '../../lib/types/portfolio';
 import { fmtInt, fmtPct, fmtPrice, fmtSigned, fmtStockLots } from '../../lib/utils/format';
 import { mobileAccountLabel, useAccountSwitchLocked } from '../components/account-switch-sheet';
-import { BottomSheet } from '../components/bottom-sheet';
+import { BottomSheet, SheetFooter } from '../components/bottom-sheet';
 import { PositionEsunDetails } from '../components/position-esun-details';
 import {
     accountKeyOf,
@@ -69,8 +75,17 @@ import { openTicket, type TicketCond, type TicketLot } from '../lib/mobile-store
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { assertResumeReady, getResumeGate, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import * as controls from '../styles/controls.css';
-import * as layout from '../styles/layout.css';
+import { srOnly } from '../styles/primitives.css';
 import * as styles from '../styles/positions.css';
+import { scaleXOf } from '../ui/bars';
+import { EmptyState } from '../ui/empty-state';
+import { GroupedSection } from '../ui/grouped';
+import { IconButton } from '../ui/icon-button';
+import { InlineNote } from '../ui/inline-note';
+import { PageHeader } from '../ui/page-header';
+import { PopUpButton } from '../ui/pop-up-button';
+import { Segmented } from '../ui/segmented';
+import { Skeleton } from '../ui/skeleton';
 
 /** 「⟳」更新持倉的冷卻時間 */
 export const REFRESH_COOLDOWN_MS = 6_000;
@@ -328,8 +343,14 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                 <span className={styles.rowCode}>{p.code}</span>
                 {contract?.name && <span className={styles.rowName}>{contract.name}</span>}
                 <span className={styles.tag}>{positionCondText(p, contract)}</span>
-                <span className={long ? styles.side.long : styles.side.short}>{sideText(p.direction)}</span>
-                <span>{maskMoney(positionQtyText(p), privMoney)}</span>
+                <span className={long ? styles.side.long : styles.side.short}>
+                    <span>{sideText(p.direction)}</span>
+                    <span>{maskMoney(positionQtyText(p), privMoney)}</span>
+                </span>
+                <span className={`${styles.rowPnl} ${styles.tone[pnlTone(p.pnl)]}`}>
+                    <span className={srOnly}>損益（估）</span>
+                    <span data-testid='position-pnl'>{maskMoney(fmtSigned(p.pnl, 0), privMoney)}</span>
+                </span>
             </div>
             <div className={styles.rowMeta}>
                 <RouteBadge account={p.account} />
@@ -338,35 +359,39 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
             <dl className={styles.rowGrid}>
                 <Cell label='均價'>{fmtPrice(p.price)}</Cell>
                 <Cell label='現價'>{fmtPrice(p.last_price)}</Cell>
-                <Cell label='損益（估）' className={styles.tone[pnlTone(p.pnl)]} testId='position-pnl'>{maskMoney(fmtSigned(p.pnl, 0), privMoney)}</Cell>
-                {stock && <Cell label='昨餘' testId='position-yd'>{yd}</Cell>}
-                {stock && <Cell label='成本' testId='position-cost'>{money(cost)}</Cell>}
-                {stock && <Cell label='市值' testId='position-value'>{money(value)}</Cell>}
                 <Cell label='報酬率（估）' className={styles.tone[ret === null ? 'flat' : pnlTone(ret)]} testId='position-return'>
                     {ret === null ? '—' : fmtPct(ret)}
                 </Cell>
+                {stock && <Cell label='昨餘' testId='position-yd'>{yd}</Cell>}
+                {stock && <Cell label='成本' testId='position-cost'>{money(cost)}</Cell>}
+                {stock && <Cell label='市值' testId='position-value'>{money(value)}</Cell>}
             </dl>
             {bar > 0 && (
                 <div className={styles.pnlBar} aria-hidden='true' data-testid='position-pnl-bar'>
                     <span className={styles.pnlBarMid} />
-                    <span className={styles.pnlBarFill[p.pnl > 0 ? 'up' : 'down']} style={{ width: `${bar}%` }} />
+                    {/* 寬度百分比（0–50，以中線為 0）→ scaleX(寬度 ÷ 100)；只動畫 transform */}
+                    <span className={styles.pnlBarFill[p.pnl > 0 ? 'up' : 'down']} style={{ transform: scaleXOf(bar / 100) }} />
                 </div>
             )}
             <div className={styles.rowActions}>
                 {esun && (
                     <button
                         type='button'
-                        className={styles.detailToggle}
+                        className={styles.action.detail}
                         aria-expanded={expanded}
                         onClick={onToggleDetail}
                         data-testid='position-detail-toggle'
                     >
+                        <ChevronRight className={styles.detailChevron} aria-hidden='true' focusable='false' />
                         {expanded ? '收合明細' : '庫存明細'}
                     </button>
                 )}
-                <button type='button' className={controls.button.neutral} disabled={closeDisabled} onClick={onClose} data-testid='position-close'>平倉</button>
-                <button type='button' className={controls.button.neutral} disabled={addOnReason !== null} onClick={() => onAddOn(contract)} data-testid='position-add'>加碼</button>
-                <button type='button' className={controls.button.ghost} onClick={() => navigate({ name: 'trade', code: p.code })} data-testid='position-chart'>看圖</button>
+                <button type='button' className={styles.action.close} disabled={closeDisabled} onClick={onClose} data-testid='position-close'>平倉</button>
+                <button type='button' className={styles.action.addOn} disabled={addOnReason !== null} onClick={() => onAddOn(contract)} data-testid='position-add'>加碼</button>
+                <button type='button' className={styles.action.chart} onClick={() => navigate({ name: 'trade', code: p.code })} data-testid='position-chart'>
+                    看圖
+                    <ChevronRight className={styles.actionIcon} aria-hidden='true' focusable='false' />
+                </button>
             </div>
             {addOnReason
                 ? <p className={styles.rowNote} data-testid='position-add-note'>{addOnReason}</p>
@@ -394,44 +419,54 @@ function CloseSheet({ position, gate, gateProblem, busy, feedback, privMoney, on
     const stock = position ? isStockPosition(position) : false;
     return (
         <BottomSheet open onClose={onCancel} dismissible={!busy} title='平倉說明' testId='position-close-sheet'>
-            {position && (
-                <p className={styles.sheetSummary}>
-                    {position.code}{contract?.name ? ` ${contract.name}` : ''} {positionCondText(position, contract)} {sideText(position.direction)}{' '}
-                    {maskMoney(positionQtyText(position), privMoney)}
-                    {typeof plan !== 'string' && ` → 市價${closeActionText(plan)}`}
-                </p>
-            )}
-            {position?.account && <p className={styles.sheetText}><RouteBadge account={position.account} size='lg' /></p>}
-            {stock ? (
-                <ul className={styles.sheetList}>
-                    <li>整張以市價（IOC）送出，未成交部分自動取消。</li>
-                    <li>零股以{position?.direction === 'Buy' ? '跌停價' : '漲停價'}的盤中零股限價送出（可立即成交的價格）。</li>
-                    <li>信用部位（融資／融券）只能整張了結；零股不能以信用條件送出。</li>
-                    <li>市價成交價可能與現價有落差。股票不提供反手。</li>
-                </ul>
-            ) : (
-                <ul className={styles.sheetList}>
-                    <li>以市價（IOC）、倉別「平倉」送出全部口數，未成交部分自動取消。</li>
-                    <li>市價成交價可能與現價有落差。</li>
-                </ul>
-            )}
-            <p className={styles.sheetText}>按「繼續」後會出現確認面板，滑動確認後才會送出；確認只出現一次。</p>
-            {problem && <p className={styles.sheetProblem} role='alert' data-testid='position-close-problem'>{problem}</p>}
-            <ResumeGateNote gate={gate} disabled={busy} showReason={false} testId='position-close-stale' />
-            {feedback && (
-                <p className={styles.sheetFeedback[feedback.kind]} role='status' data-testid='position-close-feedback'>{feedback.text}</p>
-            )}
-            <div className={styles.sheetActions}>
-                <button type='button' className={controls.button.neutral} disabled={busy} onClick={onCancel}>取消</button>
-                <button
-                    type='button'
-                    className={controls.button.primary}
-                    disabled={busy || problem !== null || typeof plan === 'string'}
-                    onClick={() => { if (typeof plan !== 'string' && !problem) onContinue(plan); }}
-                    data-testid='position-close-continue'
-                >
-                    {busy ? '等待確認…' : '繼續'}
-                </button>
+            <div className={styles.sheetBody}>
+                {position && (
+                    <GroupedSection>
+                        <p className={styles.sheetSummary}>
+                            {position.code}{contract?.name ? ` ${contract.name}` : ''} {positionCondText(position, contract)} {sideText(position.direction)}{' '}
+                            {maskMoney(positionQtyText(position), privMoney)}
+                            {typeof plan !== 'string' && ` → 市價${closeActionText(plan)}`}
+                        </p>
+                        {position.account && <p className={styles.sheetRoute}><RouteBadge account={position.account} size='lg' /></p>}
+                    </GroupedSection>
+                )}
+                <GroupedSection>
+                    {stock ? (
+                        <ul className={styles.sheetList}>
+                            <li>整張以市價（IOC）送出，未成交部分自動取消。</li>
+                            <li>零股以{position?.direction === 'Buy' ? '跌停價' : '漲停價'}的盤中零股限價送出（可立即成交的價格）。</li>
+                            <li>信用部位（融資／融券）只能整張了結；零股不能以信用條件送出。</li>
+                            <li>市價成交價可能與現價有落差。股票不提供反手。</li>
+                        </ul>
+                    ) : (
+                        <ul className={styles.sheetList}>
+                            <li>以市價（IOC）、倉別「平倉」送出全部口數，未成交部分自動取消。</li>
+                            <li>市價成交價可能與現價有落差。</li>
+                        </ul>
+                    )}
+                </GroupedSection>
+                <p className={styles.sheetText}>按「繼續」後會出現確認面板，滑動確認後才會送出；確認只出現一次。</p>
+                {problem && <InlineNote tone='warn' role='alert' testId='position-close-problem'>{problem}</InlineNote>}
+                <ResumeGateNote gate={gate} disabled={busy} showReason={false} testId='position-close-stale' />
+                <SheetFooter>
+                    <div className={styles.sheetBody}>
+                        {feedback && (
+                            <InlineNote tone={feedback.kind === 'notSent' ? 'danger' : 'info'} role='status' testId='position-close-feedback'>{feedback.text}</InlineNote>
+                        )}
+                        <div className={styles.sheetActions}>
+                            <button type='button' className={controls.button.neutral} disabled={busy} onClick={onCancel}>取消</button>
+                            <button
+                                type='button'
+                                className={controls.button.primary}
+                                disabled={busy || problem !== null || typeof plan === 'string'}
+                                onClick={() => { if (typeof plan !== 'string' && !problem) onContinue(plan); }}
+                                data-testid='position-close-continue'
+                            >
+                                {busy ? '等待確認…' : '繼續'}
+                            </button>
+                        </div>
+                    </div>
+                </SheetFooter>
             </div>
         </BottomSheet>
     );
@@ -451,25 +486,29 @@ function AddOnSwitchSheet({ position, current, priv, locked, error, onCancel, on
     const target = position?.account;
     return (
         <BottomSheet open onClose={onCancel} title='切換帳戶後加碼' testId='position-switch-sheet'>
-            {target ? (
-                <>
-                    <p className={styles.sheetText}>
-                        下單面板以「目前選取的帳戶」下單。這筆持倉屬於 {isEsunAccount(target) ? '玉山' : '永豐'} {mobileAccountLabel(target, priv)}，
-                        目前選取的是 {current ? `${isEsunAccount(current) ? '玉山' : '永豐'} ${mobileAccountLabel(current, priv)}` : '（未選擇）'}。
-                    </p>
-                    <p className={styles.sheetText}><RouteBadge account={target} size='lg' /></p>
-                    <p className={styles.sheetText}>要切換到持倉帳戶並開啟下單面板嗎？下單面板內仍需預覽並滑動確認才會送出。</p>
-                </>
-            ) : (
-                <p className={styles.sheetProblem}>{POSITIONS_TEXT.gone}</p>
-            )}
-            {locked && <p className={styles.sheetProblem} role='status'>{POSITIONS_TEXT.switchLocked}</p>}
-            {error && <p className={styles.sheetProblem} role='alert' data-testid='position-switch-error'>{error}</p>}
-            <div className={styles.sheetActions}>
-                <button type='button' className={controls.button.neutral} onClick={onCancel}>取消</button>
-                <button type='button' className={controls.button.primary} disabled={locked || !target} onClick={onConfirm} data-testid='position-switch-confirm'>
-                    切換並開啟
-                </button>
+            <div className={styles.sheetBody}>
+                {target ? (
+                    <>
+                        <p className={styles.sheetText}>
+                            下單面板以「目前選取的帳戶」下單。這筆持倉屬於 {isEsunAccount(target) ? '玉山' : '永豐'} {mobileAccountLabel(target, priv)}，
+                            目前選取的是 {current ? `${isEsunAccount(current) ? '玉山' : '永豐'} ${mobileAccountLabel(current, priv)}` : '（未選擇）'}。
+                        </p>
+                        <p className={styles.sheetText}><RouteBadge account={target} size='lg' /></p>
+                        <p className={styles.sheetText}>要切換到持倉帳戶並開啟下單面板嗎？下單面板內仍需預覽並滑動確認才會送出。</p>
+                    </>
+                ) : (
+                    <InlineNote tone='warn'>{POSITIONS_TEXT.gone}</InlineNote>
+                )}
+                {locked && <InlineNote tone='info' role='status'>{POSITIONS_TEXT.switchLocked}</InlineNote>}
+                {error && <InlineNote tone='danger' role='alert' testId='position-switch-error'>{error}</InlineNote>}
+                <SheetFooter>
+                    <div className={styles.sheetActions}>
+                        <button type='button' className={controls.button.neutral} onClick={onCancel}>取消</button>
+                        <button type='button' className={controls.button.primary} disabled={locked || !target} onClick={onConfirm} data-testid='position-switch-confirm'>
+                            切換並開啟
+                        </button>
+                    </div>
+                </SheetFooter>
             </div>
         </BottomSheet>
     );
@@ -642,65 +681,64 @@ export function PositionsPage() {
     const readFailed = query.updatedAt === null && !!query.error;
 
     return (
-        <section className={layout.page} data-testid='page-positions'>
-            <div className={styles.header}>
-                <h1 className={styles.headerTitle}>持倉</h1>
-                <select
-                    className={styles.accountSelect}
-                    aria-label='帳戶篩選'
-                    value={activeFilter}
-                    onChange={(e) => setFilterKey(e.target.value)}
-                    data-testid='position-account-filter'
-                >
-                    <option value=''>帳戶：全部</option>
-                    {accountOptions.map(([k, a]) => (
-                        <option key={k} value={k}>{groupLabel(a, priv)}</option>
-                    ))}
-                </select>
-                <button
-                    type='button'
-                    className={styles.refreshButton}
-                    aria-label={cooling ? '更新持倉（冷卻中）' : '更新持倉'}
-                    disabled={cooling}
-                    onClick={onRefresh}
-                    data-testid='position-refresh'
-                >
-                    ⟳
-                </button>
+        <section className={styles.page} data-testid='page-positions'>
+            <PageHeader
+                title='持倉'
+                actions={(
+                    <IconButton
+                        icon={RotateCw}
+                        ariaLabel={cooling ? '更新持倉（冷卻中）' : '更新持倉'}
+                        disabled={cooling}
+                        onClick={onRefresh}
+                        testId='position-refresh'
+                    />
+                )}
+            />
+
+            <div className={styles.inset}>
+                <Segmented<PositionMarketFilter>
+                    semantics='toggle'
+                    ariaLabel='市場篩選'
+                    testId='position-market-filter'
+                    items={MARKET_FILTERS.map(f => ({ value: f.key, label: f.label, testId: `position-market-${f.key}` }))}
+                    value={market}
+                    onChange={setMarket}
+                />
             </div>
 
             <div className={styles.filterRow}>
-                <div className={styles.segment} role='group' aria-label='市場篩選' data-testid='position-market-filter'>
-                    {MARKET_FILTERS.map(f => (
-                        <button
-                            key={f.key}
-                            type='button'
-                            className={styles.segmentButton[market === f.key ? 'on' : 'off']}
-                            aria-pressed={market === f.key}
-                            onClick={() => setMarket(f.key)}
-                            data-testid={`position-market-${f.key}`}
-                        >
-                            {f.label}
-                        </button>
-                    ))}
-                </div>
-                <select
-                    className={styles.sortSelect}
-                    aria-label='排序'
+                <PopUpButton
+                    className={styles.picker}
+                    ariaLabel='帳戶篩選'
+                    testId='position-account-filter'
+                    value={activeFilter}
+                    options={[{ value: '', label: '帳戶：全部' }, ...accountOptions.map(([k, a]) => ({ value: k, label: groupLabel(a, priv) }))]}
+                    onChange={setFilterKey}
+                />
+                <PopUpButton<PositionSortMode>
+                    className={styles.picker}
+                    ariaLabel='排序'
+                    testId='position-sort'
                     value={sort}
-                    onChange={(e) => setSort(e.target.value as PositionSortMode)}
-                    data-testid='position-sort'
-                >
-                    {SORT_MODES.map(s => <option key={s.key} value={s.key}>排序：{s.label}</option>)}
-                </select>
+                    options={SORT_MODES.map(s => ({ value: s.key, label: `排序：${s.label}` }))}
+                    onChange={setSort}
+                />
             </div>
 
-            {reconcile && <p className={styles.banner.warn} role='status' data-testid='position-reconcile'>{reconcile}</p>}
+            {reconcile && (
+                <div className={styles.inset}>
+                    <InlineNote tone='warn' role='status' testId='position-reconcile'>{reconcile}</InlineNote>
+                </div>
+            )}
             {gateProblem && gateProblem !== POSITIONS_TEXT.staleData && positions.length > 0 && (
-                <p className={styles.banner.info} role='status' data-testid='position-gate-note'>{gateProblem}</p>
+                <div className={styles.inset}>
+                    <InlineNote tone='info' role='status' testId='position-gate-note'>{gateProblem}</InlineNote>
+                </div>
             )}
             {/* stale-data：原因＋勾選了解＋重試同步（勾選後仍顯示，讓使用者可隨時重試） */}
-            <ResumeGateNote gate={gate} disabled={closing} testId='position-gate-stale' />
+            <div className={styles.inset}>
+                <ResumeGateNote gate={gate} disabled={closing} testId='position-gate-stale' />
+            </div>
 
             <PositionSummaryCard
                 summary={summary}
@@ -717,25 +755,33 @@ export function PositionsPage() {
             )}
 
             {loading ? (
-                <p className={styles.empty}>{POSITIONS_TEXT.loading}</p>
+                <div className={styles.emptyWrap}><Skeleton label={POSITIONS_TEXT.loading} rows={3} /></div>
             ) : positions.length === 0 ? (
-                <p className={styles.empty} data-testid='position-empty'>{readFailed ? POSITIONS_TEXT.readFailed : POSITIONS_TEXT.empty}</p>
+                <div className={styles.emptyWrap}>
+                    <EmptyState icon={Wallet} title={readFailed ? POSITIONS_TEXT.readFailed : POSITIONS_TEXT.empty} testId='position-empty' />
+                </div>
             ) : rows.length === 0 ? (
-                <p className={styles.empty}>{POSITIONS_TEXT.filteredEmpty}</p>
+                <div className={styles.emptyWrap}><EmptyState title={POSITIONS_TEXT.filteredEmpty} /></div>
             ) : (
                 groups.map(g => (
-                    <section key={g.key || 'unknown'} className={styles.group} aria-label={groupLabel(g.account, priv)} data-testid='position-group'>
-                        <div className={styles.groupHeader} data-testid='position-group-header'>
-                            <span className={styles.groupTitle}>{groupLabel(g.account, priv)}</span>
-                            <span className={styles.groupStat}>{g.count} 筆</span>
-                            {g.value && (
-                                <span className={styles.groupStat}>
-                                    市值 {maskMoney(fmtInt(Math.round(g.value.value)), privMoney)}{g.value.incomplete ? '（部分缺價未計）' : ''}
-                                </span>
-                            )}
-                            <span className={styles.tone[pnlTone(g.pnl)]}>損益 {maskMoney(fmtSigned(g.pnl, 0), privMoney)}</span>
-                        </div>
-                        <ul className={styles.list}>
+                    <GroupedSection
+                        key={g.key || 'unknown'}
+                        testId='position-group'
+                        header={(
+                            <span className={styles.groupHeader} data-testid='position-group-header'>
+                                <span className={styles.groupTitle}>{groupLabel(g.account, priv)}</span>
+                                <span className={styles.groupStat}>{g.count} 筆</span>
+                                {g.value && (
+                                    <span className={styles.groupStat}>
+                                        市值 {maskMoney(fmtInt(Math.round(g.value.value)), privMoney)}{g.value.incomplete ? '（部分缺價未計）' : ''}
+                                    </span>
+                                )}
+                                {/* 頁面底色上：損益小計用 foreground＋正負號（§4.8 規則 9，不放漲跌色小字） */}
+                                <span className={styles.groupPnl}>損益 {maskMoney(fmtSigned(g.pnl, 0), privMoney)}</span>
+                            </span>
+                        )}
+                    >
+                        <ul className={styles.list} aria-label={groupLabel(g.account, priv)}>
                             {g.rows.map(p => {
                                 const key = positionKey(p);
                                 return (
@@ -756,7 +802,7 @@ export function PositionsPage() {
                                 );
                             })}
                         </ul>
-                    </section>
+                    </GroupedSection>
                 ))
             )}
 

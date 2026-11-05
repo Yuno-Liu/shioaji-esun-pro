@@ -6,12 +6,20 @@
 // - 期貨權益數與風險指標：useTradingState().margin 屬於「目前選取的期貨帳戶」，由呼叫端決定是否顯示
 //   並傳入帳戶標籤；風險指標無意義（模擬或未押保證金）時顯示「—」並說明。風險等級一律附文字，不只靠顏色。
 // - 金額用 maskMoney 遮蔽；百分比不含金額，不遮蔽。
+// - 版面（設計規格 §7.7）：GroupedSection 卡片；caption「未實現損益合計（估）」＋numHero（漲跌色、正負號）；
+//   合計跳價閃爍（PriceFlash：遮蔽或未讀到時不閃、只動畫 opacity）；下方雙欄市值、權益數與風險指標
+//   （數值文字＋等級文字為 foreground，狀態色只給下方進度條 scaleX）。
 
+import { useRef } from 'react';
 import { maskMoney } from '../../lib/privacy';
 import type { Margin } from '../../lib/types/portfolio';
 import { fmtInt, fmtPct, fmtSigned } from '../../lib/utils/format';
 import * as styles from '../styles/positions.css';
-import { futuresRiskOf, RISK_LEVEL_TEXT, type PositionsSummary } from './position-metrics';
+import { ProgressBar, type BarTone } from '../ui/bars';
+import { GroupedSection } from '../ui/grouped';
+import { usePriceFlash } from '../ui/price-flash';
+import * as flash from '../ui/price-flash.css';
+import { futuresRiskOf, RISK_LEVEL_TEXT, type PositionsSummary, type RiskLevel } from './position-metrics';
 
 export interface PositionSummaryCardProps {
     summary: PositionsSummary;
@@ -26,51 +34,72 @@ export interface PositionSummaryCardProps {
 
 const tone = (v: number): 'up' | 'down' | 'flat' => (v > 0 ? 'up' : v < 0 ? 'down' : 'flat');
 
+/** 風險指標進度條的滿格（%）：300% 以上滿格；100%（危險線）約為三分之一 */
+export const RISK_BAR_FULL_PCT = 300;
+const RISK_TONE: Record<RiskLevel, BarTone> = { danger: 'danger', warn: 'amber', ok: 'success' };
+
 export function PositionSummaryCard({ summary, known, margin, futuresLabel, privMoney }: PositionSummaryCardProps) {
     const risk = margin ? futuresRiskOf(margin) : null;
     const value = summary.marketValue;
+    const flashRef = useRef<HTMLSpanElement | null>(null);
+    usePriceFlash(flashRef, known && Number.isFinite(summary.pnl) ? summary.pnl : null, { enabled: known, masked: privMoney });
     return (
-        <div className={styles.summary} data-testid='position-summary'>
-            <div className={styles.summaryMain}>
-                <span className={styles.summaryLabel}>未實現損益合計</span>
-                <span className={`${styles.summaryValue} ${styles.tone[known ? tone(summary.pnl) : 'flat']}`} data-testid='position-total'>
-                    {known ? maskMoney(fmtSigned(summary.pnl, 0), privMoney) : '—'}
-                </span>
-                {known && summary.pnlPct !== null && (
-                    <span className={styles.tone[tone(summary.pnlPct)]} data-testid='position-total-pct'>（{fmtPct(summary.pnlPct)}）</span>
-                )}
-                <span className={styles.estimate}>（估）</span>
-            </div>
-            <dl className={styles.summaryGrid}>
-                {value && (
-                    <div className={styles.summaryItem}>
-                        <dt className={styles.summaryLabel}>股票總市值</dt>
-                        <dd className={styles.summaryItemValue} data-testid='position-market-value'>
-                            {known ? maskMoney(fmtInt(Math.round(value.value)), privMoney) : '—'}
-                            {known && value.incomplete && <span className={styles.summaryNote}>（部分缺價未計）</span>}
-                        </dd>
+        <GroupedSection testId='position-summary'>
+            <div className={styles.summary}>
+                <div>
+                    <p className={styles.summaryCaption}>未實現損益合計（估）</p>
+                    <div className={styles.summaryMain}>
+                        <span className={`${styles.summaryValue} ${flash.host}`}>
+                            <span ref={flashRef} className={flash.overlay} aria-hidden='true' />
+                            <span className={styles.tone[known ? tone(summary.pnl) : 'flat']} data-testid='position-total'>
+                                {known ? maskMoney(fmtSigned(summary.pnl, 0), privMoney) : '—'}
+                            </span>
+                        </span>
+                        {known && summary.pnlPct !== null && (
+                            <span className={`${styles.summaryPct} ${styles.tone[tone(summary.pnlPct)]}`} data-testid='position-total-pct'>（{fmtPct(summary.pnlPct)}）</span>
+                        )}
                     </div>
+                </div>
+                {(value || risk) && (
+                    <dl className={styles.summaryGrid}>
+                        {value && (
+                            <div className={styles.summaryItem}>
+                                <dt className={styles.summaryLabel}>股票總市值</dt>
+                                <dd className={styles.summaryItemValue} data-testid='position-market-value'>
+                                    {known ? maskMoney(fmtInt(Math.round(value.value)), privMoney) : '—'}
+                                    {known && value.incomplete && <span className={styles.summaryNote}>（部分缺價未計）</span>}
+                                </dd>
+                            </div>
+                        )}
+                        {risk && (
+                            <>
+                                <div className={styles.summaryItem}>
+                                    <dt className={styles.summaryLabel}>期貨權益數{futuresLabel ? `（${futuresLabel}）` : ''}</dt>
+                                    <dd className={styles.summaryItemValue} data-testid='position-equity'>
+                                        {risk.equity === null ? '—' : maskMoney(fmtInt(Math.round(risk.equity)), privMoney)}
+                                    </dd>
+                                </div>
+                                <div className={styles.summaryItem}>
+                                    <dt className={styles.summaryLabel}>風險指標</dt>
+                                    <dd className={styles.summaryItemValue}>
+                                        <span data-testid='position-risk'>
+                                            {risk.risk === null ? '—' : `${risk.risk.toFixed(0)}%（${RISK_LEVEL_TEXT[risk.level!]}）`}
+                                        </span>
+                                        {risk.risk !== null && risk.level && (
+                                            <span className={styles.riskBar}>
+                                                <ProgressBar percent={(risk.risk / RISK_BAR_FULL_PCT) * 100} tone={RISK_TONE[risk.level]} testId='position-risk-bar' />
+                                            </span>
+                                        )}
+                                    </dd>
+                                </div>
+                            </>
+                        )}
+                    </dl>
                 )}
-                {risk && (
-                    <>
-                        <div className={styles.summaryItem}>
-                            <dt className={styles.summaryLabel}>期貨權益數{futuresLabel ? `（${futuresLabel}）` : ''}</dt>
-                            <dd className={styles.summaryItemValue} data-testid='position-equity'>
-                                {risk.equity === null ? '—' : maskMoney(fmtInt(Math.round(risk.equity)), privMoney)}
-                            </dd>
-                        </div>
-                        <div className={styles.summaryItem}>
-                            <dt className={styles.summaryLabel}>風險指標</dt>
-                            <dd className={`${styles.summaryItemValue} ${risk.level ? styles.risk[risk.level] : ''}`} data-testid='position-risk'>
-                                {risk.risk === null ? '—' : `${risk.risk.toFixed(0)}%（${RISK_LEVEL_TEXT[risk.level!]}）`}
-                            </dd>
-                        </div>
-                    </>
+                {risk && risk.risk === null && (
+                    <p className={styles.summaryNote} data-testid='position-risk-note'>沒有原始保證金（模擬環境或未持有期權部位）時，風險指標無意義，顯示「—」。</p>
                 )}
-            </dl>
-            {risk && risk.risk === null && (
-                <p className={styles.summaryNote} data-testid='position-risk-note'>沒有原始保證金（模擬環境或未持有期權部位）時，風險指標無意義，顯示「—」。</p>
-            )}
-        </div>
+            </div>
+        </GroupedSection>
     );
 }

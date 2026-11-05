@@ -17,7 +17,12 @@
 //   比照桌面 runBatchCancel 呼叫 cancelOrders(ids)（lib 依勾選順序對每筆呼叫 cancelOrder，同帳戶共用回讀確認）。
 //   完成後面板列出每筆結果（失敗用 mutationErrorNotice 的用語）並 notify 彙總；結果未知不重送、不提供重送鍵。
 //   與單筆刪單相同：不受 ResumeGate、LIVE 與風控鎖限制；送出中停用並鎖住面板。切換分頁或帳戶篩選時清除選取。
+// - 版面（設計規格 §7.6，流程與 testid 不變）：PageHeader＋「⟳ 更新（N）」；Segmented 分頁；PopUpButton 帳戶；
+//   對帳 InlineNote；委託列三行＋列上 Chip（與列主體為兄弟節點，只呼叫 openOrderAction）；
+//   選取模式的工具列與「刪除已選」以 ShellSlot bottom 放在分頁列上方（測試原地渲染）；全部刪單留在列表尾端（不黏住）。
+//   載入 Skeleton（保留「委託載入中…」）、空狀態 EmptyState；全部刪單／批次刪單面板為 GroupedSection＋footer 滑塊。
 
+import { Inbox } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { mutationErrorNotice } from '../../components/esun-order-meta';
 import { useEsunOrderMeta } from '../../lib/esun/account-details';
@@ -30,7 +35,7 @@ import type { Trade } from '../../lib/types/order';
 import { fmtInt, fmtPrice } from '../../lib/utils/format';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
 import { mobileAccountLabel } from '../components/account-switch-sheet';
-import { BottomSheet } from '../components/bottom-sheet';
+import { BottomSheet, SheetFooter } from '../components/bottom-sheet';
 import {
     isWorkingTrade,
     orderActionAvailability,
@@ -48,8 +53,16 @@ import { SlideToConfirm } from '../components/slide-to-confirm';
 import { isNotStarted } from '../lib/errors';
 import { openOrderAction } from '../lib/mobile-store';
 import { collectDealRows, dealTotals, quantitiesText, type DealRow } from '../lib/order-fills';
-import * as layout from '../styles/layout.css';
 import * as styles from '../styles/orders.css';
+import { Chip } from '../ui/chip';
+import { EmptyState } from '../ui/empty-state';
+import { GroupedSection } from '../ui/grouped';
+import { InlineNote } from '../ui/inline-note';
+import { PageHeader } from '../ui/page-header';
+import { PopUpButton } from '../ui/pop-up-button';
+import { Segmented } from '../ui/segmented';
+import { ShellSlot } from '../ui/shell-slots';
+import { Skeleton } from '../ui/skeleton';
 
 /** 「更新」冷卻（玉山委託查詢 refresh 5 秒最小間隔、10 次／分） */
 export const ORDERS_REFRESH_COOLDOWN_MS = 6_000;
@@ -171,12 +184,16 @@ export function OrdersPage() {
         if (selecting && tab === 'working' && rows.length === 0 && !batchBusy && !batchOpen) exitSelecting();
     }, [selecting, tab, rows.length, batchBusy, batchOpen, exitSelecting]);
 
-    const tabs: { key: OrdersTab; label: string }[] = [
-        { key: 'working', label: `未成交 ${workingCount}` },
-        { key: 'filled', label: '已成交' },
-        { key: 'all', label: '全部' },
-        { key: 'deals', label: '成交' },
+    const tabs: { value: OrdersTab; label: string; testId: string }[] = [
+        { value: 'working', label: `未成交 ${workingCount}`, testId: 'orders-tab-working' },
+        { value: 'filled', label: '已成交', testId: 'orders-tab-filled' },
+        { value: 'all', label: '全部', testId: 'orders-tab-all' },
+        { value: 'deals', label: '成交', testId: 'orders-tab-deals' },
     ];
+    const accountOptions = useMemo(
+        () => [{ value: '', label: '帳戶：全部' }, ...accounts.map(a => ({ value: a.key, label: mobileAccountLabel(a.account, priv) }))],
+        [accounts, priv],
+    );
     const cooling = left > 0;
     const refreshLabel = cooling ? `⟳ 更新（${Math.ceil(left / 1_000)}）` : '⟳ 更新';
     // 委託還沒讀到：不能說「沒有委託」（讀取失敗時原因另由對帳 banner 顯示）
@@ -185,108 +202,83 @@ export function OrdersPage() {
         ? (query.error ? ORDERS_TEXT.readFailed : ORDERS_TEXT.loading)
         : tab === 'deals' ? ORDERS_TEXT.noDeals : trades.length === 0 ? ORDERS_TEXT.none : ORDERS_TEXT.noneInTab;
     const showSelectToolbar = tab === 'working' && rows.length > 0;
+    const selectingWorking = selecting && tab === 'working';
+    // 讀取中顯示骨架（保留「委託載入中…」文字）；其他空狀態用 EmptyState（標題沿用常數與 testid）
+    const empty = unread && !query.error
+        ? <div className={styles.emptyWrap}><Skeleton label={emptyText} rows={4} testId='orders-empty' /></div>
+        : <div className={styles.emptyWrap}><EmptyState icon={Inbox} title={emptyText} testId='orders-empty' /></div>;
 
     return (
-        <section className={layout.page} data-testid='page-orders'>
-            <div className={styles.header}>
-                <h1 className={styles.headerTitle}>委託</h1>
-                <button
-                    type='button'
-                    className={styles.button.neutral}
-                    data-testid='orders-refresh'
-                    disabled={cooling}
-                    aria-label={cooling ? `更新委託（${Math.ceil(left / 1_000)} 秒後可再按）` : '更新委託'}
-                    onClick={refresh}
-                >
-                    {refreshLabel}
-                </button>
+        <section className={styles.page} data-testid='page-orders'>
+            <PageHeader
+                title='委託'
+                actions={(
+                    <button
+                        type='button'
+                        className={styles.refreshButton}
+                        data-testid='orders-refresh'
+                        disabled={cooling}
+                        aria-label={cooling ? `更新委託（${Math.ceil(left / 1_000)} 秒後可再按）` : '更新委託'}
+                        onClick={refresh}
+                    >
+                        {refreshLabel}
+                    </button>
+                )}
+            />
+
+            <div className={styles.tabsWrap}>
+                <Segmented<OrdersTab>
+                    semantics='tabs'
+                    ariaLabel='委託狀態'
+                    items={tabs}
+                    value={tab}
+                    disabled={batchBusy}
+                    onChange={setTab}
+                />
             </div>
 
             <div className={styles.filterRow}>
-                <div className={styles.tabs} role='tablist' aria-label='委託狀態'>
-                    {tabs.map(t => (
-                        <button
-                            key={t.key}
-                            type='button'
-                            role='tab'
-                            aria-selected={tab === t.key}
-                            className={tab === t.key ? styles.tab.on : styles.tab.off}
-                            data-testid={`orders-tab-${t.key}`}
-                            disabled={batchBusy}
-                            onClick={() => setTab(t.key)}
-                        >
-                            {t.label}
-                        </button>
-                    ))}
-                </div>
-                <select
+                <PopUpButton
                     className={styles.accountPicker}
-                    aria-label='帳戶篩選'
-                    data-testid='orders-account'
+                    ariaLabel='帳戶篩選'
+                    testId='orders-account'
                     value={scopeKey}
+                    options={accountOptions}
                     disabled={batchBusy}
-                    onChange={e => setAccountKey(e.target.value)}
-                >
-                    <option value=''>帳戶：全部</option>
-                    {accounts.map(a => (
-                        <option key={a.key} value={a.key}>{mobileAccountLabel(a.account, priv)}</option>
-                    ))}
-                </select>
+                    onChange={setAccountKey}
+                />
+                {showSelectToolbar && !selectingWorking && (
+                    <div className={styles.toolbar} data-testid='orders-select-toolbar'>
+                        <span className={styles.toolbarText}>點委託列查看明細</span>
+                        <button type='button' className={styles.textButton} data-testid='orders-select' onClick={() => setSelecting(true)}>
+                            選取
+                        </button>
+                    </div>
+                )}
             </div>
 
             {query.needsReconcile && (
-                <div className={styles.banner} role='status' data-testid='orders-reconcile'>
-                    <span className={styles.bannerText}>
-                        ⚠ {query.reasons.map(r => RECONCILE_REASON_LABELS[r] ?? r).join('、') || '待對帳'}：委託可能不完整，請按「對帳」重新讀取後核對
-                    </span>
-                    <button type='button' className={styles.button.neutral} disabled={cooling} onClick={refresh}>
-                        {cooling ? `對帳（${Math.ceil(left / 1_000)}）` : '對帳'}
-                    </button>
-                </div>
-            )}
-
-            {showSelectToolbar && (
-                <div className={styles.toolbar} data-testid='orders-select-toolbar'>
-                    {selecting ? (
-                        <>
-                            <span className={styles.toolbarText} data-testid='orders-selected-count'>已選 {fmtInt(selectedTrades.length)} 筆</span>
-                            <button
-                                type='button'
-                                className={styles.button.neutral}
-                                data-testid='orders-select-all'
-                                disabled={batchBusy}
-                                onClick={() => setSelected(allSelected ? new Set() : new Set(rows.map(t => t.order.id)))}
-                            >
-                                {allSelected ? '全不選' : '全選'}
-                            </button>
-                            <button type='button' className={styles.button.neutral} data-testid='orders-select-done' disabled={batchBusy} onClick={exitSelecting}>
-                                完成
-                            </button>
-                        </>
-                    ) : (
-                        <>
-                            <span className={styles.toolbarText}>點委託列查看明細</span>
-                            <button type='button' className={styles.button.neutral} data-testid='orders-select' onClick={() => setSelecting(true)}>
-                                選取
-                            </button>
-                        </>
-                    )}
+                <div className={styles.noteWrap}>
+                    <InlineNote
+                        tone='warn'
+                        role='status'
+                        testId='orders-reconcile'
+                        action={{ label: cooling ? `對帳（${Math.ceil(left / 1_000)}）` : '對帳', onClick: refresh, disabled: cooling }}
+                    >
+                        {query.reasons.map(r => RECONCILE_REASON_LABELS[r] ?? r).join('、') || '待對帳'}：委託可能不完整，請按「對帳」重新讀取後核對
+                    </InlineNote>
                 </div>
             )}
 
             {tab === 'deals' ? (
-                dealRows.length === 0
-                    ? <p className={styles.empty} data-testid='orders-empty'>{emptyText}</p>
-                    : <DealsList rows={dealRows} onOpen={setDetailId} />
-            ) : rows.length === 0 ? (
-                <p className={styles.empty} data-testid='orders-empty'>{emptyText}</p>
-            ) : (
+                dealRows.length === 0 ? empty : <DealsList rows={dealRows} onOpen={setDetailId} />
+            ) : rows.length === 0 ? empty : (
                 <ul className={styles.list}>
                     {rows.map(t => (
                         <OrderRow
                             key={t.order.id}
                             trade={t}
-                            selecting={selecting && tab === 'working'}
+                            selecting={selectingWorking}
                             selected={selected.has(t.order.id)}
                             disabled={batchBusy}
                             onToggle={toggle}
@@ -296,19 +288,43 @@ export function OrdersPage() {
                 </ul>
             )}
 
-            {selecting && tab === 'working' ? (
-                <div className={styles.footer}>
-                    <button
-                        type='button'
-                        className={styles.cancelAllButton}
-                        data-testid='orders-cancel-selected'
-                        disabled={selectedTrades.length === 0 || batchBusy}
-                        onClick={() => setBatchOpen(true)}
-                    >
-                        刪除已選（{selectedTrades.length} 筆）
-                    </button>
-                </div>
-            ) : allWorking.length > 0 && tab !== 'deals' && (
+            {/* 選取模式：工具列與「刪除已選」放在分頁列上方的配件槽（不在捲動容器內）；按下只開批次刪單面板（仍需滑動確認） */}
+            {selectingWorking && (
+                <ShellSlot slot='bottom'>
+                    <div className={styles.selectBar}>
+                        {showSelectToolbar && (
+                            <div className={styles.selectBarRow} data-testid='orders-select-toolbar'>
+                                <span className={styles.selectBarCount} data-testid='orders-selected-count'>
+                                    已選 {fmtInt(selectedTrades.length)} 筆
+                                </span>
+                                <button
+                                    type='button'
+                                    className={styles.textButton}
+                                    data-testid='orders-select-all'
+                                    disabled={batchBusy}
+                                    onClick={() => setSelected(allSelected ? new Set() : new Set(rows.map(t => t.order.id)))}
+                                >
+                                    {allSelected ? '全不選' : '全選'}
+                                </button>
+                                <button type='button' className={styles.textButton} data-testid='orders-select-done' disabled={batchBusy} onClick={exitSelecting}>
+                                    完成
+                                </button>
+                            </div>
+                        )}
+                        <button
+                            type='button'
+                            className={styles.cancelSelectedButton}
+                            data-testid='orders-cancel-selected'
+                            disabled={selectedTrades.length === 0 || batchBusy}
+                            onClick={() => setBatchOpen(true)}
+                        >
+                            刪除已選（{selectedTrades.length} 筆）
+                        </button>
+                    </div>
+                </ShellSlot>
+            )}
+
+            {!selectingWorking && allWorking.length > 0 && tab !== 'deals' && (
                 <div className={styles.footer}>
                     <button type='button' className={styles.cancelAllButton} data-testid='orders-cancel-all' onClick={() => setConfirmAll(true)}>
                         全部刪單（{allWorking.length} 筆）
@@ -344,10 +360,11 @@ function OrderRow({ trade, selecting, selected, disabled, onToggle, onOpen }: Or
     const avail = orderActionAvailability(trade, meta);
     const id = trade.order.id;
     const sideText = trade.order.action === 'Buy' ? '買' : '賣';
+    const showActions = working && !selecting;
     const main = (
         <button
             type='button'
-            className={styles.rowMain}
+            className={showActions ? `${styles.rowMain} ${styles.rowMainWithActions}` : styles.rowMain}
             data-testid='order-row-main'
             disabled={selecting && disabled}
             // 不用 aria-label：讓螢幕閱讀器讀出完整委託內容；選取模式以 aria-pressed 表示勾選狀態
@@ -376,21 +393,12 @@ function OrderRow({ trade, selecting, selected, disabled, onToggle, onOpen }: Or
                     {main}
                 </div>
             ) : main}
-            {working && !selecting && (
-                <div className={styles.rowActions}>
-                    {avail.price && (
-                        <button type='button' className={styles.button.neutral} data-testid='order-price-button' onClick={() => openOrderAction(id, 'price')}>
-                            改價
-                        </button>
-                    )}
-                    {avail.qty && (
-                        <button type='button' className={styles.button.neutral} data-testid='order-qty-button' onClick={() => openOrderAction(id, 'qty')}>
-                            減量
-                        </button>
-                    )}
-                    <button type='button' className={styles.button.danger} data-testid='order-cancel-button' onClick={() => openOrderAction(id, 'cancel')}>
-                        刪單
-                    </button>
+            {/* 列上動作：與列主體為兄弟節點（不巢狀在按鈕內）；只開委託操作面板，送出仍需面板內滑動確認 */}
+            {showActions && (
+                <div className={styles.rowActions} role='group' aria-label={`${trade.contract.code} ${sideText} 委託操作`}>
+                    {avail.price && <Chip label='改價' testId='order-price-button' onClick={() => openOrderAction(id, 'price')} />}
+                    {avail.qty && <Chip label='減量' testId='order-qty-button' onClick={() => openOrderAction(id, 'qty')} />}
+                    <Chip label='刪單' testId='order-cancel-button' className={styles.chipDanger} onClick={() => openOrderAction(id, 'cancel')} />
                 </div>
             )}
         </li>
@@ -407,31 +415,33 @@ function DealsList({ rows, onOpen }: { rows: DealRow[]; onOpen: (id: string) => 
     return (
         <>
             {anyUntimed && (
-                <p className={styles.sub} data-testid='deals-sort-note'>
+                <p className={`${styles.sheetNote} ${styles.noteWrap}`} data-testid='deals-sort-note'>
                     依成交時間新到舊；券商未提供成交時間的成交（玉山重新讀取後的逐筆、彙總）排在後面，依委託時間排列。
                 </p>
             )}
             <ul className={styles.list} data-testid='deals-list'>
                 {rows.map(r => <DealItem key={r.key} row={r} onOpen={onOpen} />)}
             </ul>
-            <div className={styles.totals} data-testid='deals-totals'>
-                <span data-testid='deals-total-count'>合計 {fmtInt(totals.count)} 筆</span>
-                <span data-testid='deals-total-buy'>
-                    <span className={styles.side.Buy}>買進</span> {fmtInt(totals.Buy.count)} 筆 · {quantitiesText(totals.Buy.quantities, fmtInt)}
-                    {totals.Buy.stockAmount > 0 && ` · 股票 ${money(totals.Buy.stockAmount)} 元`}
-                </span>
-                <span data-testid='deals-total-sell'>
-                    <span className={styles.side.Sell}>賣出</span> {fmtInt(totals.Sell.count)} 筆 · {quantitiesText(totals.Sell.quantities, fmtInt)}
-                    {totals.Sell.stockAmount > 0 && ` · 股票 ${money(totals.Sell.stockAmount)} 元`}
-                </span>
-                {(totals.hasDerivatives || totals.amountIncomplete) && (
-                    <span className={styles.sub}>
-                        {totals.hasDerivatives ? '金額只計股票（期貨、選擇權需契約乘數，未列入）。' : ''}
-                        {totals.amountIncomplete ? '部分成交券商未提供逐筆價格，金額不完整。' : ''}
+            <GroupedSection>
+                <div className={styles.totals} data-testid='deals-totals'>
+                    <span className={styles.totalsHead} data-testid='deals-total-count'>合計 {fmtInt(totals.count)} 筆</span>
+                    <span data-testid='deals-total-buy'>
+                        <span className={styles.side.Buy}>買進</span> {fmtInt(totals.Buy.count)} 筆 · {quantitiesText(totals.Buy.quantities, fmtInt)}
+                        {totals.Buy.stockAmount > 0 && ` · 股票 ${money(totals.Buy.stockAmount)} 元`}
                     </span>
-                )}
-                <span className={styles.sub}>成交價金未含手續費與稅；以目前讀到的委託資料為準。</span>
-            </div>
+                    <span data-testid='deals-total-sell'>
+                        <span className={styles.side.Sell}>賣出</span> {fmtInt(totals.Sell.count)} 筆 · {quantitiesText(totals.Sell.quantities, fmtInt)}
+                        {totals.Sell.stockAmount > 0 && ` · 股票 ${money(totals.Sell.stockAmount)} 元`}
+                    </span>
+                    {(totals.hasDerivatives || totals.amountIncomplete) && (
+                        <span className={styles.sub}>
+                            {totals.hasDerivatives ? '金額只計股票（期貨、選擇權需契約乘數，未列入）。' : ''}
+                            {totals.amountIncomplete ? '部分成交券商未提供逐筆價格，金額不完整。' : ''}
+                        </span>
+                    )}
+                    <span className={styles.sub}>成交價金未含手續費與稅；以目前讀到的委託資料為準。</span>
+                </div>
+            </GroupedSection>
         </>
     );
 }
@@ -445,18 +455,19 @@ function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void 
     // 玉山重新讀取後的逐筆成交：券商只給委託時間，不可當成交時間顯示
     const untimed = !!row.deal && !row.aggregate && row.ts <= 0;
     return (
-        <li data-testid='deal-row' data-trade-id={t.order.id}>
+        <li className={styles.row} data-testid='deal-row' data-trade-id={t.order.id}>
             <button
                 type='button'
                 className={styles.dealRow}
                 title='查看委託明細'
                 onClick={() => onOpen(t.order.id)}
             >
+                {/* 精簡兩行：(買) 代碼 名稱 … 時間／價 × 量 單位 … 帳戶（方向膠囊以 CSS order 排在最前） */}
                 <span className={styles.line}>
-                    <span className={styles.sub} data-testid='deal-time'>{time || '—'}</span>
                     <span className={styles.code}>{t.contract.code}</span>
                     {t.contract.name && <span>{t.contract.name}</span>}
                     <span className={styles.side[t.order.action === 'Buy' ? 'Buy' : 'Sell']} data-testid='deal-side'>{sideText}</span>
+                    <span className={styles.lineEnd} data-testid='deal-time'>{time || '—'}</span>
                 </span>
                 <span className={styles.line}>
                     <span data-testid='deal-price'>
@@ -464,7 +475,7 @@ function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void 
                     </span>
                     {row.aggregate && <span className={styles.sub}>{row.deal ? '（彙總）' : '（無逐筆明細）'}</span>}
                     {untimed && <span className={styles.sub} data-testid='deal-untimed'>（券商未提供成交時間）</span>}
-                    <span className={styles.sub} data-testid='deal-account'>{account ? mobileAccountLabel(account, priv) : '帳戶未知'}</span>
+                    <span className={styles.lineEnd} data-testid='deal-account'>{account ? mobileAccountLabel(account, priv) : '帳戶未知'}</span>
                 </span>
             </button>
         </li>
@@ -477,7 +488,7 @@ function AccountItem({ account, count }: { account: TradeAccount | null; count: 
     const priv = usePrivacyMode();
     const route = useOrderRoute(account);
     return (
-        <li>
+        <li className={styles.accountItem}>
             {account ? `${mobileAccountLabel(account, priv)}（${routeBadgeText(route)}）` : '帳戶未知'}：{fmtInt(count)} 筆
         </li>
     );
@@ -537,24 +548,30 @@ function CancelAllSheet({ open, working, onClose }: { open: boolean; working: Tr
     return (
         <BottomSheet open={open} onClose={onClose} dismissible={!busy} title='全部刪單' testId='cancel-all-sheet'>
             <div className={styles.sheetBody}>
-                <p data-testid='cancel-all-count'>將刪除 <strong>{fmtInt(working.length)}</strong> 筆未成交委託，涉及 {fmtInt(groups.length)} 個帳戶：</p>
-                <ul className={styles.accountList} data-testid='cancel-all-accounts'>
-                    {groups.map(([key, g]) => <AccountItem key={key || 'unknown'} account={g.account} count={g.count} />)}
-                </ul>
-                <p className={styles.sub}>
+                <p className={styles.sheetText} data-testid='cancel-all-count'>將刪除 <strong>{fmtInt(working.length)}</strong> 筆未成交委託，涉及 {fmtInt(groups.length)} 個帳戶：</p>
+                <GroupedSection>
+                    <ul className={styles.accountList} data-testid='cancel-all-accounts'>
+                        {groups.map(([key, g]) => <AccountItem key={key || 'unknown'} account={g.account} count={g.count} />)}
+                    </ul>
+                </GroupedSection>
+                <p className={styles.sheetNote}>
                     全部刪單涵蓋所有可交易帳戶，不受帳戶篩選限制；送出前會先向券商重新讀取委託，實際筆數以券商資料為準。
                 </p>
-                {feedback && <p className={styles.notSent} role='alert' data-testid='cancel-all-feedback'>{feedback}</p>}
-                <SlideToConfirm
-                    label={`滑動確認 全部刪單（${working.length} 筆）`}
-                    tone='danger'
-                    testId='cancel-all-slide'
-                    disabled={busy || working.length === 0}
-                    disabledReason={busy ? '處理中…' : working.length === 0 ? '目前沒有未成交委託' : null}
-                    resetKey={resetKey}
-                    onConfirm={() => { void confirm(); }}
-                />
-                <button type='button' className={styles.button.neutral} disabled={busy} onClick={onClose}>取消</button>
+                <SheetFooter>
+                    <div className={styles.footerStack}>
+                        {feedback && <InlineNote tone='danger' role='alert' testId='cancel-all-feedback'>{feedback}</InlineNote>}
+                        <SlideToConfirm
+                            label={`滑動確認 全部刪單（${working.length} 筆）`}
+                            tone='danger'
+                            testId='cancel-all-slide'
+                            disabled={busy || working.length === 0}
+                            disabledReason={busy ? '處理中…' : working.length === 0 ? '目前沒有未成交委託' : null}
+                            resetKey={resetKey}
+                            onConfirm={() => { void confirm(); }}
+                        />
+                        <button type='button' className={styles.sheetTextButton} disabled={busy} onClick={onClose}>取消</button>
+                    </div>
+                </SheetFooter>
             </div>
         </BottomSheet>
     );
@@ -656,50 +673,62 @@ function BatchCancelSheet({ open, targets, onBusyChange, onSent, onClose }: Batc
         <BottomSheet open={open} onClose={onClose} dismissible={!busy} title='刪除已選委託' testId='batch-cancel-sheet'>
             <div className={styles.sheetBody}>
                 {results ? (
-                    <>
-                        <p data-testid='batch-cancel-summary'>{results.summary}</p>
-                        <ul className={styles.resultList} data-testid='batch-cancel-results'>
-                            {results.items.map(r => (
-                                <li key={r.trade.order.id} className={styles.resultItem} data-testid='batch-cancel-result' data-trade-id={r.trade.order.id} data-tone={r.tone}>
-                                    <span>
-                                        {r.trade.contract.code} {r.trade.order.action === 'Buy' ? '買' : '賣'} {orderPriceText(r.trade)} · 剩餘 {fmtInt(remainingWorkingOrderQuantity(r.trade))} {orderUnitOf(r.trade)}
-                                    </span>
-                                    <span className={r.tone === 'ok' ? styles.resultOk : r.tone === 'warn' ? styles.resultWarn : styles.resultErr}>{r.title}</span>
-                                    {r.body && <span className={styles.sub}>{r.body}</span>}
-                                </li>
-                            ))}
-                        </ul>
-                        <button type='button' className={styles.button.neutral} data-testid='batch-cancel-close' onClick={onClose}>關閉</button>
-                    </>
+                    <div className={`${styles.sheetBody} ${styles.fade}`}>
+                        <p className={styles.sheetText} data-testid='batch-cancel-summary'>{results.summary}</p>
+                        <GroupedSection>
+                            <ul className={styles.resultList} data-testid='batch-cancel-results'>
+                                {results.items.map(r => (
+                                    <li key={r.trade.order.id} className={styles.resultItem} data-testid='batch-cancel-result' data-trade-id={r.trade.order.id} data-tone={r.tone}>
+                                        <span>
+                                            {r.trade.contract.code} {r.trade.order.action === 'Buy' ? '買' : '賣'} {orderPriceText(r.trade)} · 剩餘 {fmtInt(remainingWorkingOrderQuantity(r.trade))} {orderUnitOf(r.trade)}
+                                        </span>
+                                        <span className={r.tone === 'ok' ? styles.resultOk : r.tone === 'warn' ? styles.resultWarn : styles.resultErr}>{r.title}</span>
+                                        {r.body && <span className={styles.sub}>{r.body}</span>}
+                                    </li>
+                                ))}
+                            </ul>
+                        </GroupedSection>
+                        <SheetFooter>
+                            <button type='button' className={styles.sheetTextButton} data-testid='batch-cancel-close' onClick={onClose}>關閉</button>
+                        </SheetFooter>
+                    </div>
                 ) : (
                     <>
-                        <p data-testid='batch-cancel-count'>將刪除已選的 <strong>{fmtInt(targets.length)}</strong> 筆未成交委託，涉及 {fmtInt(groups.length)} 個帳戶：</p>
-                        <ul className={styles.accountList} data-testid='batch-cancel-accounts'>
-                            {groups.map(([key, g]) => <AccountItem key={key || 'unknown'} account={g.account} count={g.count} />)}
-                        </ul>
-                        <ul className={styles.resultList} data-testid='batch-cancel-targets'>
-                            {targets.map(t => (
-                                <li key={t.order.id} className={styles.resultItem}>
-                                    <span>
-                                        <span className={styles.side[t.order.action === 'Buy' ? 'Buy' : 'Sell']}>{t.order.action === 'Buy' ? '買' : '賣'}</span>
-                                        {' '}{t.contract.code} {t.contract.name ?? ''} {orderPriceText(t)} · 剩餘 {fmtInt(remainingWorkingOrderQuantity(t))} {orderUnitOf(t)}
-                                    </span>
-                                </li>
-                            ))}
-                        </ul>
-                        <p className={styles.sub}>每筆刪單送出後以券商回讀確認結果；若委託其實已成交，刪單不會成立。結果未知的委託請手動更新核對，勿重送。</p>
-                        {progress && <p className={styles.sub} role='status' data-testid='batch-cancel-progress'>處理中… {fmtInt(progress.done)}／{fmtInt(progress.total)}</p>}
-                        {feedback && <p className={styles.notSent} role='alert' data-testid='batch-cancel-feedback'>{feedback}</p>}
-                        <SlideToConfirm
-                            label={`滑動確認 刪除已選（${targets.length} 筆）`}
-                            tone='danger'
-                            testId='batch-cancel-slide'
-                            disabled={busy || targets.length === 0}
-                            disabledReason={busy ? '處理中…' : targets.length === 0 ? '沒有已選的未成交委託' : null}
-                            resetKey={resetKey}
-                            onConfirm={() => { void confirm(); }}
-                        />
-                        <button type='button' className={styles.button.neutral} disabled={busy} onClick={onClose}>取消</button>
+                        <p className={styles.sheetText} data-testid='batch-cancel-count'>將刪除已選的 <strong>{fmtInt(targets.length)}</strong> 筆未成交委託，涉及 {fmtInt(groups.length)} 個帳戶：</p>
+                        <GroupedSection>
+                            <ul className={styles.accountList} data-testid='batch-cancel-accounts'>
+                                {groups.map(([key, g]) => <AccountItem key={key || 'unknown'} account={g.account} count={g.count} />)}
+                            </ul>
+                        </GroupedSection>
+                        <GroupedSection>
+                            <ul className={styles.resultList} data-testid='batch-cancel-targets'>
+                                {targets.map(t => (
+                                    <li key={t.order.id} className={styles.resultItem}>
+                                        <span>
+                                            <span className={styles.side[t.order.action === 'Buy' ? 'Buy' : 'Sell']}>{t.order.action === 'Buy' ? '買' : '賣'}</span>
+                                            {' '}{t.contract.code} {t.contract.name ?? ''} {orderPriceText(t)} · 剩餘 {fmtInt(remainingWorkingOrderQuantity(t))} {orderUnitOf(t)}
+                                        </span>
+                                    </li>
+                                ))}
+                            </ul>
+                        </GroupedSection>
+                        <p className={styles.sheetNote}>每筆刪單送出後以券商回讀確認結果；若委託其實已成交，刪單不會成立。結果未知的委託請手動更新核對，勿重送。</p>
+                        <SheetFooter>
+                            <div className={styles.footerStack}>
+                                {progress && <p className={styles.sheetNote} role='status' data-testid='batch-cancel-progress'>處理中… {fmtInt(progress.done)}／{fmtInt(progress.total)}</p>}
+                                {feedback && <InlineNote tone='danger' role='alert' testId='batch-cancel-feedback'>{feedback}</InlineNote>}
+                                <SlideToConfirm
+                                    label={`滑動確認 刪除已選（${targets.length} 筆）`}
+                                    tone='danger'
+                                    testId='batch-cancel-slide'
+                                    disabled={busy || targets.length === 0}
+                                    disabledReason={busy ? '處理中…' : targets.length === 0 ? '沒有已選的未成交委託' : null}
+                                    resetKey={resetKey}
+                                    onConfirm={() => { void confirm(); }}
+                                />
+                                <button type='button' className={styles.sheetTextButton} disabled={busy} onClick={onClose}>取消</button>
+                            </div>
+                        </SheetFooter>
                     </>
                 )}
             </div>

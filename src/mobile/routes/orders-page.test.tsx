@@ -310,6 +310,53 @@ describe('OrdersPage — 委託操作', () => {
     });
 });
 
+// 設計規格 §10 S1：新入口（列上改價／減量／刪單 Chip）只呼叫 openOrderAction，lib 送出函式呼叫 0 次
+describe('OrdersPage — S1：列上 Chip 只開委託操作面板', () => {
+    const libCalls = () => m.updatePrice.mock.calls.length + m.updateQty.mock.calls.length + m.cancelOrder.mock.calls.length
+        + m.cancelOrders.mock.calls.length + m.cancelAll.mock.calls.length;
+
+    it('改價／減量／刪單 Chip 只設定 orderAction（對應 kind），不呼叫任何 lib 送出函式', async () => {
+        setState([trade('o1')]);
+        await render();
+        for (const [testId, kind] of [['order-price-button', 'price'], ['order-qty-button', 'qty'], ['order-cancel-button', 'cancel']] as const) {
+            await press(rowButton('o1', testId)!);
+            expect(getMobileUi().orderAction).toMatchObject({ tradeId: 'o1', kind });
+            // 只開面板：滑動確認仍在面板內
+            expect(slide('order-action-slide')).toBeDefined();
+            expect(libCalls()).toBe(0);
+        }
+        expect(m.notify).not.toHaveBeenCalled();
+        expect(m.assertLive).not.toHaveBeenCalled();
+    });
+
+    it('Chip 與列主體按鈕為兄弟節點（不巢狀在列主體按鈕內），可見文字恰為動作名', async () => {
+        setState([trade('o1')]);
+        await render();
+        const main = testIdIn(row('o1')!, 'order-row-main')[0]!;
+        for (const [testId, label] of [['order-price-button', '改價'], ['order-qty-button', '減量'], ['order-cancel-button', '刪單']] as const) {
+            const chip = rowButton('o1', testId)!;
+            expect(text(chip)).toBe(label);
+            expect(main.findAll(n => n === chip)).toHaveLength(0);
+        }
+        // 點列主體只開明細，不開委託操作面板、不呼叫 lib
+        await press(main);
+        expect(byTestId('order-detail-sheet')).toHaveLength(1);
+        expect(getMobileUi().orderAction).toBeNull();
+        expect(libCalls()).toBe(0);
+    });
+
+    it('選取模式的「刪除已選」只開批次刪單面板（仍需滑動確認），不呼叫 lib', async () => {
+        setState([trade('o1'), trade('o2')]);
+        await render();
+        await press(byTestId('orders-select')[0]!);
+        await act(async () => { testIdIn(row('o1')!, 'order-select')[0]!.props.onChange(); });
+        await press(byTestId('orders-cancel-selected')[0]!);
+        expect(byTestId('batch-cancel-sheet')).toHaveLength(1);
+        expect(slide('batch-cancel-slide')).toBeDefined();
+        expect(libCalls()).toBe(0);
+    });
+});
+
 describe('OrdersPage — 全部刪單', () => {
     it('requires a slide confirmation listing the count and accounts before calling cancelAllOrders', async () => {
         m.cancelAll.mockResolvedValue(3);
