@@ -1,51 +1,76 @@
-// src/mobile/components/depth-ladder.tsx — 五檔價格梯（規格 §6.2）
+// src/mobile/components/depth-ladder.tsx — 五檔（買賣同列；規格 §6.2）
 //
-//  委買量    價格     委賣量
-//            1,087      30
-//            1,085      88   ← 賣一
-//   120     1,084            ← 買一
+//  內外盤比 ███████░░░░  58%（內盤）／42%（外盤）     ← 只在 variant 'page'、串流有內外盤量時
+//  委買量 │ 買價  │ 賣價  │ 委賣量
+//    120  │ 1,084 │ 1,085 │   88     ← 第 i 列＝買 i 與賣 i
+//    …（5 列）
+//    316  │   五檔總量    │  173     ← 買量總和／賣量總和
+//  買 65% ████████░░░░ 35% 賣
 //
-// - 資料：useQuote(code) 的 BidAsk；盤中零股切換時改用 useQuote(code, { oddLot: true })（量以股計）。
-// - 點任一價位 → openTicket({ code, price })：只帶價，不決定買賣，也不會送單。
-// - 自己的未成交限價委託在對應價位標示「我 買2」（整股五檔只算整股委託，零股五檔只算零股委託）。
+// - 資料：useQuote(code) 的 BidAsk；盤中零股時改用 useQuote(code, { oddLot: true })（量以股計）。
+//   variant 'page'（交易頁）可切換整股／盤中零股；variant 'ticket'（下單面板內嵌）不顯示切換，由 oddLot prop 決定。
+// - 買價、賣價各是獨立的點擊目標：onPick(price, side)，缺省＝openTicket({ code, price, source: 'depth' })
+//   ——只帶價，不決定買賣，也不會送單。
+// - 自己的未成交限價委託標在該價位所在的那一側（「我 買2」；整股五檔只算整股委託，零股五檔只算零股委託）。
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useQuote } from '../../hooks/use-stream';
 import type { ContractInfo } from '../../lib/types/contract';
+import type { SseTick } from '../../lib/types/market';
 import type { AccountedTrade } from '../../lib/types/order';
 import { fmtCompactInt } from '../../lib/utils/format';
 import { formatToTick } from '../../lib/utils/ticksize';
 import { depthMarkText, depthOrderMarks, priceKey } from '../lib/chart-model';
 import { openTicket } from '../lib/mobile-store';
+import { innerOuterRatio, splitPercent, toneVsReference, volumeUnit, type SplitPercent } from '../lib/quote-display';
 import * as styles from '../styles/trade.css';
 
-export interface DepthLevel {
-    side: 'ask' | 'bid';
-    /** 1 = 最佳一檔 */
-    level: number;
+export const DEPTH_LEVELS = 5;
+
+export interface DepthQuote {
     price: number;
     volume: number;
 }
 
-/** BidAsk → 由上而下的列：賣五…賣一、買一…買五（價格 ≤ 0 的空檔不列） */
-export function depthLevels(bidask: { bid_price: readonly (string | number)[]; bid_volume: readonly number[]; ask_price: readonly (string | number)[]; ask_volume: readonly number[] } | undefined): DepthLevel[] {
-    if (!bidask) return [];
-    const asks: DepthLevel[] = [];
-    for (let i = 0; i < bidask.ask_price.length && i < 5; i++) {
-        const price = Number(bidask.ask_price[i]);
-        if (Number.isFinite(price) && price > 0) asks.push({ side: 'ask', level: i + 1, price, volume: bidask.ask_volume[i] ?? 0 });
-    }
-    const bids: DepthLevel[] = [];
-    for (let i = 0; i < bidask.bid_price.length && i < 5; i++) {
-        const price = Number(bidask.bid_price[i]);
-        if (Number.isFinite(price) && price > 0) bids.push({ side: 'bid', level: i + 1, price, volume: bidask.bid_volume[i] ?? 0 });
-    }
-    return [...asks.reverse(), ...bids];
+export interface DepthRow {
+    /** 1 = 最佳一檔 */
+    level: number;
+    bid: DepthQuote | null;
+    ask: DepthQuote | null;
 }
 
-function priceTone(price: number, reference: number | undefined): 'up' | 'down' | 'flat' {
-    if (!reference || reference <= 0) return 'flat';
-    return price > reference ? 'up' : price < reference ? 'down' : 'flat';
+export interface DepthBook {
+    /** 固定 5 列；價格 ≤ 0 或缺漏的檔位為 null */
+    rows: DepthRow[];
+    bidTotal: number;
+    askTotal: number;
+    /** 買賣兩側都沒有任何有效檔位 */
+    empty: boolean;
+}
+
+type BidAskLike = { bid_price: readonly (string | number)[]; bid_volume: readonly number[]; ask_price: readonly (string | number)[]; ask_volume: readonly number[] };
+
+function quoteAt(prices: readonly (string | number)[], volumes: readonly number[], i: number): DepthQuote | null {
+    const price = Number(prices[i]);
+    if (!Number.isFinite(price) || price <= 0) return null;
+    const v = Number(volumes[i] ?? 0);
+    return { price, volume: Number.isFinite(v) && v > 0 ? v : 0 };
+}
+
+/** BidAsk → 5 列（第 i 列＝買 i、賣 i）與兩側總量 */
+export function depthBook(bidask: BidAskLike | undefined): DepthBook {
+    const rows: DepthRow[] = [];
+    let bidTotal = 0;
+    let askTotal = 0;
+    let any = false;
+    for (let i = 0; i < DEPTH_LEVELS; i++) {
+        const bid = bidask ? quoteAt(bidask.bid_price, bidask.bid_volume, i) : null;
+        const ask = bidask ? quoteAt(bidask.ask_price, bidask.ask_volume, i) : null;
+        if (bid) { bidTotal += bid.volume; any = true; }
+        if (ask) { askTotal += ask.volume; any = true; }
+        rows.push({ level: i + 1, bid, ask });
+    }
+    return { rows, bidTotal, askTotal, empty: !any };
 }
 
 export interface DepthLadderProps {
@@ -63,56 +88,122 @@ export interface DepthLadderProps {
     oddLot?: boolean;
 }
 
-export function DepthLadder({ code, contract, trades, onPick }: DepthLadderProps) {
+/** 比例條（左右兩段＋文字百分比；寬度用 inline style，不依賴 color-mix 等新語法） */
+function RatioBar({ split, leftText, rightText, label, testId }: { split: SplitPercent; leftText: string; rightText: string; label: string; testId: string }) {
+    return (
+        <div className={styles.ratio} data-testid={testId} role='img' aria-label={`${label}：${leftText} ${split.leftPct}%，${rightText} ${split.rightPct}%`}>
+            <span className={`${styles.ratioText} ${styles.dirText.up}`} data-testid={`${testId}-left`}>{leftText} {split.leftPct}%</span>
+            <span className={styles.ratioTrack} aria-hidden='true'>
+                <span className={styles.ratioFill.up} style={{ width: `${split.leftPct}%` }} />
+                <span className={styles.ratioFill.down} style={{ width: `${split.rightPct}%` }} />
+            </span>
+            <span className={`${styles.ratioText} ${styles.dirText.down}`} data-testid={`${testId}-right`}>{split.rightPct}% {rightText}</span>
+        </div>
+    );
+}
+
+/** 內外盤比：內盤＝以買價成交（賣方主動，用 down 色）、外盤＝以賣價成交（買方主動，用 up 色）；文字標示不只靠顏色 */
+function InnerOuterBar({ split }: { split: SplitPercent }) {
+    return (
+        <div className={styles.innerOuter} data-testid='depth-inner-outer' role='img' aria-label={`內外盤比：內盤 ${split.leftPct}%，外盤 ${split.rightPct}%`}>
+            <span className={styles.innerOuterLabel}>內外盤比</span>
+            <span className={`${styles.ratioText} ${styles.dirText.down}`} data-testid='depth-inner'>{split.leftPct}%（內盤）</span>
+            <span className={styles.ratioTrack} aria-hidden='true'>
+                <span className={styles.ratioFill.down} style={{ width: `${split.leftPct}%` }} />
+                <span className={styles.ratioFill.up} style={{ width: `${split.rightPct}%` }} />
+            </span>
+            <span className={`${styles.ratioText} ${styles.dirText.up}`} data-testid='depth-outer'>{split.rightPct}%（外盤）</span>
+        </div>
+    );
+}
+
+export function DepthLadder({ code, contract, trades, onPick, variant = 'page', oddLot: oddLotProp }: DepthLadderProps) {
+    const ticket = variant === 'ticket';
     // 盤中零股只對股票（整股與零股分開撮合、量以股計）
     const oddCapable = contract?.security_type === 'STK';
     const [oddPref, setOddPref] = useState(false);
-    const oddLot = oddCapable && oddPref;
+    const oddLot = oddCapable && (ticket ? oddLotProp === true : oddPref);
     const quote = useQuote(code, { oddLot });
-    const levels = useMemo(() => depthLevels(quote?.bidask), [quote?.bidask]);
+    const book = useMemo(() => depthBook(quote?.bidask), [quote?.bidask]);
     const orderable = contract ? contract.target_code || contract.code : code;
     const marks = useMemo(() => depthOrderMarks(orderable, trades, oddLot), [orderable, trades, oddLot]);
-    const unit = oddLot ? '股' : contract?.security_type === 'STK' ? '張' : contract ? '口' : '';
+    const unit = contract ? volumeUnit(contract.security_type, oddLot) : '';
     const fmt = (p: number) => (contract ? formatToTick(contract, p) : String(p));
+    const reference = contract?.reference;
+
+    // 內外盤比：試撮期間沿用本元件看過的上一筆真實成交（換商品或整股／零股時重來）
+    const lastReal = useRef<{ code: string; oddLot: boolean; tick: SseTick } | null>(null);
+    const tick = quote?.tick;
+    if (tick && !tick.simtrade) lastReal.current = { code, oddLot, tick };
+    const realTick = lastReal.current?.code === code && lastReal.current.oddLot === oddLot ? lastReal.current.tick : undefined;
+    const innerOuter = ticket ? null : innerOuterRatio(realTick);
+    const bidAsk = splitPercent(book.bidTotal, book.askTotal);
+
+    const pick = (price: number, side: 'bid' | 'ask') => (onPick ? onPick(price, side) : openTicket({ code, price, source: 'depth' }));
+
+    const cell = (side: 'bid' | 'ask', level: number, q: DepthQuote | null) => {
+        const testId = `depth-${side}-${level}`;
+        if (!q) {
+            return <div key={side} className={styles.depthCell[side]} data-testid={testId} aria-hidden='true' />;
+        }
+        const mine = depthMarkText(marks.get(priceKey(q.price)));
+        const price = fmt(q.price);
+        const vol = fmtCompactInt(q.volume);
+        const sideText = side === 'bid' ? '委買' : '委賣';
+        const priceEl = (
+            <span className={`${styles.depthPrice[side]} ${styles.dirText[toneVsReference(q.price, reference)]}`}>
+                {price}
+                {mine && <span className={styles.ladderMine} data-testid='depth-mine'>{mine}</span>}
+            </span>
+        );
+        const volEl = <span className={styles.depthVol[side]}>{vol}</span>;
+        return (
+            <button
+                key={side}
+                type='button'
+                className={styles.depthCell[side]}
+                onClick={() => pick(q.price, side)}
+                aria-label={`${sideText}第${level}檔 ${price}，量 ${vol}${unit ? ` ${unit}` : ''}${mine ? `，${mine}` : ''}。${ticket ? '帶入價格' : '帶入下單面板'}`}
+                data-testid={testId}
+            >
+                {side === 'bid' ? <>{volEl}{priceEl}</> : <>{priceEl}{volEl}</>}
+            </button>
+        );
+    };
 
     return (
-        <div className={styles.ladder} data-testid='depth-ladder'>
-            {oddCapable && (
+        <div className={ticket ? styles.ladderCompact : styles.ladder} data-testid='depth-ladder' data-variant={variant}>
+            {!ticket && oddCapable && (
                 <div className={styles.ladderToolbar}>
                     <button type='button' className={styles.toggle} aria-pressed={!oddLot} onClick={() => setOddPref(false)}>整股</button>
                     <button type='button' className={styles.toggle} aria-pressed={oddLot} onClick={() => setOddPref(true)} data-testid='depth-odd-toggle'>盤中零股</button>
                 </div>
             )}
-            <div className={styles.ladderHead} aria-hidden='true'>
-                <span>委買量{unit && `（${unit}）`}</span>
-                <span>價格</span>
-                <span>委賣量{unit && `（${unit}）`}</span>
+            {innerOuter && <InnerOuterBar split={innerOuter} />}
+            <div className={styles.depthHead} aria-hidden='true'>
+                <span className={styles.depthHeadVol}>委買量</span>
+                <span className={styles.depthHeadPrice}>買價</span>
+                <span className={styles.depthHeadPrice}>賣價</span>
+                <span className={styles.depthHeadVolRight}>委賣量</span>
             </div>
-            {levels.length === 0 && <p className={styles.emptyText}>尚無五檔報價</p>}
-            {levels.map(l => {
-                const mine = depthMarkText(marks.get(priceKey(l.price)));
-                const sideText = l.level === 1 ? (l.side === 'ask' ? '賣一' : '買一') : null;
-                const price = fmt(l.price);
-                const vol = fmtCompactInt(l.volume);
-                return (
-                    <button
-                        key={`${l.side}${l.level}`}
-                        type='button'
-                        className={styles.ladderRow}
-                        onClick={() => (onPick ? onPick(l.price, l.side) : openTicket({ code, price: l.price, source: 'depth' }))}
-                        aria-label={`${l.side === 'ask' ? '委賣' : '委買'}第${l.level}檔 ${price}，量 ${vol}${mine ? `，${mine}` : ''}。帶入下單面板`}
-                        data-testid={`depth-${l.side}-${l.level}`}
-                    >
-                        <span className={styles.ladderVol}>{l.side === 'bid' ? vol : ''}</span>
-                        <span className={`${styles.ladderPrice} ${styles.dirText[priceTone(l.price, contract?.reference)]}`}>
-                            {price}
-                            {sideText && <span className={styles.ladderSideTag}>{sideText}</span>}
-                            {mine && <span className={styles.ladderMine} data-testid='depth-mine'>{mine}</span>}
-                        </span>
-                        <span className={styles.ladderVol}>{l.side === 'ask' ? vol : ''}</span>
-                    </button>
-                );
-            })}
+            {book.empty
+                ? <p className={styles.emptyText}>尚無五檔報價</p>
+                : (
+                    <>
+                        {book.rows.map(r => (
+                            <div key={r.level} className={styles.depthRow} data-testid={`depth-row-${r.level}`}>
+                                {cell('bid', r.level, r.bid)}
+                                {cell('ask', r.level, r.ask)}
+                            </div>
+                        ))}
+                        <div className={styles.depthTotal} data-testid='depth-total' aria-label={`五檔總量：委買 ${fmtCompactInt(book.bidTotal)}，委賣 ${fmtCompactInt(book.askTotal)}${unit ? ` ${unit}` : ''}`}>
+                            <span className={styles.depthTotalVol} data-testid='depth-total-bid'>{fmtCompactInt(book.bidTotal)}</span>
+                            <span className={styles.depthTotalLabel}>五檔總量{unit && `（${unit}）`}</span>
+                            <span className={styles.depthTotalVolRight} data-testid='depth-total-ask'>{fmtCompactInt(book.askTotal)}</span>
+                        </div>
+                        {bidAsk && <RatioBar split={bidAsk} leftText='買' rightText='賣' label='五檔買賣比' testId='depth-ratio' />}
+                    </>
+                )}
         </div>
     );
 }

@@ -86,6 +86,45 @@ export const infoRow = style({
 export const infoUp = style({ color: vars.color.up });
 export const infoDown = style({ color: vars.color.down });
 
+/** 漲停／跌停徽章：沿用 badge 外框，改用漲跌色；文字本身已標示「漲停」「跌停」 */
+export const badgeTone = styleVariants({
+    up: { color: vars.color.up, borderColor: vars.color.up, fontWeight: 700 },
+    down: { color: vars.color.down, borderColor: vars.color.down, fontWeight: 700 },
+});
+
+/** 統計格：開 高 均 總／參 低 單 額（每列 4 格；390px 寬每格約 88px） */
+export const statsGrid = style({
+    display: 'grid',
+    gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+    gap: `2px ${vars.space.sm}`,
+    margin: `${vars.space.xs} 0 0`,
+    fontSize: '0.8125rem',
+    fontVariantNumeric: 'tabular-nums',
+});
+
+export const statCell = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: vars.space.xs,
+    minWidth: 0,
+});
+
+export const statLabel = style({
+    flex: '0 0 auto',
+    margin: 0,
+    color: vars.color.mutedForeground,
+});
+
+export const statValue = style({
+    margin: 0,
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    fontFamily: vars.font.mono,
+});
+
 // ---- 分段切換（週期列、五檔／明細） ----
 
 export const segmentRow = style({
@@ -224,7 +263,7 @@ export const pickButton = styleVariants({
     cancel: [pickButtonBase, { background: 'transparent', color: vars.color.mutedForeground, minWidth: TOUCH_MIN, padding: `0 ${vars.space.sm}` }],
 });
 
-// ---- 五檔 ----
+// ---- 五檔（買賣同列） ----
 
 export const ladder = style({
     display: 'flex',
@@ -233,50 +272,162 @@ export const ladder = style({
     fontVariantNumeric: 'tabular-nums',
 });
 
-export const ladderHead = style({
+/** 下單面板內嵌：不留左右外距（面板自己有），其餘結構相同 */
+export const ladderCompact = style({
+    display: 'flex',
+    flexDirection: 'column',
+    padding: 0,
+    fontVariantNumeric: 'tabular-nums',
+});
+
+const DEPTH_CELL_PAD = vars.space.sm;
+
+export const depthHead = style({
     display: 'grid',
-    gridTemplateColumns: '1fr 1.2fr 1fr',
+    gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+    columnGap: '1px',
     fontSize: '0.75rem',
     color: vars.color.mutedForeground,
     padding: `${vars.space.xs} 0`,
+    borderBottom: `1px solid ${vars.color.border}`,
 });
 
-export const ladderRow = style({
+export const depthHeadVol = style({ paddingLeft: DEPTH_CELL_PAD, textAlign: 'left' });
+export const depthHeadPrice = style({ padding: `0 ${DEPTH_CELL_PAD}`, textAlign: 'center' });
+export const depthHeadVolRight = style({ paddingRight: DEPTH_CELL_PAD, textAlign: 'right' });
+
+export const depthRow = style({
     display: 'grid',
-    gridTemplateColumns: '1fr 1.2fr 1fr',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+    columnGap: '1px',
+    borderBottom: `1px solid ${vars.color.border}`,
+});
+
+const depthCellBase = style({
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
     alignItems: 'center',
+    columnGap: vars.space.xs,
     minHeight: TOUCH_MIN,
     width: '100%',
-    padding: 0,
+    minWidth: 0,
+    padding: `0 ${DEPTH_CELL_PAD}`,
     border: 'none',
-    borderBottom: `1px solid ${vars.color.border}`,
     background: 'transparent',
     color: vars.color.foreground,
     fontSize: '0.9375rem',
-    textAlign: 'center',
     selectors: {
         '&:active': { background: vars.color.muted },
         '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '-2px' },
     },
 });
 
-export const ladderVol = style({
+/** 買側：委買量靠左、買價靠右；賣側：賣價靠左、委賣量靠右（兩價在中間相鄰） */
+export const depthCell = styleVariants({
+    bid: [depthCellBase, { textAlign: 'right' }],
+    ask: [depthCellBase, { textAlign: 'left' }],
+});
+
+const ellipsis = {
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+} as const;
+
+const depthVolBase = style({
+    ...ellipsis,
     fontFamily: vars.font.mono,
 });
 
-export const ladderPrice = style({
+/** 量貼外側：買側靠左、賣側靠右 */
+export const depthVol = styleVariants({
+    bid: [depthVolBase, { textAlign: 'left' }],
+    ask: [depthVolBase, { textAlign: 'right' }],
+});
+
+const depthPriceBase = style({
+    minWidth: 0,
     fontFamily: vars.font.mono,
     fontWeight: 600,
     display: 'flex',
     flexDirection: 'column',
-    alignItems: 'center',
     lineHeight: 1.2,
+    whiteSpace: 'nowrap',
 });
 
-export const ladderSideTag = style({
-    fontSize: '0.6875rem',
+/** 價格貼中線：買價靠右、賣價靠左 */
+export const depthPrice = styleVariants({
+    bid: [depthPriceBase, { alignItems: 'flex-end' }],
+    ask: [depthPriceBase, { alignItems: 'flex-start' }],
+});
+
+export const depthTotal = style({
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) auto minmax(0, 1fr)',
+    alignItems: 'center',
+    columnGap: vars.space.sm,
+    minHeight: '36px',
+    padding: `0 ${DEPTH_CELL_PAD}`,
+    fontSize: '0.875rem',
+    borderBottom: `1px solid ${vars.color.border}`,
+});
+
+export const depthTotalVol = style({ ...ellipsis, fontFamily: vars.font.mono, fontWeight: 600, textAlign: 'left' });
+export const depthTotalVolRight = style({ ...ellipsis, fontFamily: vars.font.mono, fontWeight: 600, textAlign: 'right' });
+export const depthTotalLabel = style({ color: vars.color.mutedForeground, fontSize: '0.75rem', whiteSpace: 'nowrap' });
+
+// ---- 比例條（五檔買賣比、內外盤比） ----
+
+export const ratio = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: vars.space.sm,
+    minHeight: '28px',
+    padding: `0 ${DEPTH_CELL_PAD}`,
+    fontSize: '0.75rem',
+});
+
+export const ratioText = style({
+    flex: '0 0 auto',
+    fontFamily: vars.font.mono,
+    fontWeight: 600,
+    whiteSpace: 'nowrap',
+});
+
+export const ratioTrack = style({
+    flex: '1 1 auto',
+    minWidth: '40px',
+    display: 'flex',
+    height: '6px',
+    borderRadius: '3px',
+    overflow: 'hidden',
+    background: vars.color.muted,
+});
+
+const ratioFillBase = style({
+    height: '100%',
+    '@media': {
+        '(prefers-reduced-motion: no-preference)': { transition: 'width 0.3s ease-out' },
+    },
+});
+
+export const ratioFill = styleVariants({
+    up: [ratioFillBase, { background: vars.color.up }],
+    down: [ratioFillBase, { background: vars.color.down }],
+});
+
+export const innerOuter = style([ratio, {
+    flexWrap: 'wrap',
+    rowGap: '2px',
+    paddingTop: vars.space.xs,
+    paddingBottom: vars.space.xs,
+}]);
+
+export const innerOuterLabel = style({
+    flex: '0 0 auto',
     color: vars.color.mutedForeground,
-    fontWeight: 400,
+    whiteSpace: 'nowrap',
 });
 
 export const ladderMine = style({
@@ -331,17 +482,31 @@ export const tickList = style({
     fontSize: '0.875rem',
 });
 
-export const tickRow = style({
+/** 390px 寬：時間 8 字、價格、量可收縮（minmax(0, …)＋省略號），內外盤欄固定 */
+const tickGrid = {
     display: 'grid',
-    gridTemplateColumns: '1fr 1fr 0.8fr 2.5em',
+    gridTemplateColumns: 'minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 0.8fr) 2em',
+    columnGap: vars.space.sm,
     alignItems: 'center',
+} as const;
+
+export const tickHead = style({
+    ...tickGrid,
+    padding: `${vars.space.xs} ${vars.space.md}`,
+    fontSize: '0.75rem',
+    color: vars.color.mutedForeground,
+    borderBottom: `1px solid ${vars.color.border}`,
+});
+
+export const tickRow = style({
+    ...tickGrid,
     minHeight: '32px',
     borderBottom: `1px solid ${vars.color.border}`,
 });
 
-export const tickTime = style({ color: vars.color.mutedForeground });
-export const tickNum = style({ textAlign: 'right' });
-export const tickSide = style({ textAlign: 'right', fontSize: '0.75rem', fontFamily: vars.font.body });
+export const tickTime = style({ ...ellipsis, color: vars.color.mutedForeground });
+export const tickNum = style({ ...ellipsis, textAlign: 'right' });
+export const tickSide = style({ textAlign: 'right', fontSize: '0.75rem', fontFamily: vars.font.body, whiteSpace: 'nowrap' });
 
 // ---- 持倉摘要、未成交、底部買賣鍵 ----
 

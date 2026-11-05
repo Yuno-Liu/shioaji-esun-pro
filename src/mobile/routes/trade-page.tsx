@@ -1,8 +1,10 @@
 // src/mobile/routes/trade-page.tsx — 交易（#/trade/:code；規格 §6.2）
 //
-// ┌ 標頭：名稱・市場／即時價・漲跌・量／漲跌停・參考・當沖（股票）或到期月份・時段（期權）
+// ┌ 標頭：名稱・市場・［可當沖］／大字成交價・漲跌・漲跌%・［漲停／跌停］［參考價］［試撮］
+// │       統計格（股票）開 高 均 總／參 低 單 額（期權無「額」；顏色相對參考價）
+// │       漲跌停價・非「可當沖」的當沖狀態（股票）或到期月份・時段（期權）
 // ├ 週期列［走勢］［1分］［5分］［15分］［60分］［日］＋交易圖表（委託線、成本線、漲跌停、參考價）
-// ├［五檔］［明細］
+// ├［五檔］［明細］（五檔買賣同列：委買量｜買價｜賣價｜委賣量、五檔總量、買賣比與內外盤比）
 // ├ 持倉摘要・未成交 N 筆 ›（#/orders）
 // └ sticky［買進］［賣出］→ openTicket()（只開下單面板，送單一律經確認面板）
 //
@@ -30,7 +32,7 @@ import { chartPriceLines, formatLinePrice } from '../lib/chart-model';
 import { CHART_PERIODS, DEFAULT_CHART_PERIOD, isChartPeriod, type ChartPeriod } from '../lib/chart-ranges';
 import { formatRoute, navigate } from '../lib/hash-router';
 import { openTicket, setCurrentCode } from '../lib/mobile-store';
-import { headerQuote, type HeaderTick } from '../lib/quote-display';
+import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
 import * as styles from '../styles/trade.css';
@@ -132,6 +134,46 @@ function savePeriod(p: ChartPeriod) {
 
 // ---- 元件 ----
 
+type StatKey = 'open' | 'high' | 'low' | 'reference' | 'avg' | 'total' | 'last' | 'amount';
+
+const STAT_LABEL: Record<StatKey, string> = { open: '開', high: '高', low: '低', reference: '參', avg: '均', total: '總', last: '單', amount: '額' };
+const STAT_NAME: Record<StatKey, string> = { open: '開盤', high: '最高', low: '最低', reference: '參考價', avg: '均價', total: '總量', last: '單量', amount: '成交金額' };
+
+/** 統計格的欄位與順序（4 欄、列優先）：股票 開 高 均 總／參 低 單 額；期權 開 高 均 總／參 低 單；指數 開 高 低 參 */
+export function statKeys(secType: SecurityType | undefined): StatKey[] {
+    if (secType === 'STK') return ['open', 'high', 'avg', 'total', 'reference', 'low', 'last', 'amount'];
+    if (secType === 'FUT' || secType === 'OPT') return ['open', 'high', 'avg', 'total', 'reference', 'low', 'last'];
+    return ['open', 'high', 'low', 'reference'];
+}
+
+const fmtAvg = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+function StatsGrid({ contract, stats }: { contract: ContractInfo; stats: HeaderStats }) {
+    const unit = volumeUnit(contract.security_type);
+    const price = (v: number | null) => (v === null ? '—' : formatToTick(contract, v));
+    const vol = (v: number | null) => (v === null ? '—' : `${fmtCompactInt(v)}${unit}`);
+    const value: Record<StatKey, { text: string; tone: 'up' | 'down' | 'flat' }> = {
+        open: { text: price(stats.open), tone: toneVsReference(stats.open, stats.reference) },
+        high: { text: price(stats.high), tone: toneVsReference(stats.high, stats.reference) },
+        low: { text: price(stats.low), tone: toneVsReference(stats.low, stats.reference) },
+        reference: { text: price(stats.reference), tone: 'flat' },
+        avg: { text: stats.avg === null ? '—' : fmtAvg(stats.avg), tone: toneVsReference(stats.avg, stats.reference) },
+        total: { text: vol(stats.totalVolume), tone: 'flat' },
+        last: { text: vol(stats.lastVolume), tone: 'flat' },
+        amount: { text: stats.totalAmount === null ? '—' : fmtCompactInt(stats.totalAmount), tone: 'flat' },
+    };
+    return (
+        <dl className={styles.statsGrid} data-testid='trade-stats'>
+            {statKeys(contract.security_type).map(k => (
+                <div key={k} className={styles.statCell} data-testid={`trade-stat-${k}`}>
+                    <dt className={styles.statLabel} title={STAT_NAME[k]}>{STAT_LABEL[k]}</dt>
+                    <dd className={`${styles.statValue} ${styles.dirText[value[k].tone]}`}>{value[k].text}</dd>
+                </div>
+            ))}
+        </dl>
+    );
+}
+
 function Header({ code, contract }: { code: string; contract: ContractInfo | undefined }) {
     const quote = useQuote(code, { narrow: true });
     const tick = quote?.tick;
@@ -139,22 +181,27 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
     const lastReal = useRef<HeaderTick | undefined>(undefined);
     if (tick && !tick.simtrade) lastReal.current = tick;
     const snapshot = useSyncExternalStore(subscribeMarketSnapshots, () => (contract ? getMarketSnapshot(contract) : undefined));
-    const q = headerQuote({ reference: contract?.reference, tick, index: quote?.index, lastRealTick: lastReal.current, snapshot });
+    const input = { reference: contract?.reference, tick, index: quote?.index, lastRealTick: lastReal.current, snapshot };
+    const q = headerQuote(input);
+    const stats = headerStats(input);
     const price = q.price;
     const chg = q.change !== null ? { change: q.change, pct: q.pct, dir: q.dir } : null;
     const isStock = contract?.security_type === 'STK';
     const isFop = contract?.security_type === 'FUT' || contract?.security_type === 'OPT';
     const fmt = (p: number) => (contract ? formatToTick(contract, p) : String(p));
-    const unit = isStock ? '張' : isFop ? '口' : '';
     const arrow = chg?.dir === 'up' ? '▲' : chg?.dir === 'down' ? '▼' : '';
-    const dayTrade = contract && isStock ? dayTradeText(contract.day_trade) : null;
+    // 「可當沖」放徽章；其他狀態（僅先買後賣、不可當沖）以文字放資訊列
+    const dayTrade = contract && isStock && contract.day_trade !== 'Yes' ? dayTradeText(contract.day_trade) : null;
     const delivery = contract && isFop ? deliveryMonthText(contract.delivery_month) : null;
+    // 只有成交或快照的價格才判斷漲跌停（參考價不算）
+    const limit = contract && (q.source === 'tick' || q.source === 'snapshot') ? limitHit(price, contract.limit_up, contract.limit_down) : null;
 
     return (
         <header className={styles.header}>
             <div className={styles.titleRow}>
                 <h1 className={styles.title}>{code}{contract?.name ? ` ${contract.name}` : ''}</h1>
                 {contract && <span className={styles.subtle}>{exchangeText(contract.exchange)}</span>}
+                {contract && isStock && contract.day_trade === 'Yes' && <span className={styles.badge} data-testid='trade-daytrade'>可當沖</span>}
             </div>
             <div className={styles.priceRow} data-testid='trade-price'>
                 <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>{price !== null ? fmt(price) : '—'}</span>
@@ -165,18 +212,22 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
                         {chg.pct !== null && ` (${chg.pct > 0 ? '+' : ''}${chg.pct.toFixed(2)}%)`}
                     </span>
                 )}
-                {q.totalVolume !== null && <span className={styles.subtle}>量 {fmtCompactInt(q.totalVolume)}{unit && ` ${unit}`}</span>}
+                {limit && (
+                    <span className={`${styles.badge} ${styles.badgeTone[limit]}`} data-testid='trade-limit'>
+                        {limit === 'up' ? '漲停' : '跌停'}
+                    </span>
+                )}
                 {q.sim && (
                     <span className={styles.badge} title='試撮揭示價，非成交價' data-testid='trade-simtrade'>
                         試撮 {fmt(q.sim.price)}
                     </span>
                 )}
             </div>
-            {contract && isStock && (
+            {contract && <StatsGrid contract={contract} stats={stats} />}
+            {contract && isStock && (contract.limit_up > 0 || contract.limit_down > 0 || dayTrade) && (
                 <div className={styles.infoRow} data-testid='trade-info'>
                     {contract.limit_up > 0 && <span className={styles.infoUp}>漲停 {fmt(contract.limit_up)}</span>}
                     {contract.limit_down > 0 && <span className={styles.infoDown}>跌停 {fmt(contract.limit_down)}</span>}
-                    {contract.reference > 0 && <span>參考 {fmt(contract.reference)}</span>}
                     {dayTrade && <span>{dayTrade}</span>}
                 </div>
             )}
@@ -184,7 +235,6 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
                 <div className={styles.infoRow} data-testid='trade-info'>
                     {delivery && <span>到期 {delivery}</span>}
                     <span>{sessionText(contract.security_type, nowWallClockUtc())}</span>
-                    {contract.reference > 0 && <span>參考 {fmt(contract.reference)}</span>}
                 </div>
             )}
         </header>
@@ -256,7 +306,7 @@ function TradeView({ code }: { code: string }) {
             </div>
 
             {contract
-                ? <TradeChart code={sym} contract={contract} period={period} lines={lines} />
+                ? <TradeChart code={sym} contract={contract} period={period} lines={lines} onPeriodChange={setPeriod} />
                 : (
                     <div className={styles.chartWrap}>
                         <div className={styles.chartOverlay}>

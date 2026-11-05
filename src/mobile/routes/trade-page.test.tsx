@@ -129,9 +129,75 @@ describe('TradePage', () => {
         const info = text(byId('trade-info'));
         expect(info).toContain('漲停 1,175');
         expect(info).toContain('跌停 963');
-        expect(info).toContain('參考 1,070');
-        expect(info).toContain('可當沖');
+        expect(text(byId('trade-stat-reference'))).toBe('參1,070');
+        expect(text(byId('trade-daytrade'))).toBe('可當沖');
+        expect(info).not.toContain('可當沖');
         expect(text(byId('trade-price'))).toContain('▲15');
+    });
+
+    it('統計格（股票）：開 高 均 總／參 低 單 額，取自 tick；價格相對參考價著色', async () => {
+        m.useQuote.mockReturnValue({ tick: {
+            code: '2330', close: '1085', price_chg: '15', open: '1065', high: '1090', low: '1060', avg_price: '1077.456',
+            volume: 12, total_volume: 23456, total_amount: '25300000000',
+        } });
+        await render();
+        const stats = byId('trade-stats');
+        const cells = stats.findAll(n => typeof n.props['data-testid'] === 'string' && n.props['data-testid'].startsWith('trade-stat-'));
+        expect(cells.map(c => text(c))).toEqual(['開1,065', '高1,090', '均1,077.46', '總2.3萬張', '參1,070', '低1,060', '單12張', '額253.0億']);
+        const tone = (id: string) => String(byId(id).findByType('dd').props.className);
+        expect(tone('trade-stat-open')).toContain('down');
+        expect(tone('trade-stat-high')).toContain('up');
+        expect(tone('trade-stat-avg')).toContain('up');
+        expect(tone('trade-stat-reference')).toContain('flat');
+    });
+
+    it('統計格：沒有 tick 時用快照；期貨無「額」、量以口計，資訊列顯示到期與時段', async () => {
+        m.useQuote.mockReturnValue(undefined);
+        m.snapshot = {
+            code: '2330', datetime: '2026-11-05 13:30:00', open: 1075, high: 1095, low: 1065, close: 1085, average_price: 1080.5,
+            volume: 7, total_volume: 23456, total_amount: 25300000000, change_price: 15, change_rate: 1.4,
+        };
+        await render();
+        expect(text(byId('trade-stat-open'))).toBe('開1,075');
+        expect(text(byId('trade-stat-avg'))).toBe('均1,080.50');
+        expect(text(byId('trade-stat-last'))).toBe('單7張');
+
+        await act(async () => view?.unmount());
+        const fut = { ...stock, code: 'TXFF6', security_type: 'FUT', exchange: 'TAIFEX', name: '臺股期貨', delivery_month: '202606', limit_up: 0, limit_down: 0, reference: 22400 } as ContractInfo;
+        m.useContract.mockReturnValue(fut);
+        m.ensureContract.mockResolvedValue(fut);
+        m.snapshot = undefined;
+        m.useQuote.mockReturnValue({ tick: { code: 'TXFF6', close: '22450', price_chg: '50', open: '22400', high: '22500', low: '22380', avg_price: '22441.2', volume: 2, total_volume: 80123 } });
+        await render('TXFF6');
+        const keys = byId('trade-stats').findAll(n => typeof n.props['data-testid'] === 'string' && n.props['data-testid'].startsWith('trade-stat-')).map(c => c.props['data-testid']);
+        expect(keys).not.toContain('trade-stat-amount');
+        expect(text(byId('trade-stat-total'))).toBe('總8.0萬口');
+        expect(text(byId('trade-info'))).toContain('到期 2026/06');
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-daytrade' })).toHaveLength(0);
+    });
+
+    it('成交價等於漲停／跌停價時顯示標籤；參考價不判斷', async () => {
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '1175', price_chg: '105', total_volume: 1 } });
+        await render();
+        expect(text(byId('trade-limit'))).toBe('漲停');
+        await act(async () => view?.unmount());
+
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '963', price_chg: '-107', total_volume: 1 } });
+        await render();
+        expect(text(byId('trade-limit'))).toBe('跌停');
+        await act(async () => view?.unmount());
+
+        m.useQuote.mockReturnValue(undefined);
+        m.useContract.mockReturnValue({ ...stock, reference: 1175 });
+        await render();
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-limit' })).toHaveLength(0);
+    });
+
+    it('非「可當沖」的當沖狀態以文字放資訊列，不顯示徽章', async () => {
+        m.useContract.mockReturnValue({ ...stock, day_trade: 'OnlyBuy' });
+        await render();
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-daytrade' })).toHaveLength(0);
+        expect(text(byId('trade-info'))).toContain('僅可先買後賣當沖');
     });
 
     it('圖表收到參考價、漲跌停、成本與委託線', async () => {
@@ -191,7 +257,7 @@ describe('TradePage', () => {
         const price = text(byId('trade-price'));
         expect(price).toContain('1,085');
         expect(price).toContain('▲15 (+1.40%)');
-        expect(price).toContain('量 ');
+        expect(text(byId('trade-stat-total'))).toBe('總2.3萬張');
         expect(view!.root.findAllByProps({ 'data-testid': 'trade-price-reference' })).toHaveLength(0);
     });
 

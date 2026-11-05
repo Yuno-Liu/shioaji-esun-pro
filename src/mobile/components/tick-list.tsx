@@ -2,6 +2,7 @@
 //
 // 先以 fetchLastTicks(contract, 50) 取最近 50 筆，再接 onAnyTick()（只取目前商品）；
 // 最多保留 200 筆。內外盤以 tick_type 著色並附文字（1 外盤、2 內盤），不只靠顏色。
+// 欄寬以 minmax(0, …)＋省略號收縮，390px 寬不溢出（trade.css.ts tickGrid）。
 
 import { useEffect, useRef, useState } from 'react';
 import { retainQuote } from '../../lib/quote-ownership';
@@ -129,6 +130,14 @@ export function TickList({ code, contract }: { code: string; contract: ContractI
             )}
             {status === 'loading' && rows.length === 0 && <p className={styles.emptyText}>載入中…</p>}
             {status === 'ready' && rows.length === 0 && <p className={styles.emptyText}>今日尚無成交</p>}
+            {rows.length > 0 && (
+                <div className={styles.tickHead} aria-hidden='true' data-testid='tick-head'>
+                    <span>時間</span>
+                    <span className={styles.tickNum}>成交價</span>
+                    <span className={styles.tickNum}>單量（{unit}）</span>
+                    <span className={styles.tickSide}>內外</span>
+                </div>
+            )}
             <ul className={styles.tickList} aria-label={`逐筆明細（量：${unit}）`}>
                 {rows.map(r => {
                     const tone = r.tickType === 1 ? 'up' : r.tickType === 2 ? 'down' : 'flat';

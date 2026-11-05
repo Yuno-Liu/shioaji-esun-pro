@@ -1,7 +1,7 @@
-// 交易頁標頭的價格來源（B1 快照、B2 試撮、B8 不用 pct_chg）
+// 交易頁標頭的價格來源（B1 快照、B2 試撮、B8 不用 pct_chg）、統計格、比例條
 import { describe, expect, it } from 'vitest';
 import type { Snapshot } from '../../lib/types/market';
-import { headerQuote } from './quote-display';
+import { headerQuote, headerStats, innerOuterRatio, limitHit, splitPercent, toneVsReference, volumeUnit } from './quote-display';
 
 const snap = (over: Partial<Snapshot> = {}): Snapshot => ({
     code: '2330', exchange: 'TSE', datetime: '2026-11-05 13:30:00.000000', open: 1070, high: 1090, low: 1065, close: 1085,
@@ -56,5 +56,95 @@ describe('headerQuote', () => {
         const q = headerQuote({ reference: 0, index: { close: '23100', reference: '23000' } });
         expect(q).toMatchObject({ price: 23100, change: 100, source: 'index', totalVolume: null });
         expect(q.pct).toBeCloseTo((100 / 23000) * 100, 10);
+    });
+});
+
+const liveTick = {
+    date: '2026-11-05', time: '13:20:00', close: '2260', price_chg: '0', open: '2250', high: '2285', low: '2235', avg_price: '2254.16',
+    volume: 3, total_volume: 36368, total_amount: '81980000000',
+};
+
+describe('headerStats', () => {
+    it('即時成交：開高低、均價、總量、單量、成交金額取自 tick；參考價取合約', () => {
+        expect(headerStats({ reference: 2260, tick: liveTick })).toEqual({
+            source: 'tick', open: 2250, high: 2285, low: 2235, reference: 2260, avg: 2254.16,
+            totalVolume: 36368, lastVolume: 3, totalAmount: 81980000000,
+        });
+    });
+
+    it('沒有 tick：改用快照的 open／high／low／average_price／total_volume／volume／total_amount', () => {
+        expect(headerStats({ reference: 1070, snapshot: snap({ total_amount: 25300000000 }) })).toEqual({
+            source: 'snapshot', open: 1070, high: 1090, low: 1065, reference: 1070, avg: 1080,
+            totalVolume: 23456, lastVolume: 5, totalAmount: 25300000000,
+        });
+    });
+
+    it('來源與 headerQuote 一致：成交早於快照時整組用快照，不逐欄混用', () => {
+        const s = headerStats({ reference: 1070, tick: { ...liveTick, time: '09:10:00' }, snapshot: snap() });
+        expect(s.source).toBe('snapshot');
+        expect(s.totalVolume).toBe(23456);
+    });
+
+    it('試撮 tick 不採用；有上一筆真實成交時用它', () => {
+        const sim = { close: '1175', simtrade: true, open: '1175', high: '1175', low: '1175', total_volume: 0 };
+        expect(headerStats({ reference: 1070, tick: sim }).source).toBe('none');
+        expect(headerStats({ reference: 1070, tick: sim, lastRealTick: liveTick }).open).toBe(2250);
+    });
+
+    it('合約沒有參考價：由成交價與漲跌推回；缺欄位為 null', () => {
+        const s = headerStats({ reference: 0, tick: { close: '105', price_chg: '5' } });
+        expect(s).toMatchObject({ reference: 100, open: null, avg: null, totalVolume: null, lastVolume: null, totalAmount: null });
+    });
+
+    it('只有參考價：其他欄位 null；指數只取開高低與 index.reference', () => {
+        expect(headerStats({ reference: 1070 })).toMatchObject({ source: 'none', reference: 1070, open: null, totalVolume: null });
+        expect(headerStats({ reference: 0, index: { close: '23100', reference: '23000', open: '23050', high: '23200', low: '22990' } })).toEqual({
+            source: 'index', open: 23050, high: 23200, low: 22990, reference: 23000, avg: null, totalVolume: null, lastVolume: null, totalAmount: null,
+        });
+    });
+});
+
+describe('toneVsReference／limitHit', () => {
+    it('相對參考價著色；沒有參考價為 flat', () => {
+        expect(toneVsReference(1085, 1070)).toBe('up');
+        expect(toneVsReference(1065, 1070)).toBe('down');
+        expect(toneVsReference(1070, 1070)).toBe('flat');
+        expect(toneVsReference(1085, null)).toBe('flat');
+        expect(toneVsReference(null, 1070)).toBe('flat');
+    });
+
+    it('成交價等於漲跌停價才標示', () => {
+        expect(limitHit(1175, 1175, 963)).toBe('up');
+        expect(limitHit(963, 1175, 963)).toBe('down');
+        expect(limitHit(1170, 1175, 963)).toBeNull();
+        expect(limitHit(null, 1175, 963)).toBeNull();
+        expect(limitHit(0, 0, 0)).toBeNull();
+    });
+});
+
+describe('splitPercent／innerOuterRatio', () => {
+    it('四捨五入、相加為 100；總和 0、負值、缺值回傳 null', () => {
+        expect(splitPercent(316, 173)).toEqual({ left: 316, right: 173, leftPct: 65, rightPct: 35 });
+        expect(splitPercent(1, 0)).toMatchObject({ leftPct: 100, rightPct: 0 });
+        expect(splitPercent(0, 0)).toBeNull();
+        expect(splitPercent(-1, 5)).toBeNull();
+        expect(splitPercent(undefined, 5)).toBeNull();
+        expect(splitPercent(NaN, 5)).toBeNull();
+    });
+
+    it('內外盤比：內盤＝bid_side_total_vol、外盤＝ask_side_total_vol；缺欄位或試撮回傳 null', () => {
+        expect(innerOuterRatio({ close: '1', bid_side_total_vol: 580, ask_side_total_vol: 420 })).toMatchObject({ leftPct: 58, rightPct: 42 });
+        expect(innerOuterRatio({ close: '1' })).toBeNull();
+        expect(innerOuterRatio({ close: '1', bid_side_total_vol: 580 })).toBeNull();
+        expect(innerOuterRatio({ close: '1', bid_side_total_vol: 580, ask_side_total_vol: 420, simtrade: true })).toBeNull();
+        expect(innerOuterRatio(undefined)).toBeNull();
+    });
+
+    it('量的單位：股票張、零股股、期權口、指數無', () => {
+        expect(volumeUnit('STK')).toBe('張');
+        expect(volumeUnit('STK', true)).toBe('股');
+        expect(volumeUnit('FUT')).toBe('口');
+        expect(volumeUnit('OPT', true)).toBe('口');
+        expect(volumeUnit('IND')).toBe('');
     });
 });
