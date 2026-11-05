@@ -1,10 +1,20 @@
 // src/mobile/hooks/use-risk-pnl-feed.ts — 風控當日損益餵送（規格 §7.5）
 //
-// 【目前為樁（T1）】不做任何事；已掛在 MobileApp 根層（app.tsx）。
-// T7 實作：與 src/App.tsx:1045-1053 同公式——持倉未實現損益＋期貨結算損益，呼叫 reportDailyPnl(pnl, known)；
-// known 只有在持倉與保證金都已實際讀到時才為 true。未實作前「當日虧損上限」在手機上不會生效
-// （風控鎖與單筆上限不受影響）。
+// 桌面由 src/App.tsx 呼叫 reportDailyPnl()；手機沒有掛載 App.tsx，必須自行餵送，
+// 否則「當日虧損上限」在手機上不會生效。已掛在 MobileApp 根層（app.tsx）。
+// 與 src/App.tsx（feed risk engine）同公式：持倉未實現損益＋期貨結算損益。
+// 若上游日後把公式抽成共用函式，改為呼叫共用函式。
+
+import { useEffect } from 'react';
+import { reportDailyPnl } from '../../lib/risk';
+import { useTradingState } from '../../lib/trading-state';
 
 export function useRiskPnlFeed(): void {
-    // T7 實作
+    const trading = useTradingState();
+    useEffect(() => {
+        const unrealized = trading.positions.reduce((sum, p) => sum + (p.pnl || 0), 0);
+        const settle = trading.margin?.future_settle_profitloss ?? 0;
+        // known：持倉與保證金都已實際讀到才算數（讀到之前的 0 不是損益）
+        reportDailyPnl(unrealized + settle, trading.queries.positions.updatedAt !== null && trading.margin !== undefined);
+    }, [trading.positions, trading.margin, trading.queries.positions.updatedAt]);
 }
