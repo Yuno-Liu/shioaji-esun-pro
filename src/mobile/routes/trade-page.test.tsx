@@ -60,6 +60,9 @@ vi.mock('../../lib/market-snapshot-store', () => ({
 }));
 vi.mock('../lib/hash-router', async importOriginal => ({ ...(await importOriginal<typeof import('../lib/hash-router')>()), navigate: m.navigate }));
 
+import { pressableRow } from '../styles/primitives.css';
+import * as tradeStyles from '../styles/trade.css';
+import { card as groupedCard } from '../ui/grouped.css';
 import { ShellSlotsContext } from '../ui/shell-slots';
 import { dayTradeText, deliveryMonthText, positionSummaries, scrolledPast, sessionText, TradePage, workingOrderCount } from './trade-page';
 
@@ -272,6 +275,25 @@ describe('TradePage', () => {
         expect(masked).not.toContain('97,500');
         expect(masked).not.toContain('3張');
         expect(masked).toContain('•••••');
+    });
+
+    it('未成交連結：卡片髮絲線落在外層、按壓層（pressableRow ::after）在連結上，兩者不共用同一節點', async () => {
+        await render();
+        const classes = (n: { props: { className?: unknown } }) => String(n.props.className ?? '').split(' ').filter(Boolean);
+        const link = byId('trade-working-link');
+        // 連結帶按壓層
+        expect(pressableRow.split(' ').every(c => classes(link).includes(c))).toBe(true);
+        // 連結的父節點是外層列：它才是卡片的直接子節點（card > * + *::after 髮絲線畫在它身上），且不帶 pressableRow
+        const row = link.parent!;
+        expect(row.type).toBe('div');
+        expect(classes(row)).toEqual(tradeStyles.workingLinkRow.split(' '));
+        expect(pressableRow.split(' ').some(c => classes(row).includes(c))).toBe(false);
+        const cardNode = row.parent!;
+        expect(classes(cardNode)).toEqual(groupedCard.split(' '));
+        // 不是卡片第一列（前面有持倉摘要列）→ 髮絲線選擇器 card > * + * 命中外層列，不命中連結
+        const kids = cardNode.children.filter(k => typeof k !== 'string');
+        expect(kids.indexOf(row)).toBeGreaterThan(0);
+        expect(kids).not.toContain(link);
     });
 
     it('漲跌幅以 price_chg 與參考價計算，不用串流的 pct_chg（B8）', async () => {

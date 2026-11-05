@@ -422,9 +422,12 @@ function TradeView({ code }: { code: string }) {
                                 </span>
                             </span>
                         ))}
-                    <a className={styles.workingLink} href={formatRoute({ name: 'orders' })} data-testid='trade-working-link'>
-                        未成交：{working} 筆 ›
-                    </a>
+                    {/* 外層承接卡片髮絲線，連結的 ::after 只當按壓層（見 trade.css.ts workingLinkRow） */}
+                    <div className={styles.workingLinkRow}>
+                        <a className={styles.workingLink} href={formatRoute({ name: 'orders' })} data-testid='trade-working-link'>
+                            未成交：{working} 筆 ›
+                        </a>
+                    </div>
                 </GroupedSection>
             </div>
 

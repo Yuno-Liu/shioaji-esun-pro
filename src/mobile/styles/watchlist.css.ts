@@ -70,10 +70,16 @@ export const listHeader = style([{
 
 /**
  * 指標切換鍵：外觀 28px 文字鍵，點擊區以 ::before 上下擴到 TOUCH_MIN（左右各擴 8px）。
- * 表頭上下沒有其他可點元素（上方為控制區留白、下方為列），擴張點擊區不與相鄰元素重疊。
+ * 下方的擴張區會與第一列重疊（字級預設 8px，字級放大時 TOUCH_MIN 隨 rem 變大、可到約 14px）：
+ * 列（li.rowItem 與列按鈕）是 position relative、DOM 在後，不設 z-index 時會畫在擴張區之上而搶走點擊，
+ * 實際可點高度只剩約 36–43px，點在表頭下緣稍下方會開成第一檔商品的交易頁。
+ * 所以切換鍵 zIndex 1，讓擴張區畫在第一列之上；第一列最矮 56px，被蓋掉上緣後仍 ≥ 44px。
+ * main 不是疊層脈絡（layout.css.ts 殼層規則），zIndex 1 仍低於上方插槽與底部 chrome（Z.bars 起）。
+ * 上方擴張區落在控制區的下內距（SPACE.s2）；字級放大時可能多出數 px，蓋到控制區最後一個元素的下緣（既有行為）。
  */
 export const metricToggle = style({
     position: 'relative',
+    zIndex: 1,
     display: 'inline-flex',
     alignItems: 'center',
     gap: SPACE.s1,

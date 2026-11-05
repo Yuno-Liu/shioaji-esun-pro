@@ -115,6 +115,7 @@ import {
     type MobileIndicatorSettings,
 } from '../lib/mobile-indicators';
 import * as cs from '../styles/chart.css';
+import * as tradeStyles from '../styles/trade.css';
 import { GAP_RELOAD_MIN_MS, INDICATOR_FLUSH_MS, LONG_PRESS_MS, TradeChart } from './trade-chart';
 
 const contract = {
@@ -738,5 +739,77 @@ describe('TradeChart B3b', () => {
         ]);
         expect(m.openOrderAction.mock.calls).toEqual([['o1', 'menu']]);
         for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
+    });
+});
+
+// ---- 選價列捲到可見範圍：一般模式下圖表框下緣常在底部 chrome（交易鍵列＋分頁列）之下 ----
+
+describe('TradeChart 選價列捲到可見範圍', () => {
+    let scrollIntoView: ReturnType<typeof vi.fn>;
+    /** 選價列外層（pickAnchor，沒有 transform）帶 scrollIntoView；其他節點同 nodeMock */
+    const scrollMock = (el: { props: unknown }) =>
+        ((el.props as { className?: unknown }).className === tradeStyles.pickAnchor ? { scrollIntoView } : nodeMock());
+
+    beforeEach(() => {
+        scrollIntoView = vi.fn();
+    });
+
+    async function renderWithScroll() {
+        await act(async () => {
+            view = create(createElement(TradeChart, { code: '2330', contract, period: '5m', lines: [], onPeriodChange: vi.fn() }), { createNodeMock: scrollMock });
+        });
+        await tick(50);
+    }
+    const longPressPick = async (y = 217) => {
+        await act(async () => { wrap().props.onPointerDown(ptr(100, y)); });
+        await tick(LONG_PRESS_MS + 10);
+        await act(async () => { wrap().props.onPointerUp(ptr(100, y)); });
+    };
+
+    it('一般模式開啟選價列：對沒有 transform 的外層 scrollIntoView 一次（nearest、smooth）；收回殘影不再捲動', async () => {
+        await renderWithScroll();
+        expect(scrollIntoView).not.toHaveBeenCalled();
+        await longPressPick();
+        expect(scrollIntoView).toHaveBeenCalledTimes(1);
+        expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+        // 捲動目標是選價列的外層：動畫（translateY）在內層 chart-pick 上
+        const pick = byTestId('chart-pick')[0]!;
+        expect(pick.parent!.props.className).toBe(tradeStyles.pickAnchor);
+        expect(pick.props.className).toBe(tradeStyles.pickBar);
+
+        // 取消 → 收回殘影（chart-pick-closing）：不觸發捲動
+        const cancel = pick.findAll(n => n.type === 'button' && n.props['aria-label'] === '取消')[0]!;
+        await act(async () => { cancel.props.onClick(); });
+        expect(byTestId('chart-pick-closing')).toHaveLength(1);
+        await tick(300);
+        expect(scrollIntoView).toHaveBeenCalledTimes(1);
+        expect(m.openTicket).not.toHaveBeenCalled();
+
+        // 再次開啟：再捲一次
+        await longPressPick();
+        expect(scrollIntoView).toHaveBeenCalledTimes(2);
+    });
+
+    it('全螢幕開啟選價列：不捲動', async () => {
+        await renderWithScroll();
+        await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+        expect(rootNode().props['data-fullscreen']).toBe('true');
+        await longPressPick();
+        expect(byTestId('chart-pick')).toHaveLength(1);
+        expect(scrollIntoView).not.toHaveBeenCalled();
+    });
+
+    it('減少動態：behavior auto', async () => {
+        vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('reduced-motion'), addEventListener: () => undefined, removeEventListener: () => undefined }));
+        await renderWithScroll();
+        await longPressPick();
+        expect(scrollIntoView).toHaveBeenCalledTimes(1);
+        expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest', behavior: 'auto' });
+    });
+
+    it('沒有 scrollIntoView（jsdom 等）時不丟錯，選價列照常出現', async () => {
+        await render([]);
+        await longPressPick();
+        expect(byTestId('chart-pick')).toHaveLength(1);
     });
 });

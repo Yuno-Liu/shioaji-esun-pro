@@ -16,6 +16,8 @@
 // - 互動：單指拖曳平移、雙指縮放；長按進入追蹤模式（trackingMode），十字線價以 roundToTick 取整，
 //   放開後浮出「以 X 買進／賣出」→ openTicket({ source: 'chart' })。**只開下單面板，絕不直接送單**。
 //   長按成立時 haptic('longPress')（只在 Android 且使用者開啟介面觸覺時）；選價列由圖表底部升起、選完或取消沿原路收回。
+//   一般模式下選價列出現時捲到可見範圍（main 的 scroll-padding-bottom 讓出底部 chrome），以免落在交易鍵列／分頁列後面；
+//   量測用沒有 transform 的外層（pickAnchor），進場動畫的 translateY 不影響捲動量。全螢幕與收回殘影不捲動。
 //   副圖上的十字線不拿來選價（座標不是價格）。點委託線標籤 → openOrderAction(tradeId, 'menu')。
 //   不支援拖曳委託線改價（規格 R7）。可互動區加 data-allow-pinch="true"（平台手勢防護略過這一區）。
 // - 橫向全螢幕：手機轉橫向（lib/chart-fullscreen.ts）或按「全螢幕」→ CSS 固定定位覆蓋全畫面（留安全區），
@@ -70,6 +72,7 @@ import {
 } from '../lib/mobile-indicators';
 import { openOrderAction, openTicket } from '../lib/mobile-store';
 import { haptic } from '../motion/haptics';
+import { prefersReducedMotion } from '../motion/prefs';
 import * as cs from '../styles/chart.css';
 import * as styles from '../styles/trade.css';
 import { Chip } from '../ui/chip';
@@ -230,6 +233,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const [pick, setPick] = useState<number | null>(null);
     // 選價列沿原路收回時的殘影（只剩文字的 span、aria-hidden＋inert，不可點）
     const [pickClosing, setPickClosing] = useState<string | null>(null);
+    // 選價列的外層（沒有 transform）：捲動到可見範圍時量它
+    const pickAnchorRef = useRef<HTMLDivElement | null>(null);
     const [legend, setLegend] = useState<LegendEntry[]>([]);
     const [paneCount, setPaneCount] = useState(0);
     const [paneTops, setPaneTops] = useState<number[]>([]);
@@ -1030,6 +1035,15 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         const t = setTimeout(() => setPickClosing(null), styles.PICK_EXIT_MS);
         return () => clearTimeout(t);
     }, [pickClosing]);
+    // 選價列出現（一般模式）：捲到 main 的可見範圍內，停在底部 chrome 之上（scroll-padding-bottom）。
+    // 量沒有 transform 的外層，進場的 translateY(100%) 不會讓它多捲；減少動態時不平滑。jsdom 等沒有 scrollIntoView 時不做事。
+    const pickOpen = pick !== null;
+    useEffect(() => {
+        if (!pickOpen || fullscreen) return;
+        const anchor = pickAnchorRef.current;
+        if (!anchor || typeof anchor.scrollIntoView !== 'function') return;
+        anchor.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    }, [pickOpen, fullscreen]);
     const choose = (action: 'Buy' | 'Sell') => {
         if (pick === null) return;
         openTicket({ code, action, price: pick, source: 'chart' });
@@ -1126,17 +1140,21 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                     </div>
                 )}
                 {pick !== null && (
-                    <div className={styles.pickBar} role='dialog' aria-label={`以 ${pickText} 下單`} data-testid='chart-pick'>
-                        <button type='button' className={styles.pickButton.buy} onClick={() => choose('Buy')}>以 {pickText} 買進</button>
-                        <button type='button' className={styles.pickButton.sell} onClick={() => choose('Sell')}>以 {pickText} 賣出</button>
-                        <button type='button' className={styles.pickButton.cancel} onClick={dismissPick} aria-label='取消'>取消</button>
+                    <div ref={pickAnchorRef} className={styles.pickAnchor}>
+                        <div className={styles.pickBar} role='dialog' aria-label={`以 ${pickText} 下單`} data-testid='chart-pick'>
+                            <button type='button' className={styles.pickButton.buy} onClick={() => choose('Buy')}>以 {pickText} 買進</button>
+                            <button type='button' className={styles.pickButton.sell} onClick={() => choose('Sell')}>以 {pickText} 賣出</button>
+                            <button type='button' className={styles.pickButton.cancel} onClick={dismissPick} aria-label='取消'>取消</button>
+                        </div>
                     </div>
                 )}
                 {pick === null && pickClosing !== null && (
-                    <div className={styles.pickBarClosing} aria-hidden='true' inert data-testid='chart-pick-closing'>
-                        <span className={styles.pickButton.buy}>以 {pickClosing} 買進</span>
-                        <span className={styles.pickButton.sell}>以 {pickClosing} 賣出</span>
-                        <span className={styles.pickButton.cancel}>取消</span>
+                    <div className={styles.pickAnchor}>
+                        <div className={styles.pickBarClosing} aria-hidden='true' inert data-testid='chart-pick-closing'>
+                            <span className={styles.pickButton.buy}>以 {pickClosing} 買進</span>
+                            <span className={styles.pickButton.sell}>以 {pickClosing} 賣出</span>
+                            <span className={styles.pickButton.cancel}>取消</span>
+                        </div>
                     </div>
                 )}
             </div>

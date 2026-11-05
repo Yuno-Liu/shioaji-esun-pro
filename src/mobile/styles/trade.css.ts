@@ -310,12 +310,23 @@ const pickFadeOut = keyframes({ from: { opacity: 1 }, to: { opacity: 0 } });
 /** 收回動畫時間（trade-chart 以此移除收回中的選價列） */
 export const PICK_EXIT_MS = 220;
 
-const pickBarBase = style({
+/**
+ * 選價列的定位外層：貼圖表框底部。本身沒有 transform（進場／收回動畫在內層 pickBar），
+ * trade-chart 以它的幾何 scrollIntoView，才不會被 translateY(100%) 多捲。
+ * 外層不攔點擊（收回殘影期間長按要能穿過）；開啟中的選價列在內層恢復可點。
+ * scroll-margin-bottom：捲到可見範圍時與底部 chrome 之間留一點間距。
+ */
+export const pickAnchor = style({
     position: 'absolute',
     left: SPACE.s2,
     right: SPACE.s2,
     bottom: SPACE.s2,
     zIndex: 3,
+    pointerEvents: 'none',
+    scrollMarginBottom: SPACE.s2,
+});
+
+const pickBarBase = style({
     display: 'grid',
     gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) auto',
     alignItems: 'center',
@@ -328,6 +339,7 @@ const pickBarBase = style({
 });
 
 export const pickBar = style([pickBarBase, {
+    pointerEvents: 'auto',
     animation: `${pickRise} ${PICK_EXIT_MS}ms ${EASE.sheet} both`,
     '@media': {
         [REDUCED_MOTION]: { animation: `${pickFadeIn} ${DUR.fade}ms ease-out both` },
@@ -629,6 +641,17 @@ export const summaryRow = style({
 
 export const summaryMuted = style({
     color: vars.color.mutedForeground,
+});
+
+/**
+ * 「未成交」列的外層：卡片的列間髮絲線（GroupedSection 的 card > * + *::after）落在這一層。
+ * 連結本身帶 pressableRow，它的 ::after 是按壓層；兩者若打在同一個偽元素上會合併成 height 0＋opacity 0，
+ * 髮絲線與按壓回饋都會消失，所以分成兩層。
+ */
+export const workingLinkRow = style({
+    display: 'flex',
+    flexDirection: 'column',
+    minWidth: 0,
 });
 
 export const workingLink = style([pressableRow, {

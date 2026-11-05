@@ -5,11 +5,16 @@
 // - 配件槽高度以 ResizeObserver 寫入 --sj-accessory-h。
 // - TabBar：未成交徽章 >99 顯示 99+；needsReconcile 時委託分頁有 amber 點且 aria-label 補「，待對帳」（§10 S8）；
 //   再點目前分頁 preventDefault 並捲回頂端（減少動態時不平滑），點其他分頁照常切換。
+// - 切換分頁：新分頁模組載入中（Suspense fallback）時，舊頁 portal 到配件槽／上方插槽的內容必須已卸載；
+//   同一分頁內換商品不重掛頁面。
 import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({
+    tradeMounts: 0,
+    /** 帳戶頁模組永遠載入中：用來觀察 Suspense fallback 期間的殼層插槽 */
+    accountGate: new Promise<never>(() => undefined),
     trading: { trades: [] as { remaining: number }[], queries: { orders: { needsReconcile: false } } } as {
         trades: { remaining: number }[];
         queries?: { orders: { needsReconcile: boolean } };
@@ -26,10 +31,31 @@ vi.mock('./components/bottom-sheet', () => ({ BottomSheet: () => null }));
 vi.mock('./components/order-ticket-sheet', () => ({ OrderTicketSheet: () => null }));
 vi.mock('./components/order-action-sheet', () => ({ OrderActionSheet: () => null }));
 vi.mock('./routes/watchlist-page', () => ({ WatchlistPage: () => createElement('p', { 'data-testid': 'watchlist-page' }) }));
-vi.mock('./routes/trade-page', () => ({ TradePage: () => null }));
+// 交易頁替身：與真頁相同，以 ShellSlot 把交易鍵列放到配件槽、精簡標頭放到上方插槽
+vi.mock('./routes/trade-page', async () => {
+    const { Fragment, useEffect } = await import('react');
+    const { ShellSlot } = await import('./ui/shell-slots');
+    return {
+        TradePage: ({ code }: { code: string | null }) => {
+            useEffect(() => { m.tradeMounts++; }, []);
+            return createElement(Fragment, null,
+                createElement('p', { 'data-testid': 'trade-page' }, code),
+                createElement(ShellSlot, { slot: 'top', children: createElement('div', { 'data-testid': 'trade-compact-header' }) }),
+                createElement(ShellSlot, {
+                    slot: 'bottom',
+                    children: createElement(Fragment, null,
+                        createElement('button', { 'data-testid': 'trade-buy' }),
+                        createElement('button', { 'data-testid': 'trade-sell' })),
+                }));
+        },
+    };
+});
 vi.mock('./routes/orders-page', () => ({ OrdersPage: () => createElement('p', { 'data-testid': 'orders-page' }) }));
 vi.mock('./routes/positions-page', () => ({ PositionsPage: () => null }));
-vi.mock('./routes/account-page', () => ({ AccountPage: () => null }));
+vi.mock('./routes/account-page', async () => {
+    await m.accountGate;
+    return { AccountPage: () => null };
+});
 vi.mock('./hooks/use-risk-pnl-feed', () => ({ useRiskPnlFeed: () => undefined }));
 vi.mock('./hooks/use-fill-sound', () => ({ useFillSound: () => undefined }));
 vi.mock('./hooks/use-wake-lock', () => ({ useWakeLock: () => undefined }));
@@ -42,6 +68,9 @@ import { resetMobileUiForTest } from './lib/mobile-store';
 
 /** 假的 DOM 元素：讓殼層把它當成真實節點（instanceof HTMLElement）而啟用 portal 與背景隔離 */
 class FakeElement {
+    /** portal 目標：react-dom createPortal 檢查 nodeType；react-test-renderer 把 portal 子節點放進 children */
+    nodeType = 1;
+    children: { props?: Record<string, unknown>; isHidden?: boolean }[] = [];
     style = { setProperty: vi.fn(), removeProperty: vi.fn() };
     offsetHeight = 0;
     scrollTop = 0;
@@ -79,6 +108,7 @@ beforeEach(() => {
     resetMobileUiForTest();
     resetSheetStackForTest();
     m.trading = { trades: [], queries: { orders: { needsReconcile: false } } };
+    m.tradeMounts = 0;
     nodes = [];
     FakeResizeObserver.instances = [];
 });
@@ -223,5 +253,58 @@ describe('TabBar', () => {
         const main = nodes.find(n => n.tag === 'main')!;
         await act(async () => { one('tab-orders').props.onClick({ preventDefault: () => undefined }); });
         expect(main.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'auto' });
+    });
+});
+
+describe('切換分頁：舊頁 portal 不殘留', () => {
+    const goTo = async (hash: string) => {
+        await act(async () => {
+            (location as { hash: string }).hash = hash;
+            window.dispatchEvent(new Event('hashchange'));
+        });
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    };
+    /** 殼層插槽的 ref 節點（以 data-testid 對應 createNodeMock 產生的假節點） */
+    const slotIds = new Map<FakeElement, string>();
+    const slotNode = (testId: string) => [...slotIds].find(([, id]) => id === testId)![0];
+
+    async function mountTrade() {
+        slotIds.clear();
+        vi.stubGlobal('HTMLElement', FakeElement);
+        (location as { hash: string }).hash = '#/trade/2330';
+        await act(async () => {
+            view = create(createElement(MobileShell), {
+                createNodeMock: (el: { type: unknown; props: unknown }) => {
+                    const node = new FakeElement(String(el.type));
+                    const id = (el.props as Record<string, unknown>)['data-testid'];
+                    if (typeof id === 'string') slotIds.set(node, id);
+                    nodes.push(node);
+                    return node;
+                },
+            });
+        });
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    }
+    const portaled = (testId: string) => slotNode(testId).children.map(c => c.props?.['data-testid']);
+
+    it('交易頁 → 帳戶頁（模組載入中）：fallback 期間配件槽與上方插槽是空的', async () => {
+        await mountTrade();
+        // 前提：交易鍵列與精簡標頭確實 portal 到殼層插槽
+        expect(portaled('shell-accessory-slot')).toEqual(['trade-buy', 'trade-sell']);
+        expect(portaled('shell-top-slot')).toEqual(['trade-compact-header']);
+
+        await goTo('#/account');
+        expect(JSON.stringify(view!.toJSON())).toContain('載入中…');
+        expect(slotNode('shell-accessory-slot').children).toEqual([]);
+        expect(slotNode('shell-top-slot').children).toEqual([]);
+    });
+
+    it('同一分頁內換商品（#/trade/2330 → #/trade/2317）不重掛頁面', async () => {
+        await mountTrade();
+        expect(m.tradeMounts).toBe(1);
+        await goTo('#/trade/2317');
+        expect(byTestId('trade-page')[0]!.children).toEqual(['2317']);
+        expect(m.tradeMounts).toBe(1);
+        expect(portaled('shell-accessory-slot')).toEqual(['trade-buy', 'trade-sell']);
     });
 });

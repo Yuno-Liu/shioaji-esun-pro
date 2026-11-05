@@ -307,7 +307,10 @@ export function MobileShell() {
                                     onRetry={resetRouteModules}
                                     fallback={props => <ModuleLoadError {...props} testId='route-load-error' />}
                                 >
-                                    <Suspense fallback={<RouteFallback />}>
+                                    {/* key＝分頁名：切換分頁時卸載舊頁樹。否則新分頁模組載入中（suspend）時 React 會把舊頁以隱藏的
+                                        Offscreen 保留，而隱藏不及於 portal——舊交易頁 ShellSlot 出去的交易鍵列與精簡標頭會留在底部 chrome
+                                        與上方插槽、仍可點擊。同一分頁內換商品（#/trade/2330 → #/trade/2317）分頁名不變，不重掛。 */}
+                                    <Suspense key={route.name} fallback={<RouteFallback />}>
                                         <RoutePage route={route} />
                                         {/* 頁面提交後才還原捲動位置（Suspense 顯示 fallback 期間不記錄、不還原） */}
                                         <ScrollRestorer routeKey={routeKey} memory={scrollMemory} getTarget={getMain} />
