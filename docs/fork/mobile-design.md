@@ -695,6 +695,7 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 - 未做：字級「大」時五檔表頭改縮寫（§4.7）。
 - 選價列出現時（非全螢幕）以沒有 transform 的外層 `scrollIntoView({ block: 'nearest' })`，靠 main 的 `scroll-padding-bottom` 停在交易鍵列與分頁列之上（第二階段後修正：小螢幕或開副圖時原本會落在底部 chrome 後面）；減少動態時不平滑。
 - 持倉摘要卡的「未成交：N 筆 ›」連結外包一層 `workingLinkRow`（第二階段後修正）：GroupedSection 的列間髮絲線（`card > * + *::after`）與連結 pressableRow 的按壓層原本共用同一個 `::after`，兩者都失效；現在髮絲線落在外層，`::after` 只當按壓層。
+- 精簡標頭顯示期間，main 的 `scroll-padding-top` 設為 `SIZE.compactBarH`，隱藏或卸載時移除（第二階段後修正）。原因：遮擋檢查發現 scrollIntoView 或焦點移動會把週期列停在精簡標頭後面。
 
 ### 7.4 下單面板（`order-ticket-sheet.tsx`、`ticket/*`、`order-ticket.css.ts`）
 
@@ -741,6 +742,7 @@ y=99 ┌ 把手 36×5                                                   ┐ 17
 11. **內嵌五檔**：footnote 標題「五檔」＋中性島內 DepthLadder ticket 變體（含內外盤比）；盤後零股沿用 `ticket-no-depth` 文字。
 12. **送出中**：所有控制停用（沿用）、關閉鈕隱藏（`order-ticket-sheet.test.tsx:654`）、面板只能輕彈；確認面板疊上時本面板縮小並變暗，取消後回原狀、欄位保留、狀態行顯示「已取消」。
 13. **退場**：BottomSheet 凍結 children 期間，TicketForm 仍掛載；`use-mobile-ticket.ts` 的回饋判斷改為 `alive = mounted.current && !presence.isExiting()`（`SheetPresenceContext` 以 ref getter 提供），退場中的「未送出」改走 `notify`，與卸載後一致（§10 S4 測試）。
+14. **第一列的鎖說明鍵**（第二階段後修正）：IconButton 以負外距不撐高第一列，但第一列緊貼面板 body 頂端，body 又是上內距 0 的捲動容器，往上超出的約 8px 會被裁掉、落在拖曳區，實際可點高度不足 44px。現在 `metaRow` 以同一個 `LOCK_OVERHANG` 當上內距讓出這段（`styles/order-ticket-hit-area.test.ts`）。
 
 ### 7.5 確認面板與其他確認類面板
 

@@ -32,12 +32,19 @@ export const muted = style({
 
 // ---- 第一列：路由、帳戶、鎖說明、當沖 ----
 
+/**
+ * 鎖說明鍵（44px 點擊區）超出 1.75rem 列高的上下各一半。第一列緊貼面板 body（捲動容器、上內距 0）的頂端，
+ * 往上超出的部分會被 body 裁掉而且點不到（遮擋檢查：上緣落在面板拖曳區），所以第一列以同樣高度的上內距讓出。
+ */
+const LOCK_OVERHANG = `calc((${TOUCH_MIN} - 1.75rem) / 2)`;
+
 export const metaRow = style({
     display: 'flex',
     alignItems: 'center',
     flexWrap: 'wrap',
     gap: `${SPACE.s1} ${SPACE.s2}`,
     minWidth: 0,
+    paddingTop: LOCK_OVERHANG,
 });
 
 export const account = style({
@@ -48,9 +55,9 @@ export const account = style({
     minWidth: 0,
 });
 
-/** 鎖說明鍵（IconButton）在列中不撐高整列：外觀小、點擊區仍 44px */
+/** 鎖說明鍵（IconButton）在列中不撐高整列：外觀小、點擊區仍 44px（上緣超出的部分由 metaRow 的上內距讓出） */
 export const lockButton = style({
-    margin: `calc((${TOUCH_MIN} - 1.75rem) / -2) 0`,
+    margin: `calc(-1 * ${LOCK_OVERHANG}) 0`,
 });
 
 export const tag = style({

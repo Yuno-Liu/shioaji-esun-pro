@@ -36,6 +36,7 @@ import { openTicket, setCurrentCode } from '../lib/mobile-store';
 import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
+import { SIZE } from '../styles/tokens';
 import * as styles from '../styles/trade.css';
 import { GroupedSection } from '../ui/grouped';
 import { InlineNote } from '../ui/inline-note';
@@ -206,11 +207,13 @@ export function scrolledPast(entry: { isIntersecting: boolean; boundingClientRec
 function useCompactHeader(sentinel: { current: HTMLElement | null }): { available: boolean; visible: boolean } {
     const [available, setAvailable] = useState(false);
     const [visible, setVisible] = useState(false);
+    const rootRef = useRef<HTMLElement | null>(null);
     useEffect(() => {
         const el = sentinel.current;
         if (!el || typeof IntersectionObserver !== 'function') return undefined;
         // main 是唯一的捲動容器（殼層）；找不到時以 viewport 為根
         const root = typeof el.closest === 'function' ? el.closest('main') : null;
+        rootRef.current = root;
         let observer: IntersectionObserver;
         try {
             observer = new IntersectionObserver(entries => {
@@ -224,6 +227,14 @@ function useCompactHeader(sentinel: { current: HTMLElement | null }): { availabl
         setAvailable(true);
         return () => observer.disconnect();
     }, [sentinel]);
+    // 精簡標頭顯示期間（疊在 main 頂端 SIZE.compactBarH），main 的 scroll-padding-top 讓出它：
+    // scrollIntoView、焦點移動不會把元素停在精簡標頭後面（底部 chrome 由 layout.css.ts 的 scroll-padding-bottom 讓出）。
+    useEffect(() => {
+        const main = rootRef.current;
+        if (!visible || typeof main?.style?.setProperty !== 'function') return undefined;
+        main.style.setProperty('scroll-padding-top', SIZE.compactBarH);
+        return () => { main.style.removeProperty('scroll-padding-top'); };
+    }, [visible]);
     return { available, visible };
 }
 

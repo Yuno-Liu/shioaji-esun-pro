@@ -61,6 +61,7 @@ vi.mock('../../lib/market-snapshot-store', () => ({
 vi.mock('../lib/hash-router', async importOriginal => ({ ...(await importOriginal<typeof import('../lib/hash-router')>()), navigate: m.navigate }));
 
 import { pressableRow } from '../styles/primitives.css';
+import { SIZE } from '../styles/tokens';
 import * as tradeStyles from '../styles/trade.css';
 import { card as groupedCard } from '../ui/grouped.css';
 import { ShellSlotsContext } from '../ui/shell-slots';
@@ -480,6 +481,41 @@ describe('TradePage B3b', () => {
         await act(async () => { view!.unmount(); });
         view = undefined;
         expect(header!.disconnect).toHaveBeenCalled();
+    });
+
+    it('精簡標頭顯示期間 main 的 scroll-padding-top 讓出標頭高度（scrollIntoView／焦點不停在標頭後面），隱藏或卸載時移除', async () => {
+        const observers: { cb: IntersectionObserverCallback; opts: IntersectionObserverInit | undefined }[] = [];
+        class FakeIO {
+            constructor(cb: IntersectionObserverCallback, opts?: IntersectionObserverInit) { observers.push({ cb, opts }); }
+            observe() {}
+            unobserve() {}
+            disconnect() {}
+        }
+        vi.stubGlobal('IntersectionObserver', FakeIO);
+        const main = { tagName: 'MAIN', style: { setProperty: vi.fn(), removeProperty: vi.fn() } };
+        await act(async () => {
+            view = create(createElement(TradePage, { code: '2330' }), {
+                createNodeMock: el => ((el.props as { className?: string }).className === undefined ? null : { closest: (sel: string) => (sel === 'main' ? main : null), nodeType: 1 }),
+            });
+        });
+        const header = observers.find(o => (o.opts?.root as unknown) === main)!;
+        expect(main.style.setProperty).not.toHaveBeenCalled();
+        await act(async () => {
+            header.cb([{ isIntersecting: false, boundingClientRect: { top: -2 }, rootBounds: { top: 0 } } as unknown as IntersectionObserverEntry], {} as IntersectionObserver);
+        });
+        expect(main.style.setProperty).toHaveBeenCalledTimes(1);
+        expect(main.style.setProperty).toHaveBeenCalledWith('scroll-padding-top', SIZE.compactBarH);
+        await act(async () => {
+            header.cb([{ isIntersecting: true, boundingClientRect: { top: 10 }, rootBounds: { top: 0 } } as unknown as IntersectionObserverEntry], {} as IntersectionObserver);
+        });
+        expect(main.style.removeProperty).toHaveBeenCalledWith('scroll-padding-top');
+        await act(async () => {
+            header.cb([{ isIntersecting: false, boundingClientRect: { top: -2 }, rootBounds: { top: 0 } } as unknown as IntersectionObserverEntry], {} as IntersectionObserver);
+        });
+        expect(main.style.setProperty).toHaveBeenCalledTimes(2);
+        await act(async () => { view!.unmount(); });
+        view = undefined;
+        expect(main.style.removeProperty).toHaveBeenCalledTimes(2);
     });
 
     it('主價改用 numHero 樣式與系統字（不再用等寬字族）；價格旁有跳價閃爍覆蓋層（aria-hidden）', async () => {
