@@ -9,6 +9,7 @@ const m = vi.hoisted(() => ({
     esunBrokers: new Set<string>(),
 }));
 vi.mock('../../hooks/use-stream', () => ({ useQuote: () => undefined, useTradingLive: () => true }));
+vi.mock('../../hooks/use-display-book', () => ({ useSnapshotBaseline: () => ({ snapshot: undefined }) }));
 vi.mock('../../lib/account-store', () => ({ useAccounts: () => ({}) }));
 vi.mock('../../lib/order-account', () => ({ captureSelectedAccount: () => undefined }));
 vi.mock('../../lib/account-tradable', () => ({ canTrade: (a: Account | null | undefined) => !!a && a.signed }));
@@ -30,10 +31,17 @@ import { OrderConfirmCancelled } from '../../lib/trade';
 import { notStarted } from '../lib/errors';
 import {
     buildMobileOrderInput,
+    canConfirmPrice,
     classifyTicketOutcome,
+    confirmedPriceSeq,
+    defaultTicketPrice,
     estimateAmount,
     isOnTick,
+    marketPrice,
     parsePrice,
+    PRICE_UNCONFIRMED,
+    realTradePrice,
+    seededPriceSeq,
     TICKET_TEXT,
     ticketProblem,
     withinLimits,
@@ -186,5 +194,48 @@ describe('helpers', () => {
         expect(classifyTicketOutcome(Object.assign(new Error('t'), { mutationOutcomeUnknown: true }))).toBe('unknown');
         expect(classifyTicketOutcome(new Error('network'))).toBe('unknown');
         expect(classifyTicketOutcome('boom')).toBe('unknown');
+    });
+});
+
+describe('價格來源（B1、B2）', () => {
+    it('realTradePrice excludes simtrade ticks', () => {
+        expect(realTradePrice({ close: '100', simtrade: false })).toBe(100);
+        expect(realTradePrice({ close: '100' })).toBe(100);
+        expect(realTradePrice({ close: '105', simtrade: true })).toBeNull();
+        expect(realTradePrice({ close: '0' })).toBeNull();
+        expect(realTradePrice(undefined)).toBeNull();
+    });
+
+    it('marketPrice: real trade, then snapshot close, never the reference', () => {
+        expect(marketPrice(101, { close: 98 })).toEqual({ price: 101, source: 'trade' });
+        expect(marketPrice(null, { close: 98 })).toEqual({ price: 98, source: 'snapshot' });
+        expect(marketPrice(null, { close: 0 })).toBeNull();
+        expect(marketPrice(null, undefined)).toBeNull();
+    });
+
+    it('defaultTicketPrice: ticket price → trade → snapshot → reference', () => {
+        expect(defaultTicketPrice(99.5, 101, { close: 98 }, stock)).toEqual({ price: 99.5, source: 'ticket' });
+        expect(defaultTicketPrice(undefined, 101, { close: 98 }, stock)).toEqual({ price: 101, source: 'trade' });
+        expect(defaultTicketPrice(null, null, { close: 98 }, stock)).toEqual({ price: 98, source: 'snapshot' });
+        expect(defaultTicketPrice(null, null, undefined, stock)).toEqual({ price: 100, source: 'reference' });
+        expect(defaultTicketPrice(null, null, undefined, { reference: 0 } as ContractInfo)).toBeNull();
+    });
+});
+
+describe('價格確認與 ResumeGate（A-2）', () => {
+    it('a price seeded while not ready is unconfirmed (never equals any resumeSeq)', () => {
+        expect(seededPriceSeq({ state: 'ready', resumeSeq: 3 })).toBe(3);
+        expect(seededPriceSeq({ state: 'resyncing', resumeSeq: 3 })).toBe(PRICE_UNCONFIRMED);
+        expect(seededPriceSeq({ state: 'stale-data', resumeSeq: 3 })).toBe(PRICE_UNCONFIRMED);
+        expect(seededPriceSeq({ state: 'failed', resumeSeq: 3 })).toBe(PRICE_UNCONFIRMED);
+        expect(PRICE_UNCONFIRMED).toBeLessThan(0);
+    });
+
+    it('user confirmation counts only when the stream has recovered (ready / stale-data)', () => {
+        expect(confirmedPriceSeq({ state: 'ready', resumeSeq: 2 })).toBe(2);
+        expect(confirmedPriceSeq({ state: 'stale-data', resumeSeq: 2 })).toBe(2);
+        expect(confirmedPriceSeq({ state: 'resyncing', resumeSeq: 2 })).toBe(PRICE_UNCONFIRMED);
+        expect(confirmedPriceSeq({ state: 'failed', resumeSeq: 2 })).toBe(PRICE_UNCONFIRMED);
+        expect(canConfirmPrice({ state: 'resyncing' })).toBe(false);
     });
 });

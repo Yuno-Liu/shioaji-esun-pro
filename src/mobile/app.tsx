@@ -21,6 +21,7 @@ import { formatRoute, isCanonicalHash, navigate, parseHash, useHashRoute, type M
 import { setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
 import { startResumeGate } from './lib/resume-gate-runtime';
 import type { SecureContextDiagnostics } from './lib/secure-context';
+import { WatchlistProvider } from './lib/watchlist-context';
 import { AccountPage } from './routes/account-page';
 import { OrdersPage } from './routes/orders-page';
 import { PositionsPage } from './routes/positions-page';
@@ -106,18 +107,21 @@ export function MobileShell() {
         else if (ui.currentCode) navigate({ name: 'trade', code: ui.currentCode }, { replace: true });
     }, [routeKey, ui.currentCode]);
 
+    // 自選清單狀態常駐在殼層：切換分頁回「自選」不重新讀取清單、合約與快照（lib/watchlist-context.tsx）
     return (
-        <div className={layout.shell} data-testid='mobile-shell'>
-            <StatusBar />
-            <main className={layout.main}>
-                <RoutePage route={route} />
-            </main>
-            <TabBar active={route.name} currentCode={ui.currentCode} />
-            <ToastHost />
-            <OrderTicketSheet />
-            <OrderActionSheet />
-            <OrderConfirmSheet />
-        </div>
+        <WatchlistProvider>
+            <div className={layout.shell} data-testid='mobile-shell'>
+                <StatusBar />
+                <main className={layout.main}>
+                    <RoutePage route={route} />
+                </main>
+                <TabBar active={route.name} currentCode={ui.currentCode} />
+                <ToastHost />
+                <OrderTicketSheet />
+                <OrderActionSheet />
+                <OrderConfirmSheet />
+            </div>
+        </WatchlistProvider>
     );
 }
 

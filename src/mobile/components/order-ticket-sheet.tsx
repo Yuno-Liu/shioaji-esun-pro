@@ -15,7 +15,17 @@ import { FUTURES_OCTYPES, ORDER_TYPES, orderTypeDisabledReason, PRICE_TYPE_LABEL
 import { maskMoney, usePrivacyMode, usePrivacyMoney } from '../../lib/privacy';
 import type { ContractInfo } from '../../lib/types/contract';
 import { formatToTick } from '../../lib/utils/ticksize';
-import { ODD_QTY_PRESETS, QTY_PRESETS, isOnTick, parsePrice, positivePrice, TICKET_TEXT, useMobileTicket, type TicketLot } from '../hooks/use-mobile-ticket';
+import {
+    ODD_QTY_PRESETS,
+    PRICE_SOURCE_LABEL,
+    QTY_PRESETS,
+    isOnTick,
+    parsePrice,
+    positivePrice,
+    TICKET_TEXT,
+    useMobileTicket,
+    type TicketLot,
+} from '../hooks/use-mobile-ticket';
 import { closeTicket, useMobileUi, type TicketRequest } from '../lib/mobile-store';
 import * as styles from '../styles/order-ticket.css';
 import * as layout from '../styles/layout.css';
@@ -249,14 +259,22 @@ function TicketForm({ ticket, contract, onBusyChange }: { ticket: TicketRequest;
                     <button type='button' className={styles.stepButton} aria-label='價格加一檔' disabled={busy || market} onClick={() => t.stepPriceBy(1)}>＋</button>
                 </div>
                 <span className={styles.livePrice[lastDir]} data-testid='ticket-live-price'>
-                    成交 {last === null ? '—' : `${lastSign}${formatToTick(contract, last)}`}
+                    {t.quote.lastSource === 'snapshot' ? PRICE_SOURCE_LABEL.snapshot : PRICE_SOURCE_LABEL.trade}{' '}
+                    {last === null ? '—' : `${lastSign}${formatToTick(contract, last)}`}
                 </span>
             </div>
+            {!market && (t.priceSource === 'snapshot' || t.priceSource === 'reference') && (
+                <span className={styles.muted} data-testid='ticket-price-source'>
+                    {t.priceSource === 'reference'
+                        ? `帶入價為${PRICE_SOURCE_LABEL.reference}（尚無成交與快照），請確認價格`
+                        : `帶入價為${PRICE_SOURCE_LABEL.snapshot}（尚無即時成交）`}
+                </span>
+            )}
             {tickWarn && <p className={styles.problem} role='alert'>{TICKET_TEXT.priceTick}</p>}
             {t.priceStale && (
                 <div className={styles.staleRow} data-testid='ticket-price-stale'>
-                    <span>⚠ 價格可能過期</span>
-                    <button type='button' className={styles.seg.off} disabled={busy} onClick={t.confirmPrice}>使用此價格</button>
+                    <span>⚠ 價格可能過期{t.canConfirmPrice ? '' : '（同步完成後請再確認）'}</span>
+                    <button type='button' className={styles.seg.off} disabled={busy || !t.canConfirmPrice} onClick={t.confirmPrice}>使用此價格</button>
                 </div>
             )}
             <div className={styles.quickRow} role='group' aria-label='快捷價（送限價）'>

@@ -11,6 +11,7 @@ const m = vi.hoisted(() => ({
     risk: { confirmManualOrders: false },
     setRiskSettings: vi.fn(),
     subscribeRiskSettings: vi.fn(() => () => undefined),
+    watchlistMounts: 0,
 }));
 vi.mock('../../lib/boot', () => ({ bootstrap: m.bootstrap }));
 vi.mock('../../lib/theme-store', () => ({ initTheme: m.initTheme }));
@@ -35,6 +36,13 @@ vi.mock('../routes/positions-page', () => ({ PositionsPage: () => null }));
 vi.mock('../routes/account-page', () => ({ AccountPage: () => null }));
 vi.mock('../hooks/use-risk-pnl-feed', () => ({ useRiskPnlFeed: () => undefined }));
 vi.mock('../lib/resume-gate-runtime', () => ({ startResumeGate: () => () => undefined }));
+// 常駐自選狀態（殼層掛載 useWatchlist）：記錄是否被掛載，驗證非 secure context 不讀自選清單
+vi.mock('../lib/watchlist-context', () => ({
+    WatchlistProvider: ({ children }: { children?: unknown }) => {
+        m.watchlistMounts++;
+        return children;
+    },
+}));
 
 import { MobileApp } from '../app';
 import { isMobileSecure, readSecureContextDiagnostics } from '../lib/secure-context';
@@ -65,6 +73,7 @@ beforeEach(() => {
     m.useTradingState.mockClear();
     m.setRiskSettings.mockClear();
     m.risk.confirmManualOrders = false;
+    m.watchlistMounts = 0;
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
@@ -121,6 +130,7 @@ describe('SecureContextGate', () => {
         expect(m.bootstrap).not.toHaveBeenCalled();
         expect(m.ensureStream).not.toHaveBeenCalled();
         expect(m.useTradingState).not.toHaveBeenCalled();
+        expect(m.watchlistMounts).toBe(0);
     });
 
     it('MobileApp in a secure context mounts the trading shell and opens the stream', async () => {
@@ -128,5 +138,6 @@ describe('SecureContextGate', () => {
         expect(text(view!)).not.toContain('需要 HTTPS');
         expect(view!.root.findAll(n => n.props['data-testid'] === 'mock-status-bar').length).toBeGreaterThan(0);
         expect(m.ensureStream).toHaveBeenCalled();
+        expect(m.watchlistMounts).toBeGreaterThan(0);
     });
 });

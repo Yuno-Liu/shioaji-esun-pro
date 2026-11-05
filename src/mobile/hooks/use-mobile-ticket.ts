@@ -2,12 +2,17 @@
 //
 // - 帳戶在開啟時以 captureSelectedAccount(market) 固定（面板顯示的就是送單帳戶）。
 // - 價格只在開啟時帶入一次，之後不自動跟價；ResumeGate 的 resumeSeq 改變時標示「價格可能過期」，
-//   需重新點快捷價、手動修改或按「使用此價格」確認才可預覽。
+//   需重新點快捷價、手動修改或按「使用此價格」確認才可預覽。ResumeGate 不是 ready 時自動帶入的價格、
+//   以及同步中／失敗時的確認，一律記為未確認（PRICE_UNCONFIRMED），回到可下單狀態後仍須使用者重新確認。
+// - 帶入價與即時價：真實成交（排除試撮 simtrade tick；試撮時沿用上一筆真實成交）→ 市場快照收盤 → 參考價，
+//   面板標示價格來源。開啟時只有參考價（或沒有價格）時，第一筆真實成交或快照到達時補帶一次
+//   （使用者已動過價格就不帶）；之後不再跟價。
 // - 即時驗證依 §6.3 的 1～7 順序（ticketProblem），回傳第一個原因；有原因就停用「預覽並確認委託」。
 // - 送出一律呼叫 submitMobileOrder()（lib/mobile-order.ts）；結果依 §7.2 分四類處理，結果未知不提供重送。
 // MVP 單位只有整股與盤中零股，信用條件固定現股、不提供當沖先賣（P1）。
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useSnapshotBaseline } from '../../hooks/use-display-book';
 import { useOrderContext } from '../../hooks/use-order-context';
 import { useQuote, useTradingLive } from '../../hooks/use-stream';
 import { useAccounts } from '../../lib/account-store';
@@ -23,6 +28,7 @@ import { orderStatusWithNumber } from '../../lib/order-status-label';
 import { checkOrderAllowed, useRiskSettings } from '../../lib/risk';
 import { notify, OrderConfirmCancelled } from '../../lib/trade';
 import type { ContractInfo } from '../../lib/types/contract';
+import type { Snapshot } from '../../lib/types/market';
 import type { Action, FuturesOCType, FuturesPriceType, OrderType, StockOrderLot, StockOrderReq } from '../../lib/types/order';
 import type { Account } from '../../lib/types/portfolio';
 import { contractMultiplier } from '../../lib/utils/contract-cost';
@@ -107,6 +113,66 @@ export function parsePrice(text: string): number {
     if (!t) return NaN;
     const n = Number(t);
     return Number.isFinite(n) ? n : NaN;
+}
+
+/** 真實成交價：試撮（simtrade）tick 的揭示價不是成交，一律不算 */
+export function realTradePrice(tick: { close?: string | number | null; simtrade?: boolean } | null | undefined): number | null {
+    if (!tick || tick.simtrade) return null;
+    return positivePrice(tick.close);
+}
+
+/** 價格來源：ticket＝開啟時帶入（例如五檔）、trade＝真實成交、snapshot＝市場快照收盤、reference＝參考價 */
+export type PriceSource = 'ticket' | 'trade' | 'snapshot' | 'reference';
+
+export const PRICE_SOURCE_LABEL: Record<Exclude<PriceSource, 'ticket'>, string> = {
+    trade: '成交',
+    snapshot: '快照收盤',
+    reference: '參考價',
+};
+
+export interface SourcedPrice {
+    price: number;
+    source: PriceSource;
+}
+
+/** 即時價：真實成交優先，沒有時用市場快照收盤（不退回參考價） */
+export function marketPrice(trade: number | null, snapshot: Pick<Snapshot, 'close'> | null | undefined): SourcedPrice | null {
+    if (trade !== null && trade > 0) return { price: trade, source: 'trade' };
+    const close = positivePrice(snapshot?.close);
+    return close !== null ? { price: close, source: 'snapshot' } : null;
+}
+
+/** 開啟時的預設價：帶入價 → 真實成交 → 快照收盤 → 參考價 */
+export function defaultTicketPrice(
+    ticketPrice: number | null | undefined,
+    trade: number | null,
+    snapshot: Pick<Snapshot, 'close'> | null | undefined,
+    contract: Pick<ContractInfo, 'reference'>,
+): SourcedPrice | null {
+    const given = positivePrice(ticketPrice);
+    if (given !== null) return { price: given, source: 'ticket' };
+    const market = marketPrice(trade, snapshot);
+    if (market) return market;
+    const reference = positivePrice(contract.reference);
+    return reference !== null ? { price: reference, source: 'reference' } : null;
+}
+
+/** 價格確認哨兵：resumeSeq 一律 >= 0，所以記成這個值的價格一律視為「價格可能過期」 */
+export const PRICE_UNCONFIRMED = -1;
+
+/** stale-data 時串流已恢復（只是委託／持倉或快照讀取失敗），使用者可以確認價格；同步中或失敗時不行 */
+export function canConfirmPrice(gate: Pick<ResumeGateSnapshot, 'state'>): boolean {
+    return gate.state === 'ready' || gate.state === 'stale-data';
+}
+
+/** 自動帶入價格時記下的 resumeSeq：ResumeGate 不是 ready（同步中、資料可能過期、失敗）→ 未確認 */
+export function seededPriceSeq(gate: Pick<ResumeGateSnapshot, 'state' | 'resumeSeq'>): number {
+    return gate.state === 'ready' ? gate.resumeSeq : PRICE_UNCONFIRMED;
+}
+
+/** 使用者確認價格時記下的 resumeSeq：同步中或失敗時的確認不算，恢復後須再確認 */
+export function confirmedPriceSeq(gate: Pick<ResumeGateSnapshot, 'state' | 'resumeSeq'>): number {
+    return canConfirmPrice(gate) ? gate.resumeSeq : PRICE_UNCONFIRMED;
 }
 
 export function isOnTick(contract: ContractInfo, price: number): boolean {
@@ -275,33 +341,45 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
     const route = useOrderRoute(account);
 
     const quote = useQuote(contract.code);
+    // 沒有真實成交時以市場快照收盤為準（store 已有快照就不再讀取；沒有時 fetchSnapshots 一次）
+    const { snapshot } = useSnapshotBaseline(contract.code, undefined, contract);
+    const commonTrade = useRealTradePrice(quote?.tick);
+    const [initialPrice] = useState(() => defaultTicketPrice(ticket.price, commonTrade, snapshot, contract));
     const [fields, setFields] = useState<TicketFields>(() => ({
         action: ticket.action,
         priceType: 'LMT',
         orderType: 'ROD',
         orderLot: 'Common',
         octype: 'Auto',
-        priceText: initialPriceText(contract, ticket.price ?? positivePrice(quote?.tick?.close)),
+        priceText: initialPriceText(contract, initialPrice?.price ?? null),
         quantity: 1,
     }));
+    /** 價格欄自動帶入的來源；使用者動過價格後為 null */
+    const [priceSource, setPriceSource] = useState<PriceSource | null>(() => initialPrice?.source ?? null);
     const odd = !isFutures && isOddLot(fields.orderLot);
     const oddQuote = useQuote(!isFutures && fields.orderLot === 'IntradayOdd' ? contract.code : null, { oddLot: true });
+    const oddTrade = useRealTradePrice(oddQuote?.tick);
     const activeQuote = odd ? oddQuote : quote;
-    const lastPrice = positivePrice(activeQuote?.tick?.close);
+    const live = marketPrice(odd ? oddTrade : commonTrade, snapshot);
+    const lastPrice = live?.price ?? null;
     const bid1 = positivePrice(activeQuote?.bidask?.bid_price?.[0]);
     const ask1 = positivePrice(activeQuote?.bidask?.ask_price?.[0]);
 
-    // 價格帶入當時的 resumeSeq；不同＝價格可能過期
-    const [priceSeq, setPriceSeq] = useState(() => gate.resumeSeq);
-    // 開啟時還沒有行情：第一次收到成交價時補帶一次（使用者已動過價格就不帶）；之後不再跟價
-    const seeded = useRef(fields.priceText !== '');
-    const openClose = positivePrice(quote?.tick?.close);
+    // 價格帶入當時的 resumeSeq；不同（或 PRICE_UNCONFIRMED）＝價格可能過期
+    const [priceSeq, setPriceSeq] = useState(() => seededPriceSeq(gate));
+    // 開啟時只有參考價或沒有價格：第一次收到真實成交或快照時補帶一次（使用者已動過價格就不帶）；之後不再跟價
+    const seeded = useRef(initialPrice !== null && initialPrice.source !== 'reference');
+    const busyRef = useRef(false);
+    const better = marketPrice(commonTrade, snapshot);
+    const betterPrice = better?.price ?? null;
+    const betterSource = better?.source ?? null;
     useEffect(() => {
-        if (seeded.current || openClose === null) return;
+        if (seeded.current || busyRef.current || betterPrice === null || betterSource === null) return;
         seeded.current = true;
-        setFields(f => (f.priceText === '' ? { ...f, priceText: initialPriceText(contract, openClose) } : f));
-        setPriceSeq(getResumeGate().resumeSeq);
-    }, [openClose, contract]);
+        setFields(f => ({ ...f, priceText: initialPriceText(contract, betterPrice) }));
+        setPriceSource(betterSource);
+        setPriceSeq(seededPriceSeq(getResumeGate()));
+    }, [betterPrice, betterSource, contract]);
 
     const priceStale = fields.priceType === 'LMT' && fields.priceText !== '' && priceSeq !== gate.resumeSeq;
 
@@ -317,7 +395,6 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
     });
 
     const [busy, setBusy] = useState(false);
-    const busyRef = useRef(false);
     const [feedback, setFeedback] = useState<TicketFeedback | null>(null);
     const mounted = useRef(true);
     useEffect(() => {
@@ -334,7 +411,8 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
 
     const markPriceConfirmed = () => {
         seeded.current = true;
-        setPriceSeq(getResumeGate().resumeSeq);
+        setPriceSource(null);
+        setPriceSeq(confirmedPriceSeq(getResumeGate()));
     };
 
     const setAction = (action: Action) => edit({ action });
@@ -441,8 +519,10 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         route,
         gate,
         fields,
-        quote: { last: lastPrice, bid1, ask1 },
+        quote: { last: lastPrice, lastSource: live?.source ?? null, bid1, ask1 },
+        priceSource,
         priceStale,
+        canConfirmPrice: canConfirmPrice(gate),
         problem,
         busy,
         feedback,
@@ -465,3 +545,11 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
 }
 
 export type MobileTicket = ReturnType<typeof useMobileTicket>;
+
+/** 最近一筆真實成交價：試撮 tick 到達時沿用上一筆真實成交，不被揭示價覆蓋 */
+function useRealTradePrice(tick: { close?: string | number | null; simtrade?: boolean } | null | undefined): number | null {
+    const last = useRef<number | null>(null);
+    const now = realTradePrice(tick);
+    if (now !== null) last.current = now;
+    return now ?? last.current;
+}

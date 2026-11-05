@@ -18,6 +18,7 @@ const h = vi.hoisted(() => {
         contract: null as unknown,
         quote: undefined as unknown,
         oddQuote: undefined as unknown,
+        snapshot: undefined as unknown,
         live: true,
         route: { esun: false, broker: '永豐', simulation: true } as { esun: boolean; broker: string; simulation: boolean | undefined } | null,
         privMoney: false,
@@ -39,6 +40,10 @@ vi.mock('../../lib/contracts-cache', () => ({
 vi.mock('../../hooks/use-stream', () => ({
     useQuote: (code: string | null, opts?: { oddLot?: boolean }) => (code ? (opts?.oddLot ? h.oddQuote : h.quote) : undefined),
     useTradingLive: () => h.live,
+}));
+// 市場快照（沒有真實成交時的價格來源）：測試直接決定快照內容，不讀取任何 API
+vi.mock('../../hooks/use-display-book', () => ({
+    useSnapshotBaseline: (_code: string, _supplied: unknown, contract: unknown) => ({ snapshot: h.snapshot, contract }),
 }));
 vi.mock('../../lib/account-store', () => ({
     useAccounts: () => ({ accounts: [], selectedStock: h.selected.S, selectedFutures: h.selected.F, loaded: true, loadError: false }),
@@ -132,6 +137,7 @@ beforeEach(() => {
     h.contract = stock;
     h.quote = { tick: { close: '100' }, bidask: { bid_price: ['99.5'], ask_price: ['100.5'] } };
     h.oddQuote = { tick: { close: '100.5' }, bidask: { bid_price: ['100'], ask_price: ['101'] } };
+    h.snapshot = undefined;
     h.live = true;
     h.route = { esun: false, broker: '永豐', simulation: true };
     h.privMoney = false;
@@ -175,6 +181,7 @@ describe('OrderTicketSheet — 欄位規則', () => {
 
     it('fills the price once when the first quote arrives after opening, then stops following', async () => {
         h.quote = undefined;
+        h.contract = { ...stock, reference: 0 };
         await open({ code: '2330', action: 'Buy' });
         expect(priceInput().props.value).toBe('');
         expect(problemText()).toContain(TICKET_TEXT.priceRequired);
@@ -297,6 +304,78 @@ describe('OrderTicketSheet — 欄位規則', () => {
     });
 });
 
+describe('OrderTicketSheet — 價格來源（B1）與試撮（B2）', () => {
+    it('without a real trade, seeds the market snapshot close (not the reference) and labels it', async () => {
+        h.quote = undefined;
+        h.snapshot = { code: '2330', close: 98 };
+        await open({ code: '2330', action: 'Buy' });
+        expect(priceInput().props.value).toBe('98');
+        expect(text(one('ticket-price-source'))).toContain('快照收盤');
+        expect(text(one('ticket-live-price'))).toContain('快照');
+        expect(text(one('ticket-live-price'))).toContain('98');
+        expect(btn('成交').props['aria-label']).toMatch(/^成交 98(\.0+)?$/);
+        expect(preview().props.disabled).toBe(false);
+    });
+
+    it('falls back to the reference price only without snapshot, labels it, and upgrades once when the snapshot arrives', async () => {
+        h.quote = undefined;
+        await open({ code: '2330', action: 'Buy' });
+        expect(priceInput().props.value).toBe('100');
+        expect(text(one('ticket-price-source'))).toContain('參考價');
+        expect(text(one('ticket-live-price'))).toContain('—');
+        h.snapshot = { code: '2330', close: 98 };
+        await rerender();
+        expect(priceInput().props.value).toBe('98');
+        expect(text(one('ticket-price-source'))).toContain('快照收盤');
+        // 之後不再跟價
+        h.quote = { tick: { close: '97' } };
+        await rerender();
+        expect(priceInput().props.value).toBe('98');
+        // 使用者動過價格：不再標示自動帶入的來源
+        await typePrice('99');
+        expect(byTestId('ticket-price-source')).toHaveLength(0);
+    });
+
+    it('does not upgrade the reference price after the user changed the price', async () => {
+        h.quote = undefined;
+        await open({ code: '2330', action: 'Buy' });
+        await typePrice('101');
+        h.snapshot = { code: '2330', close: 98 };
+        await rerender();
+        expect(priceInput().props.value).toBe('101');
+    });
+
+    it('ignores a simtrade tick for the default price, live price and the 成交 quick price', async () => {
+        h.quote = { tick: { close: '105', simtrade: true } };
+        h.snapshot = { code: '2330', close: 98 };
+        await open({ code: '2330', action: 'Buy' });
+        expect(priceInput().props.value).toBe('98');
+        expect(text(one('ticket-live-price'))).not.toContain('105');
+        expect(btn('成交').props['aria-label']).toMatch(/^成交 98(\.0+)?$/);
+        await click('成交');
+        expect(priceInput().props.value).toBe('98');
+    });
+
+    it('keeps the previous real trade when a simtrade tick arrives', async () => {
+        h.quote = { tick: { close: '100' } };
+        await open({ code: '2330', action: 'Buy' });
+        h.quote = { tick: { close: '108', simtrade: true } };
+        await rerender();
+        expect(text(one('ticket-live-price'))).toContain('成交');
+        expect(text(one('ticket-live-price'))).toContain('100');
+        expect(text(one('ticket-live-price'))).not.toContain('108');
+        expect(btn('成交').props['aria-label']).toMatch(/^成交 100(\.0+)?$/);
+    });
+
+    it('a simtrade-only quote without snapshot falls back to the reference price', async () => {
+        h.quote = { tick: { close: '105', simtrade: true } };
+        await open({ code: '2330', action: 'Buy' });
+        expect(priceInput().props.value).toBe('100');
+        expect(text(one('ticket-price-source'))).toContain('參考價');
+        expect(btn('成交').props.disabled).toBe(true);
+    });
+});
+
 describe('OrderTicketSheet — 期貨／選擇權', () => {
     it('shows notional value and sends a futures input', async () => {
         h.contract = futures;
@@ -356,6 +435,9 @@ describe('OrderTicketSheet — 連線與 ResumeGate', () => {
         });
         await act(async () => { setResumeGateForTest({ state: 'stale-data', resumeSeq: 0, message: '讀取失敗' }); });
         await open({ code: '2330', action: 'Buy' });
+        // stale-data 時帶入的價格（快照可能沒更新）也要使用者確認；stale-data 下可以確認
+        expect(problemText()).toContain(TICKET_TEXT.priceStale);
+        await click('使用此價格');
         expect(problemText()).toContain(TICKET_TEXT.staleData);
         expect(preview().props.disabled).toBe(true);
         await act(async () => { one('ticket-stale-ack').props.onChange(); });
@@ -378,6 +460,58 @@ describe('OrderTicketSheet — 連線與 ResumeGate', () => {
         await act(async () => { setResumeGateForTest({ state: 'ready', resumeSeq: 2 }); });
         expect(preview().props.disabled).toBe(true);
         await click('成交');
+        expect(preview().props.disabled).toBe(false);
+    });
+});
+
+describe('OrderTicketSheet — ResumeGate 未就緒時帶入的價格（A-2）', () => {
+    it('a price seeded while resyncing stays unconfirmed after ready until the user confirms it', async () => {
+        await act(async () => { setResumeGateForTest({ state: 'resyncing', resumeSeq: 1 }); });
+        await open({ code: '2330', action: 'Buy' });
+        expect(priceInput().props.value).toBe('100');
+        expect(preview().props.disabled).toBe(true);
+        // 同步中按「使用此價格」不算確認（按鈕停用）
+        expect(btn('使用此價格').props.disabled).toBe(true);
+        await act(async () => { setResumeGateForTest({ state: 'ready', resumeSeq: 1 }); });
+        expect(byTestId('ticket-price-stale')).toHaveLength(1);
+        expect(problemText()).toContain(TICKET_TEXT.priceStale);
+        expect(preview().props.disabled).toBe(true);
+        await click('使用此價格');
+        expect(byTestId('ticket-price-stale')).toHaveLength(0);
+        expect(preview().props.disabled).toBe(false);
+    });
+
+    it('the first-trade backfill during resyncing is also unconfirmed after ready', async () => {
+        h.quote = undefined;
+        h.contract = { ...stock, reference: 0 };
+        await act(async () => { setResumeGateForTest({ state: 'resyncing', resumeSeq: 3 }); });
+        await open({ code: '2330', action: 'Buy' });
+        expect(priceInput().props.value).toBe('');
+        h.quote = { tick: { close: '101' } };
+        await rerender();
+        expect(priceInput().props.value).toBe('101');
+        await act(async () => { setResumeGateForTest({ state: 'ready', resumeSeq: 3 }); });
+        expect(problemText()).toContain(TICKET_TEXT.priceStale);
+        expect(preview().props.disabled).toBe(true);
+        await click('成交');
+        expect(preview().props.disabled).toBe(false);
+    });
+
+    it('a price typed while resyncing must be confirmed again after ready', async () => {
+        await act(async () => { setResumeGateForTest({ state: 'resyncing', resumeSeq: 2 }); });
+        await open({ code: '2330', action: 'Buy' });
+        await typePrice('101');
+        await act(async () => { setResumeGateForTest({ state: 'ready', resumeSeq: 2 }); });
+        expect(problemText()).toContain(TICKET_TEXT.priceStale);
+        await typePrice('101.5');
+        expect(problemText()).toBeNull();
+        expect(preview().props.disabled).toBe(false);
+    });
+
+    it('opened while ready: no stale mark (regression guard)', async () => {
+        await act(async () => { setResumeGateForTest({ state: 'ready', resumeSeq: 4 }); });
+        await open({ code: '2330', action: 'Buy' });
+        expect(byTestId('ticket-price-stale')).toHaveLength(0);
         expect(preview().props.disabled).toBe(false);
     });
 });

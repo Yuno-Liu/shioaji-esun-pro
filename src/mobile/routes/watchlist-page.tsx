@@ -1,17 +1,20 @@
 // src/mobile/routes/watchlist-page.tsx — 自選（規格 §6.1、§9.1、§9.4）
 //
-// - 清單：useWatchlist()（伺服器端清單，與桌面共用）；清單切換 serverLists／setActiveList。
+// - 清單：useWatchlist()（伺服器端清單，與桌面共用）由 MobileShell 的 WatchlistProvider 常駐掛載，
+//   這裡以 useMobileWatchlist() 取用；切換分頁再回來不會重新讀取清單（lib/watchlist-context.tsx）。
+//   清單切換 serverLists／setActiveList。
 // - 行情：**只有可見列**訂閱（IntersectionObserver）。不可見的列不掛載 WatchQuoteProbe，
 //   也就不呼叫 useQuote；離開畫面時 probe 卸載，由 src/lib/quote-ownership 在 RELEASE_GRACE_MS（1.5 秒）
 //   後才真正退訂，快速捲動來回不會反覆訂閱／退訂。永豐行情訂閱 50 次／5 秒（§9.1）。
 // - 重繪：行情 store 已以 50 ms 合併通知；每列再以 WATCH_REPAINT_MS（100 ms）節流重繪（§9.4）。
 // - 點一列 → #/trade/:code；長按（或編輯模式的「更多」鍵）→ 開交易、上移、下移、移到最上、移除。
 // - 搜尋：search-sheet.tsx（searchProducts(query, 10)）。
+// - 試撮（tick.simtrade）：比照桌面，價格前加「試撮」徽章，不當成真實成交顯示。
 
 import { MoreHorizontal, Pencil, Search } from 'lucide-react';
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { useQuote, type PriceQuoteState } from '../../hooks/use-stream';
-import { useWatchlist, type WatchItem } from '../../hooks/use-watchlist';
+import type { WatchItem } from '../../hooks/use-watchlist';
 import { neighborCode } from '../../lib/list-move';
 import type { ProductSuggestion } from '../../lib/product-search';
 import type { ContractInfo } from '../../lib/types/contract';
@@ -20,6 +23,7 @@ import { fmtPct, fmtPrice } from '../../lib/utils/format';
 import { BottomSheet } from '../components/bottom-sheet';
 import { SearchSheet } from '../components/search-sheet';
 import { navigate } from '../lib/hash-router';
+import { useMobileWatchlist } from '../lib/watchlist-context';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
 import * as styles from '../styles/watchlist.css';
@@ -43,6 +47,8 @@ export interface RowQuoteView {
     chg?: number;
     pct?: number;
     dir: 'up' | 'down' | 'flat';
+    /** 試撮揭示價（不是真實成交）：列上顯示「試撮」徽章 */
+    simtrade: boolean;
 }
 
 /**
@@ -68,11 +74,14 @@ export function rowQuoteView(contract: Pick<ContractInfo, 'reference'>, snapshot
         chg: chg !== undefined && Number.isFinite(chg) ? chg : undefined,
         pct: pct !== undefined && Number.isFinite(pct) ? pct : undefined,
         dir,
+        simtrade: tick?.simtrade === true,
     };
 }
 
 const ARROW: Record<RowQuoteView['dir'], string> = { up: '▲', down: '▼', flat: '' };
 const DIR_TEXT: Record<RowQuoteView['dir'], string> = { up: '漲', down: '跌', flat: '平盤' };
+/** 試撮徽章文字 */
+export const SIM_LABEL = '試撮';
 
 // ---------------------------------------------------------------------------
 // 可見列追蹤（整頁共用一個 IntersectionObserver）
@@ -228,7 +237,7 @@ const WatchRow = memo(function WatchRow({ item, index, tracker, editing, onOpen,
             <button
                 type='button'
                 className={styles.row}
-                aria-label={`${code} ${name}，${priceText}，${DIR_TEXT[view.dir]} ${chgText} ${pctText}`.trim()}
+                aria-label={`${code} ${name}，${view.simtrade ? `${SIM_LABEL} ` : ''}${priceText}，${DIR_TEXT[view.dir]} ${chgText} ${pctText}`.trim()}
                 onPointerDown={onPointerDown}
                 onPointerMove={onPointerMove}
                 onPointerUp={clearPress}
@@ -255,7 +264,10 @@ const WatchRow = memo(function WatchRow({ item, index, tracker, editing, onOpen,
                     <span className={styles.rowCode}>{code}</span>
                     <span className={styles.rowSub}>{name}</span>
                 </span>
-                <span className={`${styles.rowPrice} ${styles.tone[view.dir]}`} data-testid='watch-price'>{priceText}</span>
+                <span className={styles.rowPriceCell}>
+                    {view.simtrade && <span className={styles.simBadge} data-testid='watch-simtrade'>{SIM_LABEL}</span>}
+                    <span className={`${styles.rowPrice} ${styles.tone[view.dir]}`} data-testid='watch-price'>{priceText}</span>
+                </span>
                 <span className={`${styles.rowChange} ${styles.tone[view.dir]}`}>
                     <span>{chgText}</span>
                     <span>{pctText}</span>
@@ -336,7 +348,7 @@ function RowActionsSheet({ code, items, onClose, onOpen, onRemove, onMove }: {
 // 頁面
 
 export function WatchlistPage() {
-    const wl = useWatchlist();
+    const wl = useMobileWatchlist();
     const [tracker, setTracker] = useState<VisibilityTracker | null>(null);
     const [searchOpen, setSearchOpen] = useState(false);
     const [editing, setEditing] = useState(false);

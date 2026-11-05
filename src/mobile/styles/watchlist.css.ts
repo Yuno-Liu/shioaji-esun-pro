@@ -113,6 +113,26 @@ export const rowSub = style({
     whiteSpace: 'nowrap',
 });
 
+/** 價格欄：試撮徽章＋價格 */
+export const rowPriceCell = style({
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: '4px',
+});
+
+/** 試撮（simtrade）徽章：揭示價不是成交，比照桌面在價格前標示（文字＋框線，不只靠顏色） */
+export const simBadge = style({
+    flex: '0 0 auto',
+    padding: '0 4px',
+    borderRadius: vars.radius.sm,
+    border: `1px solid ${vars.color.amber}`,
+    color: vars.color.amber,
+    fontSize: '0.75rem',
+    fontWeight: 600,
+    lineHeight: 1.4,
+});
+
 export const rowPrice = style({
     fontVariantNumeric: 'tabular-nums',
     fontWeight: 700,

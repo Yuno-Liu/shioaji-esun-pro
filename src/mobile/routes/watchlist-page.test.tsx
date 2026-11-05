@@ -1,6 +1,6 @@
 // 自選頁（規格 §6.1、§9.4）：只有可見列呼叫 useQuote；離開畫面卸載；每列重繪以 100 ms 節流；
-// 點列開交易頁、長按開操作面板（移除、移動）；清單切換。
-import { createElement, useSyncExternalStore } from 'react';
+// 點列開交易頁、長按開操作面板（移除、移動）；清單切換；試撮徽章；自選狀態常駐（切換分頁不重新讀清單）。
+import { createElement, useState, useSyncExternalStore } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -20,6 +20,8 @@ const m = vi.hoisted(() => {
         retryLoad: vi.fn(),
         searchProducts: vi.fn(async () => []),
         wl: {} as Record<string, unknown>,
+        /** useWatchlist() 掛載次數（每次掛載＝一次完整讀取清單、合約與快照） */
+        watchlistLoads: 0,
     };
 });
 
@@ -32,11 +34,21 @@ vi.mock('../../hooks/use-stream', () => ({
         );
     },
 }));
-vi.mock('../../hooks/use-watchlist', () => ({ useWatchlist: () => m.wl }));
+vi.mock('../../hooks/use-watchlist', async () => {
+    const { useEffect } = await import('react');
+    return {
+        useWatchlist: () => {
+            // 真正的 useWatchlist 在掛載時讀取清單：以掛載次數代表讀取次數
+            useEffect(() => { m.watchlistLoads++; }, []);
+            return m.wl;
+        },
+    };
+});
 vi.mock('../../lib/product-search', () => ({ searchProducts: m.searchProducts }));
 vi.mock('../lib/hash-router', () => ({ navigate: m.navigate }));
 
-import { createVisibilityTracker, LONG_PRESS_MS, rowQuoteView, WATCH_REPAINT_MS, WatchlistPage, WatchQuoteProbe } from './watchlist-page';
+import { WatchlistProvider } from '../lib/watchlist-context';
+import { createVisibilityTracker, LONG_PRESS_MS, rowQuoteView, SIM_LABEL, WATCH_REPAINT_MS, WatchlistPage, WatchQuoteProbe } from './watchlist-page';
 
 // ---- 假的 IntersectionObserver：測試手動決定哪些元素可見 ----
 type Entry = { target: object; isIntersecting: boolean };
@@ -73,7 +85,7 @@ const items = [
 
 let view: ReactTestRenderer | undefined;
 async function render() {
-    await act(async () => { view = create(createElement(WatchlistPage), { createNodeMock: nodeMock }); });
+    await act(async () => { view = create(createElement(WatchlistProvider, null, createElement(WatchlistPage)), { createNodeMock: nodeMock }); });
 }
 const quoteCodes = () => new Set(m.useQuoteCalls.map(c => c.code));
 const probes = () => view!.root.findAll(n => n.type === WatchQuoteProbe).map(n => n.props.code as string);
@@ -81,7 +93,7 @@ const rowButton = (code: string): ReactTestInstance =>
     view!.root.find(n => n.type === 'li' && n.props['data-code'] === code).find(n => n.props['data-testid'] === 'watch-row-button');
 const priceText = (code: string) =>
     view!.root.find(n => n.type === 'li' && n.props['data-code'] === code).find(n => n.props['data-testid'] === 'watch-price').props.children as string;
-const tick = (close: string, chg: string) => ({ tick: { close, price_chg: chg }, index: undefined });
+const tick = (close: string, chg: string, simtrade = false) => ({ tick: { close, price_chg: chg, simtrade }, index: undefined });
 
 beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
@@ -95,6 +107,7 @@ beforeEach(() => {
     m.removeSymbol.mockClear();
     m.reorderSymbol.mockClear();
     m.setActiveList.mockClear();
+    m.watchlistLoads = 0;
     m.wl = {
         items,
         loading: false,
@@ -128,7 +141,11 @@ describe('rowQuoteView', () => {
     });
     it('falls back to the snapshot close when no live quote', () => {
         const v = rowQuoteView({ reference: 200 }, { close: 200, change_rate: 0 } as never, undefined);
-        expect(v).toMatchObject({ close: 200, chg: 0, dir: 'flat' });
+        expect(v).toMatchObject({ close: 200, chg: 0, dir: 'flat', simtrade: false });
+    });
+    it('flags a simtrade tick (indicative price, not a real trade)', () => {
+        expect(rowQuoteView({ reference: 1000 }, undefined, { tick: { close: '1050', price_chg: '50', simtrade: true } as never }).simtrade).toBe(true);
+        expect(rowQuoteView({ reference: 1000 }, undefined, { tick: { close: '1010', price_chg: '10', simtrade: false } as never }).simtrade).toBe(false);
     });
 });
 
@@ -189,6 +206,25 @@ describe('WatchlistPage visible-row subscription', () => {
         expect(priceText('2330')).toBe('1,004');
     });
 
+    it('shows a 試撮 badge for simtrade ticks, and drops it once a real trade arrives', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+        await render();
+        await setVisible('2330', true);
+        const row = () => view!.root.find(n => n.type === 'li' && n.props['data-code'] === '2330');
+        const badges = () => row().findAll(n => n.props['data-testid'] === 'watch-simtrade' && typeof n.type === 'string');
+        m.quotes.set('2330', tick('1050', '50', true));
+        await act(async () => { m.emit(); });
+        await act(async () => { vi.advanceTimersByTime(WATCH_REPAINT_MS); });
+        expect(badges()).toHaveLength(1);
+        expect(badges()[0]!.props.children).toBe(SIM_LABEL);
+        expect(rowButton('2330').props['aria-label']).toContain(`${SIM_LABEL} 1,050`);
+        m.quotes.set('2330', tick('1010', '10'));
+        await act(async () => { m.emit(); });
+        await act(async () => { vi.advanceTimersByTime(WATCH_REPAINT_MS); });
+        expect(badges()).toHaveLength(0);
+        expect(rowButton('2330').props['aria-label']).not.toContain(SIM_LABEL);
+    });
+
     it('without IntersectionObserver only the first rows subscribe', async () => {
         vi.stubGlobal('IntersectionObserver', undefined);
         await render();
@@ -243,5 +279,37 @@ describe('WatchlistPage interactions', () => {
         const picker = view!.root.find(n => n.props['data-testid'] === 'watch-list-picker');
         await act(async () => { picker.props.onChange({ target: { value: 'b' } }); });
         expect(m.setActiveList).toHaveBeenCalledWith('b');
+    });
+});
+
+describe('WatchlistPage 常駐自選狀態（B4）', () => {
+    it('switching tabs away and back does not reload the watchlist; quotes are released while away', async () => {
+        let setShown!: (v: boolean) => void;
+        function Shell() {
+            const [shown, set] = useState(true);
+            setShown = set;
+            return createElement(WatchlistProvider, null, shown ? createElement(WatchlistPage) : null);
+        }
+        await act(async () => { view = create(createElement(Shell), { createNodeMock: nodeMock }); });
+        expect(m.watchlistLoads).toBe(1);
+        await setVisible('2330', true);
+        expect(probes()).toEqual(['2330']);
+        // 切到別的分頁：頁面卸載，可見列的行情訂閱一起釋放
+        await act(async () => { setShown(false); });
+        expect(probes()).toEqual([]);
+        expect(view!.root.findAll(n => n.props['data-testid'] === 'page-watchlist')).toHaveLength(0);
+        // 切回「自選」：清單立即顯示，不重新讀取
+        await act(async () => { setShown(true); });
+        expect(m.watchlistLoads).toBe(1);
+        expect(view!.root.findAll(n => n.type === 'li' && typeof n.props['data-code'] === 'string')).toHaveLength(3);
+        expect(view!.root.findAll(n => n.props.role === 'status')).toHaveLength(0);
+    });
+
+    it('WatchlistPage outside the provider fails loudly instead of loading its own copy', async () => {
+        const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        await expect(act(async () => { view = create(createElement(WatchlistPage), { createNodeMock: nodeMock }); })).rejects.toThrow(/WatchlistProvider/);
+        expect(m.watchlistLoads).toBe(0);
+        spy.mockRestore();
+        view = undefined;
     });
 });
