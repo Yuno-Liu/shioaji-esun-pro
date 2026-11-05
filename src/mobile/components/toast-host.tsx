@@ -3,7 +3,7 @@
 // - onNotice()（src/lib/trade.ts）：lib 發出的通知。
 // - onOrderEvent()（src/lib/stream.ts）＋ describeOrderReport()：成交／委託回報文字（與桌面 event-toasts 同一來源）。
 // - 遮蔽金額／隱私模式：以 useRevealText() 在渲染時依目前開關重新遮蔽（通知產生後才打開也會遮）。
-// - 成交時 Android 震動 10 ms（iOS 不支援，只作加分，不是唯一回饋）。點一下關閉。
+// - 成交震動不在這裡：由 hooks/use-fill-sound.ts 依帳戶頁「震動」開關呼叫 vibrateOnFill()（Android；iOS 不支援）。點一下關閉。
 // - 「結果未知」（kind 'err' 且標題含「結果未知」，例如下單面板的 OUTCOME_UNKNOWN_TITLE、mutationErrorNotice 的
 //   「刪單失敗或結果未知」）改用琥珀色（規格 §7.2），與確定未送出的紅色錯誤區分。
 
@@ -36,14 +36,6 @@ export function noticeToastKind(n: Pick<AppNotice, 'kind' | 'title'>): ToastKind
     return n.kind === 'ok' ? 'ok' : 'info';
 }
 
-function vibrate(ms: number) {
-    try {
-        if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') navigator.vibrate(ms);
-    } catch {
-        // 部分瀏覽器在沒有使用者手勢時丟出例外：忽略
-    }
-}
-
 export function ToastHost() {
     const [toasts, setToasts] = useState<ToastItem[]>([]);
     const nextId = useRef(1);
@@ -64,7 +56,6 @@ export function ToastHost() {
         const offOrder = onOrderEvent((ev) => {
             const d = describeOrderReport(ev);
             push(d.kind, d.title, d.lines);
-            if (d.kind === 'deal') vibrate(10);
         });
         const offNotice = onNotice((n) => {
             push(noticeToastKind(n), n.title, n.body ? [{ text: n.body }] : []);
