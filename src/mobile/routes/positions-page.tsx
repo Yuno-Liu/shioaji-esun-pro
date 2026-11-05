@@ -78,6 +78,7 @@ export const REFRESH_COOLDOWN_MS = 6_000;
 export const POSITIONS_TEXT = {
     loading: '持倉載入中…',
     empty: '目前沒有持倉',
+    readFailed: '持倉尚未讀取成功，請按「⟳」',
     notLive: '行情／交易連線未就緒，暫停平倉',
     resyncing: '回到前景後正在重新同步行情與委託，暫停平倉',
     staleData: '委託／持倉資料可能過期：請按「重試同步」，或勾選「我了解委託／持倉資料可能過期」後再平倉',
@@ -637,6 +638,8 @@ export function PositionsPage() {
 
     const reconcile = reconcileText(query);
     const loading = query.updatedAt === null && !query.error;
+    // 第一次讀取就失敗（從未讀到）：不能說「目前沒有持倉」（比照委託頁 readFailed、桌面 holdingsPhase 'failed'）
+    const readFailed = query.updatedAt === null && !!query.error;
 
     return (
         <section className={layout.page} data-testid='page-positions'>
@@ -716,7 +719,7 @@ export function PositionsPage() {
             {loading ? (
                 <p className={styles.empty}>{POSITIONS_TEXT.loading}</p>
             ) : positions.length === 0 ? (
-                <p className={styles.empty}>{POSITIONS_TEXT.empty}</p>
+                <p className={styles.empty} data-testid='position-empty'>{readFailed ? POSITIONS_TEXT.readFailed : POSITIONS_TEXT.empty}</p>
             ) : rows.length === 0 ? (
                 <p className={styles.empty}>{POSITIONS_TEXT.filteredEmpty}</p>
             ) : (

@@ -106,7 +106,7 @@ vi.mock('../components/account/trading-cost-section', () => ({ TradingCostSectio
 vi.mock('../components/account/device-settings-section', () => ({ DeviceSettingsSection: () => createElement('div', { 'data-testid': 'stub-device-settings' }) }));
 vi.mock('../components/account/esun-reconnect-section', () => ({ EsunReconnectSection: () => createElement('div', { 'data-testid': 'stub-esun-reconnect' }) }));
 
-import { resetTradingLimitsForTest } from '../hooks/use-trading-limits';
+import { loadTradingLimits, resetTradingLimitsForTest, TRADING_LIMITS_MIN_REFRESH_MS } from '../hooks/use-trading-limits';
 import { AccountPage, resetAccountPageCacheForTest, SETTLEMENT_REUSE_MS } from './account-page';
 
 const stock = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A1' };
@@ -364,6 +364,40 @@ describe('AccountPage funds and settlements', () => {
         expect(m.fetchSettlements).toHaveBeenCalledTimes(1);
     });
 
+    // X3 F4:F6：失敗也套用冷卻（不可連按、切回帳戶頁不重查）
+    it('a failed settlement query also starts the cooldown: no double tap and no re-query on reopen', async () => {
+        let t = Date.now();
+        const spy = vi.spyOn(Date, 'now').mockImplementation(() => t);
+        try {
+            m.fetchSettlements.mockReset().mockRejectedValue(new Error('settle down'));
+            await render();
+            expect(m.fetchSettlements).toHaveBeenCalledTimes(1);
+            expect(text()).toContain('settle down');
+            const button = () => byTestId('funds-settle-refresh');
+            expect(button().props.disabled).toBe(true);
+            expect(textOf(button())).toBe(`更新交割款（${SETTLEMENT_REUSE_MS / 1000} 秒）`);
+            // 即使直接觸發也不重查
+            await click('funds-settle-refresh');
+            expect(m.fetchSettlements).toHaveBeenCalledTimes(1);
+            // 切回帳戶頁（重新掛載）：冷卻內不重查，仍顯示上次的錯誤
+            t += 5_000;
+            await act(async () => view!.unmount());
+            await render();
+            expect(m.fetchSettlements).toHaveBeenCalledTimes(1);
+            expect(text()).toContain('settle down');
+            expect(textOf(button())).toBe(`更新交割款（${SETTLEMENT_REUSE_MS / 1000 - 5} 秒）`);
+            // 冷卻結束：再進頁面才查
+            t += SETTLEMENT_REUSE_MS;
+            m.fetchSettlements.mockResolvedValue([{ date: twDate(2), amount: 12000, T: 2 }]);
+            await act(async () => view!.unmount());
+            await render();
+            expect(m.fetchSettlements).toHaveBeenCalledTimes(2);
+            expect(text()).not.toContain('settle down');
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     it('shows the simulation note for an all-zero futures margin', async () => {
         m.route = { simulation: true };
         m.trading = { ...m.trading, funds: [{ account: fut, margin: { equity: 0, available_margin: 0, initial_margin: 0, maintenance_margin: 0, risk_indicator: 0, today_balance: 0, future_settle_profitloss: 0 }, updatedAt: Date.now() }] };
@@ -386,6 +420,65 @@ describe('AccountPage trading limits', () => {
         m.route = { simulation: true };
         await render();
         expect(textOf(byTestId('limits-empty'))).toContain('模擬環境不提供交易額度');
+    });
+
+    // X3 F4:F1：玉山只提供額度上限，不可顯示可用／剩餘
+    it('E.SUN accounts show only the caps, never available / remaining', async () => {
+        m.accounts = { accounts: [esunStock, fut], selectedStock: esunStock, selectedFutures: fut, loaded: true, loadError: false };
+        // lib 對玉山把缺的可用補成上限
+        m.fetchTradingLimits.mockResolvedValue({
+            trading_limit: 2000000, trading_used: 0, trading_available: 2000000, margin_limit: 500000, margin_used: 0, margin_available: 500000, short_limit: 300000, short_used: 0, short_available: 300000,
+        });
+        await render();
+        const v = textOf(byTestId('limits-values'));
+        expect(v).toContain('現股 上限$2,000,000');
+        expect(v).toContain('融資 上限$500,000');
+        expect(v).toContain('融券 上限$300,000');
+        expect(v).not.toContain('可用');
+        expect(v).not.toContain(' / ');
+        expect(textOf(byTestId('limits-caps-only'))).toContain('未提供可用／剩餘額度');
+    });
+
+    // X3 F4:F7：冷卻與 hook 的 TRADING_LIMITS_MIN_REFRESH_MS（以發出時間計）一致
+    it('after a failed auto query the refresh cooldown follows the hook attempt time', async () => {
+        let t = 5_000_000;
+        const spy = vi.spyOn(Date, 'now').mockImplementation(() => t);
+        try {
+            m.fetchTradingLimits.mockRejectedValue(new Error('limits down'));
+            await render();
+            expect(m.fetchTradingLimits).toHaveBeenCalledTimes(1);
+            expect(text()).toContain('limits down');
+            // 自動查詢剛發出（失敗也算）：hook 在最短間隔內不會再查 → 停用並倒數
+            expect(byTestId('limits-refresh').props.disabled).toBe(true);
+            expect(textOf(byTestId('limits-refresh'))).toBe(`重新整理（${TRADING_LIMITS_MIN_REFRESH_MS / 1000} 秒）`);
+            t += TRADING_LIMITS_MIN_REFRESH_MS;
+            await rerender();
+            expect(byTestId('limits-refresh').props.disabled).toBe(false);
+            await click('limits-refresh');
+            expect(m.fetchTradingLimits).toHaveBeenCalledTimes(2);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it('a press the hook ignores (queried elsewhere moments ago) shows a note instead of a fake countdown', async () => {
+        let t = 7_000_000;
+        const spy = vi.spyOn(Date, 'now').mockImplementation(() => t);
+        try {
+            m.fetchTradingLimits.mockRejectedValue(new Error('limits down'));
+            // 下單面板剛查過（失敗）
+            await loadTradingLimits(stock);
+            t += 3_000;
+            await render();
+            expect(m.fetchTradingLimits).toHaveBeenCalledTimes(1);
+            await click('limits-refresh');
+            // hook 忽略：沒有請求、不進入倒數，改顯示說明
+            expect(m.fetchTradingLimits).toHaveBeenCalledTimes(1);
+            expect(textOf(byTestId('limits-refresh'))).toBe('重新整理');
+            expect(textOf(byTestId('limits-throttled'))).toContain(`至少 ${TRADING_LIMITS_MIN_REFRESH_MS / 1000} 秒`);
+        } finally {
+            spy.mockRestore();
+        }
     });
 
     it('shows available / limit for cash, margin and short', async () => {

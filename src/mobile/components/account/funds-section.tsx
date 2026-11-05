@@ -3,7 +3,8 @@
 // - 股票：交割帳戶餘額（useTradingState().funds）、股票市值（sumStockMarketValue）、未交割款（pendingSettlementAmount）、
 //   資產市值＝Σ清算價值（useStockLiquidationValue）＋未交割款＋交割戶餘額；有待確認原因時不給合計。
 // - 期貨：權益數、可用／原始／維持保證金、風險指標與色條、期貨平倉損益。
-// - 交割行事曆：固定 T+0／T+1／T+2；交割款 SETTLEMENT_REUSE_MS 內重用、手動更新受同一間隔限制，不自動重查。
+// - 交割行事曆：固定 T+0／T+1／T+2；交割款 SETTLEMENT_REUSE_MS 內重用、手動更新受同一間隔限制，不自動重查；
+//   間隔以最後一次發出查詢的時間（attemptedAt，失敗也算）計算，冷卻中顯示剩餘秒數。
 // - 餘額與保證金隨帳務同步更新，不另外輪詢（§9.1）。
 
 import { ChevronDown, ChevronRight } from 'lucide-react';
@@ -26,9 +27,9 @@ import type { Account, AccountFunds, AccountedPosition } from '../../../lib/type
 import { useOrderRoute } from '../route-badge';
 import { accountKeyOf, formatClock, formatTwd, signDir } from '../../lib/account-format';
 import { marginLooksBlank, marginRisk, settlementSlots, stockAssetSummary, stockPositionKind, type RiskLevel } from '../../lib/account-funds';
-import { SETTLEMENT_REUSE_MS, useSettlements, type SettlementState } from '../../lib/account-settlements';
+import { settlementCooldownMs, useSettlements, type SettlementState } from '../../lib/account-settlements';
 import * as styles from '../../styles/account.css';
-import { brokerName, Card, Item, useNow, type Tone } from './account-ui';
+import { brokerName, Card, Item, RefreshButton, useNow, type Tone } from './account-ui';
 
 function fundsFor(funds: AccountFunds[] | undefined, account: Account | null): AccountFunds | undefined {
     if (!account) return undefined;
@@ -193,7 +194,9 @@ interface SettlementCardProps {
 
 function SettlementCard({ stock, settle, pending, settlementsStale, priorDay, now }: SettlementCardProps) {
     const { money } = useMoney();
-    const canRefresh = !!stock && !settle.loading && (settle.at === null || now - settle.at >= SETTLEMENT_REUSE_MS);
+    // 冷卻以發出查詢的時間計算（失敗也算）；now 只會落後真實時間，畫面不會比 hook 早放行
+    const cooldownSec = Math.ceil(settlementCooldownMs(settle.attemptedAt, now) / 1000);
+    const canRefresh = !!stock && !settle.loading && cooldownSec === 0;
     const slots = settle.rows ? settlementSlots(settle.rows, now) : null;
     return (
         <Card title='交割行事曆' testId='account-settlements'>
@@ -226,9 +229,14 @@ function SettlementCard({ stock, settle, pending, settlementsStale, priorDay, no
                     {settle.error && <p className={styles.warning} role='alert'>{settle.error}</p>}
                     <div className={styles.actions}>
                         <span className={styles.note}>資料時間 {formatClock(settle.at)}</span>
-                        <button type='button' className={styles.smallButton} disabled={!canRefresh} onClick={() => settle.refresh()} data-testid='funds-settle-refresh'>
-                            更新交割款
-                        </button>
+                        <RefreshButton
+                            label='更新交割款'
+                            loading={settle.loading}
+                            cooldownSec={settle.loading ? 0 : cooldownSec}
+                            disabled={!canRefresh}
+                            onClick={() => settle.refresh()}
+                            testId='funds-settle-refresh'
+                        />
                     </div>
                 </>
             )}

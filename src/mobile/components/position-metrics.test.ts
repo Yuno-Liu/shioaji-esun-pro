@@ -108,6 +108,16 @@ describe('摘要與分組小計', () => {
         expect(s.marketValue).toEqual({ value: 220_000, incomplete: true });
     });
 
+    // X3 F2:F3：現價 0 與列一致視為缺價：不計入合計並標示不完整
+    it('現價 0 的股票列：摘要與分組小計都略過並標示不完整（與列的「—」一致）', () => {
+        const zero = stock({ id: 9, code: '9909', last_price: 0 });
+        expect(positionMarketValue(zero)).toBeNull();
+        expect(summarizePositions([stock(), zero]).marketValue).toEqual({ value: 220_000, incomplete: true });
+        const groups = groupPositionsByAccount([stock(), zero]);
+        expect(groups[0]!.value).toEqual({ value: 220_000, incomplete: true });
+        expect(groupPositionsByAccount([zero])[0]!.value).toEqual({ value: 0, incomplete: true });
+    });
+
     it('groupPositionsByAccount：依帳戶第一次出現的順序分組；小計筆數、損益、股票市值', () => {
         const rows = [stock(), fut(), stock({ id: 4, account: accS2, pnl: -5_000 }), stock({ id: 5, code: '9903', pnl: 1_000 }), opt(), stock({ id: 6, account: undefined, pnl: 7 })];
         const groups = groupPositionsByAccount(rows);

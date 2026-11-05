@@ -1,15 +1,19 @@
 // 委託成交資料的純函式：均價、進度、類別徽章、時間軸、逐筆成交清單與合計。
 import { describe, expect, it } from 'vitest';
-import { esunAggregateDealSeq } from '../../lib/esun/order-mapping';
+import { esunAggregateDealSeq, fromEsunOrderResult } from '../../lib/esun/order-mapping';
+import type { EsunOrderResult } from '../../lib/esun/types';
+import type { Account } from '../../lib/types/portfolio';
 import type { Trade } from '../../lib/types/order';
 import {
     avgFillPrice,
     avgPriceDigits,
     collectDealRows,
+    dealFillTs,
     dealTimeline,
     dealTotals,
     esunCancellableText,
     fillProgress,
+    lastDealFillTs,
     missingDealQuantity,
     orderBadges,
     quantitiesText,
@@ -94,6 +98,52 @@ describe('deal timeline and rows', () => {
         expect(totals.amountIncomplete).toBe(true);
         expect(quantitiesText(totals.Buy.quantities, fmt)).toBe('3 張、1 口');
         expect(quantitiesText({}, fmt)).toBe('0');
+    });
+});
+
+// X3 F2:F1：玉山權威讀取（fromEsunOrderResult）的逐筆成交 ts 是委託時間（esun_fills 沒有成交時間），不可當成交時間
+describe('E.SUN fill times after an authoritative read', () => {
+    const esunAccount = { account_type: 'S', broker_id: '8840', account_id: '0099887', person_id: '', signed: true } as unknown as Account;
+    const esunTrade = () => fromEsunOrderResult({
+        ord_no: 'C0001', pre_ord_no: '', stock_no: '2884', buy_sell: 'B', ap_code: '1', price_flag: '0', bs_flag: 'R',
+        trade: '0', od_price: 25.5, org_qty: 5, org_qty_share: 5000, mat_qty: 2, mat_qty_share: 2000, cel_qty: 0, cel_qty_share: 0,
+        avg_price: 25.4, ord_date: '20261023', ord_time: '090005000',
+        esun_fills: [
+            { mkt_seq_num: '000417', mat_qty_share: 1000, mat_price: 25.5 },
+            { mkt_seq_num: '000418', mat_qty_share: 1000, mat_price: 25.3 },
+        ],
+    } as unknown as EsunOrderResult, esunAccount)!;
+
+    it('per-fill deals carrying the order time have no fill time (timeline keeps broker order, no 最後成交)', () => {
+        const t = esunTrade();
+        const orderTs = t.status.order_ts!;
+        // 前提：lib 把每一筆逐筆成交的 ts 填成委託時間
+        expect(orderTs).toBeGreaterThan(0);
+        expect(t.status.deals.map(d => d.ts)).toEqual([orderTs, orderTs]);
+        expect(t.status.deals.map(d => dealFillTs(t, d))).toEqual([0, 0]);
+        expect(dealTimeline(t).map(d => d.seq)).toEqual(['000417', '000418']);
+        expect(lastDealFillTs(t)).toBe(0);
+    });
+
+    it('deal rows: untimed E.SUN deals have ts 0 and sort after timed deals (by order time), not by the order time as fill time', () => {
+        const t = esunTrade();
+        const orderTs = t.status.order_ts!;
+        // 永豐成交時間早於玉山委託時間：以委託時間當成交時間排序時，玉山會錯排在前
+        const sinopac = trade('s1', { status: { deal_quantity: 1, order_ts: orderTs - 7200, deals: [deal('9', 100, 1, orderTs - 3600)] } });
+        const rows = collectDealRows([t, sinopac]);
+        expect(rows.map(r => `${r.trade.order.id}:${r.deal?.seq}`)).toEqual(['s1:9', `${t.order.id}:000417`, `${t.order.id}:000418`]);
+        expect(rows.map(r => r.ts)).toEqual([orderTs - 3600, 0, 0]);
+    });
+
+    it('keeps real fill times: E.SUN SSE deals (mat_time) and SinoPac deals even at the order second', () => {
+        const t = esunTrade();
+        const orderTs = t.status.order_ts!;
+        const live = { ...t, status: { ...t.status, deals: [...t.status.deals, { seq: '000419', price: 25.6, quantity: 1, ts: orderTs + 5400 }] } };
+        expect(dealFillTs(live, live.status.deals[2]!)).toBe(orderTs + 5400);
+        expect(lastDealFillTs(live)).toBe(orderTs + 5400);
+        expect(dealTimeline(live).map(d => d.seq)).toEqual(['000419', '000417', '000418']);
+        const sameSecond = trade('s2', { status: { order_ts: 50, deals: [deal('1', 100, 1, 50)] } });
+        expect(dealFillTs(sameSecond, sameSecond.status.deals[0]!)).toBe(50);
     });
 });
 

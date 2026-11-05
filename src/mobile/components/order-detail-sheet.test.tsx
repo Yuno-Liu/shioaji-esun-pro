@@ -185,6 +185,34 @@ describe('OrderDetailSheet', () => {
         expect(text(byTestId('order-detail-sheet')[0]!)).toContain(ORDER_DETAIL_TEXT.notFound);
     });
 
+    // X3 F2:F1：玉山重新讀取後的逐筆成交只有委託時間
+    it('E.SUN per-fill deals carrying only the order time are not shown as fill times', async () => {
+        h.trades = [trade('e2', {
+            account: esun,
+            order: { quantity: 2 },
+            status: { status: 'Filled', order_quantity: 2, deal_quantity: 2, deals: [deal('000417', 1080, 1, 1_700_000_000), deal('000418', 1085, 1, 1_700_000_000)] },
+        })];
+        await render('e2');
+        expect(one('detail-last-deal')).toBe('券商未提供成交時間');
+        const deals = byTestId('detail-deal').map(text);
+        expect(deals).toEqual(['—成交 1,080 × 1 張（券商未提供成交時間）', '—成交 1,085 × 1 張（券商未提供成交時間）']);
+    });
+
+    it('E.SUN: a live (SSE) deal keeps its fill time, sorts first and is the 最後成交; untimed deals follow with a note', async () => {
+        h.trades = [trade('e3', {
+            account: esun,
+            order: { quantity: 2 },
+            status: { status: 'Filled', order_quantity: 2, deal_quantity: 2, deals: [deal('000417', 1080, 1, 1_700_000_000), deal('000418', 1085, 1, 1_700_000_900)] },
+        })];
+        await render('e3');
+        const deals = byTestId('detail-deal').map(text);
+        expect(deals[0]).toMatch(/^(\d\d\/\d\d )?\d\d:\d\d:\d\d成交 1,085 × 1 張$/);
+        expect(deals[1]).toBe('—成交 1,080 × 1 張（券商未提供成交時間）');
+        expect(one('detail-last-deal')).toBe(deals[0]!.replace('成交 1,085 × 1 張', ''));
+        expect(byTestId('detail-timeline-note')).toHaveLength(1);
+        expect(lastDealTs(h.trades[0] as AccountedTrade)).toBe(1_700_000_900);
+    });
+
     it('lastDealTs returns the latest deal time', () => {
         expect(lastDealTs(trade('o1', { status: { deals: [deal('a', 1, 1, 5), deal('b', 1, 1, 9), deal('c', 1, 1, 7)] } }))).toBe(9);
         expect(lastDealTs(trade('o1'))).toBe(0);

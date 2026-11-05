@@ -165,6 +165,11 @@ export function OrdersPage() {
         setSelected(new Set());
         setSelecting(false);
     }, []);
+    // 選取中目前範圍的未成交全部成交或刪除：自動離開選取模式（否則「完成」隨工具列消失、「全部刪單」也被隱藏）。
+    // 批次刪單面板開著或送出中不動，關閉面板後再判斷。
+    useEffect(() => {
+        if (selecting && tab === 'working' && rows.length === 0 && !batchBusy && !batchOpen) exitSelecting();
+    }, [selecting, tab, rows.length, batchBusy, batchOpen, exitSelecting]);
 
     const tabs: { key: OrdersTab; label: string }[] = [
         { key: 'working', label: `未成交 ${workingCount}` },
@@ -398,8 +403,14 @@ function DealsList({ rows, onOpen }: { rows: DealRow[]; onOpen: (id: string) => 
     const privMoney = usePrivacyMoney();
     const totals = useMemo(() => dealTotals(rows), [rows]);
     const money = (n: number) => maskMoney(fmtInt(Math.round(n)), privMoney);
+    const anyUntimed = rows.some(r => r.ts <= 0);
     return (
         <>
+            {anyUntimed && (
+                <p className={styles.sub} data-testid='deals-sort-note'>
+                    依成交時間新到舊；券商未提供成交時間的成交（玉山重新讀取後的逐筆、彙總）排在後面，依委託時間排列。
+                </p>
+            )}
             <ul className={styles.list} data-testid='deals-list'>
                 {rows.map(r => <DealItem key={r.key} row={r} onOpen={onOpen} />)}
             </ul>
@@ -431,6 +442,8 @@ function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void 
     const account = tradeAccountOf(t);
     const sideText = t.order.action === 'Buy' ? '買' : '賣';
     const time = row.deal && !row.aggregate ? orderTimeText(row.ts) : '';
+    // 玉山重新讀取後的逐筆成交：券商只給委託時間，不可當成交時間顯示
+    const untimed = !!row.deal && !row.aggregate && row.ts <= 0;
     return (
         <li data-testid='deal-row' data-trade-id={t.order.id}>
             <button
@@ -450,6 +463,7 @@ function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void 
                         {row.price === null ? '價格未提供' : fmtPrice(row.price)} × {fmtInt(row.quantity)} {row.unit}
                     </span>
                     {row.aggregate && <span className={styles.sub}>{row.deal ? '（彙總）' : '（無逐筆明細）'}</span>}
+                    {untimed && <span className={styles.sub} data-testid='deal-untimed'>（券商未提供成交時間）</span>}
                     <span className={styles.sub} data-testid='deal-account'>{account ? mobileAccountLabel(account, priv) : '帳戶未知'}</span>
                 </span>
             </button>

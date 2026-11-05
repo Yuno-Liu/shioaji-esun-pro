@@ -117,7 +117,7 @@ vi.mock('../lib/resume-gate-runtime', () => ({
 vi.mock('../lib/hash-router', () => ({ navigate: m.navigate }));
 vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket }));
 
-import { addOnBlockReason, addOnPlanFor, closePlanFor, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
+import { addOnBlockReason, addOnPlanFor, closePlanFor, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
 
 const stockAcc = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '' };
 const stockAcc2 = { account_type: 'S', broker_id: 'ESUN1', account_id: '7777777', person_id: 'A', signed: true, username: '' };
@@ -301,6 +301,9 @@ describe('PositionsPage 顯示', () => {
         setPositions([], { updatedAt: null, error: 'S 持倉查詢失敗', needsReconcile: true, reasons: ['query-failed'] });
         await rerender();
         expect(textOf(one('position-total'))).toBe('—');
+        // X3 F2:F5：清單不能說「目前沒有持倉」，比照委託頁提示尚未讀取成功
+        expect(textOf(one('position-empty'))).toBe(POSITIONS_TEXT.readFailed);
+        expect(pageText()).not.toContain(POSITIONS_TEXT.empty);
         setPositions([], { updatedAt: 5 });
         await rerender();
         expect(textOf(one('position-total'))).not.toBe('—');

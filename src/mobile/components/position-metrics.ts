@@ -4,12 +4,12 @@
 //   期權商品資料尚未載入時「無法歸類」，只在「全部」顯示，不猜。
 // - 報酬率：股票＝損益 ÷（均價 × |股數|）；期貨＝(現價 − 均價) ÷ 均價 × 方向（桌面 retPctOf 同式）；算不出回 null。
 // - 成本＝均價 × |股數|、市值＝|股數| × 現價（stockMarketValue），只對股票；期權沒有乘數資訊回 null。
-// - 摘要與分組小計：損益加總、股票市值（sumStockMarketValue；缺價列略過並標示不完整）；
+// - 摘要與分組小計：損益加總、股票市值（sumMarketValue：與列相同用 positionMarketValue，現價 ≤ 0 或缺值的列略過並標示不完整）；
 //   報酬率合計只在全部為股票時提供（期貨是保證金交易，沒有成本基礎）。
 // - 期貨風險指標：initial_margin 與 risk_indicator 都 > 0 才有意義（模擬或未押保證金時全 0，顯示「—」）。
 
 import { positionMarket } from '../../components/bottom-dock-shared';
-import { stockMarketValue, sumStockMarketValue, type ValueSum } from '../../lib/position-value';
+import { stockMarketValue, type ValueSum } from '../../lib/position-value';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Account, AccountedPosition, Margin, Position, StockPosition } from '../../lib/types/portfolio';
 
@@ -111,6 +111,21 @@ export function sortPositions<T extends AccountedPosition>(rows: readonly T[], m
     return out;
 }
 
+/**
+ * 股票市值合計：與列相同用 positionMarketValue（現價 0 也算缺價），缺價列不計入並標示 incomplete。
+ * 不用 lib 的 sumStockMarketValue：它只把非有限值當缺價，現價 0 會被當成市值 0 悄悄加總。
+ */
+export function sumMarketValue(stocks: readonly Position[]): ValueSum {
+    let value = 0;
+    let incomplete = false;
+    for (const p of stocks) {
+        const v = positionMarketValue(p);
+        if (v === null || !finite(v)) incomplete = true;
+        else value += v;
+    }
+    return { value, incomplete };
+}
+
 const sumPnl = (rows: readonly Position[]): number => rows.reduce((s, p) => s + (finite(p.pnl) ? p.pnl : 0), 0);
 
 export interface PositionsSummary {
@@ -132,7 +147,7 @@ export function summarizePositions(rows: readonly AccountedPosition[]): Position
     return {
         count: rows.length,
         pnl,
-        marketValue: stocks.length ? sumStockMarketValue(stocks) : null,
+        marketValue: stocks.length ? sumMarketValue(stocks) : null,
         stockCost,
         pnlPct: allStock && stockCost !== null && stockCost > 0 ? (pnl / stockCost) * 100 : null,
     };
@@ -169,7 +184,7 @@ export function groupPositionsByAccount<T extends AccountedPosition>(rows: reado
         const stocks = (g.rows as readonly Position[]).filter(isStock);
         g.count = g.rows.length;
         g.pnl = sumPnl(g.rows);
-        g.value = stocks.length ? sumStockMarketValue(stocks) : null;
+        g.value = stocks.length ? sumMarketValue(stocks) : null;
     }
     return [...map.values()];
 }

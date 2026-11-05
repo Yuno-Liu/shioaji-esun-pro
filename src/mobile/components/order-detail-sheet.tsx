@@ -5,6 +5,8 @@
 // - 內容：完整欄位（狀態、價格、類別徽章、原始／成交／已取消／剩餘量、成交均價與進度、帳戶與路由、
 //   委託時間與最後成交時間、書號與序號、券商訊息）、玉山中繼資料（預約、原始委託日期時間、可否刪）、
 //   成交時間軸（status.deals：時間、價格、數量；玉山彙總成交另外標示）。
+// - 成交時間用 order-fills 的 dealFillTs：玉山重新讀取後的逐筆成交只有委託時間，標示「券商未提供成交時間」，
+//   不當成「最後成交」或時間軸的成交時間。
 // - 改價／減量／刪單：只關閉本面板並以 openOrderAction(id, kind) 開啟既有的委託操作面板，
 //   顯示規則（orderActionAvailability）、閘門與滑動確認全部沿用 order-action-sheet.tsx，這裡不呼叫任何 lib 交易函式。
 
@@ -17,7 +19,7 @@ import type { Trade } from '../../lib/types/order';
 import { fmtInt, fmtPrice } from '../../lib/utils/format';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
 import { openOrderAction, type OrderActionKind } from '../lib/mobile-store';
-import { dealTimeline, esunCancellableText, fillProgress, isAggregateDeal, missingDealQuantity } from '../lib/order-fills';
+import { dealFillTs, dealTimeline, esunCancellableText, fillProgress, isAggregateDeal, lastDealFillTs, missingDealQuantity } from '../lib/order-fills';
 import * as styles from '../styles/orders.css';
 import { mobileAccountLabel } from './account-switch-sheet';
 import { BottomSheet } from './bottom-sheet';
@@ -48,9 +50,9 @@ export interface OrderDetailSheetProps {
     onClose: () => void;
 }
 
-/** 最後成交時間（秒或毫秒）；沒有回 0 */
+/** 最後成交時間（秒或毫秒）；沒有成交或券商未提供成交時間回 0 */
 export function lastDealTs(trade: Trade): number {
-    return dealTimeline(trade).reduce((max, d) => (Number.isFinite(d.ts) && d.ts > max ? d.ts : max), 0);
+    return lastDealFillTs(trade);
 }
 
 export function OrderDetailSheet({ tradeId, onClose }: OrderDetailSheetProps) {
@@ -86,6 +88,7 @@ function DetailBody({ trade, working, onClose }: { trade: Trade; working: boolea
     const lastTs = lastDealTs(trade);
     const timeline = dealTimeline(trade);
     const missing = missingDealQuantity(trade);
+    const lastDealText = lastTs > 0 ? orderTimeText(lastTs) : timeline.length > 0 ? '券商未提供成交時間' : '—';
     const reservation = esunReservationText(meta);
 
     const act = (kind: OrderActionKind) => {
@@ -125,7 +128,7 @@ function DetailBody({ trade, working, onClose }: { trade: Trade; working: boolea
                 ))}
                 {field('帳戶', `${route ? routeBadgeText(route) : '帳戶未知'}${account ? ` · ${mobileAccountLabel(account, priv)}` : ''}`, 'detail-account')}
                 {field('委託時間', orderTime || '—', 'detail-order-time')}
-                {field('最後成交', lastTs > 0 ? orderTimeText(lastTs) : '—', 'detail-last-deal')}
+                {field('最後成交', lastDealText, 'detail-last-deal')}
                 {field('書號', trade.order.ordno || '—', 'detail-ordno')}
                 {field('序號', trade.order.seqno || '—', 'detail-seqno')}
                 {message && field('訊息', <span className={styles.msg}>{message}</span>, 'detail-msg')}
@@ -150,15 +153,21 @@ function DetailBody({ trade, working, onClose }: { trade: Trade; working: boolea
                 </li>
                 {timeline.map((d, i) => {
                     const aggregate = isAggregateDeal(trade, d);
+                    const ts = dealFillTs(trade, d);
                     return (
                         <li key={`${d.seq}|${i}`} className={styles.timelineItem} data-testid='detail-deal'>
-                            <span className={styles.timelineTime}>{aggregate ? '—' : orderTimeText(d.ts) || '—'}</span>
+                            <span className={styles.timelineTime}>{ts > 0 ? orderTimeText(ts) || '—' : '—'}</span>
                             <span>成交 {fmtPrice(d.price)} × {fmtInt(d.quantity)} {unit}</span>
-                            {aggregate && <span className={styles.sub}>（彙總，無逐筆時間）</span>}
+                            {aggregate
+                                ? <span className={styles.sub}>（彙總，無逐筆時間）</span>
+                                : ts <= 0 && <span className={styles.sub}>（券商未提供成交時間）</span>}
                         </li>
                     );
                 })}
             </ol>
+            {timeline.some(d => dealFillTs(trade, d) <= 0) && timeline.some(d => dealFillTs(trade, d) > 0) && (
+                <p className={styles.sub} data-testid='detail-timeline-note'>依成交時間排序；券商未提供成交時間的成交排在最後。</p>
+            )}
             {timeline.length === 0 && missing === 0 && <p className={styles.sub} data-testid='detail-no-deals'>{ORDER_DETAIL_TEXT.noDeals}</p>}
             {missing > 0 && (
                 <p className={styles.sub} data-testid='detail-missing'>另有 {fmtInt(missing)} {unit} 成交，券商未提供逐筆明細</p>

@@ -5,11 +5,15 @@
 // - 成交進度：成交量 ÷（原始委託量 − 已取消量），同桌面 FillRing。減量累計在 cancel_quantity，不會改寫 order.quantity。
 // - 委託類別徽章：價別、效期、倉別（期貨）、交易單位（零股等）、信用、當沖。
 // - 逐筆成交清單：攤平所有委託的 status.deals，附委託資訊；逐筆合計量少於 deal_quantity 時另列「未提供逐筆明細」的差額。
+// - 成交時間（dealFillTs）：玉山權威讀取（fromEsunOrderResult）的逐筆／彙總成交 ts 填的是委託時間（ord_date＋ord_time），
+//   bridge 的 esun_fills 沒有成交時間；只有 SSE 即時投影的成交帶 mat_time。所以玉山委託中 ts 等於 status.order_ts（或 ≤ 0）
+//   的成交、以及彙總成交一律視為「券商未提供成交時間」：不顯示成成交時間、排序排在有時間的成交之後（依委託時間）。
+//   同秒成交（IOC／市價）也會被當成沒有時間——只會少顯示，不會顯示錯誤的時間。永豐維持原本行為。
 
-import { esunAggregateDealSeq } from '../../lib/esun/order-mapping';
+import { esunAggregateDealSeq, isEsunBroker } from '../../lib/esun/order-mapping';
 import { isOddLot, lotLabel, orderQtyUnit } from '../../lib/odd-lot';
 import { octypeLabel, PRICE_TYPE_LABEL } from '../../lib/order-conditions';
-import type { Deal, FuturesPriceType, Trade } from '../../lib/types/order';
+import type { AccountedTrade, Deal, FuturesPriceType, Trade } from '../../lib/types/order';
 
 function isFutures(trade: Pick<Trade, 'contract'>): boolean {
     const st = trade.contract.security_type;
@@ -101,16 +105,38 @@ export function missingDealQuantity(trade: Trade): number {
     return Math.max(0, num(trade.status.deal_quantity) - listed);
 }
 
-/** 成交時間軸：時間由舊到新（沒有時間的排最後，同時間保持原順序） */
+/** 玉山委託（帳戶或委託帳戶的 broker_id 為玉山） */
+function isEsunTrade(trade: Trade): boolean {
+    const broker = (trade as AccountedTrade).account?.broker_id || trade.order.account?.broker_id;
+    return isEsunBroker(broker);
+}
+
+/**
+ * 逐筆成交的「成交時間」（秒或毫秒，同 deal.ts）；券商沒有提供時回 0。
+ * 彙總成交、ts ≤ 0，以及玉山委託中 ts 等於委託時間（status.order_ts）的成交都回 0（見檔頭說明）。
+ */
+export function dealFillTs(trade: Trade, deal: Pick<Deal, 'seq' | 'ts'>): number {
+    const ts = num(deal.ts);
+    if (ts <= 0 || isAggregateDeal(trade, deal)) return 0;
+    if (isEsunTrade(trade) && ts === num(trade.status.order_ts)) return 0;
+    return ts;
+}
+
+/** 成交時間軸：成交時間由舊到新；沒有成交時間的排最後（保持券商回傳順序） */
 export function dealTimeline(trade: Trade): Deal[] {
     return validDeals(trade)
-        .map((d, i) => ({ d, i }))
+        .map((d, i) => ({ d, i, ts: dealFillTs(trade, d) }))
         .sort((a, b) => {
-            const ta = num(a.d.ts) > 0 ? a.d.ts : Infinity;
-            const tb = num(b.d.ts) > 0 ? b.d.ts : Infinity;
+            const ta = a.ts > 0 ? a.ts : Infinity;
+            const tb = b.ts > 0 ? b.ts : Infinity;
             return ta === tb ? a.i - b.i : ta - tb;
         })
         .map(x => x.d);
+}
+
+/** 最後成交時間（dealFillTs 的最大值）；沒有成交或券商未提供成交時間回 0 */
+export function lastDealFillTs(trade: Trade): number {
+    return validDeals(trade).reduce((max, d) => Math.max(max, dealFillTs(trade, d)), 0);
 }
 
 export interface DealRow {
@@ -120,12 +146,16 @@ export interface DealRow {
     deal: Deal | null;
     price: number | null;
     quantity: number;
+    /** 成交時間（dealFillTs）；0＝券商未提供成交時間 */
     ts: number;
     unit: string;
     aggregate: boolean;
 }
 
-/** 所有委託的逐筆成交，最新在前（沒有時間的排最後） */
+/**
+ * 所有委託的逐筆成交：有成交時間的依成交時間新到舊；沒有成交時間的（玉山重新讀取後的逐筆、彙總、差額）排在後面，
+ * 依委託時間新到舊（委託時間只用來排序，不當成交時間顯示）。
+ */
 export function collectDealRows(trades: readonly Trade[]): DealRow[] {
     const rows: DealRow[] = [];
     for (const trade of trades) {
@@ -137,7 +167,7 @@ export function collectDealRows(trades: readonly Trade[]): DealRow[] {
                 deal,
                 price: deal.price,
                 quantity: deal.quantity,
-                ts: num(deal.ts),
+                ts: dealFillTs(trade, deal),
                 unit,
                 aggregate: isAggregateDeal(trade, deal),
             });
@@ -148,11 +178,13 @@ export function collectDealRows(trades: readonly Trade[]): DealRow[] {
         }
     }
     return rows
-        .map((r, i) => ({ r, i }))
+        .map((r, i) => ({ r, i, orderTs: num(r.trade.status.order_ts) }))
         .sort((a, b) => {
             const ta = a.r.ts > 0 ? a.r.ts : -Infinity;
             const tb = b.r.ts > 0 ? b.r.ts : -Infinity;
-            return ta === tb ? a.i - b.i : tb - ta;
+            if (ta !== tb) return tb - ta;
+            if (ta === -Infinity && a.orderTs !== b.orderTs) return b.orderTs - a.orderTs;
+            return a.i - b.i;
         })
         .map(x => x.r);
 }

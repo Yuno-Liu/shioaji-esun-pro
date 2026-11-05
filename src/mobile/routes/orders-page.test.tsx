@@ -533,6 +533,29 @@ describe('OrdersPage — 成交分頁', () => {
         expect(byTestId('order-detail-sheet')).toHaveLength(1);
     });
 
+    // X3 F2:F1：玉山重新讀取後的逐筆成交 ts 等於委託時間，不當成交時間顯示與排序
+    it('E.SUN deals carrying only the order time show 券商未提供成交時間 and sort after timed deals', async () => {
+        setState([
+            trade('s1', { status: { status: 'Filled', deal_quantity: 1, deals: [deal('d1', 1080, 1, 1_700_000_100)] } }),
+            trade('e1', {
+                account: esun,
+                order: { quantity: 2 },
+                status: { status: 'Filled', order_quantity: 2, deal_quantity: 2, order_ts: 1_700_000_200, deals: [deal('000417', 1080, 1, 1_700_000_200), deal('000418', 1081, 1, 1_700_000_200)] },
+            }),
+        ]);
+        await render();
+        await press(byTestId('orders-tab-deals')[0]!);
+        const dealRows = byTestId('deal-row');
+        expect(dealRows.map(r => r.props['data-trade-id'])).toEqual(['s1', 'e1', 'e1']);
+        expect(text(testIdIn(dealRows[0]!, 'deal-time')[0]!)).toMatch(/\d\d:\d\d:\d\d$/);
+        expect(testIdIn(dealRows[0]!, 'deal-untimed')).toHaveLength(0);
+        for (const r of dealRows.slice(1)) {
+            expect(text(testIdIn(r, 'deal-time')[0]!)).toBe('—');
+            expect(text(testIdIn(r, 'deal-untimed')[0]!)).toBe('（券商未提供成交時間）');
+        }
+        expect(text(byTestId('deals-sort-note')[0]!)).toContain('排在後面，依委託時間排列');
+    });
+
     it('masks money totals when money privacy is on', async () => {
         h.privMoney = true;
         setState([trade('o1', { status: { status: 'Filled', deal_quantity: 1, deals: [deal('d1', 1080, 1, 1_700_000_100)] } })]);
@@ -667,6 +690,24 @@ describe('OrdersPage — 勾選批次刪單', () => {
         expect(m.notify).toHaveBeenLastCalledWith({ kind: 'err', title: '批次刪單失敗或結果未知', body: 'timeout；請手動更新委託確認，勿自動重送' });
         expect(byTestId('batch-cancel-sheet')).toHaveLength(0);
         expect(m.cancelOrders).toHaveBeenCalledTimes(2);
+    });
+
+    // X3 F2:F4：選取中目前範圍的未成交清單變空 → 自動離開選取模式，「全部刪單」恢復
+    it('leaves selection mode when the scoped working list empties', async () => {
+        setState([trade('o1'), trade('o2', { account: esun })]);
+        await render();
+        await act(async () => { byTestId('orders-account')[0]!.props.onChange({ target: { value: '9A95-0123456' } }); });
+        await selectRows('o1');
+        expect(text(byTestId('orders-selected-count')[0]!)).toBe('已選 1 筆');
+        setState([trade('o1', { status: { status: 'Filled', deal_quantity: 5 } }), trade('o2', { account: esun })]);
+        await rerender();
+        expect(byTestId('orders-cancel-selected')).toHaveLength(0);
+        expect(text(byTestId('orders-cancel-all')[0]!)).toBe('全部刪單（1 筆）');
+        // 再有新的未成交時是一般模式（選取鍵，沒有勾選框）
+        setState([trade('o1', { status: { status: 'Filled', deal_quantity: 5 } }), trade('o2', { account: esun }), trade('o3')]);
+        await rerender();
+        expect(byTestId('orders-select')).toHaveLength(1);
+        expect(byTestId('order-select')).toHaveLength(0);
     });
 
     it('clears the selection when switching tabs and offers 選取 only in 未成交', async () => {
