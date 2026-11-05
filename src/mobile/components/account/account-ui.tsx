@@ -1,10 +1,12 @@
 // src/mobile/components/account/account-ui.tsx — 帳戶頁區塊共用的小元件（卡片、鍵值列、開關、分段選擇）
+// 設計規格 §7.8：GroupedSection 外觀（標題在卡片外 footnote、資訊列 ≥44px、髮絲分隔）；props 與 testId 不變。
 
-import { ChevronDown, ChevronRight } from 'lucide-react';
+import { ChevronRight, TriangleAlert } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { isEsunAccount } from '../../../lib/esun';
 import type { Account } from '../../../lib/types/portfolio';
 import * as styles from '../../styles/account.css';
+import { Segmented as UiSegmented } from '../../ui/segmented';
 
 export type Tone = 'normal' | 'muted' | 'accent' | 'good' | 'warn' | 'bad';
 
@@ -21,6 +23,7 @@ export function useNow(intervalMs: number): number {
     return now;
 }
 
+/** 區塊（GroupedSection 外觀）：標題在卡片外（footnote），extra 在標題列右側；props 與 testId 不變 */
 export function Card({ title, extra, children, testId }: { title: string; extra?: ReactNode; children: ReactNode; testId?: string }) {
     return (
         <section className={styles.card} data-testid={testId} aria-label={title}>
@@ -28,12 +31,16 @@ export function Card({ title, extra, children, testId }: { title: string; extra?
                 <h2 className={styles.cardTitle}>{title}</h2>
                 {extra}
             </div>
-            {children}
+            <div className={styles.cardBody}>{children}</div>
         </section>
     );
 }
 
-/** 可展開的卡片：收合時只顯示標題（展開才讀取資料的區塊用） */
+/**
+ * 可展開的卡片：收合時只顯示標題列（展開才讀取資料的區塊用）。
+ * 標題列是卡片內第一列（整列可點、≥ 44px、chevron 旋轉）；展開立即掛載內容、150ms 淡入。
+ * 讀取時機由呼叫端的 onToggle／open 決定，本元件只負責外觀。
+ */
 export function CollapsibleCard({ title, open, onToggle, extra, children, testId }: {
     title: string;
     open: boolean;
@@ -44,29 +51,36 @@ export function CollapsibleCard({ title, open, onToggle, extra, children, testId
 }) {
     return (
         <section className={styles.card} data-testid={testId} aria-label={title}>
-            <div className={styles.cardHeader}>
-                <h2 className={styles.cardTitle}>
-                    <button type='button' className={styles.disclosure} aria-expanded={open} onClick={onToggle} data-testid={testId ? `${testId}-toggle` : undefined}>
-                        {open ? <ChevronDown size={18} aria-hidden='true' /> : <ChevronRight size={18} aria-hidden='true' />}
-                        {title}
-                    </button>
-                </h2>
-                {open && extra}
+            <div className={styles.cardBody}>
+                <div className={styles.disclosureRow}>
+                    <h2 className={styles.disclosureHeading}>
+                        <button type='button' className={styles.disclosure} aria-expanded={open} onClick={onToggle} data-testid={testId ? `${testId}-toggle` : undefined}>
+                            {title}
+                            <ChevronRight className={styles.chevron} aria-hidden='true' focusable='false' />
+                        </button>
+                    </h2>
+                    {open && extra}
+                </div>
+                {open && <div className={styles.collapsibleContent}>{children}</div>}
             </div>
-            {open && children}
         </section>
     );
 }
 
+/** 鍵值列：dt＋dd（testId 在 dd）；warn 為 foreground 文字＋amber 圖示（§4.8 規則 4） */
 export function Item({ term, children, tone = 'normal', className, testId }: { term: ReactNode; children: ReactNode; tone?: Tone; className?: string; testId?: string }) {
     return (
         <>
             <dt className={styles.term}>{term}</dt>
-            <dd className={`${styles.value} ${styles.tone[tone]}${className ? ` ${className}` : ''}`} data-testid={testId}>{children}</dd>
+            <dd className={`${styles.value} ${styles.tone[tone]}${className ? ` ${className}` : ''}`} data-testid={testId}>
+                {tone === 'warn' && <TriangleAlert className={styles.warnIcon} aria-hidden='true' focusable='false' />}
+                {children}
+            </dd>
         </>
     );
 }
 
+/** 開關（role=switch）：拇指以 transform 移動、開啟底色以 opacity 淡入 */
 export function Switch({ checked, onChange, label, disabled = false, testId }: { checked: boolean; onChange?: (next: boolean) => void; label: string; disabled?: boolean; testId?: string }) {
     return (
         <button
@@ -86,15 +100,17 @@ export function Switch({ checked, onChange, label, disabled = false, testId }: {
     );
 }
 
+/** 分段選擇：沿用全站唯一的 ui/segmented（toggle 語意：role=group＋aria-pressed、按鈕文字恰為選項文字） */
 export function Segmented<T extends string | number>({ label, value, options, onChange, testId }: { label: string; value: T; options: readonly { value: T; text: string }[]; onChange: (v: T) => void; testId?: string }) {
     return (
-        <div className={styles.segmented} role='group' aria-label={label} data-testid={testId}>
-            {options.map(o => (
-                <button key={String(o.value)} type='button' className={styles.segment} aria-pressed={o.value === value} onClick={() => onChange(o.value)}>
-                    {o.text}
-                </button>
-            ))}
-        </div>
+        <UiSegmented<T>
+            semantics='toggle'
+            ariaLabel={label}
+            value={value}
+            items={options.map(o => ({ value: o.value, label: o.text }))}
+            onChange={onChange}
+            testId={testId}
+        />
     );
 }
 

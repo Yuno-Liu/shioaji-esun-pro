@@ -29,6 +29,7 @@ import { accountKeyOf, formatClock, formatTwd, signDir } from '../../lib/account
 import { marginLooksBlank, marginRisk, settlementSlots, stockAssetSummary, stockPositionKind, type RiskLevel } from '../../lib/account-funds';
 import { settlementCooldownMs, useSettlements, type SettlementState } from '../../lib/account-settlements';
 import * as styles from '../../styles/account.css';
+import { ProgressBar, type BarTone } from '../../ui/bars';
 import { brokerName, Card, Item, RefreshButton, useNow, type Tone } from './account-ui';
 
 function fundsFor(funds: AccountFunds[] | undefined, account: Account | null): AccountFunds | undefined {
@@ -44,6 +45,8 @@ export function stockRowsOf(positions: readonly AccountedPosition[] | undefined,
 
 const RISK_TONE: Record<RiskLevel, Tone> = { none: 'muted', danger: 'bad', warn: 'warn', safe: 'good' };
 const RISK_TEXT: Record<RiskLevel, string> = { none: '', danger: '追繳風險', warn: '偏低', safe: '安全' };
+/** 風險指標條顏色（狀態色，不隨漲跌配色翻轉） */
+const RISK_BAR_TONE: Record<RiskLevel, BarTone> = { none: 'flat', danger: 'danger', warn: 'amber', safe: 'success' };
 
 function useMoney() {
     const privMoney = usePrivacyMoney();
@@ -162,7 +165,7 @@ function FuturesFunds({ fut, futFunds }: { fut: Account; futFunds: AccountFunds 
                             aria-valuetext={`${risk.value.toFixed(0)}%，${RISK_TEXT[risk.level]}`}
                             data-testid='funds-risk-bar'
                         >
-                            <span className={styles.riskFill[risk.level]} style={{ width: `${risk.barPercent}%` }} />
+                            <ProgressBar percent={risk.barPercent} tone={RISK_BAR_TONE[risk.level]} />
                         </div>
                     )}
                     <dl className={styles.kv}>

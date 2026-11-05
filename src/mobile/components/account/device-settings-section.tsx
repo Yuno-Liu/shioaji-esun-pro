@@ -6,11 +6,14 @@
 // - 震動：選配（lib/mobile-device-settings）；瀏覽器沒有 navigator.vibrate（iOS Safari）時停用並說明。
 // - 螢幕常亮：選配（lib/mobile-device-settings → hooks/use-wake-lock 在殼層啟停）；不支援 Wake Lock 時停用並說明，
 //   支援時顯示目前狀態（持有中、背景已釋放、系統暫停、失敗原因）。
+// - 介面觸覺回饋（Android）：lib/ui-settings 的 uiHaptics（設計規格 §5.3、§7.8）；滑塊到達門檻、長按、步進撞界時短震。
+//   iOS 或不支援 navigator.vibrate 時停用並說明（與成交震動同一判斷；motion/haptics 另在 iOS 一律不執行）。
 
 import { useState, type ReactNode } from 'react';
 import { setSoundEnabled, soundEnabled } from '../../../lib/sounds';
 import { playFillSound, unlockFillAudio } from '../../lib/fill-audio';
 import { setMobileDeviceSettings, useMobileDeviceSettings, vibrationSupported, wakeLockSupported } from '../../lib/mobile-device-settings';
+import { isIOSWebKit, setMobileUiSettings, useMobileUiSettings } from '../../lib/ui-settings';
 import { useWakeLockStatus, type WakeLockStatus } from '../../lib/wake-lock';
 import * as styles from '../../styles/account.css';
 import { Card, Switch } from './account-ui';
@@ -42,10 +45,12 @@ export function wakeLockHint(supported: boolean, enabled: boolean, status: WakeL
 
 export function DeviceSettingsSection() {
     const device = useMobileDeviceSettings();
+    const ui = useMobileUiSettings();
     const wake = useWakeLockStatus();
     const [sound, setSound] = useState(() => soundEnabled());
     const canVibrate = vibrationSupported();
     const canWake = wakeLockSupported();
+    const canUiHaptic = canVibrate && !isIOSWebKit();
 
     const toggleSound = (next: boolean) => {
         try {
@@ -89,6 +94,21 @@ export function DeviceSettingsSection() {
                     onChange={(next) => setMobileDeviceSettings({ vibrate: next })}
                     label='成交震動'
                     testId='device-vibrate'
+                />
+            </SettingRow>
+            <SettingRow
+                label='介面觸覺回饋（Android）'
+                hint={canUiHaptic
+                    ? '滑動確認到達門檻、長按、數量撞到上下限時輕震一下（不影響成交震動）。'
+                    : '此瀏覽器不支援震動（iPhone／iPad 的 Safari 不支援），改以畫面變化提示。'}
+                testId='device-ui-haptics-row'
+            >
+                <Switch
+                    checked={canUiHaptic && ui.uiHaptics}
+                    disabled={!canUiHaptic}
+                    onChange={(next) => setMobileUiSettings({ uiHaptics: next })}
+                    label='介面觸覺回饋'
+                    testId='device-ui-haptics'
                 />
             </SettingRow>
             <SettingRow label='螢幕常亮' hint={wakeLockHint(canWake, device.wakeLock, wake)} testId='device-wake-row'>

@@ -7,6 +7,7 @@ import { useServerInfo } from '../../../lib/server-info-store';
 import { fetchHealth, fetchInfo } from '../../../lib/shioaji';
 import type { Health } from '../../../lib/types/health';
 import * as styles from '../../styles/account.css';
+import { ProgressBar, type BarTone } from '../../ui/bars';
 import { Card, Item, useNow, type Tone } from './account-ui';
 import { RECHECK_COOLDOWN_MS } from './connection-card';
 
@@ -62,7 +63,7 @@ export function ServerCard() {
 
     const mode = info?.simulation === true ? { text: '模擬', tone: 'accent' as Tone } : info?.simulation === false ? { text: '正式', tone: 'bad' as Tone } : { text: '未確認', tone: 'warn' as Tone };
     const ca = !health ? '—' : health.ca_expired ? '已過期' : health.ca_expires_in_days !== undefined ? `${health.ca_expires_in_days} 天` : '—';
-    const quotaFill = quota.tone === 'danger' ? 'danger' : quota.tone === 'warning' ? 'warning' : quota.tone === 'muted' ? 'muted' : 'normal';
+    const quotaFill: BarTone = quota.tone === 'danger' ? 'danger' : quota.tone === 'warning' ? 'amber' : quota.tone === 'muted' ? 'flat' : 'accent';
 
     return (
         <Card title='伺服器' testId='account-server'>
@@ -77,8 +78,8 @@ export function ServerCard() {
             </dl>
             {usage.data && (
                 <>
-                    <div className={styles.meter} aria-hidden='true'>
-                        <span className={styles.meterFill[quotaFill]} style={{ width: `${Math.min(100, Math.max(0, quota.percent ?? 0))}%` }} />
+                    <div className={styles.meter}>
+                        <ProgressBar percent={Math.min(100, Math.max(0, quota.percent ?? 0))} tone={quotaFill} />
                     </div>
                     <p className={styles.note}>{quota.label}{quota.percent !== null ? `（${quota.percent.toFixed(1)}%）` : ''}</p>
                 </>

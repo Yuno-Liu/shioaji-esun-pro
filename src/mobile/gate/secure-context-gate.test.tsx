@@ -1,4 +1,5 @@
 // 手機版 R1：非 secure context 只顯示「需要 HTTPS」說明，不呼叫 bootstrap()、不開串流、不讀交易狀態
+import { readFileSync } from 'node:fs';
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -146,6 +147,27 @@ describe('SecureContextGate', () => {
         expect(selectable.some(n => n.type === 'dd' && n.props.children === readSecureContextDiagnostics(lanHttp).buildVersion)).toBe(true);
         // 全域恢復選取的規則確實涵蓋這個類別與其子孫
         expect(SELECTABLE_RESTORE_SELECTOR.split(',').map(x => x.trim())).toEqual(expect.arrayContaining([`.${SELECTABLE}`, `.${SELECTABLE} *`]));
+    });
+
+    // 設計規格 §7.8：步驟為編號卡（ol 保留清單語意）、診斷表不溢出；靜態、無材質、無動畫、不連線
+    it('renders the HTTPS options as a numbered list of cards and keeps the diagnostics list', async () => {
+        await act(async () => { view = create(createElement(SecureContextGate, { diagnostics: readSecureContextDiagnostics(lanHttp) })); });
+        const lists = view!.root.findAll(n => n.type === 'ol');
+        expect(lists).toHaveLength(1);
+        expect(lists[0]!.findAll(n => n.type === 'li')).toHaveLength(4);
+        expect(view!.root.findAll(n => n.type === 'dl' && n.props['data-testid'] === 'secure-context-diagnostics')).toHaveLength(1);
+        expect(view!.root.findAll(n => n.type === 'main')).toHaveLength(1);
+    });
+
+    it('gate styles: no horizontal overflow, minmax(0, 1fr) diagnostics, static (no material / motion)', () => {
+        const css = readFileSync(new URL('../styles/gate.css.ts', import.meta.url), 'utf8');
+        expect(css).toContain("overflowX: 'hidden'");
+        expect(css).toContain("overflowWrap: 'anywhere'");
+        expect(css).toContain("gridTemplateColumns: 'auto minmax(0, 1fr)'");
+        expect(css).not.toMatch(/backdropFilter|BackdropFilter|transition|animation|transform|willChange|filter:/);
+        // 說明頁不 import src/lib（不建立任何連線）
+        const tsx = readFileSync(new URL('./secure-context-gate.tsx', import.meta.url), 'utf8');
+        expect(tsx).not.toMatch(/from '\.\.\/\.\.\/lib\//);
     });
 
     it('MobileApp outside a secure context renders only the gate: no bootstrap, no stream, no trading state', async () => {

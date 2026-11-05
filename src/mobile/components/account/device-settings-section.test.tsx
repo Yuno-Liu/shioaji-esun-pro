@@ -17,6 +17,7 @@ vi.mock('../../../lib/sounds', () => ({
 vi.mock('../../lib/fill-audio', () => ({ unlockFillAudio: m.unlock, playFillSound: m.play }));
 
 import { getMobileDeviceSettings, resetMobileDeviceSettingsForTest } from '../../lib/mobile-device-settings';
+import { getMobileUiSettings, resetMobileUiSettingsForTest } from '../../lib/ui-settings';
 import { resetWakeLockStatusForTest } from '../../lib/wake-lock';
 import { DeviceSettingsSection, wakeLockHint } from './device-settings-section';
 
@@ -33,6 +34,7 @@ beforeEach(() => {
     vi.stubGlobal('localStorage', undefined);
     resetMobileDeviceSettingsForTest();
     resetWakeLockStatusForTest();
+    resetMobileUiSettingsForTest();
     m.sound = false;
     m.setSoundEnabled.mockClear();
     m.unlock.mockClear();
@@ -82,6 +84,36 @@ describe('DeviceSettingsSection', () => {
         await act(async () => byTestId('device-wake').props.onClick());
         expect(getMobileDeviceSettings().wakeLock).toBe(true);
         expect(byTestId('device-wake').props['aria-checked']).toBe(true);
+    });
+
+    // 設計規格 §5.3、§7.8：介面觸覺回饋（Android）寫 ui-settings.uiHaptics；iOS／不支援震動時停用並說明
+    it('Android: UI haptics switch writes ui-settings.uiHaptics (independent of fill vibration)', async () => {
+        vi.stubGlobal('navigator', { vibrate: () => true, hardwareConcurrency: 8 });
+        await mount();
+        expect(byTestId('device-ui-haptics').props.role).toBe('switch');
+        expect(byTestId('device-ui-haptics').props.disabled).toBe(false);
+        expect(byTestId('device-ui-haptics').props['aria-checked']).toBe(true);
+        expect(text(byTestId('device-ui-haptics-row'))).toContain('介面觸覺回饋（Android）');
+        await act(async () => byTestId('device-ui-haptics').props.onClick());
+        expect(getMobileUiSettings().uiHaptics).toBe(false);
+        expect(byTestId('device-ui-haptics').props['aria-checked']).toBe(false);
+        // 成交震動設定不受影響
+        expect(getMobileDeviceSettings().vibrate).toBe(true);
+    });
+
+    it('iOS (no vibrate) or WebKit GestureEvent: UI haptics switch disabled with an explanation', async () => {
+        vi.stubGlobal('navigator', {});
+        await mount();
+        expect(byTestId('device-ui-haptics').props.disabled).toBe(true);
+        expect(byTestId('device-ui-haptics').props['aria-checked']).toBe(false);
+        expect(text(byTestId('device-ui-haptics-row'))).toContain('不支援震動');
+        await act(async () => byTestId('device-ui-haptics').props.onClick());
+        expect(getMobileUiSettings().uiHaptics).toBe(true);
+        await act(async () => view?.unmount());
+        vi.stubGlobal('navigator', { vibrate: () => true });
+        vi.stubGlobal('GestureEvent', function GestureEvent() { /* iPadOS WebKit */ });
+        await mount();
+        expect(byTestId('device-ui-haptics').props.disabled).toBe(true);
     });
 
     it('wake lock hint follows the status', () => {

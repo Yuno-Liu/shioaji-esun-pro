@@ -1,12 +1,25 @@
-// src/mobile/components/account/display-card.tsx — 帳戶頁「顯示」：主題、漲跌配色、字級、遮蔽（規格 §6.7）
+// src/mobile/components/account/display-card.tsx — 帳戶頁「顯示」：主題、漲跌配色、字級、降低透明度、遮蔽（規格 §6.7；設計規格 §7.8）
+//
+// 降低透明度寫入 lib/ui-settings 的 transparency（跟隨系統＝system、開＝reduced、關＝full）；
+// html[data-sj-transparency] 由殼層的 useHtmlAttributes 訂閱設定後立即改寫（不在本元件）。
 
 import { setPrivacyMode, setPrivacyMoney, usePrivacyMode, usePrivacyMoney } from '../../../lib/privacy';
 import { setThemeSettings, useThemeSettings, type Convention, type FontScale, type ThemeMode } from '../../../lib/theme-store';
+import { setMobileUiSettings, useMobileUiSettings, type MobileUiSettings } from '../../lib/ui-settings';
 import * as styles from '../../styles/account.css';
 import { Card, Segmented, Switch } from './account-ui';
 
+type Transparency = MobileUiSettings['transparency'];
+
+export const TRANSPARENCY_OPTIONS: readonly { value: Transparency; text: string }[] = [
+    { value: 'system', text: '跟隨系統' },
+    { value: 'reduced', text: '開' },
+    { value: 'full', text: '關' },
+];
+
 export function DisplayCard() {
     const theme = useThemeSettings();
+    const ui = useMobileUiSettings();
     const privMoney = usePrivacyMoney();
     const priv = usePrivacyMode();
     const modes: { value: ThemeMode; text: string }[] = [
@@ -39,6 +52,17 @@ export function DisplayCard() {
                     onChange={fontScale => setThemeSettings({ fontScale })}
                     testId='display-font'
                 />
+            </div>
+            <div className={styles.settingBlock}>
+                <span>降低透明度</span>
+                <Segmented<Transparency>
+                    label='降低透明度'
+                    value={ui.transparency}
+                    options={TRANSPARENCY_OPTIONS}
+                    onChange={transparency => setMobileUiSettings({ transparency })}
+                    testId='display-transparency'
+                />
+                <span className={styles.settingHint}>開：底部列與通知改為實心、不模糊（較省電，低階 Android 預設開啟）。iPhone 的 Safari 不會套用系統的「降低透明度」，請在這裡切換。</span>
             </div>
             <div className={styles.settingRow}>
                 <span className={styles.settingLabel}>
