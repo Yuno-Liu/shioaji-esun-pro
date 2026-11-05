@@ -83,7 +83,7 @@ export const scroller = style({
     overflowX: 'auto',
     overflowY: 'hidden',
     scrollbarWidth: 'none',
-    WebkitOverflowScrolling: 'touch',
+    // 不設 WebkitOverflowScrolling：iOS 13 起預設即慣性捲動，且 WebKit 會因它建立疊層脈絡（styles/layout-stacking.test.ts）
     // 上下各留 4px：compact 膠囊的擴張點擊區不被裁切
     padding: '4px 0',
     selectors: { '&::-webkit-scrollbar': { display: 'none' } },

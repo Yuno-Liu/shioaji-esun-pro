@@ -76,6 +76,10 @@ globalStyle('*, *::before, *::after', {
 //
 // 重要：.shell、.mainWrap、main 不得有 transform／filter／backdrop-filter／will-change／contain:paint，
 // 否則 main 內 position:fixed 的全螢幕圖表（chart.css.ts）與面板會改以該祖先定位而無法覆蓋全頁。
+// 也不得建立疊層脈絡（z-index、isolation、opacity…），也不可設定 WebkitOverflowScrolling：
+// WebKit（iOS Safari）會把帶 touch 值的捲動容器當成 z-index 0 的疊層脈絡，main 內 fixed 子孫因此永遠在
+// .bottomStack（z 10）／.topSlot（z 11）之下（舊版「平倉說明」按鈕被分頁列擋住即此原因；Chrome 不支援該屬性，
+// 模擬器重現不了）。iOS 13 起捲動容器預設就有慣性捲動，不需要它。styles/layout-stacking.test.ts 靜態檢查。
 // 材質（backdrop-filter、isolation）只放在 .bottomStack（main 的兄弟節點）。
 
 /** 底部 chrome 讓出的高度：分頁列＋配件槽（交易鍵列） */
@@ -112,7 +116,6 @@ export const main = style({
     inset: 0,
     overflowY: 'auto',
     overflowX: 'hidden',
-    WebkitOverflowScrolling: 'touch',
     paddingLeft: SAFE_LEFT,
     paddingRight: SAFE_RIGHT,
     paddingBottom: BOTTOM_CHROME,

@@ -32,7 +32,7 @@
 10. 退場凍結期間仍以 `mounted.current` 決定回饋寫入（`use-mobile-ticket.ts:674-678`）。
 11. 字重 800；主價 2.25rem；每頁 28px 大標題（與「字級預設小、高密度」衝突）。
 12. 帳戶頁改「列表＋第二層面板」並改變刷新時機（P3）；委託操作面板改分段（P2）。
-13. 讓 `main` 或其祖先產生 transform／filter／backdrop-filter／will-change／contain:paint（會破壞 `chart.css.ts:22-38` 的 fixed 全螢幕圖表與面板定位）；在圖表 canvas 上方、或捲動容器內的 sticky 列用 backdrop-filter；同畫面超過 3 個模糊層；動畫 blur 半徑、height、box-shadow、background。
+13. 讓 `main` 或其祖先產生 transform／filter／backdrop-filter／will-change／contain:paint（會破壞 `chart.css.ts:22-38` 的 fixed 全螢幕圖表與面板定位），或建立疊層脈絡、設定 `-webkit-overflow-scrolling`（iOS 會把 main 內 fixed 子孫壓在底部 chrome 之下，見 §6.6）；在圖表 canvas 上方、或捲動容器內的 sticky 列用 backdrop-filter；同畫面超過 3 個模糊層；動畫 blur 半徑、height、box-shadow、background。
 14. 引用 `vars.color.wickUp／wickDown`（`theme.css.ts:113-114` 用 color-mix，iOS 15.4 整條宣告無效）；使用 theme 的 `flash-up／flash-down` 關鍵影格（`theme.css.ts:154-162` 動畫 background）。
 15. 未經使用者看樣張就改動已確認的設計：整面雙層方向著色、紅綠方向大鍵的大小與形式。
 
@@ -537,6 +537,7 @@ backdrop  data-testid=`${testId}-backdrop`（退場中 `${testId}-closing-backdr
 ```
 
 - 不得對 `.mainWrap`、`main` 設 transform、filter、backdrop-filter、will-change、contain:paint（保護 fixed 全螢幕圖表）。
+- `.shell`、`.mainWrap`、`main` 也不得建立疊層脈絡（z-index、isolation、opacity 等），`src/mobile` 也不得設定 `-webkit-overflow-scrolling`。WebKit（iOS Safari）會把帶 `touch` 值的捲動容器當成 z-index 0 的疊層脈絡，main 內所有 fixed 子孫（全螢幕圖表、原地渲染的面板）因此永遠畫在 `.bottomStack`（z 10）與 `.topSlot`（z 11）之下。實機案例：舊版「持倉 → 平倉說明」的「取消／繼續」被分頁列擋住。Chrome 不支援這個屬性，模擬器重現不了，因此由 `styles/layout-stacking.test.ts` 靜態檢查。iOS 13 起捲動容器預設就有慣性捲動，不需要它。
 - `ui/shell-slots.tsx`：`ShellSlotsContext`（`{ top, bottom } | 'inline'`）與 `ShellSlot({ slot: 'top' | 'bottom', children })`：有目標時 portal，否則原地渲染（測試維持原地，testId 不變）。
 - TabBar：lucide 24px（strokeWidth 1.75，active 2.25）＋caption 標籤；active 用 accent；未成交徽章 danger＋inkStrong 白字、>99 顯示 99+；待對帳 amber 點；點擊立即切換、無轉場；**再點目前分頁**：`preventDefault` 並 `main.scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' })`。
 - 捲動記憶（`lib/scroll-memory.ts`，Map<routeKey, top>；routeKey＝`formatRoute(route)`，交易頁依代碼分開）：main 上被動 scroll 監聽（rAF 合併）記錄目前 routeKey 的 scrollTop；routeKey 改變時於殼層 layout effect 標記 `pending = newKey`，pending 期間不記錄；`<ScrollRestorer routeKey>` 放在 Suspense 內、RoutePage 之後，於 layout effect 還原（沒有紀錄則 0）並清除 pending。
