@@ -1,4 +1,5 @@
-// src/mobile/styles/controls.css.ts — 共用控制項：按鈕、買賣鍵、滑動確認、徽章（規格 §5.3、§11）
+// src/mobile/styles/controls.css.ts — 共用控制項：按鈕、買賣鍵、滑動確認（規格 §11）
+// 送單路由徽章的樣式在 route-badge.css.ts。
 import { style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
 import { REDUCED_MOTION, TOUCH_MIN, TRADE_BUTTON_GAP, TRADE_BUTTON_MIN_HEIGHT } from './metrics';
@@ -187,32 +188,4 @@ export const slideReasonIcon = style({
     flex: '0 0 auto',
     marginTop: '0.15em',
     color: vars.color.amber,
-});
-
-// ---- 送單路由徽章（route-badge.tsx）----
-
-const routeBadgeBase = style({
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: '4px',
-    padding: '2px 8px',
-    borderRadius: vars.radius.md,
-    fontSize: '0.8125rem',
-    fontWeight: 600,
-    whiteSpace: 'nowrap',
-    border: '1px solid',
-});
-
-export const routeBadge = styleVariants({
-    /** 正式：醒目的 danger 色框 */
-    production: [routeBadgeBase, { borderColor: vars.color.danger, color: vars.color.danger, background: vars.color.dangerDim }],
-    /** 模擬：accent 色 */
-    simulation: [routeBadgeBase, { borderColor: vars.color.accent, color: vars.color.accent, background: vars.color.accentDim }],
-    /** 環境未確認 */
-    unknown: [routeBadgeBase, { borderColor: vars.color.amber, color: vars.color.amber, background: 'transparent' }],
-});
-
-export const routeBadgeLarge = style({
-    fontSize: '1.0625rem',
-    padding: '4px 12px',
 });

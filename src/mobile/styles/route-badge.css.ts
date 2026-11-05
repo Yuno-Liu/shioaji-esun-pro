@@ -2,7 +2,7 @@
 // - 外框膠囊（borderBright）＋foreground「送往 永豐 」＋環境實心小膠囊；沒有路由（未選擇帳戶）時 amber 框。
 // - 環境小膠囊（狀態列、帳戶切換面板、RouteBadge 共用）：正式＝danger＋inkStrong 白字、模擬＝accent＋inkStrong 白字、
 //   環境未確認＝amber 實心黑字（§4.8 規則 4、10：狀態色固定、不隨配色翻轉）。
-// controls.css.ts 的舊 routeBadge 匯出暫留（B4 清理），新程式改用這裡。
+// 路由徽章樣式只在這裡（controls.css.ts 的舊 routeBadge 匯出已在 B4 刪除）。
 import { style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
 import { fill } from './primitives.css';

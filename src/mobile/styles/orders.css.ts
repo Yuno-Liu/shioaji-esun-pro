@@ -2,11 +2,10 @@
 // components/order-detail-sheet.tsx）與委託操作面板共用的 OrderLines／OrderBadges（components/order-action-sheet.tsx）。
 // 設計規格 §7.6：清單型頁面（contentBg）、列間髮絲線從文字起點開始、方向小膠囊實心＋inkStrong、狀態外框膠囊 foreground 文字、
 // 列上 Chip（改價／減量／刪單）、選取工具列在底部配件槽（bar 材質上：foreground 文字、字重加一級）。
-// 觸控目標 ≥ 44px、輸入字級 ≥ 16px；買賣一律有文字，買賣色只用 vars.color.up／down；狀態色（danger／amber／success）不隨配色翻轉。
+// 觸控目標 ≥ 44px；買賣一律有文字，買賣色只用 vars.color.up／down；狀態色（danger／amber／success）不隨配色翻轉。
 // 只動畫 transform／opacity；不用 color-mix()、:has()、容器查詢。
 import { globalStyle, keyframes, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
-import { INPUT_FONT_SIZE } from './metrics';
 import { fill, focusRing, pressable, pressableRow } from './primitives.css';
 import { elevation, sj } from './theme-vars.css';
 import { DUR, EASE, LOW_DPR, MORE_CONTRAST, RADIUS, REDUCED_MOTION, SAFE_LEFT, SAFE_RIGHT, SIZE, SPACE, TOUCH_MIN } from './tokens';
@@ -264,14 +263,6 @@ export const code = style({
 export const sub = style({
     ...TEXT.subhead,
     color: vars.color.mutedForeground,
-});
-
-/** 警示小字：foreground 文字＋前方 3px amber 條（§4.8 規則 4：amber 不作小字顏色） */
-export const warn = style({
-    ...TEXT.subhead,
-    color: vars.color.foreground,
-    paddingLeft: SPACE.s1_5,
-    boxShadow: `inset 3px 0 0 ${vars.color.amber}`,
 });
 
 const sideBase = style({
@@ -732,103 +723,4 @@ export const fade = style({
     '@media': {
         [REDUCED_MOTION]: { animation: 'none' },
     },
-});
-
-// ---- 舊樣式（委託操作面板改用 order-action.css.ts 後已無引用；由 B4 統一清理） ----
-
-const legacyButtonBase = style({
-    minHeight: TOUCH_MIN,
-    minWidth: TOUCH_MIN,
-    padding: `0 ${vars.space.sm}`,
-    borderRadius: vars.radius.md,
-    border: `1px solid ${vars.color.borderBright}`,
-    background: vars.color.panelRaised,
-    color: vars.color.foreground,
-    fontSize: '0.9375rem',
-    fontWeight: 600,
-    whiteSpace: 'nowrap',
-    selectors: {
-        '&:disabled': { opacity: 0.45 },
-        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '2px' },
-    },
-});
-
-export const button = styleVariants({
-    neutral: [legacyButtonBase],
-    danger: [legacyButtonBase, { borderColor: vars.color.danger, color: vars.color.danger }],
-    dangerSolid: [legacyButtonBase, { background: vars.color.danger, borderColor: vars.color.danger, color: '#ffffff' }],
-});
-
-export const summary = style({
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '2px',
-    padding: vars.space.sm,
-    borderRadius: vars.radius.md,
-    background: vars.color.inset,
-});
-
-export const menu = style({
-    display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fit, minmax(6rem, 1fr))',
-    gap: vars.space.sm,
-});
-
-export const menuButton = styleVariants({
-    neutral: [legacyButtonBase, { minHeight: '52px', fontSize: '1rem' }],
-    danger: [legacyButtonBase, { minHeight: '52px', fontSize: '1rem', borderColor: vars.color.danger, color: vars.color.danger }],
-});
-
-export const fieldRow = style({
-    display: 'flex',
-    alignItems: 'center',
-    gap: vars.space.sm,
-    flexWrap: 'wrap',
-});
-
-export const fieldLabel = style({
-    flex: '0 0 auto',
-    minWidth: '4.5em',
-    fontSize: '0.9375rem',
-    color: vars.color.mutedForeground,
-});
-
-export const stepper = style({
-    display: 'grid',
-    gridTemplateColumns: `${TOUCH_MIN} minmax(0, 1fr) ${TOUCH_MIN}`,
-    alignItems: 'center',
-    gap: '6px',
-    flex: '1 1 12rem',
-});
-
-export const stepButton = style([legacyButtonBase, { fontSize: '1.25rem', fontWeight: 700, padding: 0 }]);
-
-export const input = style({
-    minHeight: TOUCH_MIN,
-    width: '100%',
-    boxSizing: 'border-box',
-    padding: `0 ${vars.space.sm}`,
-    borderRadius: vars.radius.md,
-    border: `1px solid ${vars.color.borderBright}`,
-    background: vars.color.inset,
-    color: vars.color.foreground,
-    fontSize: INPUT_FONT_SIZE,
-    fontVariantNumeric: 'tabular-nums',
-    textAlign: 'center',
-});
-
-export const problem = style({
-    margin: 0,
-    fontSize: '0.875rem',
-    color: vars.color.amber,
-});
-
-export const gateRow = style({
-    display: 'flex',
-    alignItems: 'center',
-    gap: vars.space.sm,
-    flexWrap: 'wrap',
-    minHeight: TOUCH_MIN,
-    fontSize: '0.875rem',
-    color: vars.color.amber,
 });

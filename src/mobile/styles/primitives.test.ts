@@ -70,9 +70,8 @@ describe('controls（既有匯出相容）', () => {
         for (const c of [...Object.values(controls.button), ...Object.values(controls.tradeButton)]) {
             expect(composes(c, pressable)).toBe(true);
         }
-        // 滑塊與路由徽章段落仍在
+        // 滑塊段落仍在（路由徽章樣式已移到 route-badge.css.ts）
         expect(isClass(controls.slideTrack)).toBe(true);
         expect(Object.keys(controls.slideHandle).sort()).toEqual(['buy', 'danger', 'neutral', 'sell']);
-        expect(Object.keys(controls.routeBadge).sort()).toEqual(['production', 'simulation', 'unknown']);
     });
 });
