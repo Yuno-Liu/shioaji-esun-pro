@@ -13,6 +13,7 @@
 // - 結果：成功 notify；失敗一律 notify({ kind: 'err', ...mutationErrorNotice(err, verb) })。
 //   「未送出」（mutationNotStarted）面板保留可修改後重試；其餘＝結果未知，關閉面板，不自動重送、不提供重送鍵。
 // - 面板開啟期間該委託已不在未成交（成交或已刪）時，顯示「此委託已不在未成交」並停用所有動作。
+// - OrderLines（委託頁列、本面板摘要共用）：類別徽章、成交均價、成交進度條、已取消／原始委託量、券商訊息（遮蔽身分證號）。
 
 import { useEffect, useRef, useState } from 'react';
 import { mutationErrorNotice, isEsunReservationTrade } from '../../components/esun-order-meta';
@@ -26,7 +27,7 @@ import { orderStatusLabel } from '../../lib/order-status-label';
 import { usePrivacyMode } from '../../lib/privacy';
 import { cancelOrder, updateOrderPrice, updateOrderQty } from '../../lib/shioaji';
 import { assertTradingLive, notify } from '../../lib/trade';
-import { cancellationSummary } from '../../lib/trade-mutations';
+import { cancellationSummary, maskIdentifiers } from '../../lib/trade-mutations';
 import { useTradingState } from '../../lib/trading-state';
 import type { ContractBase, ContractInfo } from '../../lib/types/contract';
 import { ACTIVE_ORDER_STATUSES, type AccountedTrade, type FuturesPriceType, type Trade } from '../../lib/types/order';
@@ -36,6 +37,7 @@ import { roundToTick, stepPrice } from '../../lib/utils/ticksize';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
 import { useResumeGate } from '../hooks/use-resume-gate';
 import { isNotStarted, notStarted } from '../lib/errors';
+import { avgFillPrice, avgPriceDigits, fillProgress, orderBadges } from '../lib/order-fills';
 import { closeOrderAction, useMobileUi, type OrderActionKind } from '../lib/mobile-store';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { acknowledgeStaleData, assertResumeReady, getResumeGate, retryResume, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
@@ -197,7 +199,50 @@ export function esunReservationText(meta: EsunOrderMeta | null): string | null {
     return meta.workDate ? `預約 ${meta.workDate.slice(5).replace('-', '/')}` : '預約';
 }
 
-/** 委託內容（委託頁列與操作面板摘要共用） */
+/** 成交均價文字（沒有逐筆成交回 null） */
+export function avgFillText(trade: Trade): string | null {
+    const avg = avgFillPrice(trade);
+    return avg === null ? null : fmtPrice(avg, avgPriceDigits(avg));
+}
+
+/** 券商狀態訊息（遮蔽身分證號與帳號長度的數字）；空白回 null */
+export function orderMessageText(trade: Trade): string | null {
+    const raw = typeof trade.status.msg === 'string' ? trade.status.msg.trim() : '';
+    return raw ? maskIdentifiers(raw) : null;
+}
+
+/** 委託類別徽章（價別、效期、倉別、當沖、零股、信用）；文字徽章，不只靠顏色 */
+export function OrderBadges({ trade }: { trade: Trade }) {
+    return (
+        <span className={styles.badges} data-testid='order-badges'>
+            {orderBadges(trade).map(b => (
+                <span key={`${b.kind}-${b.label}`} className={styles.badge[b.kind]} data-badge={b.kind}>{b.label}</span>
+            ))}
+        </span>
+    );
+}
+
+/** 成交進度條（成交量 ÷ 減量後的委託量）；數字另有文字 */
+export function FillBar({ trade }: { trade: Trade }) {
+    const p = fillProgress(trade);
+    const unit = orderUnitOf(trade);
+    const pct = Math.round(p.ratio * 100);
+    return (
+        <span
+            className={styles.progressTrack}
+            role='progressbar'
+            aria-label={`成交進度 ${fmtInt(p.filled)}／${fmtInt(p.effective)} ${unit}`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={pct}
+            data-testid='order-progress'
+        >
+            <span className={styles.progressFill[p.ratio >= 1 ? 'done' : 'partial']} style={{ width: `${pct}%` }} />
+        </span>
+    );
+}
+
+/** 委託內容（委託頁列與操作面板摘要共用；全部用 span，可放在按鈕內） */
 export function OrderLines({ trade, meta }: { trade: Trade; meta: EsunOrderMeta | null }) {
     const priv = usePrivacyMode();
     const account = tradeAccountOf(trade);
@@ -208,22 +253,38 @@ export function OrderLines({ trade, meta }: { trade: Trade; meta: EsunOrderMeta 
     const time = orderTimeText(trade.status.order_ts);
     const reservation = esunReservationText(meta);
     const ordNo = trade.order.ordno || trade.order.seqno;
+    const progress = fillProgress(trade);
+    const avg = avgFillText(trade);
+    const message = orderMessageText(trade);
     return (
         <>
-            <div className={styles.line}>
+            <span className={styles.line}>
                 <span className={styles.code}>{trade.contract.code}</span>
                 {trade.contract.name && <span>{trade.contract.name}</span>}
                 <span className={styles.side[trade.order.action === 'Buy' ? 'Buy' : 'Sell']} data-testid='order-side'>{sideText}</span>
-                <span className={styles.sub}>· {orderConditionText(trade)}</span>
-            </div>
-            <div className={styles.line}>
+                <OrderBadges trade={trade} />
+            </span>
+            <span className={styles.line}>
                 <span data-testid='order-price'>{orderPriceText(trade)} × {fmtInt(trade.order.quantity)} {unit}</span>
                 <span className={styles.sub} data-testid='order-fill'>
                     成交 {fmtInt(trade.status.deal_quantity)} · 剩餘 {fmtInt(remaining)}
                 </span>
+                {avg && <span className={styles.sub} data-testid='order-avg'>均價 {avg}</span>}
                 <span className={styles.status}>{orderStatusLabel(trade.status.status)}</span>
-            </div>
-            <div className={styles.line}>
+            </span>
+            {(progress.filled > 0 || progress.cancelled > 0) && (
+                <span className={styles.line}>
+                    {progress.filled > 0 && <FillBar trade={trade} />}
+                    {progress.cancelled > 0 && (
+                        <span className={styles.sub} data-testid='order-cancelled'>
+                            已取消 {fmtInt(progress.cancelled)} · 原始委託 {fmtInt(progress.original)} {unit}
+                            {remaining > 0 ? `（減量後 ${fmtInt(progress.effective)}）` : ''}
+                        </span>
+                    )}
+                </span>
+            )}
+            {message && <span className={styles.msg} data-testid='order-msg'>訊息：{message}</span>}
+            <span className={styles.line}>
                 <span className={styles.sub} data-testid='order-route'>
                     {route ? routeBadgeText(route) : '帳戶未知'}
                     {account ? ` · ${mobileAccountLabel(account, priv)}` : ''}
@@ -231,7 +292,7 @@ export function OrderLines({ trade, meta }: { trade: Trade; meta: EsunOrderMeta 
                 {reservation && <span className={styles.reservation} data-testid='order-reservation'>{reservation}</span>}
                 {time && <span className={styles.sub}>{time}</span>}
                 {ordNo && <span className={styles.sub}>書號 {ordNo}</span>}
-            </div>
+            </span>
         </>
     );
 }

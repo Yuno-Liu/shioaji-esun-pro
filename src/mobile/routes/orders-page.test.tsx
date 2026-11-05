@@ -11,6 +11,7 @@ const h = vi.hoisted(() => ({
     live: true,
     meta: new Map<string, unknown>(),
     contracts: {} as Record<string, unknown>,
+    privMoney: false,
 }));
 const m = vi.hoisted(() => ({
     refresh: vi.fn(async () => undefined),
@@ -19,6 +20,7 @@ const m = vi.hoisted(() => ({
     assertLive: vi.fn(),
     cancelAll: vi.fn(),
     cancelOrder: vi.fn(),
+    cancelOrders: vi.fn(),
     updatePrice: vi.fn(),
     updateQty: vi.fn(),
 }));
@@ -30,9 +32,15 @@ vi.mock('../../lib/trading-state', () => ({
     RECONCILE_REASON_LABELS: { disconnect: '串流中斷', 'mutation-outcome': '改刪待確認', 'query-failed': '查詢失敗' },
 }));
 vi.mock('../../lib/trade', () => ({ notify: m.notify, assertTradingLive: m.assertLive, cancelAllOrders: m.cancelAll }));
-vi.mock('../../lib/shioaji', () => ({ cancelOrder: m.cancelOrder, updateOrderPrice: m.updatePrice, updateOrderQty: m.updateQty }));
+vi.mock('../../lib/shioaji', () => ({ cancelOrder: m.cancelOrder, cancelOrders: m.cancelOrders, updateOrderPrice: m.updatePrice, updateOrderQty: m.updateQty }));
 vi.mock('../../lib/trade-mutations', () => ({
-    cancellationSummary: () => ({ kind: 'ok', body: '已確認取消 1 筆。' }),
+    cancellationSummary: (results?: PromiseSettledResult<unknown>[]) => {
+        if (!results || results.length <= 1) return { kind: 'ok', body: '已確認取消 1 筆。' };
+        const ok = results.filter(r => r.status === 'fulfilled').length;
+        return { kind: ok === results.length ? 'ok' : 'err', body: `已確認取消 ${ok} 筆；其他 ${results.length - ok} 筆。` };
+    },
+    cancellationOutcome: (t: { status: { status: string } }) => (t.status.status === 'Cancelled' ? 'confirmed' : t.status.status === 'Filled' ? 'filled' : 'pending'),
+    maskIdentifiers: (s: string) => s.replace(/\b[A-Z][A-Z0-9]\d{8}\b/g, '***'),
 }));
 vi.mock('../../hooks/use-stream', () => ({ useTradingLive: () => h.live }));
 vi.mock('../../lib/contracts-cache', () => ({
@@ -42,7 +50,11 @@ vi.mock('../../lib/contracts-cache', () => ({
 vi.mock('../../lib/esun/account-details', () => ({
     useEsunOrderMeta: (t: { order: { id: string } } | null) => (t ? h.meta.get(t.order.id) ?? null : null),
 }));
-vi.mock('../../lib/privacy', () => ({ usePrivacyMode: () => false }));
+vi.mock('../../lib/privacy', () => ({
+    usePrivacyMode: () => false,
+    usePrivacyMoney: () => h.privMoney,
+    maskMoney: (text: string, priv: boolean) => (priv ? '•••••' : text),
+}));
 vi.mock('../../lib/tick-bands', () => ({ bandTickFor: () => undefined, prefetchTickBands: () => undefined }));
 vi.mock('../components/route-badge', () => ({
     useOrderRoute: (a: { broker_id: string } | null) => (a ? { esun: a.broker_id.startsWith('884'), broker: a.broker_id.startsWith('884') ? '玉山' : '永豐', simulation: true } : null),
@@ -53,6 +65,7 @@ vi.mock('../components/account-switch-sheet', () => ({
 }));
 
 import type { AccountedTrade } from '../../lib/types/order';
+import { BottomSheet } from '../components/bottom-sheet';
 import { OrderActionSheet } from '../components/order-action-sheet';
 import { SlideToConfirm } from '../components/slide-to-confirm';
 import { getMobileUi, resetMobileUiForTest } from '../lib/mobile-store';
@@ -126,6 +139,7 @@ beforeEach(() => {
     h.live = true;
     h.meta.clear();
     h.contracts = {};
+    h.privMoney = false;
     m.assertLive.mockImplementation(() => undefined);
     resetMobileUiForTest();
     resetOrdersRefreshCooldownForTest();
@@ -171,7 +185,7 @@ describe('OrdersPage — 分類與顯示', () => {
         const r1 = row('o1')!;
         expect(text(r1.findAll(n => n.props?.['data-testid'] === 'order-side')[0]!)).toBe('賣');
         expect(text(r1.findAll(n => n.props?.['data-testid'] === 'order-price')[0]!)).toBe('1,085 × 5 張');
-        expect(text(r1)).toContain('整股 · 限價 ROD');
+        expect(r1.findAll(n => n.props?.['data-badge'] !== undefined && typeof n.type === 'string').map(text)).toEqual(['整股', '限價', 'ROD']);
         expect(text(r1.findAll(n => n.props?.['data-testid'] === 'order-route')[0]!)).toContain('送往 永豐 模擬');
         expect(text(r1)).toContain('書號 Ao1');
         expect(text(row('o2')!.findAll(n => n.props?.['data-testid'] === 'order-price')[0]!)).toBe('市價 × 5 張');
@@ -415,5 +429,265 @@ describe('OrdersPage — Q1：委託尚未讀到', () => {
         setState([], { updatedAt: null, error: '委託查詢失敗' });
         await render();
         expect(text(byTestId('orders-empty')[0]!)).toContain('尚未讀取成功');
+    });
+});
+
+// ---- W6：委託列欄位、明細、成交分頁、勾選批次刪單 ----
+
+const deal = (seq: string, price: number, quantity: number, ts: number) => ({ seq, price, quantity, ts });
+const testIdIn = (node: ReactTestInstance, id: string) => node.findAll(n => n.props?.['data-testid'] === id && typeof n.type === 'string');
+function deferred<T>() {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>(r => { resolve = r; });
+    return { promise, resolve };
+}
+
+describe('OrdersPage — 委託列新欄位', () => {
+    it('shows average fill price, fill progress, cancelled / original quantity, broker message and badges', async () => {
+        setState([
+            trade('o1', {
+                order: { quantity: 10, order_cond: 'MarginTrading' },
+                status: {
+                    status: 'PartFilled', deal_quantity: 3, cancel_quantity: 2, msg: '部分成交 A123456789',
+                    deals: [deal('d1', 1080, 1, 1_700_000_100), deal('d2', 1085, 2, 1_700_000_200)],
+                },
+            }),
+            trade('o2', { order: { action: 'Sell', daytrade_short: true } }),
+            trade('f1', { contract: { code: 'TXFL6', name: '台指期', security_type: 'FUT', exchange: 'TAIFEX' }, order: { octype: 'DayTrade', price: 22800, quantity: 2, order_type: 'IOC' } }),
+        ]);
+        await render();
+        const r1 = row('o1')!;
+        // 均價＝(1080×1 + 1085×2)/3 = 1083.33
+        expect(text(testIdIn(r1, 'order-avg')[0]!)).toBe('均價 1,083.33');
+        const bar = testIdIn(r1, 'order-progress')[0]!;
+        expect(bar.props.role).toBe('progressbar');
+        expect(bar.props['aria-valuenow']).toBe(38); // 3 ÷ (10 − 2)
+        expect(bar.props['aria-label']).toBe('成交進度 3／8 張');
+        expect(text(testIdIn(r1, 'order-cancelled')[0]!)).toBe('已取消 2 · 原始委託 10 張（減量後 8）');
+        // 券商訊息遮蔽身分證號
+        expect(text(testIdIn(r1, 'order-msg')[0]!)).toBe('訊息：部分成交 ***');
+        expect(r1.findAll(n => n.props?.['data-badge'] === 'credit' && typeof n.type === 'string').map(text)).toEqual(['融資']);
+
+        const r2 = row('o2')!;
+        expect(testIdIn(r2, 'order-avg')).toHaveLength(0);
+        expect(testIdIn(r2, 'order-progress')).toHaveLength(0);
+        expect(testIdIn(r2, 'order-cancelled')).toHaveLength(0);
+        expect(testIdIn(r2, 'order-msg')).toHaveLength(0);
+        expect(r2.findAll(n => n.props?.['data-badge'] === 'daytrade' && typeof n.type === 'string').map(text)).toEqual(['當沖先賣']);
+
+        const f1 = row('f1')!;
+        expect(f1.findAll(n => n.props?.['data-badge'] !== undefined && typeof n.type === 'string').map(text)).toEqual(['當沖', '限價', 'IOC']);
+        expect(text(testIdIn(f1, 'order-price')[0]!)).toBe('22,800 × 2 口');
+    });
+});
+
+describe('OrdersPage — 委託明細', () => {
+    it('tapping a row opens the detail sheet with the deal timeline; its actions open the existing action sheet', async () => {
+        setState([trade('o1', {
+            status: { status: 'PartFilled', deal_quantity: 3, deals: [deal('d2', 1085, 2, 1_700_000_200), deal('d1', 1080, 1, 1_700_000_100)] },
+        })]);
+        await render();
+        expect(byTestId('order-detail-sheet')).toHaveLength(0);
+        await press(testIdIn(row('o1')!, 'order-row-main')[0]!);
+        expect(byTestId('order-detail-sheet')).toHaveLength(1);
+        const deals = byTestId('detail-deal').map(text);
+        // 由舊到新
+        expect(deals[0]).toContain('成交 1,080 × 1 張');
+        expect(deals[1]).toContain('成交 1,085 × 2 張');
+        expect(text(byTestId('detail-ordno')[0]!)).toBe('Ao1');
+        expect(text(byTestId('detail-seqno')[0]!)).toBe('So1');
+        // 明細不呼叫任何交易函式；改價經由委託操作面板
+        await press(byTestId('detail-price-button')[0]!);
+        expect(byTestId('order-detail-sheet')).toHaveLength(0);
+        expect(getMobileUi().orderAction).toMatchObject({ tradeId: 'o1', kind: 'price' });
+        expect(m.updatePrice).not.toHaveBeenCalled();
+        expect(m.cancelOrder).not.toHaveBeenCalled();
+    });
+});
+
+describe('OrdersPage — 成交分頁', () => {
+    it('lists every deal newest first with time, symbol, side, price, quantity and account, plus totals', async () => {
+        setState([
+            trade('o1', { status: { status: 'Filled', deal_quantity: 2, deals: [deal('d1', 1080, 1, 1_700_000_100), deal('d2', 1085, 1, 1_700_000_300)] } }),
+            trade('o2', { account: esun, order: { action: 'Sell', order_lot: 'IntradayOdd', price: 500, quantity: 300 }, status: { status: 'PartFilled', order_quantity: 300, deal_quantity: 100, deals: [deal('d3', 500, 100, 1_700_000_200)] } }),
+            trade('o3'), // 沒有成交
+        ]);
+        await render();
+        await press(byTestId('orders-tab-deals')[0]!);
+        const dealRows = byTestId('deal-row');
+        expect(dealRows.map(r => r.props['data-trade-id'])).toEqual(['o1', 'o2', 'o1']);
+        expect(text(testIdIn(dealRows[1]!, 'deal-side')[0]!)).toBe('賣');
+        expect(text(testIdIn(dealRows[1]!, 'deal-price')[0]!)).toBe('500 × 100 股');
+        expect(text(testIdIn(dealRows[1]!, 'deal-account')[0]!)).toBe('8840-***87');
+        expect(text(testIdIn(dealRows[0]!, 'deal-time')[0]!)).toMatch(/\d\d:\d\d:\d\d$/);
+
+        expect(text(byTestId('deals-total-count')[0]!)).toBe('合計 3 筆');
+        // 張與股分開計；股票金額＝價 × 股數
+        expect(text(byTestId('deals-total-buy')[0]!)).toBe('買進 2 筆 · 2 張 · 股票 2,165,000 元');
+        expect(text(byTestId('deals-total-sell')[0]!)).toBe('賣出 1 筆 · 100 股 · 股票 50,000 元');
+        // 成交分頁沒有全部刪單
+        expect(byTestId('orders-cancel-all')).toHaveLength(0);
+
+        // 點成交列開啟委託明細
+        await press(dealRows[1]!.findAllByType('button')[0]!);
+        expect(byTestId('order-detail-sheet')).toHaveLength(1);
+    });
+
+    it('masks money totals when money privacy is on', async () => {
+        h.privMoney = true;
+        setState([trade('o1', { status: { status: 'Filled', deal_quantity: 1, deals: [deal('d1', 1080, 1, 1_700_000_100)] } })]);
+        await render();
+        await press(byTestId('orders-tab-deals')[0]!);
+        expect(text(byTestId('deals-total-buy')[0]!)).toBe('買進 1 筆 · 1 張 · 股票 ••••• 元');
+    });
+
+    it('shows 目前沒有成交 when there are orders but no deals', async () => {
+        setState([trade('o1')]);
+        await render();
+        await press(byTestId('orders-tab-deals')[0]!);
+        expect(text(byTestId('orders-empty')[0]!)).toBe('目前沒有成交');
+    });
+});
+
+describe('OrdersPage — 勾選批次刪單', () => {
+    async function selectRows(...ids: string[]) {
+        await press(byTestId('orders-select')[0]!);
+        for (const id of ids) {
+            await act(async () => { testIdIn(row(id)!, 'order-select')[0]!.props.onChange(); });
+        }
+    }
+    const cancelled = (id: string, account = sinopac) => trade(id, { account, status: { status: 'Cancelled', cancel_quantity: 5 } });
+
+    it('requires selection and a slide confirmation listing count and accounts, then calls cancelOrders once in display order', async () => {
+        m.cancelOrders.mockImplementation(async (ids: string[], onSettled?: () => void) => {
+            ids.forEach(() => onSettled?.());
+            return [{ status: 'fulfilled', value: cancelled('o3', esun) }, { status: 'fulfilled', value: cancelled('o1') }];
+        });
+        setState([trade('o1'), trade('o2'), trade('o3', { account: esun })]); // 畫面：o3, o2, o1
+        await render();
+        // 未選取時沒有勾選框
+        expect(byTestId('order-select')).toHaveLength(0);
+        await selectRows('o1', 'o3');
+        expect(text(byTestId('orders-selected-count')[0]!)).toBe('已選 2 筆');
+        // 選取模式不顯示單筆操作鍵與全部刪單
+        expect(byTestId('order-cancel-button')).toHaveLength(0);
+        expect(byTestId('orders-cancel-all')).toHaveLength(0);
+        const button = byTestId('orders-cancel-selected')[0]!;
+        expect(text(button)).toBe('刪除已選（2 筆）');
+        await press(button);
+        expect(text(byTestId('batch-cancel-count')[0]!)).toContain('2 筆未成交委託，涉及 2 個帳戶');
+        const accounts = text(byTestId('batch-cancel-accounts')[0]!);
+        expect(accounts).toContain('9A95-***56（送往 永豐 模擬）：1 筆');
+        expect(accounts).toContain('8840-***87（送往 玉山 模擬）：1 筆');
+        // 滑動前不呼叫
+        expect(m.cancelOrders).not.toHaveBeenCalled();
+        expect(m.cancelOrder).not.toHaveBeenCalled();
+
+        await confirmSlide('batch-cancel-slide');
+        expect(m.cancelOrders).toHaveBeenCalledTimes(1);
+        expect(m.cancelOrders.mock.calls[0]![0]).toEqual(['o3', 'o1']);
+        expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ title: '批次刪單結果', kind: 'ok' }));
+        const results = byTestId('batch-cancel-result');
+        expect(results.map(r => r.props['data-tone'])).toEqual(['ok', 'ok']);
+        expect(text(results[0]!)).toContain('已確認取消');
+        // 完成後清除選取並離開選取模式
+        expect(byTestId('order-select')).toHaveLength(0);
+        await press(byTestId('batch-cancel-close')[0]!);
+        expect(byTestId('batch-cancel-sheet')).toHaveLength(0);
+    });
+
+    it('summarizes partial failures with mutationErrorNotice wording and never resends', async () => {
+        m.cancelOrders.mockResolvedValue([
+            { status: 'fulfilled', value: cancelled('o3') },
+            { status: 'rejected', reason: Object.assign(new Error('委託已變更'), { mutationNotStarted: true }) },
+            { status: 'rejected', reason: Object.assign(new Error('刪單已送出但未確認取消'), { code: 'CANCEL_UNCONFIRMED', mutationOutcomeUnknown: true }) },
+        ]);
+        setState([trade('o1'), trade('o2'), trade('o3')]);
+        await render();
+        await selectRows('o1', 'o2', 'o3');
+        await press(byTestId('orders-cancel-selected')[0]!);
+        await confirmSlide('batch-cancel-slide');
+        expect(m.cancelOrders).toHaveBeenCalledTimes(1);
+        expect(m.cancelOrders.mock.calls[0]![0]).toEqual(['o3', 'o2', 'o1']);
+        const notice = m.notify.mock.calls.at(-1)![0];
+        expect(notice).toMatchObject({ title: '批次刪單結果', kind: 'err' });
+        const results = byTestId('batch-cancel-result');
+        expect(results.map(r => r.props['data-trade-id'])).toEqual(['o3', 'o2', 'o1']);
+        expect(results.map(r => r.props['data-tone'])).toEqual(['ok', 'warn', 'err']);
+        expect(text(results[1]!)).toContain('刪單未送出');
+        expect(text(results[1]!)).toContain('委託已變更');
+        expect(text(results[2]!)).toContain('刪單失敗或結果未知');
+        expect(text(results[2]!)).toContain('勿自動重送');
+        // 不提供重送鍵、不自動重送
+        expect(buttonsWithText('重送')).toHaveLength(0);
+        expect(buttonsWithText('重試')).toHaveLength(0);
+        await act(async () => { await Promise.resolve(); });
+        expect(m.cancelOrders).toHaveBeenCalledTimes(1);
+        expect(m.cancelOrder).not.toHaveBeenCalled();
+    });
+
+    it('disables the slide and locks the sheet while sending; not gated by ResumeGate or LIVE', async () => {
+        const pending = deferred<PromiseSettledResult<unknown>[]>();
+        m.cancelOrders.mockReturnValue(pending.promise);
+        setResumeGateForTest({ state: 'resyncing' });
+        h.live = false;
+        setState([trade('o1'), trade('o2')]);
+        await render();
+        await selectRows('o1');
+        await press(byTestId('orders-cancel-selected')[0]!);
+        expect(slide('batch-cancel-slide')!.props.disabled).toBe(false);
+        await confirmSlide('batch-cancel-slide');
+        expect(m.cancelOrders).toHaveBeenCalledTimes(1);
+        expect(m.assertLive).not.toHaveBeenCalled();
+        expect(slide('batch-cancel-slide')!.props.disabled).toBe(true);
+        expect(slide('batch-cancel-slide')!.props.disabledReason).toBe('處理中…');
+        const sheet = root().findAll(n => n.type === BottomSheet && n.props.testId === 'batch-cancel-sheet')[0]!;
+        expect(sheet.props.dismissible).toBe(false);
+        expect(byTestId('orders-tab-filled')[0]!.props.disabled).toBe(true);
+        // 再滑一次也不會重複送出
+        await confirmSlide('batch-cancel-slide');
+        expect(m.cancelOrders).toHaveBeenCalledTimes(1);
+        await act(async () => { pending.resolve([{ status: 'fulfilled', value: cancelled('o1') }]); });
+        expect(byTestId('batch-cancel-result')).toHaveLength(1);
+    });
+
+    it('a not-started batch failure keeps the sheet open; an unknown one closes it without resend', async () => {
+        m.cancelOrders.mockRejectedValueOnce(Object.assign(new Error('帳戶未簽署'), { mutationNotStarted: true }));
+        setState([trade('o1')]);
+        await render();
+        await selectRows('o1');
+        await press(byTestId('orders-cancel-selected')[0]!);
+        await confirmSlide('batch-cancel-slide');
+        expect(text(byTestId('batch-cancel-feedback')[0]!)).toBe('未送出：帳戶未簽署');
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: '批次刪單未送出', body: '帳戶未簽署' });
+        expect(byTestId('batch-cancel-sheet')).toHaveLength(1);
+
+        m.cancelOrders.mockRejectedValueOnce(new Error('timeout'));
+        await confirmSlide('batch-cancel-slide');
+        expect(m.notify).toHaveBeenLastCalledWith({ kind: 'err', title: '批次刪單失敗或結果未知', body: 'timeout；請手動更新委託確認，勿自動重送' });
+        expect(byTestId('batch-cancel-sheet')).toHaveLength(0);
+        expect(m.cancelOrders).toHaveBeenCalledTimes(2);
+    });
+
+    it('clears the selection when switching tabs and offers 選取 only in 未成交', async () => {
+        setState([trade('o1'), trade('o2', { status: { status: 'Filled', deal_quantity: 5 } })]);
+        await render();
+        await selectRows('o1');
+        expect(text(byTestId('orders-selected-count')[0]!)).toBe('已選 1 筆');
+        await press(byTestId('orders-tab-all')[0]!);
+        expect(byTestId('orders-select-toolbar')).toHaveLength(0);
+        expect(byTestId('order-select')).toHaveLength(0);
+        await press(byTestId('orders-tab-working')[0]!);
+        expect(byTestId('order-select')).toHaveLength(0);
+        await press(byTestId('orders-select')[0]!);
+        expect(text(byTestId('orders-selected-count')[0]!)).toBe('已選 0 筆');
+        expect(byTestId('orders-cancel-selected')[0]!.props.disabled).toBe(true);
+        // 全選／全不選
+        await press(byTestId('orders-select-all')[0]!);
+        expect(text(byTestId('orders-selected-count')[0]!)).toBe('已選 1 筆');
+        // 選取模式點列主體＝切換勾選，不開明細
+        await press(testIdIn(row('o1')!, 'order-row-main')[0]!);
+        expect(text(byTestId('orders-selected-count')[0]!)).toBe('已選 0 筆');
+        expect(byTestId('order-detail-sheet')).toHaveLength(0);
     });
 });

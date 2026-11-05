@@ -22,7 +22,10 @@ const m = vi.hoisted(() => ({
 vi.mock('../../lib/trading-state', () => ({ useTradingState: () => ({ trades: h.trades }) }));
 vi.mock('../../lib/trade', () => ({ notify: m.notify, assertTradingLive: m.assertLive }));
 vi.mock('../../lib/shioaji', () => ({ cancelOrder: m.cancelOrder, updateOrderPrice: m.updatePrice, updateOrderQty: m.updateQty }));
-vi.mock('../../lib/trade-mutations', () => ({ cancellationSummary: () => ({ kind: 'ok', body: '已確認取消 1 筆。' }) }));
+vi.mock('../../lib/trade-mutations', () => ({
+    cancellationSummary: () => ({ kind: 'ok', body: '已確認取消 1 筆。' }),
+    maskIdentifiers: (s: string) => s.replace(/\b[A-Z][A-Z0-9]\d{8}\b/g, '***'),
+}));
 vi.mock('../../hooks/use-stream', () => ({ useTradingLive: () => h.live }));
 vi.mock('../../lib/contracts-cache', () => ({
     useContract: (code: string | null) => (code ? h.contracts[code] : undefined),

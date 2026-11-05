@@ -285,3 +285,219 @@ export const accountList = style({
     paddingLeft: '1.25rem',
     fontSize: '0.9375rem',
 });
+
+// ---- 委託列：可點開明細、類別徽章、成交進度（W6）----
+
+/** 委託列主體（點開委託明細）；選取模式時改為切換勾選 */
+export const rowMain = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '4px',
+    width: '100%',
+    minHeight: TOUCH_MIN,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    textAlign: 'left',
+    cursor: 'pointer',
+    selectors: {
+        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '2px', borderRadius: vars.radius.sm },
+    },
+});
+
+/** 選取模式：勾選框＋列主體 */
+export const rowSelectable = style({
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: vars.space.sm,
+});
+
+/** 勾選框的觸控區（≥ 44px） */
+export const checkHit = style({
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flex: '0 0 auto',
+    minWidth: TOUCH_MIN,
+    minHeight: TOUCH_MIN,
+    margin: `calc(-1 * ${vars.space.xs}) 0`,
+    cursor: 'pointer',
+});
+
+export const badges = style({
+    display: 'inline-flex',
+    flexWrap: 'wrap',
+    gap: '4px',
+});
+
+const badgeBase = style({
+    display: 'inline-block',
+    padding: '0 5px',
+    borderRadius: vars.radius.sm,
+    border: `1px solid ${vars.color.border}`,
+    fontSize: '0.75rem',
+    lineHeight: 1.5,
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+});
+
+export const badge = styleVariants({
+    price: [badgeBase],
+    tif: [badgeBase],
+    octype: [badgeBase, { color: vars.color.foreground }],
+    lot: [badgeBase, { color: vars.color.foreground }],
+    credit: [badgeBase, { borderColor: vars.color.amber, color: vars.color.amber }],
+    daytrade: [badgeBase, { borderColor: vars.color.accent, color: vars.color.accent }],
+});
+
+export const progressTrack = style({
+    position: 'relative',
+    display: 'block',
+    width: '100%',
+    height: '6px',
+    borderRadius: '3px',
+    overflow: 'hidden',
+    background: vars.color.muted,
+});
+
+const progressFillBase = style({
+    display: 'block',
+    height: '100%',
+    borderRadius: '3px',
+    '@media': {
+        '(prefers-reduced-motion: no-preference)': { transition: 'width 200ms ease-out' },
+    },
+});
+
+export const progressFill = styleVariants({
+    partial: [progressFillBase, { background: vars.color.amber }],
+    done: [progressFillBase, { background: vars.color.success }],
+});
+
+export const msg = style({
+    fontSize: '0.8125rem',
+    color: vars.color.amber,
+    overflowWrap: 'anywhere',
+});
+
+// ---- 選取模式（勾選批次刪單）----
+
+export const toolbar = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: vars.space.sm,
+    flexWrap: 'wrap',
+    marginBottom: vars.space.sm,
+});
+
+export const toolbarText = style({
+    flex: '1 1 auto',
+    fontSize: '0.875rem',
+    color: vars.color.mutedForeground,
+});
+
+export const footerStack = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: vars.space.sm,
+    marginTop: vars.space.md,
+});
+
+export const resultList = style({
+    listStyle: 'none',
+    margin: 0,
+    padding: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+    maxHeight: '40vh',
+    overflowY: 'auto',
+});
+
+export const resultItem = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+    padding: vars.space.xs,
+    borderRadius: vars.radius.sm,
+    background: vars.color.inset,
+    fontSize: '0.875rem',
+});
+
+export const resultOk = style({ color: vars.color.success, fontWeight: 600 });
+export const resultErr = style({ color: vars.color.danger, fontWeight: 600 });
+export const resultWarn = style({ color: vars.color.amber, fontWeight: 600 });
+
+// ---- 委託明細面板 ----
+
+export const detailGrid = style({
+    display: 'grid',
+    gridTemplateColumns: 'auto minmax(0, 1fr)',
+    columnGap: vars.space.sm,
+    rowGap: '6px',
+    margin: 0,
+    fontSize: '0.9375rem',
+    fontVariantNumeric: 'tabular-nums',
+});
+
+export const detailTerm = style({
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+});
+
+export const detailValue = style({
+    margin: 0,
+    overflowWrap: 'anywhere',
+});
+
+export const sectionTitle = style({
+    margin: `${vars.space.xs} 0 0`,
+    fontSize: '0.9375rem',
+    fontWeight: 700,
+});
+
+export const timeline = style({
+    listStyle: 'none',
+    margin: 0,
+    padding: `0 0 0 ${vars.space.sm}`,
+    borderLeft: `2px solid ${vars.color.border}`,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+});
+
+export const timelineItem = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    gap: '6px',
+    flexWrap: 'wrap',
+    fontSize: '0.875rem',
+    fontVariantNumeric: 'tabular-nums',
+});
+
+export const timelineTime = style({
+    minWidth: '5.5em',
+    color: vars.color.mutedForeground,
+});
+
+// ---- 成交分頁 ----
+
+export const dealRow = style([rowMain, {
+    padding: `${vars.space.sm} 0`,
+    borderBottom: `1px solid ${vars.color.border}`,
+}]);
+
+export const totals = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '4px',
+    marginTop: vars.space.sm,
+    padding: vars.space.sm,
+    borderRadius: vars.radius.md,
+    background: vars.color.inset,
+    fontSize: '0.9375rem',
+    fontVariantNumeric: 'tabular-nums',
+});
