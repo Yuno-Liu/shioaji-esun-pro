@@ -142,7 +142,13 @@ server {
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
 
-        proxy_set_header Host $host;
+        # Shioaji sidecar 只接受 loopback Host，且帶非本機 Origin 一律 403
+        # （"Host is not a loopback address"／"cross-origin request to the local server"，1.7.10 實測）。
+        # 以 WEB_SERVER_NAMES（區網、Tailscale／Caddy 的 HTTPS 主機名）開啟時，上面已由 nginx 檢查
+        # Host 白名單、Origin 與 Host 相同、Sec-Fetch-Site；通過後轉給 sidecar 一律用本機 Host 並移除 Origin
+        # （空值時 nginx 不送出此標頭）。本機開啟時 $host 本來就是 127.0.0.1，行為不變。
+        proxy_set_header Host 127.0.0.1;
+        proxy_set_header Origin "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;

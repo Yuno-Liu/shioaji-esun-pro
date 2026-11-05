@@ -1183,7 +1183,7 @@ K 線端點只回 1 分 K，資料量與天數成正比（股票每日約 270 �
 
 | # | 項目 | 影響 | 驗證方式 |
 |---|---|---|---|
-| Q1 | `tailscale serve` 轉送時是否保留 `Host` | 不保留則 nginx 444／403 | 方案 A 部署後以手機開啟並檢查 nginx log；不行就改方案 B |
+| Q1 | `tailscale serve` 轉送時是否保留 `Host` | 不保留則 nginx 444／403 | ✅ 已實測（Tailscale 1.104，2026-11-05）：會保留。同時發現永豐 sidecar 只接受本機 Host／Origin，已由 nginx 處理（見 §17） |
 | Q2 | iOS「加入主畫面」模式與 Basic Auth | 可能無法登入 | 實機測試（P2 才需要） |
 | Q3 | 永豐 sidecar 自選清單在容器重建後是否保留 | 清單遺失 | `docker compose up -d --force-recreate` 前後比對；必要時另提 compose volume 變更 |
 | Q4 | 永豐委託頻率上限 | repo 未記載 | 查永豐官方文件並補入 §9.1 |
@@ -1211,3 +1211,4 @@ MVP（Phase 0＋Phase 1）實作時發現的規格範例錯誤，以及經獨立
 | §7.4 stale-data | 新單勾選「我了解」後可送 | 新單、改價、減量、平倉都要勾選；持倉頁、平倉面板與狀態列也提供勾選與重試；回前景前帶入的價格須重新確認 | 降低以過期資料操作的風險；刪單與全部刪單不受限制 |
 | §6.2／§6.3 價格來源 | 標頭與下單面板以 `tick.close` 為最新價 | 排除試撮（`simtrade`）tick 並標示「試撮」；沒有真實成交時用市場快照，連快照都沒有才用參考價並標示「參考價」；百分比一律由 `price_chg` 與參考價計算 | 盤前試撮揭示價不是成交價；串流 `pct_chg` 的單位因商品而異 |
 | §9.4 效能 | ≤ 400 KB | 首次載入 19 個 JS、347.1 KiB gzip（桌面 `index.html` 27 個、764.0 KiB） | 量測方式同 §9.4 |
+| §3.3 nginx 轉送永豐 | `/api/` 保留原始 `Host` | nginx 完成 Host 白名單、Origin＝Host、Sec-Fetch-Site 檢查後，轉給 sidecar 一律用 `Host: 127.0.0.1` 並移除 `Origin` | Shioaji sidecar 1.7.10 只接受本機 Host／Origin（否則 403），且沒有放寬的設定；玉山 `/esun/` 不變 |

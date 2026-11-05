@@ -35,6 +35,9 @@
 1. **保留 Host**：TLS 前端轉給 nginx 時必須保留原始 `Host`（例如 `trade.example.ts.net`）。
    - nginx 只接受白名單 Host，其餘直接斷線（444）。
    - `/api/`、`/esun/` 要求 `Origin` 的主機等於 `Host`，否則回 403。
+   - 永豐 sidecar 自己只接受本機 `Host`／`Origin`（否則回 403「Host is not a loopback address」）。
+     nginx 完成上述檢查後，轉給 sidecar 時一律改用 `Host: 127.0.0.1` 並移除 `Origin`
+     （`deploy/nginx.conf.template`）；玉山 bridge 則保留原始 Host 與 Origin，由它自己比對。
 2. **加入白名單**：`.env` 的 `WEB_SERVER_NAMES` 加入手機使用的主機名；compose 會同時帶入玉山 bridge 的
    `ESUN_ALLOWED_HOSTS`，否則 `/esun/` 回 421。
 3. **SSE 不可緩衝**：TLS 前端需即時 flush `text/event-stream`，讀取逾時 ≥ 120 秒（心跳 30 秒、看門狗 75 秒）。
@@ -65,8 +68,17 @@ WEB_SERVER_NAMES=trade.lan
    ```
 5. 手機開啟 `https://<機器>.<tailnet>.ts.net/mobile.html`（或 `/m`）。
 
-> ⚠️ 尚未驗證 `tailscale serve` 轉送時是否保留 ts.net 的 `Host`（規格 §16 Q1）。若 nginx 回 444（連線被關閉）或
-> `/api/` 回 403，代表 Host 沒有保留：改用方案 B，或讓 Tailscale 轉到同機的 Caddy、再由 Caddy 轉給 nginx。
+> ✅ 已實測（Tailscale 1.104，2026-11-05）：`tailscale serve` 轉送時保留 ts.net 的 `Host`（規格 §16 Q1）。
+> 部署後可在主機上驗證（只讀取，不會下單）：
+>
+> ```powershell
+> # 預期 200：Origin 與 Host 相同
+> curl.exe -s -o NUL -w "%{http_code}`n" -H "Origin: https://<機器>.<tailnet>.ts.net" https://<機器>.<tailnet>.ts.net/api/v1/info
+> # 預期 403：Origin 是別的網站
+> curl.exe -s -o NUL -w "%{http_code}`n" -H "Origin: https://evil.example" https://<機器>.<tailnet>.ts.net/api/v1/info
+> ```
+>
+> 第一行若是 `000`（nginx 以 444 斷線），代表 `WEB_SERVER_NAMES` 沒有這個主機名或容器尚未重建。
 
 撤銷存取：在 tailnet 管理介面移除或停用遺失的手機。
 
