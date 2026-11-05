@@ -27,9 +27,18 @@ globalStyle('body', {
     WebkitTouchCallout: 'none',
 });
 
-// 可輸入與明確標示可選取（className 加 selectable）的區域恢復選取與長按選單；
+/**
+ * 可選取／長按複製的全域類別（不經 vanilla-extract 雜湊）：需要讓使用者複製回報的值（網址、診斷值、UA、建置版本）
+ * 在 className 加上 SELECTABLE，下方的全域規則會恢復選取（-webkit-user-select／user-select: text）與 iOS 長按選單。
+ */
+export const SELECTABLE = 'selectable';
+
+/** 恢復選取與長按選單的選擇器（輸入欄位、contenteditable、.selectable 及其子孫） */
+export const SELECTABLE_RESTORE_SELECTOR = `input, textarea, [contenteditable]:not([contenteditable="false"]), .${SELECTABLE}, .${SELECTABLE} *`;
+
+// 可輸入與明確標示可選取（className 加 SELECTABLE）的區域恢復選取與長按選單；
 // iOS 在祖先為 -webkit-user-select: none 時輸入框可能無法定位游標，需明確設回 text
-globalStyle('input, textarea, [contenteditable]:not([contenteditable="false"]), .selectable, .selectable *', {
+globalStyle(SELECTABLE_RESTORE_SELECTOR, {
     WebkitUserSelect: 'text',
     userSelect: 'text',
     WebkitTouchCallout: 'default',
@@ -140,4 +149,26 @@ export const routeLoading = style({
     padding: '32px 16px',
     textAlign: 'center',
     color: vars.color.mutedForeground,
+});
+
+/** 延遲載入模組失敗時的提示（components/route-error-boundary.tsx） */
+export const moduleError = style({
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: vars.space.md,
+    padding: '32px 16px',
+    textAlign: 'center',
+});
+
+export const moduleErrorText = style({
+    margin: 0,
+    color: vars.color.foreground,
+});
+
+export const moduleErrorActions = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: vars.space.sm,
 });

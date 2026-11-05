@@ -52,6 +52,7 @@ vi.mock('../lib/watchlist-context', () => ({
 import { MobileApp } from '../app';
 import { isMobileSecure, readSecureContextDiagnostics } from '../lib/secure-context';
 import { startMobile } from '../start';
+import { SELECTABLE, SELECTABLE_RESTORE_SELECTOR } from '../styles/layout.css';
 import { SecureContextGate } from './secure-context-gate';
 
 const lanHttp = {
@@ -127,6 +128,23 @@ describe('SecureContextGate', () => {
         expect(out).toContain('isSecureContext');
         expect(out).toContain('http://192.168.1.20:8080');
         expect(out).toContain('iPhone OS 17_5');
+    });
+
+    // M-PLAT-6：全域 user-select: none 之下，網址與診斷值要加 .selectable 才能長按選取複製
+    it('marks the URLs and the origin／UA／build diagnostics as selectable', async () => {
+        await act(async () => { view = create(createElement(SecureContextGate, { diagnostics: readSecureContextDiagnostics(lanHttp) })); });
+        const selectable = view!.root.findAll(n => typeof n.type === 'string' && typeof n.props.className === 'string'
+            && n.props.className.split(' ').includes(SELECTABLE));
+        const texts = selectable.map(n => JSON.stringify(n.children));
+        const has = (needle: string) => texts.some(t => t.includes(needle));
+        expect(has('http://192.168.1.20:8080')).toBe(true); // 來源
+        expect(has('iPhone OS 17_5')).toBe(true); // UA
+        expect(has('ts.net/mobile.html')).toBe(true); // Tailscale 網址
+        expect(has('docs/fork/mobile.md')).toBe(true); // 文件路徑
+        expect(has('http://192.168.x.x:8080')).toBe(true);
+        expect(selectable.some(n => n.type === 'dd' && n.props.children === readSecureContextDiagnostics(lanHttp).buildVersion)).toBe(true);
+        // 全域恢復選取的規則確實涵蓋這個類別與其子孫
+        expect(SELECTABLE_RESTORE_SELECTOR.split(',').map(x => x.trim())).toEqual(expect.arrayContaining([`.${SELECTABLE}`, `.${SELECTABLE} *`]));
     });
 
     it('MobileApp outside a secure context renders only the gate: no bootstrap, no stream, no trading state', async () => {

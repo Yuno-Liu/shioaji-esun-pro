@@ -10,6 +10,9 @@
 // 解鎖：第一次 pointerdown／touchend／click 時（capture、passive）建立 context、resume，並播放 1 個 sample 的靜音 buffer
 // （舊版 iOS 需要在手勢內「開始播放」才算解鎖），不發出聲音；context 進入 running 後移除監聽。
 // 回前景時 iOS 可能把 context 改成 suspended／interrupted：播放時發現不是 running 就嘗試 resume 並重新掛上解鎖監聽。
+// context 不是 running 時不排程音效（審查 M-PLAT-5）：suspended 的 currentTime 凍結，已排程的 oscillator 會在之後
+// 某次無關的觸控解鎖時才補響，使用者會誤以為那時才成交。只有 resume 在 RESUME_GRACE_MS 內完成（例如「試聽」
+// 在同一次點擊內先解鎖再播放）才補播；逾時就直接略過這一聲。
 // 監聽只掛一次（armFillAudioUnlock 冪等）。頁面隱藏時不播。
 
 import { soundEnabled } from '../../lib/sounds';
@@ -18,6 +21,8 @@ type AudioCtor = new () => AudioContext;
 
 const UNLOCK_EVENTS = ['pointerdown', 'touchend', 'click'] as const;
 const LISTEN_OPTS: AddEventListenerOptions = { capture: true, passive: true };
+/** 播放時 context 不是 running：resume 在這段時間內完成才補播，否則略過（避免之後解鎖時補響） */
+export const RESUME_GRACE_MS = 1_000;
 
 let ctx: AudioContext | null = null;
 let armedTarget: EventTarget | null = null;
@@ -110,10 +115,20 @@ function tone(ac: AudioContext, freq: number, startAt: number, duration: number,
     osc.stop(t0 + duration + 0.05);
 }
 
+function now(): number {
+    return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
+}
+
+function playChime(ac: AudioContext): void {
+    tone(ac, 880, 0, 0.12);
+    tone(ac, 1320, 0.09, 0.18);
+}
+
 /**
  * 成交音效（與桌面 playDeal 同音色）。音效關閉、頁面隱藏或沒有 Web Audio 時不播。
- * context 尚未解鎖（iOS 未有手勢）時嘗試 resume 並重新掛上解鎖監聽；這一次可能無聲。
- * 回傳是否有排程音訊。
+ * context 不是 running（iOS 未有手勢、回前景後被暫停）時不排程：嘗試 resume 並重新掛上解鎖監聽，
+ * resume 在 RESUME_GRACE_MS 內完成才補播，否則這一聲略過（不會在之後解鎖時補響）。
+ * 回傳是否已立即排程音訊（非 running 時回傳 false）。
  */
 export function playFillSound(): boolean {
     if (!soundEnabled() || pageHidden()) return false;
@@ -121,11 +136,20 @@ export function playFillSound(): boolean {
     if (!ac) return false;
     try {
         if (ac.state !== 'running') {
-            void ac.resume().catch(() => undefined);
+            const requestedAt = now();
+            void ac.resume().then(() => {
+                if (!isRunning(ac) || pageHidden() || !soundEnabled()) return;
+                if (now() - requestedAt > RESUME_GRACE_MS) return;
+                try {
+                    playChime(ac);
+                } catch {
+                    // 補播失敗：略過這一聲
+                }
+            }, () => undefined);
             armFillAudioUnlock();
+            return false;
         }
-        tone(ac, 880, 0, 0.12);
-        tone(ac, 1320, 0.09, 0.18);
+        playChime(ac);
         return true;
     } catch {
         return false;

@@ -1,4 +1,4 @@
-// 手勢防護：頁面雙指縮放與 iOS gesture 事件被擋；圖表（data-allow-pinch）內與單指操作不受影響
+// 手勢防護：iOS gesture 事件一律擋（頁面永遠不縮放）；雙指 touchmove 在圖表（data-allow-pinch）內放行；單指操作不受影響
 import { describe, expect, it, vi } from 'vitest';
 import { ALLOW_PINCH_SELECTOR, GESTURE_EVENTS, installGestureGuard, isInPinchAllowedArea } from './gesture-guard';
 
@@ -59,15 +59,37 @@ describe('installGestureGuard', () => {
         }
     });
 
-    it('允許區域（圖表）：gesture 事件與雙指 touchmove 都不擋', () => {
+    // M-PLAT-2：data-allow-pinch 掛在整個圖表 frame 上，價格軸／時間軸／委託線標籤沒有自己的 pinch 處理；
+    // iOS 頁面縮放由 gesture* 驅動，所以 gesture 事件在圖表區內也必須擋，頁面才永遠不縮放。
+    // lightweight-charts 的雙指縮放只用 touch 事件，不受影響。
+    it('允許區域（圖表）內 gesturestart／gesturechange／gestureend 仍然擋下（頁面永遠不縮放）', () => {
         const t = fakeTarget();
         installGestureGuard(t);
-        const g = event(element(true));
-        t.fire('gesturestart', g);
-        expect(g.preventDefault).not.toHaveBeenCalled();
+        for (const type of GESTURE_EVENTS) {
+            const g = event(element(true));
+            t.fire(type, g);
+            expect(g.preventDefault).toHaveBeenCalledTimes(1);
+        }
+        // 文字節點（例如委託線標籤文字）在圖表區內也一樣
+        const text = event({ parentElement: element(true) });
+        t.fire('gesturestart', text);
+        expect(text.preventDefault).toHaveBeenCalledTimes(1);
+    });
+
+    it('允許區域（圖表）：雙指 touchmove 不擋，交給圖表自己的雙指縮放', () => {
+        const t = fakeTarget();
+        installGestureGuard(t);
         const pinch = event(element(true), { touches: [{}, {}] });
         t.fire('touchmove', pinch);
         expect(pinch.preventDefault).not.toHaveBeenCalled();
+    });
+
+    it('不可取消的 gesture 事件不呼叫 preventDefault', () => {
+        const t = fakeTarget();
+        installGestureGuard(t);
+        const g = event(element(true), { cancelable: false });
+        t.fire('gesturechange', g);
+        expect(g.preventDefault).not.toHaveBeenCalled();
     });
 
     it('非允許區域：兩指以上 touchmove 被擋；單指不擋（捲動、輸入框不受影響）', () => {

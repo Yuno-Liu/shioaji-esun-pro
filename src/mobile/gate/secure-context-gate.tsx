@@ -6,6 +6,11 @@
 import { useMemo } from 'react';
 import { isMobileSecure, readSecureContextDiagnostics, type SecureContextDiagnostics } from '../lib/secure-context';
 import * as styles from '../styles/gate.css';
+import { SELECTABLE } from '../styles/layout.css';
+
+// 網址與診斷值要能長按選取、複製回報（全域 user-select: none 的例外，styles/layout.css.ts）
+const valueClass = `${styles.value} ${SELECTABLE}`;
+const codeClass = `${styles.code} ${SELECTABLE}`;
 
 function Flag({ ok, yes = '可用', no = '不可用' }: { ok: boolean; yes?: string; no?: string }) {
     return <span className={ok ? styles.flag.ok : styles.flag.bad}>{ok ? yes : no}</span>;
@@ -23,11 +28,11 @@ export function SecureContextDiagnosticsList({ diagnostics }: { diagnostics: Sec
             <dt className={styles.term}>BroadcastChannel</dt>
             <dd className={styles.value}><Flag ok={d.broadcastChannel} /></dd>
             <dt className={styles.term}>來源</dt>
-            <dd className={styles.value}>{d.origin || '—'}</dd>
+            <dd className={valueClass}>{d.origin || '—'}</dd>
             <dt className={styles.term}>User Agent</dt>
-            <dd className={styles.value}>{d.userAgent || '—'}</dd>
+            <dd className={valueClass}>{d.userAgent || '—'}</dd>
             <dt className={styles.term}>建置版本</dt>
-            <dd className={styles.value}>{d.buildVersion}</dd>
+            <dd className={valueClass}>{d.buildVersion}</dd>
         </dl>
     );
 }
@@ -54,10 +59,10 @@ export function SecureContextGate({ diagnostics }: { diagnostics?: SecureContext
             <section className={styles.section}>
                 <h2 className={styles.heading}>怎麼改用 HTTPS</h2>
                 <ul className={styles.list}>
-                    <li>建議：主機與手機加入同一個 Tailscale tailnet，以 <span className={styles.code}>https://&lt;機器&gt;.&lt;tailnet&gt;.ts.net/mobile.html</span> 開啟。</li>
-                    <li>或在主機上以 Caddy（<span className={styles.code}>tls internal</span>）提供 HTTPS，手機安裝並信任 Caddy 根憑證。</li>
-                    <li>區網 HTTP（例如 <span className={styles.code}>http://192.168.x.x:8080</span>）只能開啟頁面，無法下單。</li>
-                    <li>設定步驟請參考專案文件 <span className={styles.code}>docs/fork/mobile.md</span>。</li>
+                    <li>建議：主機與手機加入同一個 Tailscale tailnet，以 <span className={codeClass}>https://&lt;機器&gt;.&lt;tailnet&gt;.ts.net/mobile.html</span> 開啟。</li>
+                    <li>或在主機上以 Caddy（<span className={codeClass}>tls internal</span>）提供 HTTPS，手機安裝並信任 Caddy 根憑證。</li>
+                    <li>區網 HTTP（例如 <span className={codeClass}>http://192.168.x.x:8080</span>）只能開啟頁面，無法下單。</li>
+                    <li>設定步驟請參考專案文件 <span className={codeClass}>docs/fork/mobile.md</span>。</li>
                 </ul>
             </section>
             <section className={styles.section}>

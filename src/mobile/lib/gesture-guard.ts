@@ -5,8 +5,11 @@
 // - 監聽器以 { passive: false, capture: true } 掛在 document：必須非 passive 才能 preventDefault；
 //   capture 讓子元素 stopPropagation 也擋得到。preventDefault 不會阻止事件送到元件自己的監聽器。
 // - 單指 touchmove 一律不處理：不影響捲動、滑動確認、下拉面板與輸入框。
-// - 目標在 [data-allow-pinch="true"] 之內（例如 K 線圖容器）時完全不處理，元件自己的雙指縮放照常運作；
-//   該區域的頁面縮放由元件自己的 touch-action 控制。
+// - gesturestart／gesturechange／gestureend 不論目標在哪裡一律 preventDefault（頁面永遠不縮放）：
+//   iOS 的頁面縮放由這三個事件驅動；lightweight-charts 的圖表雙指縮放只用 touchstart／touchmove，不受影響。
+//   早期版本對 [data-allow-pinch] 內的 gesture 事件放行，但該屬性掛在整個圖表 frame 上，
+//   價格軸／時間軸／委託線標籤／選價列都沒有自己的 pinch 處理，兩指放在這些位置會縮放整頁（審查 M-PLAT-2）。
+// - [data-allow-pinch="true"] 只用來放行該區域內的兩指 touchmove，讓圖表 pane 自己的雙指縮放照常收到事件。
 // - 不可取消的事件（cancelable=false，例如捲動中的 touchmove）不呼叫 preventDefault，避免瀏覽器警告。
 // 雙擊放大由全域 CSS touch-action: manipulation 處理（styles/layout.css.ts）。
 
@@ -32,18 +35,16 @@ export function isInPinchAllowedArea(target: EventTarget | null): boolean {
     return node.closest(ALLOW_PINCH_SELECTOR) != null;
 }
 
-function block(e: Event): void {
-    if (e.cancelable && !isInPinchAllowedArea(e.target)) e.preventDefault();
-}
-
+/** iOS gesture 事件：一律擋（不看 data-allow-pinch） */
 function onGesture(e: Event): void {
-    block(e);
+    if (e.cancelable) e.preventDefault();
 }
 
+/** 兩指以上 touchmove：圖表區（data-allow-pinch）內放行給圖表自己的雙指縮放，其餘擋下 */
 function onTouchMove(e: Event): void {
     const touches = (e as TouchEvent).touches;
     if (!touches || touches.length < 2) return;
-    block(e);
+    if (e.cancelable && !isInPinchAllowedArea(e.target)) e.preventDefault();
 }
 
 type GuardTarget = EventTarget & { [INSTALLED]?: () => void };

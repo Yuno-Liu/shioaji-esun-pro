@@ -5,13 +5,14 @@
 //   根層掛載 toast host、下單／委託操作／確認面板 host、風控損益餵送、ResumeGate、
 //   成交音效／震動（useFillSound）與螢幕常亮（useWakeLock，依帳戶頁「本裝置」設定）。
 
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { Briefcase, ChartCandlestick, ClipboardList, Star, UserRound, type LucideIcon } from 'lucide-react';
 import { useTradingState } from '../lib/trading-state';
 import { ensureStream } from '../lib/stream';
 import type { Trade } from '../lib/types/order';
 import { remainingWorkingOrderQuantity } from '../lib/working-order-quantity';
 import { OrderConfirmSheet } from './components/order-confirm-sheet';
+import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from './components/route-error-boundary';
 import { StatusBar } from './components/status-bar';
 import { ToastHost } from './components/toast-host';
 import { SecureContextGate } from './gate/secure-context-gate';
@@ -19,7 +20,7 @@ import { useFillSound } from './hooks/use-fill-sound';
 import { useRiskPnlFeed } from './hooks/use-risk-pnl-feed';
 import { useWakeLock } from './hooks/use-wake-lock';
 import { formatRoute, isCanonicalHash, navigate, parseHash, useHashRoute, type MobileRoute, type MobileTab } from './lib/hash-router';
-import { setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
+import { closeOrderAction, closeTicket, setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
 import { startResumeGate } from './lib/resume-gate-runtime';
 import type { SecureContextDiagnostics } from './lib/secure-context';
 import { WatchlistProvider } from './lib/watchlist-context';
@@ -35,16 +36,25 @@ const loadAccountPage = () => import('./routes/account-page');
 const loadTicketSheet = () => import('./components/order-ticket-sheet');
 const loadActionSheet = () => import('./components/order-action-sheet');
 
-const TradePage = lazy(() => loadTradePage().then(m => ({ default: m.TradePage })));
-const OrdersPage = lazy(() => loadOrdersPage().then(m => ({ default: m.OrdersPage })));
-const PositionsPage = lazy(() => loadPositionsPage().then(m => ({ default: m.PositionsPage })));
-const AccountPage = lazy(() => loadAccountPage().then(m => ({ default: m.AccountPage })));
-const OrderTicketSheet = lazy(() => loadTicketSheet().then(m => ({ default: m.OrderTicketSheet })));
-const OrderActionSheet = lazy(() => loadActionSheet().then(m => ({ default: m.OrderActionSheet })));
+// retryableLazy：載入失敗後按［重試］會換一個新的 lazy 重新 import（React.lazy 會永久快取失敗的 promise）
+const TradePage = retryableLazy(() => loadTradePage().then(m => m.TradePage), 'TradePage');
+const OrdersPage = retryableLazy(() => loadOrdersPage().then(m => m.OrdersPage), 'OrdersPage');
+const PositionsPage = retryableLazy(() => loadPositionsPage().then(m => m.PositionsPage), 'PositionsPage');
+const AccountPage = retryableLazy(() => loadAccountPage().then(m => m.AccountPage), 'AccountPage');
+const OrderTicketSheet = retryableLazy(() => loadTicketSheet().then(m => m.OrderTicketSheet), 'OrderTicketSheet');
+const OrderActionSheet = retryableLazy(() => loadActionSheet().then(m => m.OrderActionSheet), 'OrderActionSheet');
+
+const ROUTE_MODULES = [TradePage, OrdersPage, PositionsPage, AccountPage];
+const resetRouteModules = () => { for (const page of ROUTE_MODULES) page.reset(); };
+const resetTicketSheet = () => { OrderTicketSheet.reset(); };
+const resetActionSheet = () => { OrderActionSheet.reset(); };
 
 const PREFETCH_DELAY_MS = 1_500;
 
-/** 首屏完成後閒置時預先抓取其餘模組（失敗無妨：真正用到時會再載一次） */
+/**
+ * 首屏完成後閒置時預先抓取其餘模組。失敗只吞掉、不重試：預先抓取不經過 lazy 元件，不會讓它們記住失敗；
+ * 真正用到時 lazy 會自己 import，若仍失敗由 ModuleErrorBoundary 顯示「載入失敗」與［重試］（不會卸載整個 App）。
+ */
 function usePrefetchDeferredModules(): void {
     useEffect(() => {
         const run = () => {
@@ -163,16 +173,36 @@ export function MobileShell() {
             <div className={layout.shell} data-testid='mobile-shell'>
                 <StatusBar />
                 <main className={layout.main}>
-                    <Suspense fallback={<RouteFallback />}>
-                        <RoutePage route={route} />
-                    </Suspense>
+                    {/* 錯誤邊界只包延遲載入的區塊：狀態列、分頁列、toast、確認面板在邊界之外，模組載入失敗也不會被卸載 */}
+                    <ModuleErrorBoundary
+                        resetKey={route.name}
+                        onRetry={resetRouteModules}
+                        fallback={props => <ModuleLoadError {...props} testId='route-load-error' />}
+                    >
+                        <Suspense fallback={<RouteFallback />}>
+                            <RoutePage route={route} />
+                        </Suspense>
+                    </ModuleErrorBoundary>
                 </main>
                 <TabBar active={route.name} currentCode={ui.currentCode} />
                 <ToastHost />
-                <Suspense fallback={null}>
-                    {ticketMounted && <OrderTicketSheet />}
-                    {actionMounted && <OrderActionSheet />}
-                </Suspense>
+                {/* 下單與委託操作面板各自一個邊界：一邊載入失敗不連帶另一邊 */}
+                <ModuleErrorBoundary
+                    onRetry={resetTicketSheet}
+                    fallback={props => <SheetLoadError {...props} open={ui.ticket !== null} onClose={closeTicket} testId='ticket-load-error' />}
+                >
+                    <Suspense fallback={null}>
+                        {ticketMounted && <OrderTicketSheet />}
+                    </Suspense>
+                </ModuleErrorBoundary>
+                <ModuleErrorBoundary
+                    onRetry={resetActionSheet}
+                    fallback={props => <SheetLoadError {...props} open={ui.orderAction !== null} onClose={closeOrderAction} testId='action-load-error' />}
+                >
+                    <Suspense fallback={null}>
+                        {actionMounted && <OrderActionSheet />}
+                    </Suspense>
+                </ModuleErrorBoundary>
                 <OrderConfirmSheet />
             </div>
         </WatchlistProvider>

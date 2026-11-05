@@ -37,7 +37,7 @@ function makeAudioContext() {
     };
 }
 
-import { armFillAudioUnlock, playFillSound, resetFillAudioForTest, unlockFillAudio } from './fill-audio';
+import { armFillAudioUnlock, playFillSound, RESUME_GRACE_MS, resetFillAudioForTest, unlockFillAudio } from './fill-audio';
 
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
@@ -109,8 +109,9 @@ describe('gesture unlock', () => {
 });
 
 describe('playFillSound', () => {
-    it('plays the desktop playDeal timbre: 880 Hz then 1320 Hz sine', () => {
+    it('plays the desktop playDeal timbre: 880 Hz then 1320 Hz sine', async () => {
         unlockFillAudio();
+        await flush();
         expect(playFillSound()).toBe(true);
         expect(m.contexts[0]!.oscillators).toEqual([{ type: 'sine', freq: 880 }, { type: 'sine', freq: 1320 }]);
     });
@@ -130,9 +131,53 @@ describe('playFillSound', () => {
     it('re-arms the unlock listeners when the context is not running (iOS after background)', () => {
         const win = spyTarget();
         vi.stubGlobal('window', win.target);
-        expect(playFillSound()).toBe(true);
+        // M-PLAT-5：非 running 時不立即排程，回傳 false
+        expect(playFillSound()).toBe(false);
         expect(m.contexts[0]!.resumeCalls).toBe(1);
         expect(win.add.mock.calls.map(c => c[0]).sort()).toEqual(['click', 'pointerdown', 'touchend']);
+    });
+
+    // M-PLAT-5：suspended 的 context 上排程的音效會在之後無關的觸控解鎖時補響，誤導使用者「剛剛成交」
+    it('does not schedule tones on a suspended context; a much later unlock does not replay the fill', async () => {
+        const Base = makeAudioContext();
+        // 手勢外 resume 不會成功（iOS）
+        vi.stubGlobal('AudioContext', class extends Base { resumeResult = 'suspended' as const; });
+        const win = spyTarget();
+        vi.stubGlobal('window', win.target);
+        let clock = 0;
+        vi.stubGlobal('performance', { now: () => clock });
+        expect(playFillSound()).toBe(false);
+        expect(playFillSound()).toBe(false);
+        await flush();
+        const ac = m.contexts[0]!;
+        expect(ac.oscillators).toHaveLength(0);
+        // 幾分鐘後使用者觸控畫面 → 解鎖成功，但不應補響先前的成交音
+        clock = 5 * 60_000;
+        ac.resumeResult = 'running';
+        win.target.dispatchEvent(new Event('touchend'));
+        await flush();
+        expect(ac.state).toBe('running');
+        expect(ac.oscillators).toHaveLength(0);
+    });
+
+    it('plays once resume completes within the grace window (preview: unlock then play in the same click)', async () => {
+        let clock = 0;
+        vi.stubGlobal('performance', { now: () => clock });
+        unlockFillAudio();
+        expect(playFillSound()).toBe(false);
+        clock = RESUME_GRACE_MS - 1;
+        await flush();
+        expect(m.contexts[0]!.oscillators).toEqual([{ type: 'sine', freq: 880 }, { type: 'sine', freq: 1320 }]);
+    });
+
+    it('skips the tone when resume completes after the grace window', async () => {
+        let clock = 0;
+        vi.stubGlobal('performance', { now: () => clock });
+        expect(playFillSound()).toBe(false);
+        clock = RESUME_GRACE_MS + 1;
+        await flush();
+        expect(m.contexts[0]!.state).toBe('running');
+        expect(m.contexts[0]!.oscillators).toHaveLength(0);
     });
 
     it('returns false without Web Audio', () => {
