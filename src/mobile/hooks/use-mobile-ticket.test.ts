@@ -1,5 +1,8 @@
-// 下單面板純函式（規格 §6.3、§7.1、§7.2）：即時驗證的 1～7 順序、預估金額、送單輸入、結果分類
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+// 下單面板純函式（規格 §6.3、§7.1、§7.2）：即時驗證的 1～7 順序、預估金額、送單輸入、結果分類；
+// 面板退場凍結期間的「未送出」改走通知（設計規格 §7.4 第 13 點、§10 S4）
+import { createElement, type ReactNode } from 'react';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Account } from '../../lib/types/portfolio';
 
@@ -7,11 +10,15 @@ const m = vi.hoisted(() => ({
     risk: vi.fn((): string | null => null),
     esunLeg: vi.fn((): string | null => null),
     esunBrokers: new Set<string>(),
+    // 只有 hook 渲染案例會設定；預設與純函式測試原本的 mock 相同（undefined／{}／null）
+    captured: undefined as unknown,
+    accounts: {} as Record<string, unknown>,
+    route: null as unknown,
 }));
 vi.mock('../../hooks/use-stream', () => ({ useQuote: () => undefined, useTradingLive: () => true }));
 vi.mock('../../hooks/use-display-book', () => ({ useSnapshotBaseline: () => ({ snapshot: undefined }) }));
-vi.mock('../../lib/account-store', () => ({ useAccounts: () => ({}) }));
-vi.mock('../../lib/order-account', () => ({ captureSelectedAccount: () => undefined }));
+vi.mock('../../lib/account-store', () => ({ useAccounts: () => m.accounts }));
+vi.mock('../../lib/order-account', () => ({ captureSelectedAccount: () => m.captured }));
 vi.mock('../../lib/account-tradable', () => ({ canTrade: (a: Account | null | undefined) => !!a && a.signed }));
 vi.mock('../../lib/esun', () => ({ isEsunAccount: (a?: { broker_id: string } | null) => !!a && m.esunBrokers.has(a.broker_id) }));
 vi.mock('../../lib/order-route', () => ({ esunStockLegProblem: m.esunLeg }));
@@ -25,10 +32,13 @@ vi.mock('../../lib/trade', () => {
 vi.mock('../../lib/order-outcome', () => ({ reconcileAfterUnknownOutcome: vi.fn() }));
 vi.mock('../../lib/tick-bands', () => ({ bandTickFor: () => undefined, prefetchTickBands: () => undefined }));
 vi.mock('../lib/mobile-order', () => ({ submitMobileOrder: vi.fn() }));
-vi.mock('../components/route-badge', () => ({ useOrderRoute: () => null }));
+vi.mock('../components/route-badge', () => ({ useOrderRoute: () => m.route }));
 
 import { CREDIT_TEXT, ODD_LOT_TEXT } from '../../lib/odd-lot';
-import { OrderConfirmCancelled } from '../../lib/trade';
+import { notify, OrderConfirmCancelled } from '../../lib/trade';
+import { submitMobileOrder } from '../lib/mobile-order';
+import type { TicketRequest } from '../lib/mobile-store';
+import { SheetPresenceContext, type SheetPresence } from '../ui/sheet-context';
 import { notStarted } from '../lib/errors';
 import {
     buildMobileOrderInput,
@@ -44,6 +54,7 @@ import {
     estimateAmount,
     initialTicketFields,
     isOnTick,
+    NOT_SENT_TITLE,
     marketPrice,
     parsePrice,
     previewLabel,
@@ -54,6 +65,7 @@ import {
     TICKET_TEXT,
     ticketActionText,
     ticketProblem,
+    useMobileTicket,
     withinLimits,
     type TicketCheck,
     type TicketFields,
@@ -361,5 +373,69 @@ describe('信用交易與盤後零股（Phase 2，比照桌面 order-ticket.tsx�
         const input = buildMobileOrderInput(stock, stockAccount, { ...fields(), action: 'Buy' }, '現股買進不會回補融券');
         expect(input).toMatchObject({ isFutures: false, creditHint: '現股買進不會回補融券' });
         expect('creditHint' in buildMobileOrderInput(stock, stockAccount, { ...fields(), action: 'Buy' }, null)).toBe(false);
+    });
+});
+
+describe('面板退場凍結（設計規格 §7.4 第 13 點、§10 S4）', () => {
+    type Ticket = ReturnType<typeof useMobileTicket>;
+    let view: ReactTestRenderer | undefined;
+    let t: Ticket | undefined;
+    const ticket: TicketRequest = { code: '2330', action: 'Buy', price: 100, source: 'button', seq: 1 };
+    const Probe = () => { t = useMobileTicket(ticket, stock); return null; };
+    const presence = (exiting: boolean): SheetPresence => ({
+        phase: exiting ? 'exiting' : 'open', settled: !exiting, shownAt: 0, isExiting: () => exiting,
+    });
+    async function mount(exiting: boolean, wrap = true) {
+        const probe = createElement(Probe);
+        const el: ReactNode = wrap ? createElement(SheetPresenceContext.Provider, { value: presence(exiting) }, probe) : probe;
+        await act(async () => { view = create(el as Parameters<typeof create>[0]); });
+    }
+
+    beforeEach(() => {
+        vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+        m.captured = stockAccount;
+        m.accounts = { selectedStock: stockAccount, selectedFutures: undefined };
+        m.route = { esun: false, broker: '永豐', simulation: true };
+        vi.mocked(submitMobileOrder).mockRejectedValue(notStarted('風控鎖單中'));
+    });
+    afterEach(async () => {
+        await act(async () => view?.unmount());
+        view = undefined;
+        t = undefined;
+        m.captured = undefined;
+        m.accounts = {};
+        m.route = null;
+        vi.unstubAllGlobals();
+    });
+
+    it('退場中遇到「未送出」→ 以通知告知，不寫進即將消失的面板', async () => {
+        await mount(true);
+        expect(t!.problem).toBeNull();
+        await act(async () => { await t!.submit(); });
+        expect(submitMobileOrder).toHaveBeenCalledOnce();
+        expect(notify).toHaveBeenCalledWith({ kind: 'err', title: NOT_SENT_TITLE, body: '風控鎖單中' });
+        expect(t!.feedback).toBeNull();
+    });
+
+    it('面板開啟中遇到「未送出」→ 顯示在面板上（行為不變）', async () => {
+        await mount(false);
+        await act(async () => { await t!.submit(); });
+        expect(t!.feedback).toEqual({ kind: 'not-sent', text: '未送出：風控鎖單中' });
+        expect(notify).not.toHaveBeenCalled();
+    });
+
+    it('不在面板內（預設 presence）時行為不變', async () => {
+        await mount(false, false);
+        await act(async () => { await t!.submit(); });
+        expect(t!.feedback).toEqual({ kind: 'not-sent', text: '未送出：風控鎖單中' });
+        expect(notify).not.toHaveBeenCalled();
+    });
+
+    it('退場中遇到「已取消」→ 不寫回饋', async () => {
+        vi.mocked(submitMobileOrder).mockRejectedValue(new OrderConfirmCancelled());
+        await mount(true);
+        await act(async () => { await t!.submit(); });
+        expect(t!.feedback).toBeNull();
+        expect(notify).not.toHaveBeenCalled();
     });
 });

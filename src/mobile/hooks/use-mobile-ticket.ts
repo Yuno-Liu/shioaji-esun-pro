@@ -16,7 +16,7 @@
 //   切換買賣不改信用條件；openTicket 帶入的 lot／cond／daytradeShort 只在開啟時帶入一次，不合規則時保留並顯示原因。
 //   驗證用「使用者的意圖」（含現股與勾選的當沖）；實際送出只在非現股時送 order_cond、只在可送時送 daytrade_short。
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { useSnapshotBaseline } from '../../hooks/use-display-book';
 import { useOrderContext } from '../../hooks/use-order-context';
 import { useQuote, useTradingLive } from '../../hooks/use-stream';
@@ -44,6 +44,7 @@ import { submitMobileOrder } from '../lib/mobile-order';
 import type { MobileOrderInput } from '../lib/mobile-order-types';
 import { closeTicket, getMobileUi, type TicketCond, type TicketLot, type TicketRequest } from '../lib/mobile-store';
 import { acknowledgeStaleData, assertResumeReady, getResumeGate, retryResume, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
+import { SheetPresenceContext } from '../ui/sheet-context';
 import { useResumeGate } from './use-resume-gate';
 
 // 單位與信用條件的型別只有一份（lib/mobile-store.ts），這裡轉出方便元件取用
@@ -550,6 +551,11 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         mounted.current = true;
         return () => { mounted.current = false; };
     }, []);
+    // 面板退場凍結期間 TicketForm 仍掛載：視同卸載（「未送出」改走通知，不寫進即將消失的面板；設計規格 §7.4 第 13 點）
+    const presence = useContext(SheetPresenceContext);
+    const presenceRef = useRef(presence);
+    presenceRef.current = presence;
+    const alive = () => mounted.current && !presenceRef.current.isExiting();
     // 單位、信用條件、當沖、方向任一改變 → 確認中的舊流程在 beforeDispatch 失效
     const captureContext = useOrderContext(contract, `${fields.orderLot}:${fields.orderCond}:${fields.daytradeShort ? 'dt' : ''}:${fields.action ?? ''}`);
 
@@ -671,10 +677,10 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         } catch (err) {
             const outcome = classifyTicketOutcome(err);
             if (outcome === 'cancelled') {
-                if (mounted.current) setFeedback({ kind: 'cancelled', text: '已取消' });
+                if (alive()) setFeedback({ kind: 'cancelled', text: '已取消' });
             } else if (outcome === 'not-sent') {
-                // 面板在送出中被卸載（例如被關閉）：改用通知告知，不可靜默丟棄「未送出」
-                if (mounted.current) setFeedback({ kind: 'not-sent', text: `未送出：${errorText(err)}` });
+                // 面板在送出中被卸載或正在退場（例如被關閉）：改用通知告知，不可靜默丟棄「未送出」
+                if (alive()) setFeedback({ kind: 'not-sent', text: `未送出：${errorText(err)}` });
                 else notify({ kind: 'err', title: NOT_SENT_TITLE, body: errorText(err) });
             } else {
                 // 結果未知：禁止重送，關閉面板並提示到委託頁核對（R6、§7.2）
