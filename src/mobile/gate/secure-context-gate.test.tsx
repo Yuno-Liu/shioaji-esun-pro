@@ -27,6 +27,14 @@ vi.mock('../components/toast-host', () => ({ ToastHost: () => null }));
 vi.mock('../components/order-confirm-sheet', () => ({ OrderConfirmSheet: () => null }));
 vi.mock('../components/order-ticket-sheet', () => ({ OrderTicketSheet: () => null }));
 vi.mock('../components/order-action-sheet', () => ({ OrderActionSheet: () => null }));
+// 各分頁與根層 hook 也各自讀 src/lib（串流狀態、持倉、ResumeGate）：一併隔離，殼層測試只看掛載與否
+vi.mock('../routes/watchlist-page', () => ({ WatchlistPage: () => null }));
+vi.mock('../routes/trade-page', () => ({ TradePage: () => null }));
+vi.mock('../routes/orders-page', () => ({ OrdersPage: () => null }));
+vi.mock('../routes/positions-page', () => ({ PositionsPage: () => null }));
+vi.mock('../routes/account-page', () => ({ AccountPage: () => null }));
+vi.mock('../hooks/use-risk-pnl-feed', () => ({ useRiskPnlFeed: () => undefined }));
+vi.mock('../lib/resume-gate-runtime', () => ({ startResumeGate: () => () => undefined }));
 
 import { MobileApp } from '../app';
 import { isMobileSecure, readSecureContextDiagnostics } from '../lib/secure-context';
