@@ -1,4 +1,4 @@
-// src/mobile/components/ranking-list.tsx — 漲跌幅排行（規格 §2.2、§8.1、§13 Phase 3）
+// src/mobile/components/ranking-list.tsx — 漲跌幅排行（規格 §2.2、§8.1、§13 Phase 3；設計規格 §7.2）
 //
 // - 資料：fetchScanner(type, RANKING_COUNT, ascending)（POST /api/v1/data/scanner，src/lib/shioaji.ts）。
 //   伺服器的 ascending 旗標相反（sinotrade/shioaji#207，桌面 scanner-panel.tsx 同樣處理）：true＝由大到小。
@@ -8,16 +8,23 @@
 // - 只在自選頁的「排行」分段掛載本元件時才讀取；頁面在背景（document.hidden）時不讀，回前景時若快取過期才讀。
 // - 每種排行有模組層快取 RANKING_CACHE_MS（30 秒）：切換種類、切換分頁再回來都先用快取；
 //   任何讀取（含自動、手動、錯誤後重試）距上次讀取未滿 RANKING_COOLDOWN_MS（15 秒）都不發出。
-// - 列：名次、名稱代碼、成交價、漲跌（▲▼＋顏色）、漲跌%、成交量（張）；點一列 → 交易頁；「＋」加入自選。
-// - 排行是快照資料（不訂閱即時行情），以「更新於」標示時間。
+// - 列：名次、名稱代碼（＋量）、成交價＋漲跌（▲▼＋顏色）、漲跌%膠囊；點一列 → 交易頁；「＋」加入自選。
+// - 排行是快照資料（不訂閱即時行情、不讀 K 線），以「更新於」標示時間；不顯示走勢圖。
+// - 版面（設計規格 §7.2）：種類用 Segmented scroll 變體（tablist 語意不變）；載入 Skeleton、空 EmptyState、錯誤 InlineNote。
 
-import { Check, Plus } from 'lucide-react';
+import { Check, Plus, TrendingUp } from 'lucide-react';
 import { useCallback, useEffect, useReducer, useState, useSyncExternalStore } from 'react';
 import { fetchScanner } from '../../lib/shioaji';
 import type { ScannerItem, ScannerType } from '../../lib/types/market';
 import { fmtCompactInt, fmtPct, fmtPrice } from '../../lib/utils/format';
-import * as controls from '../styles/controls.css';
+import { fill, focusRing, pressable, pressableRow } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
+import { expandHit } from '../ui/chip.css';
+import { EmptyState } from '../ui/empty-state';
+import { IconButton } from '../ui/icon-button';
+import { InlineNote } from '../ui/inline-note';
+import { Segmented } from '../ui/segmented';
+import { Skeleton } from '../ui/skeleton';
 
 export type RankingKind = 'gainers' | 'losers' | 'volume' | 'amount' | 'range';
 
@@ -276,65 +283,62 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
 
     return (
         <div data-testid='ranking'>
-            <div className={styles.rankKinds} role='tablist' aria-label='排行種類'>
-                {RANKING_DEFS.map(d => (
+            <div className={styles.rankControls}>
+                <Segmented<RankingKind>
+                    items={RANKING_DEFS.map(d => ({ value: d.kind, label: d.label, testId: `ranking-kind-${d.kind}` }))}
+                    value={kind}
+                    onChange={setKind}
+                    semantics='tabs'
+                    variant='scroll'
+                    ariaLabel='排行種類'
+                />
+
+                <div className={styles.rankMeta}>
+                    <span className={styles.rankMetaText} role='status' data-testid='ranking-updated'>
+                        {state.loading
+                            ? `${def.label}排行讀取中…`
+                            : state.fetchedAt !== null
+                                ? `${def.label}前 ${RANKING_COUNT} 名・更新於 ${fmtTime(state.fetchedAt)}`
+                                : ''}
+                    </span>
                     <button
-                        key={d.kind}
                         type='button'
-                        role='tab'
-                        aria-selected={kind === d.kind}
-                        className={kind === d.kind ? styles.rankKind.on : styles.rankKind.off}
-                        onClick={() => setKind(d.kind)}
-                        data-testid={`ranking-kind-${d.kind}`}
+                        className={`${styles.rankRefresh} ${expandHit} ${pressable} ${focusRing}`}
+                        disabled={state.loading || cooling}
+                        aria-label={cooling ? `更新排行（${secs} 秒後可再按）` : '更新排行'}
+                        onClick={() => requestRanking(kind, { force: true })}
+                        data-testid='ranking-refresh'
                     >
-                        {d.label}
+                        {cooling ? `⟳ 更新（${secs}）` : '⟳ 更新'}
                     </button>
-                ))}
-            </div>
-
-            <div className={styles.rankMeta}>
-                <span className={styles.rankMetaText} role='status' data-testid='ranking-updated'>
-                    {state.loading
-                        ? `${def.label}排行讀取中…`
-                        : state.fetchedAt !== null
-                            ? `${def.label}前 ${RANKING_COUNT} 名・更新於 ${fmtTime(state.fetchedAt)}`
-                            : ''}
-                </span>
-                <button
-                    type='button'
-                    className={controls.button.neutral}
-                    disabled={state.loading || cooling}
-                    aria-label={cooling ? `更新排行（${secs} 秒後可再按）` : '更新排行'}
-                    onClick={() => requestRanking(kind, { force: true })}
-                    data-testid='ranking-refresh'
-                >
-                    {cooling ? `⟳ 更新（${secs}）` : '⟳ 更新'}
-                </button>
-            </div>
-
-            {state.error && (
-                <div role='alert' data-testid='ranking-error'>
-                    <p className={styles.error}>排行讀取失敗：{state.error}</p>
-                    {!items && (
-                        <div className={styles.stateActions}>
-                            <button
-                                type='button'
-                                className={controls.button.neutral}
-                                disabled={state.loading || cooling}
-                                onClick={() => requestRanking(kind, { force: true })}
-                                data-testid='ranking-retry'
-                            >
-                                {cooling ? `重試（${secs}）` : '重試'}
-                            </button>
-                        </div>
-                    )}
                 </div>
-            )}
-            {addError && <p className={styles.error} role='alert' data-testid='ranking-add-error'>{addError}</p>}
 
-            {!items && state.loading && <p className={styles.state}>排行讀取中…</p>}
+                {state.error && (
+                    <InlineNote
+                        tone='danger'
+                        role='alert'
+                        testId='ranking-error'
+                        action={items ? undefined : {
+                            label: cooling ? `重試（${secs}）` : '重試',
+                            onClick: () => requestRanking(kind, { force: true }),
+                            disabled: state.loading || cooling,
+                            testId: 'ranking-retry',
+                        }}
+                    >
+                        排行讀取失敗：{state.error}
+                    </InlineNote>
+                )}
+                {addError && <InlineNote tone='danger' role='alert' testId='ranking-add-error'>{addError}</InlineNote>}
+            </div>
+
+            {!items && state.loading && <Skeleton label='排行讀取中…' rows={6} testId='ranking-loading' />}
             {items && items.length === 0 && (
-                <p className={styles.state} data-testid='ranking-empty'>目前沒有排行資料（非交易時段或模擬環境可能沒有資料）。</p>
+                <EmptyState
+                    icon={TrendingUp}
+                    title='目前沒有排行資料'
+                    description='非交易時段或模擬環境可能沒有資料。'
+                    testId='ranking-empty'
+                />
             )}
 
             {items && items.length > 0 && (
@@ -389,11 +393,14 @@ function RankingRow({ rank, kind, item, watched, canAdd, adding, onOpen, onAdd }
             : null;
     const name = item.name ?? '';
 
+    const pillTone = pct === undefined ? 'flat' : dir;
+    const pillClass = pillTone === 'flat' ? styles.pill.flat : `${styles.pill[pillTone]} ${fill[pillTone].strong}`;
+
     return (
         <li className={styles.rowItem} data-code={item.code} data-testid='ranking-row'>
             <button
                 type='button'
-                className={styles.rankRow}
+                className={`${styles.rankRow} ${pressableRow}`}
                 aria-label={`第 ${rank} 名 ${item.code} ${name}，${priceText}，${DIR_TEXT[dir]} ${chgText} ${pctText}，成交量 ${volText} 張${extra ? `，${extra}` : ''}`}
                 onClick={() => onOpen(item.code)}
                 data-testid='ranking-row-button'
@@ -401,27 +408,23 @@ function RankingRow({ rank, kind, item, watched, canAdd, adding, onOpen, onAdd }
                 <span className={styles.rankNo}>{rank}</span>
                 <span className={styles.rowName}>
                     <span className={styles.rowCode}>{name || item.code}</span>
-                    <span className={styles.rowSub}>{item.code}</span>
+                    <span className={styles.rowSub}>{item.code}・量 {volText}{extra ? ` ${extra}` : ''}</span>
                 </span>
-                <span className={styles.rankPriceCell}>
+                <span className={styles.priceCell}>
                     <span className={`${styles.rowPrice} ${styles.tone[dir]}`} data-testid='ranking-price'>{priceText}</span>
-                    <span className={styles.rankVolume}>量 {volText}{extra ? ` ${extra}` : ''}</span>
+                    <span className={`${styles.priceSub} ${styles.tone[dir]}`} data-testid='ranking-change'>{chgText}</span>
                 </span>
-                <span className={`${styles.rowChange} ${styles.tone[dir]}`}>
-                    <span data-testid='ranking-change'>{chgText}</span>
-                    <span data-testid='ranking-pct'>{pctText}</span>
-                </span>
+                <span className={pillClass} data-testid='ranking-pct'>{pctText}</span>
             </button>
-            <button
-                type='button'
-                className={styles.rowMore}
-                disabled={watched || !canAdd}
-                aria-label={watched ? `${item.code} 已在自選` : adding ? `${item.code} 加入自選中` : `${item.code} 加入自選`}
-                onClick={() => onAdd(item.code)}
-                data-testid='ranking-add'
-            >
-                {watched ? <Check size={20} aria-hidden='true' /> : <Plus size={20} aria-hidden='true' />}
-            </button>
+            <span className={styles.rowTrailing}>
+                <IconButton
+                    ariaLabel={watched ? `${item.code} 已在自選` : adding ? `${item.code} 加入自選中` : `${item.code} 加入自選`}
+                    icon={watched ? Check : Plus}
+                    disabled={watched || !canAdd}
+                    onClick={() => onAdd(item.code)}
+                    testId='ranking-add'
+                />
+            </span>
         </li>
     );
 }

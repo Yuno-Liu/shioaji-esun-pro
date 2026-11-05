@@ -23,6 +23,19 @@ const m = vi.hoisted(() => {
         wl: {} as Record<string, unknown>,
         /** useWatchlist() 掛載次數（每次掛載＝一次完整讀取清單、合約與快照） */
         watchlistLoads: 0,
+        // S1：lib 的送單／改單／刪單函式與確認面板請求（自選頁的任何入口都不得呼叫）
+        placeStockOrder: vi.fn(),
+        placeFuturesOrder: vi.fn(),
+        placeComboOrder: vi.fn(),
+        cancelOrder: vi.fn(),
+        cancelOrders: vi.fn(),
+        cancelVerifiedOrder: vi.fn(),
+        cancelComboOrder: vi.fn(),
+        updateOrderPrice: vi.fn(),
+        updateOrderQty: vi.fn(),
+        requestOrderConfirm: vi.fn(),
+        fetchKbars: vi.fn(),
+        haptic: vi.fn(() => false),
     };
 });
 
@@ -47,16 +60,36 @@ vi.mock('../../hooks/use-watchlist', async () => {
 });
 vi.mock('../../lib/product-search', () => ({ searchProducts: m.searchProducts }));
 vi.mock('../lib/hash-router', () => ({ navigate: m.navigate }));
-vi.mock('../../lib/shioaji', () => ({ fetchScanner: m.fetchScanner }));
+vi.mock('../../lib/shioaji', () => ({
+    fetchScanner: m.fetchScanner,
+    fetchKbars: m.fetchKbars,
+    placeStockOrder: m.placeStockOrder,
+    placeFuturesOrder: m.placeFuturesOrder,
+    placeComboOrder: m.placeComboOrder,
+    cancelOrder: m.cancelOrder,
+    cancelOrders: m.cancelOrders,
+    cancelVerifiedOrder: m.cancelVerifiedOrder,
+    cancelComboOrder: m.cancelComboOrder,
+    updateOrderPrice: m.updateOrderPrice,
+    updateOrderQty: m.updateOrderQty,
+}));
+vi.mock('../../lib/order-confirm', () => ({ requestOrderConfirm: m.requestOrderConfirm }));
+vi.mock('../motion/haptics', () => ({ haptic: m.haptic }));
 
+import { BottomSheet } from '../components/bottom-sheet';
 import { resetRankingForTest } from '../components/ranking-list';
+import { getMobileUi, resetMobileUiForTest } from '../lib/mobile-store';
 import { WatchlistProvider } from '../lib/watchlist-context';
+import { fill } from '../styles/primitives.css';
+import * as wlStyles from '../styles/watchlist.css';
 import {
     createVisibilityTracker,
     LONG_PRESS_MS,
+    nextWatchMetric,
     resetWatchlistSegmentForTest,
     rowQuoteView,
     SIM_LABEL,
+    WATCH_METRIC_KEY,
     WATCH_REPAINT_MS,
     WatchlistPage,
     WatchQuoteProbe,
@@ -382,5 +415,201 @@ describe('WatchlistPage 自選｜排行分段', () => {
         expect(segmentButton('ranking').props['aria-selected']).toBe(true);
         // 30 秒快取：重新掛載不再讀取
         expect(m.fetchScanner).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ---- B3c 自選現代化（設計規格 §7.2、§10 S1）----
+
+const ORDER_FNS = [
+    'placeStockOrder', 'placeFuturesOrder', 'placeComboOrder', 'cancelOrder', 'cancelOrders',
+    'cancelVerifiedOrder', 'cancelComboOrder', 'updateOrderPrice', 'updateOrderQty', 'requestOrderConfirm',
+] as const;
+
+/** 以 Map 模擬 localStorage（測試環境沒有） */
+function fakeStorage(initial: Record<string, string> = {}) {
+    const map = new Map(Object.entries(initial));
+    return {
+        map,
+        getItem: (k: string) => (map.has(k) ? map.get(k)! : null),
+        setItem: (k: string, v: string) => { map.set(k, String(v)); },
+        removeItem: (k: string) => { map.delete(k); },
+    };
+}
+
+describe('WatchlistPage 操作面板「買進…／賣出…」（S1：只開下單面板）', () => {
+    beforeEach(() => {
+        resetMobileUiForTest();
+        m.haptic.mockClear();
+        for (const k of ORDER_FNS) m[k].mockClear();
+        m.fetchKbars.mockClear();
+    });
+
+    const longPress = async (code: string) => {
+        await act(async () => { rowButton(code).props.onPointerDown({ pointerId: 1, pointerType: 'touch', button: 0, clientX: 10, clientY: 10 }); });
+        await act(async () => { vi.advanceTimersByTime(LONG_PRESS_MS); });
+        await act(async () => { rowButton(code).props.onPointerUp(); rowButton(code).props.onClick(); });
+    };
+    const btnByText = (text: string) => view!.root.findAll(n => n.type === 'button' && n.props.children === text);
+    const actionsOpen = () => view!.root.find(n => n.type === BottomSheet && n.props.testId === 'watch-actions').props.open as boolean;
+
+    for (const [label, action] of [['買進…', 'Buy'], ['賣出…', 'Sell']] as const) {
+        it(`長按 → ${label}：只呼叫 openTicket（帶方向、source other），lib 送出／改刪單函式 0 次，操作面板關閉`, async () => {
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+            await render();
+            await longPress('2317');
+            expect(m.haptic).toHaveBeenCalledWith('longPress');
+            expect(actionsOpen()).toBe(true);
+            expect(btnByText(label)).toHaveLength(1);
+            await act(async () => { btnByText(label)[0]!.props.onClick(); });
+
+            const ticket = getMobileUi().ticket;
+            expect(ticket).toMatchObject({ code: '2317', action, price: null, source: 'other' });
+            expect(getMobileUi().orderAction).toBeNull();
+            for (const k of ORDER_FNS) expect(m[k], k).not.toHaveBeenCalled();
+            expect(m.navigate).not.toHaveBeenCalled();
+            expect(actionsOpen()).toBe(false);
+        });
+    }
+
+    it('買賣入口一律有文字，方向小膠囊用 up／down 實心填色（fill.<tone>.strong）', async () => {
+        await render();
+        await act(async () => { view!.root.find(n => n.props['data-testid'] === 'watch-edit').props.onClick(); });
+        await act(async () => { view!.root.findAll(n => n.props['data-testid'] === 'watch-more')[0]!.props.onClick(); });
+        const row = (id: string) => view!.root.find(n => n.props['data-testid'] === id && typeof n.type === 'string');
+        const badge = (id: string) => row(id).find(n => n.type === 'span' && typeof n.props.className === 'string' && n.props.className.includes(wlStyles.sideBadge));
+        expect(badge('watch-action-buy').props.children).toBe('買');
+        expect(badge('watch-action-buy').props.className).toContain(fill.up.strong);
+        expect(badge('watch-action-sell').props.children).toBe('賣');
+        expect(badge('watch-action-sell').props.className).toContain(fill.down.strong);
+        for (const k of ORDER_FNS) expect(m[k], k).not.toHaveBeenCalled();
+    });
+
+    it('指數不能下單：操作面板不提供「買進…／賣出…」', async () => {
+        m.wl = { ...m.wl, items: [{ contract: { ...contract('TSE001', '加權指數', 0), security_type: 'IND' } }] };
+        await render();
+        await act(async () => { view!.root.find(n => n.props['data-testid'] === 'watch-edit').props.onClick(); });
+        await act(async () => { view!.root.findAll(n => n.props['data-testid'] === 'watch-more')[0]!.props.onClick(); });
+        expect(btnByText('開啟交易頁')).toHaveLength(1);
+        expect(btnByText('買進…')).toHaveLength(0);
+        expect(btnByText('賣出…')).toHaveLength(0);
+    });
+
+    it('開啟交易頁只導頁，不開下單面板', async () => {
+        await render();
+        await act(async () => { view!.root.find(n => n.props['data-testid'] === 'watch-edit').props.onClick(); });
+        await act(async () => { view!.root.findAll(n => n.props['data-testid'] === 'watch-more')[1]!.props.onClick(); });
+        await act(async () => { btnByText('開啟交易頁')[0]!.props.onClick(); });
+        expect(m.navigate).toHaveBeenCalledWith({ name: 'trade', code: '2317' });
+        expect(getMobileUi().ticket).toBeNull();
+    });
+
+    it('自選頁不讀 K 線（不做迷你走勢）', async () => {
+        await render();
+        await setVisible('2330', true);
+        m.quotes.set('2330', tick('1010', '10'));
+        await act(async () => { m.emit(); });
+        expect(m.fetchKbars).not.toHaveBeenCalled();
+    });
+});
+
+describe('WatchlistPage 表頭指標切換鍵（watch-metric-toggle）', () => {
+    const toggle = () => view!.root.find(n => n.props['data-testid'] === 'watch-metric-toggle' && n.type === 'button');
+    const pill = (code: string) =>
+        view!.root.find(n => n.type === 'li' && n.props['data-code'] === code).find(n => n.props['data-testid'] === 'watch-pill');
+
+    it('在表頭、不在列按鈕內；漲跌幅 → 漲跌 → 總量 循環並存 localStorage；列 aria-label 永遠含全部資訊', async () => {
+        const storage = fakeStorage();
+        vi.stubGlobal('localStorage', storage);
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+        m.wl = { ...m.wl, items: [{ contract: contract('2330', '台積電', 1000), snapshot: { close: 1000, total_volume: 45678, change_rate: 0 } }, ...items.slice(1)] };
+        await render();
+        // 不巢狀：列按鈕內沒有切換鍵
+        expect(rowButton('2330').findAll(n => n.props['data-testid'] === 'watch-metric-toggle')).toHaveLength(0);
+        expect(view!.root.find(n => n.props['data-testid'] === 'watch-list-header').findAll(n => n.props['data-testid'] === 'watch-metric-toggle' && n.type === 'button')).toHaveLength(1);
+
+        await setVisible('2330', true);
+        m.quotes.set('2330', { tick: { close: '1014', price_chg: '14', total_volume: 45678 }, index: undefined });
+        await act(async () => { m.emit(); });
+        await act(async () => { vi.advanceTimersByTime(WATCH_REPAINT_MS); });
+
+        expect(toggle().props['data-metric']).toBe('pct');
+        expect(pill('2330').props.children).toBe('+1.40%');
+        await act(async () => { toggle().props.onClick(); });
+        expect(toggle().props['data-metric']).toBe('chg');
+        expect(pill('2330').props.children).toBe('▲14.00');
+        expect(storage.map.get(WATCH_METRIC_KEY)).toBe('chg');
+        await act(async () => { toggle().props.onClick(); });
+        expect(pill('2330').props.children).toBe('4.6萬');
+        // 總量沒有方向：中性膠囊（不用實心漲跌色）
+        expect(pill('2330').props.className).toContain(wlStyles.pill.flat);
+        expect(pill('2330').props.className).not.toContain(fill.up.strong);
+        const label = rowButton('2330').props['aria-label'] as string;
+        expect(label).toContain('1,014');
+        expect(label).toContain('漲 ▲14.00 +1.40%');
+        expect(label).toContain('總量 4.6萬');
+        await act(async () => { toggle().props.onClick(); });
+        expect(toggle().props['data-metric']).toBe('pct');
+        expect(storage.map.get(WATCH_METRIC_KEY)).toBe('pct');
+    });
+
+    it('上漲膠囊為實心 up＋inkStrong（fill.up.strong）；下跌為 fill.down.strong；平盤為中性', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+        await render();
+        for (const code of ['2330', '2317', '2454']) await setVisible(code, true);
+        m.quotes.set('2330', tick('1010', '10'));
+        m.quotes.set('2317', tick('190', '-10'));
+        m.quotes.set('2454', tick('1200', '0'));
+        await act(async () => { m.emit(); });
+        await act(async () => { vi.advanceTimersByTime(WATCH_REPAINT_MS); });
+        expect(pill('2330').props.className).toContain(fill.up.strong);
+        expect(pill('2317').props.className).toContain(fill.down.strong);
+        expect(pill('2317').props.children).toBe('-5.00%');
+        expect(pill('2454').props.className).toContain(wlStyles.pill.flat);
+    });
+
+    it('讀回儲存的指標；無效值或 localStorage 失敗時退回漲跌幅', async () => {
+        vi.stubGlobal('localStorage', fakeStorage({ [WATCH_METRIC_KEY]: 'vol' }));
+        await render();
+        expect(toggle().props['data-metric']).toBe('vol');
+        await act(async () => view!.unmount());
+        vi.stubGlobal('localStorage', { getItem: () => { throw new Error('denied'); }, setItem: () => { throw new Error('denied'); } });
+        await render();
+        expect(toggle().props['data-metric']).toBe('pct');
+        await act(async () => { toggle().props.onClick(); });
+        expect(toggle().props['data-metric']).toBe('chg');
+        expect(nextWatchMetric('vol')).toBe('pct');
+    });
+});
+
+describe('WatchlistPage 載入、空清單與錯誤狀態', () => {
+    const text = (n: ReactTestInstance): string => n.children.map(c => (typeof c === 'string' ? c : text(c))).join('');
+
+    it('載入中：骨架（role=status，保留「自選清單載入中…」文字）', async () => {
+        m.wl = { ...m.wl, items: [], loading: true };
+        await render();
+        const status = view!.root.findAll(n => n.props.role === 'status' && typeof n.type === 'string');
+        expect(status).toHaveLength(1);
+        expect(text(status[0]!)).toContain('自選清單載入中…');
+        expect(view!.root.findAll(n => n.props['data-testid'] === 'watch-list')).toHaveLength(0);
+    });
+
+    it('空清單：EmptyState 的「搜尋並加入」開啟搜尋面板', async () => {
+        m.wl = { ...m.wl, items: [] };
+        await render();
+        expect(text(view!.root.find(n => n.props['data-testid'] === 'watch-empty' && typeof n.type === 'string'))).toBe('這份清單還沒有商品。');
+        const search = () => view!.root.find(n => n.props.testId === 'search-sheet' && n.type === BottomSheet);
+        expect(search().props.open).toBe(false);
+        await act(async () => { view!.root.find(n => n.props['data-testid'] === 'watch-empty-search' && n.type === 'button').props.onClick(); });
+        expect(search().props.open).toBe(true);
+    });
+
+    it('載入失敗：InlineNote（role=alert）＋重試', async () => {
+        m.retryLoad.mockClear();
+        m.wl = { ...m.wl, items: [], loadError: true };
+        await render();
+        const alert = view!.root.find(n => n.props.role === 'alert' && typeof n.type === 'string');
+        expect(text(alert)).toContain('自選清單載入失敗。');
+        await act(async () => { view!.root.find(n => n.props['data-testid'] === 'watch-retry' && n.type === 'button').props.onClick(); });
+        expect(m.retryLoad).toHaveBeenCalledTimes(1);
     });
 });

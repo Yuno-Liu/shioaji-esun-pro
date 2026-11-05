@@ -9,6 +9,10 @@ const m = vi.hoisted(() => ({
 }));
 vi.mock('../../lib/shioaji', () => ({ fetchScanner: m.fetchScanner }));
 
+import { fill } from '../styles/primitives.css';
+import * as wlStyles from '../styles/watchlist.css';
+import { Segmented } from '../ui/segmented';
+
 import {
     getRankingState,
     RANKING_CACHE_MS,
@@ -275,5 +279,54 @@ describe('RankingList', () => {
         await act(async () => { listeners.get('visibilitychange')!(); });
         await flush();
         expect(m.fetchScanner).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ---- B3c 排行現代化（設計規格 §7.2）----
+
+describe('RankingList — v2 版面', () => {
+    it('種類為 Segmented scroll 變體（tablist／tab 語意不變）', async () => {
+        await render();
+        const list = view!.root.find(n => n.type === Segmented);
+        expect(list.props.variant).toBe('scroll');
+        expect(list.props.semantics).toBe('tabs');
+        const tablist = view!.root.find(n => n.props.role === 'tablist' && typeof n.type === 'string');
+        expect(tablist.props['aria-label']).toBe('排行種類');
+        const tabs = tablist.findAll(n => n.props.role === 'tab' && n.type === 'button');
+        expect(tabs.map(t => t.props.children)).toEqual(RANKING_DEFS.map(d => d.label));
+        expect(one('ranking-kind-gainers').props['aria-selected']).toBe(true);
+    });
+
+    it('漲跌%膠囊：上漲 fill.up.strong、下跌 fill.down.strong、平盤中性；漲跌在價格下方（▲▼＋顏色）', async () => {
+        m.fetchScanner.mockResolvedValue([item('2330', 1100, 100), item('1101', 45, -5), item('2002', 30, 0)]);
+        await render();
+        const pct = byTestId('ranking-pct');
+        expect(pct.map(p => p.props.children)).toEqual(['+10.00%', '0.00%', '-10.00%']);
+        expect(pct[0]!.props.className).toContain(fill.up.strong);
+        expect(pct[1]!.props.className).toContain(wlStyles.pill.flat);
+        expect(pct[2]!.props.className).toContain(fill.down.strong);
+        expect(byTestId('ranking-change')[0]!.props.className).toContain(wlStyles.tone.up);
+        expect(byTestId('ranking-change')[2]!.props.className).toContain(wlStyles.tone.down);
+    });
+
+    it('讀取中（尚無資料）顯示骨架（role=status＋視覺隱藏文字）', async () => {
+        m.fetchScanner.mockImplementationOnce(() => new Promise(() => undefined));
+        await render();
+        const skeleton = byTestId('ranking-loading');
+        expect(skeleton).toHaveLength(1);
+        expect(skeleton[0]!.props.role).toBe('status');
+        expect(textOf(skeleton[0]!)).toContain('排行讀取中…');
+    });
+
+    it('已有資料時讀取失敗：顯示原因但不顯示重試（保留舊名單）', async () => {
+        m.fetchScanner.mockResolvedValueOnce([item('2330', 1100, 100)]).mockRejectedValueOnce(new Error('HTTP 502'));
+        await render();
+        await act(async () => { vi.advanceTimersByTime(RANKING_COOLDOWN_MS); });
+        await act(async () => { one('ranking-refresh').props.onClick(); });
+        await flush();
+        expect(textOf(one('ranking-error'))).toContain('排行讀取失敗：HTTP 502');
+        expect(one('ranking-error').props.role).toBe('alert');
+        expect(byTestId('ranking-retry')).toHaveLength(0);
+        expect(byTestId('ranking-row')).toHaveLength(1);
     });
 });

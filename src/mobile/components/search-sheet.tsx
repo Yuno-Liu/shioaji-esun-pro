@@ -1,13 +1,19 @@
-// src/mobile/components/search-sheet.tsx — 商品搜尋面板（規格 §6.1）
+// src/mobile/components/search-sheet.tsx — 商品搜尋面板（規格 §6.1；設計規格 §7.2）
 //
 // - searchProducts(query, 10)：輸入以 SEARCH_DEBOUNCE_MS debounce；新的輸入會 abort 前一次查詢（signal），
 //   晚到的舊結果不會蓋掉新結果。
 // - 每筆結果可「加入自選」（由父層呼叫 useWatchlist().addSymbol）或直接開交易頁。
 // - 只做查詢與導覽，不會下單。
+// - 版面：面板 large；搜尋框在 body 內 position: sticky; top: 0（不透明、不模糊）；結果列與自選列同樣式
+//   （代碼 headline＋名稱、第二行種類），列尾「加入自選／已在自選」與「交易」晶片（沿用 ui/chip.css 外觀，
+//   按鈕文字節點恰為標籤）。
 
 import { useEffect, useRef, useState } from 'react';
 import { searchProducts, type ProductSuggestion } from '../../lib/product-search';
+import { focusRing, pressable, pressableRow } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
+import { chip } from '../ui/chip.css';
+import { InlineNote } from '../ui/inline-note';
 import { BottomSheet } from './bottom-sheet';
 
 /** 輸入停頓多久才查詢（ms） */
@@ -93,24 +99,28 @@ export function SearchSheet({ open, onClose, watchedCodes, canAdd, onAdd, onOpen
         }
     };
 
+    const chipClass = `${chip} ${pressable} ${focusRing} ${styles.resultChip}`;
+
     return (
-        <BottomSheet open={open} onClose={onClose} title='搜尋商品' testId='search-sheet'>
-            <input
-                className={styles.searchInput}
-                type='search'
-                inputMode='search'
-                enterKeyHint='search'
-                autoComplete='off'
-                autoCorrect='off'
-                autoCapitalize='off'
-                spellCheck={false}
-                placeholder='代碼或名稱，例如 2330、台積電、台指期'
-                aria-label='搜尋商品'
-                value={query}
-                maxLength={40}
-                onChange={e => setQuery(e.target.value)}
-                data-testid='search-input'
-            />
+        <BottomSheet open={open} onClose={onClose} title='搜尋商品' testId='search-sheet' detent='large'>
+            <div className={styles.searchBar}>
+                <input
+                    className={styles.searchInput}
+                    type='search'
+                    inputMode='search'
+                    enterKeyHint='search'
+                    autoComplete='off'
+                    autoCorrect='off'
+                    autoCapitalize='off'
+                    spellCheck={false}
+                    placeholder='代碼或名稱，例如 2330、台積電、台指期'
+                    aria-label='搜尋商品'
+                    value={query}
+                    maxLength={40}
+                    onChange={e => setQuery(e.target.value)}
+                    data-testid='search-input'
+                />
+            </div>
             {status === 'loading' && <p className={styles.searchStatus} role='status'>搜尋中…</p>}
             {status === 'error' && <p className={styles.searchStatus} role='status'>搜尋失敗，請稍後再試。</p>}
             {status === 'done' && results.length === 0 && <p className={styles.searchStatus} role='status'>找不到符合的商品。</p>}
@@ -120,21 +130,25 @@ export function SearchSheet({ open, onClose, watchedCodes, canAdd, onAdd, onOpen
                         const watched = watchedCodes.has(s.code);
                         const message = messages[s.code];
                         return (
-                            <li key={`${s.security_type}:${s.exchange}:${s.code}`} data-testid='search-result'>
+                            <li key={`${s.security_type}:${s.exchange}:${s.code}`} className={styles.resultItem} data-testid='search-result'>
                                 <div className={styles.resultRow}>
                                     <button
                                         type='button'
-                                        className={styles.resultMain}
+                                        className={`${styles.resultMain} ${pressableRow}`}
                                         onClick={() => onOpenTrade(s.code)}
                                         aria-label={`開啟 ${s.code} ${s.name} 交易頁`}
                                     >
-                                        <span className={styles.rowCode}>{s.code} {s.name}</span>
+                                        <span className={styles.rowTitleLine}>
+                                            <span className={styles.rowCode}>{s.code}</span>
+                                            <span className={styles.resultName}>{s.name}</span>
+                                        </span>
                                         <span className={styles.rowSub}>{[TYPE_TEXT[s.security_type] ?? s.security_type, s.detail].filter(Boolean).join(' · ')}</span>
                                     </button>
                                     <button
                                         type='button'
-                                        className={styles.resultButton}
+                                        className={chipClass}
                                         disabled={watched || !canAdd || adding !== null}
+                                        aria-label={watched ? `${s.code} 已在自選` : adding === s.code ? `${s.code} 加入中` : `${s.code} 加入自選`}
                                         onClick={() => void add(s)}
                                         data-testid='search-add'
                                     >
@@ -142,14 +156,19 @@ export function SearchSheet({ open, onClose, watchedCodes, canAdd, onAdd, onOpen
                                     </button>
                                     <button
                                         type='button'
-                                        className={styles.resultButton}
+                                        className={chipClass}
+                                        aria-label={`${s.code} 交易`}
                                         onClick={() => onOpenTrade(s.code)}
                                         data-testid='search-trade'
                                     >
                                         交易
                                     </button>
                                 </div>
-                                {message && <p className={styles.resultMessage} role='alert'>{message}</p>}
+                                {message && (
+                                    <div className={styles.resultMessage}>
+                                        <InlineNote tone='warn' role='alert'>{message}</InlineNote>
+                                    </div>
+                                )}
                             </li>
                         );
                     })}

@@ -7,6 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const m = vi.hoisted(() => ({ searchProducts: vi.fn() }));
 vi.mock('../../lib/product-search', () => ({ searchProducts: m.searchProducts }));
 
+import * as wlStyles from '../styles/watchlist.css';
+import { InlineNote } from '../ui/inline-note';
+import { BottomSheet } from './bottom-sheet';
 import { SEARCH_DEBOUNCE_MS, SEARCH_LIMIT, SearchSheet, type SearchSheetProps } from './search-sheet';
 
 const tsmc = { code: '2330', name: '台積電', security_type: 'STK', exchange: 'TSE', detail: '上市' };
@@ -112,5 +115,33 @@ describe('SearchSheet', () => {
         expect(m.searchProducts).not.toHaveBeenCalled();
         await act(async () => { view!.update(createElement(SearchSheet, props({ open: true }))); });
         expect(input().props.value).toBe('');
+    });
+});
+
+// ---- B3c 搜尋面板現代化（設計規格 §7.2）----
+
+describe('SearchSheet — v2 版面', () => {
+    it('面板 large；搜尋框在 sticky 搜尋欄內（不模糊）', async () => {
+        await render();
+        expect(view!.root.find(n => n.type === BottomSheet).props.detent).toBe('large');
+        const bar = view!.root.find(n => n.type === 'div' && n.props.className === wlStyles.searchBar);
+        expect(bar.findAll(n => n.props['data-testid'] === 'search-input')).toHaveLength(1);
+    });
+
+    it('結果列：代碼為獨立文字節點；列尾晶片文字恰為標籤，aria-label 含代碼；加入失敗以 InlineNote（role=alert）顯示', async () => {
+        m.searchProducts.mockResolvedValue([tsmc, hon]);
+        onAdd.mockRejectedValueOnce(new Error('自選清單更新中'));
+        await render();
+        await type('2');
+        await act(async () => { vi.advanceTimersByTime(SEARCH_DEBOUNCE_MS); });
+        const adds = view!.root.findAll(n => n.props['data-testid'] === 'search-add');
+        expect(adds.map(a => a.props.children)).toEqual(['加入自選', '已在自選']);
+        expect(adds.map(a => a.props['aria-label'])).toEqual(['2330 加入自選', '2317 已在自選']);
+        expect(view!.root.findAll(n => n.props['data-testid'] === 'search-trade')[0]!.props.children).toBe('交易');
+        await act(async () => { adds[0]!.props.onClick(); });
+        const note = view!.root.findAll(n => n.type === InlineNote);
+        expect(note).toHaveLength(1);
+        expect(note[0]!.props.role).toBe('alert');
+        expect(JSON.stringify(view!.toJSON())).toContain('自選清單更新中');
     });
 });
