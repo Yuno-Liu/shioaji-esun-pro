@@ -1,5 +1,5 @@
 // src/mobile/styles/sheet.css.ts — 共用底部面板（bottom-sheet.tsx）
-import { keyframes, style } from '@vanilla-extract/css';
+import { keyframes, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
 import { REDUCED_MOTION, SAFE_BOTTOM, SAFE_LEFT, SAFE_RIGHT, TOUCH_MIN, Z } from './metrics';
 
@@ -39,6 +39,24 @@ export const panel = style({
     animation: `${slideUp} 200ms ease-out`,
     touchAction: 'pan-y',
     '@media': { [REDUCED_MOTION]: { animation: 'none' } },
+});
+
+/**
+ * 買賣方向著色（bottom-sheet.tsx 的 tone）：在 panel 底色上疊兩層方向淡色（upDim／downDim 本身是半透明 rgba），
+ * 不用 color-mix()，iOS 15.4 Safari 也能顯示；四種主題（深淺色 × 台灣／國際配色）都跟著 vars 走。
+ * 頂框加粗成方向色，色弱或強光下仍有形狀線索；文字另由面板內的大字方向說明（不只靠顏色）。
+ * 必須定義在 panel 之後：同權重時後者的 background-image 蓋過 panel 的 background 簡寫。
+ */
+const toneBase = style({ borderTopWidth: '4px', borderTopStyle: 'solid' });
+export const panelTone = styleVariants({
+    buy: [toneBase, {
+        backgroundImage: `linear-gradient(${vars.color.upDim}, ${vars.color.upDim}), linear-gradient(${vars.color.upDim}, ${vars.color.upDim})`,
+        borderTopColor: vars.color.up,
+    }],
+    sell: [toneBase, {
+        backgroundImage: `linear-gradient(${vars.color.downDim}, ${vars.color.downDim}), linear-gradient(${vars.color.downDim}, ${vars.color.downDim})`,
+        borderTopColor: vars.color.down,
+    }],
 });
 
 /** 拖曳區（把手＋標題）：在這裡往下滑關閉；touch-action none 避免與頁面捲動衝突 */

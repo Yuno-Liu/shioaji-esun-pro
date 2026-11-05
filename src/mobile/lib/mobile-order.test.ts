@@ -10,6 +10,8 @@ const h = vi.hoisted(() => ({
     accountUnchanged: true,
     serverSame: true,
     routeSame: true,
+    /** 合約快取的最新內容（beforeDispatch 的現沖檢查用）；undefined＝快取沒有這檔 */
+    cachedContract: undefined as unknown,
 }));
 const m = vi.hoisted(() => ({
     risk: vi.fn((): string | null => null),
@@ -20,6 +22,7 @@ const m = vi.hoisted(() => ({
     captureRoute: vi.fn(),
 }));
 
+vi.mock('../../lib/contracts-cache', () => ({ getCachedContract: () => h.cachedContract }));
 vi.mock('../../hooks/use-order-context', () => ({ ORDER_CONTEXT_CHANGED_MESSAGE: '商品、交易單位或信用條件已變更，已停止後續下單' }));
 vi.mock('../../lib/esun', async () => {
     const om = await vi.importActual<typeof import('../../lib/esun/order-mapping')>('../../lib/esun/order-mapping');
@@ -134,6 +137,7 @@ beforeEach(() => {
     h.accountUnchanged = true;
     h.serverSame = true;
     h.routeSame = true;
+    h.cachedContract = undefined;
     resumeOk = true;
     contextCurrent = true;
     m.risk.mockImplementation(() => null);
@@ -349,6 +353,93 @@ describe('submitMobileOrder — 送出', () => {
         const err = await rejection(submitMobileOrder(stockInput(sinoStock), guards));
         expect(err).toBe(unknownOutcome);
         expect(err.mutationNotStarted).toBeUndefined();
+        expect(m.placeStock).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('submitMobileOrder — 信用交易與現股當沖先賣（Phase 2）', () => {
+    const creditInput = (over: { action: 'Buy' | 'Sell'; cond?: 'MarginTrading' | 'ShortSelling'; daytrade?: boolean; hint?: string }): MobileOrderInput => {
+        const base = stockInput(sinoStock, { action: over.action, quantity: 1, price: 100 });
+        if (base.isFutures) throw new Error('expected stock input');
+        return {
+            ...base,
+            stockOrder: {
+                ...base.stockOrder,
+                ...(over.cond ? { order_cond: over.cond } : {}),
+                ...(over.daytrade ? { daytrade_short: true } : {}),
+            },
+            ...(over.hint ? { creditHint: over.hint } : {}),
+        };
+    };
+    beforeEach(() => {
+        m.placeStock.mockImplementation(async () => ({ order: { id: 's1' } }));
+    });
+    const beforeDispatchOf = () => (m.placeStock.mock.calls[0] as unknown as [unknown, unknown, unknown, { beforeDispatch: () => void }])[3].beforeDispatch;
+
+    it('融資買進：確認面板 credit＝融資、note 含信用名稱；送出 order_cond', async () => {
+        await submitMobileOrder(creditInput({ action: 'Buy', cond: 'MarginTrading' }), guards);
+        const [req] = m.confirm.mock.calls[0] as unknown as [Record<string, unknown>];
+        expect(req).toMatchObject({ action: 'Buy', credit: '融資', note: 'ROD・融資・送往 永豐 模擬環境' });
+        const [, order] = m.placeStock.mock.calls[0] as unknown as [unknown, Record<string, unknown>];
+        expect(order).toMatchObject({ order_cond: 'MarginTrading' });
+        expect('daytrade_short' in order).toBe(false);
+    });
+
+    it('融券賣出與融券買進（回補）：credit 都是「融券」', async () => {
+        await submitMobileOrder(creditInput({ action: 'Sell', cond: 'ShortSelling' }), guards);
+        await submitMobileOrder(creditInput({ action: 'Buy', cond: 'ShortSelling' }), guards);
+        const reqs = m.confirm.mock.calls.map(c => (c as unknown as [Record<string, unknown>])[0]);
+        expect(reqs[0]).toMatchObject({ action: 'Sell', credit: '融券', note: 'ROD・融券・送往 永豐 模擬環境' });
+        expect(reqs[1]).toMatchObject({ action: 'Buy', credit: '融券' });
+    });
+
+    it('現股當沖先賣：credit 為空、note 加「現股當沖」（比照桌面 §17），送出 daytrade_short true', async () => {
+        await submitMobileOrder(creditInput({ action: 'Sell', daytrade: true }), guards);
+        const [req] = m.confirm.mock.calls[0] as unknown as [Record<string, unknown>];
+        expect(req).toMatchObject({ credit: undefined, note: 'ROD・現股當沖・送往 永豐 模擬環境' });
+        const [, order] = m.placeStock.mock.calls[0] as unknown as [unknown, Record<string, unknown>];
+        expect(order).toMatchObject({ daytrade_short: true });
+        expect('order_cond' in order).toBe(false);
+    });
+
+    it('信用提醒附在路由備註之前', async () => {
+        await submitMobileOrder(creditInput({ action: 'Buy', hint: '現股買進不會回補融券' }), guards);
+        const [req] = m.confirm.mock.calls[0] as unknown as [Record<string, unknown>];
+        expect(req).toMatchObject({ note: 'ROD・現股買進不會回補融券・送往 永豐 模擬環境' });
+    });
+
+    it('確認前：合約不可當沖時現沖先賣不確認、不送出', async () => {
+        const input = creditInput({ action: 'Sell', daytrade: true });
+        const err = await rejection(submitMobileOrder({ ...input, contract: { ...stock, day_trade: 'No' } as ContractInfo }, guards));
+        expect(err.mutationNotStarted).toBe(true);
+        expect(err.message).toContain('不能現股當沖先賣');
+        expect(m.confirm).not.toHaveBeenCalled();
+        noOrderSent();
+    });
+
+    it('beforeDispatch：確認期間最新合約變成不可當沖 → 以 notStarted 拒絕（比照桌面 assertDayTradeStillAllowed）', async () => {
+        h.cachedContract = stock;
+        await submitMobileOrder(creditInput({ action: 'Sell', daytrade: true }), guards);
+        const beforeDispatch = beforeDispatchOf();
+        expect(() => beforeDispatch()).not.toThrow();
+        h.cachedContract = { ...stock, day_trade: 'OnlyBuy' };
+        let thrown: unknown;
+        try { beforeDispatch(); } catch (err) { thrown = err; }
+        expect(thrown).toMatchObject({ mutationNotStarted: true });
+        expect((thrown as Error).message).toContain('不能現股當沖先賣');
+    });
+
+    it('beforeDispatch 在確認前就擋：快取已是不可當沖時不送單', async () => {
+        h.cachedContract = { ...stock, day_trade: 'No' };
+        const err = await rejection(submitMobileOrder(creditInput({ action: 'Sell', daytrade: true }), guards));
+        expect(err.mutationNotStarted).toBe(true);
+        expect(m.confirm).toHaveBeenCalledTimes(1);
+        noOrderSent();
+    });
+
+    it('非現沖的委託不檢查當沖（合約不可當沖也照送）', async () => {
+        h.cachedContract = { ...stock, day_trade: 'No' };
+        await submitMobileOrder(creditInput({ action: 'Sell' }), guards);
         expect(m.placeStock).toHaveBeenCalledTimes(1);
     });
 });

@@ -1,5 +1,7 @@
 // 手機下單面板（規格 §6.3、§7.2、§14.1）：零股強制限價＋ROD＋現股、單位切換數量歸 1、升降單位／漲跌停／
 // 環境未確認／連線閘門停用預覽、開啟後不自動跟價，以及四種結果分類（結果未知不提供重送）。
+// Phase 2：依買賣著色與方向文字、信用條件與現沖先賣規則、盤後零股、帶入 lot／cond／daytradeShort、
+// 剩餘交易額度、交易成本列、內嵌五檔帶價。
 // 以 vi.mock 隔離 src/lib，不打任何真實 API；submitMobileOrder 也以 mock 取代。
 import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
@@ -23,6 +25,11 @@ const h = vi.hoisted(() => {
         route: { esun: false, broker: '永豐', simulation: true } as { esun: boolean; broker: string; simulation: boolean | undefined } | null,
         privMoney: false,
         esunBrokers: new Set<string>(),
+        positions: [] as unknown[],
+        positionsLoaded: true,
+        limits: { data: null, error: null, loading: false, updatedAt: null } as { data: unknown; error: string | null; loading: boolean; updatedAt: number | null },
+        limitsAccount: undefined as unknown,
+        ladder: null as Record<string, unknown> | null,
     };
 });
 const m = vi.hoisted(() => ({
@@ -73,6 +80,26 @@ vi.mock('./route-badge', () => ({
     RouteBadge: () => createElement('span', { 'data-testid': 'mobile-route-badge' }, '送往'),
 }));
 vi.mock('./account-switch-sheet', () => ({ mobileAccountLabel: (a: Account) => `${a.broker_id}-${a.account_id}` }));
+// 持倉與委託（信用提醒、五檔的「我的委託」標示）：測試直接決定內容
+vi.mock('../../lib/trading-state', () => ({
+    useTradingState: () => ({ trades: [], positions: h.positions, queries: { positions: { updatedAt: h.positionsLoaded ? 1 : null } } }),
+}));
+// 交易額度：只替換讀取的 hook，availableLimitFor／limitsLookEmpty 用真的
+vi.mock('../../lib/shioaji', () => ({ fetchTradingLimits: vi.fn() }));
+vi.mock('../hooks/use-trading-limits', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../hooks/use-trading-limits')>()),
+    useTradingLimits: (account: unknown) => {
+        h.limitsAccount = account;
+        return { ...h.limits, refresh: () => undefined };
+    },
+}));
+// 五檔：記下面板傳入的 props（variant／oddLot／onPick），內容由交易頁負責者的測試涵蓋
+vi.mock('./depth-ladder', () => ({
+    DepthLadder: (props: Record<string, unknown>) => {
+        h.ladder = props;
+        return createElement('div', { 'data-testid': 'depth-ladder-stub' });
+    },
+}));
 
 import { OrderConfirmCancelled } from '../../lib/trade';
 import { OUTCOME_UNKNOWN_TITLE, TICKET_TEXT } from '../hooks/use-mobile-ticket';
@@ -128,6 +155,21 @@ async function typeQty(value: string) {
 async function pressPreview() {
     await act(async () => { await preview().props.onClick(); });
 }
+const priceType = () => one('ticket-price-type');
+async function choosePriceType(value: string) {
+    await act(async () => { priceType().props.onChange({ target: { value } }); });
+}
+const priceOption = (value: string) => priceType().findAll(n => n.type === 'option' && n.props.value === value)[0]!;
+/** 展開條件摘要列（信用、時段、效期） */
+async function expand() {
+    if (byTestId('ticket-cond-panel').length === 0) await act(async () => { one('ticket-cond-summary').props.onClick(); });
+}
+const panel = () => root().findAll(n => n.props['data-testid'] === 'order-ticket-sheet' && typeof n.type === 'string')[0]!;
+const stockLimits = (over: Record<string, number> = {}) => ({
+    trading_limit: 500_000, trading_used: 200_000, trading_available: 300_000,
+    margin_limit: 400_000, margin_used: 0, margin_available: 400_000,
+    short_limit: 100_000, short_used: 0, short_available: 100_000, ...over,
+});
 
 beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
@@ -144,6 +186,11 @@ beforeEach(() => {
     h.esunBrokers.clear();
     h.captured = { S: h.stockAccount, F: h.futuresAccount };
     h.selected = { S: h.stockAccount, F: h.futuresAccount };
+    h.positions = [];
+    h.positionsLoaded = true;
+    h.limits = { data: null, error: null, loading: false, updatedAt: null };
+    h.limitsAccount = undefined;
+    h.ladder = null;
     resetMobileUiForTest();
     setResumeGateForTest(null);
 });
@@ -196,22 +243,28 @@ describe('OrderTicketSheet — 欄位規則', () => {
     it('odd lot forces limit + ROD + cash and sends IntradayOdd shares without order_cond', async () => {
         m.submit.mockResolvedValue({ status: { status: 'Submitted' }, order: { id: 'o1', seqno: '77' } });
         await open({ code: '2330', action: 'Buy' });
-        await click('市價');
-        expect(btn('市價').props['aria-pressed']).toBe(true);
+        await choosePriceType('MKT');
+        await expand();
+        expect(priceType().props.value).toBe('MKT');
         expect(btn('IOC').props['aria-pressed']).toBe(true);
-        await click('盤中零股');
-        expect(btn('限價').props['aria-pressed']).toBe(true);
+        await click('零股');
+        expect(priceType().props.value).toBe('LMT');
         expect(btn('ROD').props['aria-pressed']).toBe(true);
-        expect(btn('市價').props.disabled).toBe(true);
+        expect(priceOption('MKT').props.disabled).toBe(true);
         expect(btn('IOC').props.disabled).toBe(true);
         expect(btn('FOK').props.disabled).toBe(true);
-        expect(buttons().some(b => text(b) === '融資（P1）')).toBe(false); // 零股不顯示信用條件
+        // 零股只能現股：融資、融券停用
+        expect(btn('現股').props['aria-pressed']).toBe(true);
+        expect(btn('融資').props.disabled).toBe(true);
+        expect(btn('融券（回補）').props.disabled).toBe(true);
         expect(text(one('ticket-odd-note'))).toContain('限價 ROD');
         expect(qtyInput().props['aria-label']).toBe('數量（股）');
         // 價別／效期的設定函式也不接受零股不允許的值
-        await act(async () => { btn('市價').props.onClick(); btn('IOC').props.onClick(); });
-        expect(btn('限價').props['aria-pressed']).toBe(true);
+        await act(async () => { priceType().props.onChange({ target: { value: 'MKT' } }); btn('IOC').props.onClick(); });
+        expect(priceType().props.value).toBe('LMT');
         expect(btn('ROD').props['aria-pressed']).toBe(true);
+        // 盤中零股看盤中零股五檔
+        expect(h.ladder).toMatchObject({ variant: 'ticket', oddLot: true, code: '2330' });
         await typeQty('300');
         await pressPreview();
         expect(m.submit).toHaveBeenCalledTimes(1);
@@ -227,7 +280,7 @@ describe('OrderTicketSheet — 欄位規則', () => {
         await open({ code: '2330', action: 'Buy' });
         await typeQty('5');
         expect(qtyInput().props.value).toBe('5');
-        await click('盤中零股');
+        await click('零股');
         expect(qtyInput().props.value).toBe('1');
         await typeQty('300');
         await click('整股');
@@ -235,12 +288,17 @@ describe('OrderTicketSheet — 欄位規則', () => {
         expect(qtyInput().props['aria-label']).toBe('數量（張）');
     });
 
-    it('P1 units and credit conditions are shown disabled', async () => {
+    it('summary row shows 現股 / 盤中 / ROD and expands to three segment groups; 整股盤後 is disabled with reason', async () => {
         await open({ code: '2330', action: 'Buy' });
-        expect(btn('盤後零股（P1）').props.disabled).toBe(true);
-        expect(btn('融資（P1）').props.disabled).toBe(true);
-        expect(btn('融券（P1）').props.disabled).toBe(true);
-        expect(btn('當沖先賣（P1）').props.disabled).toBe(true);
+        expect(text(one('ticket-cond-summary'))).toContain('現股 / 盤中 / ROD');
+        expect(byTestId('ticket-cond-panel')).toHaveLength(0);
+        await expand();
+        expect(one('ticket-cond-summary').props['aria-expanded']).toBe(true);
+        expect(btn('盤中').props['aria-pressed']).toBe(true);
+        expect(btn('盤後').props.disabled).toBe(true);
+        expect(text(one('ticket-after-hours-note'))).toContain(TICKET_TEXT.afterHoursCommon);
+        // 借券類不提供
+        expect(buttons().some(b => /借券/.test(text(b)))).toBe(false);
     });
 
     it('disables preview when the price is off the tick ladder', async () => {
@@ -262,10 +320,11 @@ describe('OrderTicketSheet — 欄位規則', () => {
         await typePrice('111');
         expect(preview().props.disabled).toBe(true);
         expect(problemText()).toContain(TICKET_TEXT.priceRange);
-        await click('市價');
+        await choosePriceType('MKT');
         await click('漲停');
         expect(priceInput().props.value).toBe('110');
-        expect(btn('限價').props['aria-pressed']).toBe(true);
+        expect(priceType().props.value).toBe('LMT');
+        await expand();
         expect(btn('ROD').props['aria-pressed']).toBe(true);
         expect(preview().props.disabled).toBe(false);
         await click('跌停');
@@ -301,6 +360,12 @@ describe('OrderTicketSheet — 欄位規則', () => {
         await open({ code: '2330', action: 'Buy' });
         expect(text(one('ticket-estimate'))).toContain('•••••');
         expect(text(one('ticket-estimate'))).not.toContain('100,000');
+        // 成本列與剩餘額度也遮蔽
+        expect(text(one('ticket-cost'))).toContain('•••••');
+        h.limits = { data: stockLimits(), error: null, loading: false, updatedAt: 1 };
+        await rerender();
+        expect(text(one('ticket-limit'))).toContain('•••••');
+        expect(text(one('ticket-limit'))).not.toContain('300,000');
     });
 });
 
@@ -382,14 +447,20 @@ describe('OrderTicketSheet — 期貨／選擇權', () => {
         h.quote = { tick: { close: '22800' } };
         m.submit.mockResolvedValue({ status: { status: 'Submitted' }, order: { id: 'f1', seqno: '9' } });
         await open({ code: 'TXFL6', action: 'Sell' });
-        expect(buttons().some(b => text(b) === '盤中零股')).toBe(false);
+        expect(buttons().some(b => text(b) === '零股')).toBe(false);
+        expect(buttons().some(b => text(b) === '融資')).toBe(false);
+        expect(byTestId('ticket-limit')).toHaveLength(0);
+        expect(byTestId('ticket-cost')).toHaveLength(0);
+        expect(h.limitsAccount).toBeNull();
         expect(qtyInput().props['aria-label']).toBe('數量（口）');
         await typeQty('2');
         expect(text(one('ticket-estimate'))).toContain('名目價值');
         expect(text(one('ticket-estimate'))).toContain((22800 * 200 * 2).toLocaleString('en-US'));
         await click('平倉');
-        await click('範圍市價');
+        await choosePriceType('MKP');
         expect(btn('IOC').props['aria-pressed']).toBe(true);
+        expect(text(preview())).toBe('預覽賣出委託 · TXFL6 · 2 口 · 範圍市價');
+        expect(panel().props['data-tone']).toBe('sell');
         await pressPreview();
         const input = m.submit.mock.calls[0]![0];
         expect(input.isFutures).toBe(true);
@@ -580,5 +651,238 @@ describe('OrderTicketSheet — 結果處理（§7.2）', () => {
         expect(m.submit).toHaveBeenCalledTimes(1);
         await act(async () => { resolve({ status: { status: 'Submitted' }, order: { id: 'o1', seqno: '1' } }); });
         expect(getMobileUi().ticket).toBeNull();
+    });
+});
+
+describe('OrderTicketSheet — 依買賣著色與方向文字', () => {
+    it('買進：整個面板 tone＝buy、頂端大字「買進」、預覽鍵寫完整內容', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        expect(panel().props['data-tone']).toBe('buy');
+        expect(text(one('ticket-direction'))).toBe('買進');
+        expect(text(preview())).toBe('預覽買進委託 · 2330 · 1 張 · 限價 100');
+    });
+
+    it('賣出：tone＝sell；未選方向時中性且提示先選', async () => {
+        await open({ code: '2330', action: null, price: 100, source: 'depth' });
+        expect(panel().props['data-tone']).toBeUndefined();
+        expect(text(one('ticket-direction'))).toBe('請選擇買進或賣出');
+        expect(text(preview())).toBe('請先選擇買進或賣出');
+        expect(preview().props.disabled).toBe(true);
+        await click('賣出');
+        expect(panel().props['data-tone']).toBe('sell');
+        expect(text(one('ticket-direction'))).toBe('賣出');
+        expect(text(preview())).toContain('預覽賣出委託');
+        await click('買進');
+        expect(panel().props['data-tone']).toBe('buy');
+    });
+
+    it('精簡報價列：成交價相對參考價著色符號、漲跌與漲跌%、單量與總量；可當沖標籤', async () => {
+        h.quote = { tick: { close: '101', price_chg: '1', volume: 46, total_volume: 36368 }, bidask: { bid_price: ['100.5'], ask_price: ['101'] } };
+        await open({ code: '2330', action: 'Buy' });
+        expect(text(one('ticket-quote-price'))).toBe('▲101.0');
+        expect(text(one('ticket-quote-change'))).toContain('+1.00%');
+        expect(text(one('ticket-quote-volume'))).toBe('單:46　總:36,368 張');
+        expect(text(one('ticket-daytrade-tag'))).toContain('可當沖');
+        h.contract = { ...stock, day_trade: 'No' };
+        await act(async () => { closeTicket(); });
+        await open({ code: '2330', action: 'Buy' });
+        expect(byTestId('ticket-daytrade-tag')).toHaveLength(0);
+    });
+});
+
+describe('OrderTicketSheet — 信用交易（整股）', () => {
+    it('買進時融券標示「融券（回補）」；切換買賣不改信用條件', async () => {
+        m.submit.mockResolvedValue({ status: { status: 'Submitted' }, order: { id: 'o1', seqno: '1' } });
+        await open({ code: '2330', action: 'Buy' });
+        await expand();
+        await click('融資');
+        expect(text(one('ticket-direction'))).toBe('融資買進');
+        expect(text(one('ticket-cond-summary'))).toContain('融資 / 盤中 / ROD');
+        await click('賣出');
+        expect(btn('融資').props['aria-pressed']).toBe(true);
+        expect(text(one('ticket-direction'))).toBe('融資賣出');
+        await click('融券');
+        await click('買進');
+        expect(btn('融券（回補）').props['aria-pressed']).toBe(true);
+        expect(text(one('ticket-direction'))).toBe('融券買進（回補）');
+        await pressPreview();
+        const input = m.submit.mock.calls[0]![0];
+        expect(input.stockOrder).toEqual({ action: 'Buy', price: 100, quantity: 1, price_type: 'LMT', order_type: 'ROD', order_lot: 'Common', order_cond: 'ShortSelling' });
+    });
+
+    it('融資買進送出 order_cond，現股不送；剩餘額度依條件切換', async () => {
+        h.limits = { data: stockLimits(), error: null, loading: false, updatedAt: 1 };
+        m.submit.mockResolvedValue({ status: { status: 'Submitted' }, order: { id: 'o1', seqno: '1' } });
+        await open({ code: '2330', action: 'Buy' });
+        expect(h.limitsAccount).toBe(h.stockAccount);
+        expect(text(one('ticket-limit'))).toContain('剩餘交易額度');
+        expect(text(one('ticket-limit'))).toContain('300,000 元');
+        await expand();
+        await click('融資');
+        expect(text(one('ticket-limit'))).toContain('融資剩餘額度');
+        expect(text(one('ticket-limit'))).toContain('400,000 元');
+        expect(text(one('ticket-cost'))).toContain('融資金額');
+        await pressPreview();
+        expect(m.submit.mock.calls[0]![0].stockOrder).toMatchObject({ order_cond: 'MarginTrading' });
+        expect('daytrade_short' in m.submit.mock.calls[0]![0].stockOrder).toBe(false);
+    });
+
+    it('剩餘額度：模擬或非交易時段（全 0）顯示「—」與說明；讀取中；失敗', async () => {
+        h.limits = { data: stockLimits({ trading_limit: 0, trading_used: 0, trading_available: 0, margin_limit: 0, margin_available: 0, short_limit: 0, short_available: 0 }), error: null, loading: false, updatedAt: 1 };
+        await open({ code: '2330', action: 'Buy' });
+        expect(text(one('ticket-limit'))).toContain('—');
+        expect(text(one('ticket-limit'))).toContain('08:30–15:00');
+        expect(text(one('ticket-limit'))).not.toContain('0 元');
+        h.limits = { data: null, error: null, loading: true, updatedAt: null };
+        await rerender();
+        expect(text(one('ticket-limit'))).toContain('讀取中');
+        h.limits = { data: null, error: 'boom', loading: false, updatedAt: null };
+        await rerender();
+        expect(text(one('ticket-limit'))).toContain('無法取得');
+    });
+
+    it('交易成本列（估）：依方向與信用條件組字；市價不估', async () => {
+        await open({ code: '2330', action: 'Sell' });
+        const cost = text(one('ticket-cost'));
+        expect(cost).toContain('交易成本（估）');
+        expect(cost).toContain('金額 100,000');
+        expect(cost).toContain('證交稅');
+        await choosePriceType('MKT');
+        expect(byTestId('ticket-cost')).toHaveLength(0);
+    });
+});
+
+describe('OrderTicketSheet — 現股當沖先賣', () => {
+    it('只在 賣出＋整股＋現股＋可當沖 時可勾選；送出 daytrade_short', async () => {
+        m.submit.mockResolvedValue({ status: { status: 'Submitted' }, order: { id: 'o1', seqno: '1' } });
+        await open({ code: '2330', action: 'Buy' });
+        await expand();
+        expect(byTestId('ticket-daytrade')).toHaveLength(0); // 買進不顯示
+        await click('賣出');
+        expect(one('ticket-daytrade').props.disabled).toBe(false);
+        await act(async () => { one('ticket-daytrade').props.onClick(); });
+        expect(one('ticket-daytrade').props['aria-pressed']).toBe(true);
+        expect(text(one('ticket-direction'))).toBe('現股當沖賣出');
+        expect(text(one('ticket-cond-summary'))).toContain('現沖先賣');
+        expect(text(one('ticket-cost'))).toContain('證交稅');
+        await pressPreview();
+        expect(m.submit.mock.calls[0]![0].stockOrder).toEqual({ action: 'Sell', price: 100, quantity: 1, price_type: 'LMT', order_type: 'ROD', order_lot: 'Common', daytrade_short: true });
+    });
+
+    it('選融資會取消勾選；不可當沖的股票無法勾選', async () => {
+        await open({ code: '2330', action: 'Sell' });
+        await expand();
+        await act(async () => { one('ticket-daytrade').props.onClick(); });
+        await click('融資');
+        expect(byTestId('ticket-daytrade')).toHaveLength(0);
+        await click('現股');
+        expect(one('ticket-daytrade').props['aria-pressed']).toBe(false);
+        h.contract = { ...stock, day_trade: 'OnlyBuy' };
+        await act(async () => { closeTicket(); });
+        await open({ code: '2330', action: 'Sell' });
+        await expand();
+        expect(one('ticket-daytrade').props.disabled).toBe(true);
+    });
+
+    it('切到零股會改回現股、取消當沖（使用者操作，比照桌面）', async () => {
+        await open({ code: '2330', action: 'Sell' });
+        await expand();
+        await act(async () => { one('ticket-daytrade').props.onClick(); });
+        await click('零股');
+        expect(btn('現股').props['aria-pressed']).toBe(true);
+        expect(byTestId('ticket-daytrade')).toHaveLength(0);
+        expect(text(one('ticket-direction'))).toBe('賣出');
+    });
+});
+
+describe('OrderTicketSheet — 盤後零股', () => {
+    it('零股的盤後＝Odd：送出 order_lot Odd、LMT、ROD、無 order_cond；隱藏五檔並說明時段', async () => {
+        m.submit.mockResolvedValue({ status: { status: 'Submitted' }, order: { id: 'o1', seqno: '1' } });
+        await open({ code: '2330', action: 'Buy' });
+        await click('零股');
+        await expand();
+        await click('盤後');
+        expect(btn('盤後').props['aria-pressed']).toBe(true);
+        expect(text(one('ticket-cond-summary'))).toContain('現股 / 盤後 / ROD');
+        expect(text(one('ticket-odd-note'))).toContain('13:40–14:30 收單');
+        expect(text(one('ticket-odd-note'))).toContain('14:30');
+        expect(byTestId('depth-ladder-stub')).toHaveLength(0);
+        expect(byTestId('ticket-no-depth')).toHaveLength(1);
+        // 盤後零股沒有即時五檔：買一／賣一無資料
+        expect(btn('買一').props.disabled).toBe(true);
+        await click('盤中');
+        expect(btn('盤中').props['aria-pressed']).toBe(true);
+        expect(h.ladder).toMatchObject({ oddLot: true });
+        await click('盤後');
+        await typeQty('250');
+        await pressPreview();
+        const input = m.submit.mock.calls[0]![0];
+        expect(input.orderLot).toBe('Odd');
+        expect(input.stockOrder).toEqual({ action: 'Buy', price: 100, quantity: 250, price_type: 'LMT', order_type: 'ROD', order_lot: 'Odd' });
+        expect('order_cond' in input.stockOrder).toBe(false);
+        expect(m.risk).toHaveBeenLastCalledWith(250, 'Odd');
+    });
+});
+
+describe('OrderTicketSheet — openTicket 帶入 lot／cond／daytradeShort', () => {
+    it('帶入合規則的值：條件列預設展開並照用', async () => {
+        m.submit.mockResolvedValue({ status: { status: 'Submitted' }, order: { id: 'o1', seqno: '1' } });
+        await open({ code: '2330', action: 'Sell', cond: 'ShortSelling' });
+        expect(byTestId('ticket-cond-panel')).toHaveLength(1);
+        expect(btn('融券').props['aria-pressed']).toBe(true);
+        expect(text(one('ticket-direction'))).toBe('融券賣出');
+        await pressPreview();
+        expect(m.submit.mock.calls[0]![0].stockOrder).toMatchObject({ order_cond: 'ShortSelling' });
+    });
+
+    it('帶入盤後零股', async () => {
+        await open({ code: '2330', action: 'Buy', lot: 'Odd' });
+        expect(btn('零股').props['aria-pressed']).toBe(true);
+        expect(btn('盤後').props['aria-pressed']).toBe(true);
+        expect(qtyInput().props['aria-label']).toBe('數量（股）');
+    });
+
+    it('不合規則（零股＋融資、買進＋當沖以外的組合）保留帶入值並顯示原因、停用預覽，不自動換條件', async () => {
+        await open({ code: '2330', action: 'Sell', lot: 'IntradayOdd', cond: 'MarginTrading' });
+        expect(btn('融資').props['aria-pressed']).toBe(true);
+        expect(problemText()).toContain('零股只能以現股買賣');
+        expect(preview().props.disabled).toBe(true);
+        await act(async () => { closeTicket(); });
+        h.contract = { ...stock, day_trade: 'No' };
+        await open({ code: '2330', action: 'Sell', daytradeShort: true });
+        expect(one('ticket-daytrade').props['aria-pressed']).toBe(true);
+        expect(one('ticket-daytrade').props.disabled).toBe(false); // 可以取消
+        expect(problemText()).toContain('不能現股當沖先賣');
+        expect(preview().props.disabled).toBe(true);
+        await act(async () => { one('ticket-daytrade').props.onClick(); });
+        expect(problemText()).toBeNull();
+    });
+});
+
+describe('OrderTicketSheet — 內嵌五檔與信用提醒', () => {
+    it('五檔點價位：帶入價格並改成限價、視為已確認（不決定買賣）', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        expect(h.ladder).toMatchObject({ variant: 'ticket', oddLot: false, code: '2330' });
+        await choosePriceType('MKT');
+        await act(async () => { setResumeGateForTest({ state: 'ready', resumeSeq: 1 }); });
+        await act(async () => { (h.ladder!.onPick as (p: number, s: 'bid' | 'ask') => void)(99, 'bid'); });
+        expect(priceType().props.value).toBe('LMT');
+        expect(priceInput().props.value).toBe('99');
+        expect(byTestId('ticket-price-stale')).toHaveLength(0);
+        expect(preview().props.disabled).toBe(false);
+        expect(text(one('ticket-direction'))).toBe('買進');
+    });
+
+    it('持倉衝突的信用提醒：只提示，按了才改條件，並附在送單備註', async () => {
+        m.submit.mockRejectedValue(new OrderConfirmCancelled());
+        h.positions = [{ code: '2330', direction: 'Sell', cond: 'ShortSelling', quantity: 1, account: h.stockAccount }];
+        await open({ code: '2330', action: 'Buy' });
+        expect(text(one('ticket-credit-hint'))).toContain('現股買進不會回補融券');
+        await pressPreview();
+        expect(m.submit.mock.calls[0]![0].creditHint).toContain('現股買進不會回補融券');
+        expect(m.submit.mock.calls[0]![0].stockOrder).not.toHaveProperty('order_cond');
+        await act(async () => { btn('改用融券（回補）').props.onClick(); });
+        expect(text(one('ticket-direction'))).toBe('融券買進（回補）');
+        expect(byTestId('ticket-credit-hint')).toHaveLength(0);
     });
 });

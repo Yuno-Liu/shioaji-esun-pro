@@ -26,12 +26,14 @@ interface MobileOrderCommon {
     orderType: OrderType;
 }
 
-/** 股票：stockOrder.order_cond 為現股時不送（undefined）；daytrade_short 只在「賣出＋現股」時送 true */
+/** 股票：stockOrder.order_cond 為現股時不送（undefined）；daytrade_short 只在「賣出＋現股＋整股」時送 true */
 export type MobileStockOrderInput = MobileOrderCommon & {
     isFutures: false;
     priceType: 'LMT' | 'MKT';
     orderLot: StockOrderLot;
     stockOrder: StockOrderReq;
+    /** 持倉衝突的信用提醒（manualStockCreditHint 的文字；只提示），附在確認面板備註 */
+    creditHint?: string;
 };
 
 /** 期貨／選擇權單式（玉山帳戶不可用，見規格 R8） */

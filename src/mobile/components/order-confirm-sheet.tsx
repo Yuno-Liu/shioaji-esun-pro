@@ -10,6 +10,8 @@
 // - ResumeGate：面板開著時 resumeSeq 與這筆出現時不同、或 resumeAllowsNewOrders() 為 false，立即取消並提示。
 //   T2 進入 resyncing 時也會 resolveOrderConfirm(false)；lib 在沒有待確認時直接 return，重複呼叫無害。
 // - 同一筆只 resolve(true) 一次；元件卸載時若仍有待確認就 resolve(false)，不讓 promise 懸置。
+// - 依 request.action 著色整個面板（BottomSheet tone：買進 vars.color.up、賣出 vars.color.down），
+//   並以大字顯示動作（含信用名稱：融資買進、融券賣出、融券買進（回補）、現股當沖賣出）。
 // - 即時價：桌面取自 trigger-engine 的 usePendingPrices()，但 livePriceCode 只有觸價單會帶，手機不載入
 //   trigger-engine（載入即啟動觸價執行器，違反 R7）；因此有 livePriceCode 時一律視為「行情中斷」並停用（fail-closed）。
 
@@ -51,9 +53,18 @@ export function confirmEnvText(simulation: boolean | null): string {
     return simulation === true ? '模擬環境' : simulation === false ? '正式環境' : '環境未確認';
 }
 
-/** 動作文字（信用條件寫進動作：融資買進／融券賣出；買賣一律有文字） */
-export function confirmActionText(request: Pick<OrderConfirmRequest, 'action' | 'credit'>): string {
-    return `${request.credit ?? ''}${request.action === 'Buy' ? '買進' : '賣出'}`;
+/** 備註裡的「現股當沖」段（桌面與手機新單都以「・現股當沖」附在 note；credit 不含當沖，見規格 §17） */
+const DAYTRADE_NOTE = '現股當沖';
+
+/**
+ * 動作文字（信用條件寫進動作；買賣一律有文字）：融資買進、融券賣出、融券買進（回補）、
+ * 現股當沖賣出（credit 為空且 note 有「現股當沖」段）、買進、賣出。
+ */
+export function confirmActionText(request: Pick<OrderConfirmRequest, 'action' | 'credit'> & { note?: string }): string {
+    const side = request.action === 'Buy' ? '買進' : '賣出';
+    if (request.credit) return request.credit === '融券' && request.action === 'Buy' ? '融券買進（回補）' : `${request.credit}${side}`;
+    if (request.action === 'Sell' && (request.note ?? '').split('・').includes(DAYTRADE_NOTE)) return `${DAYTRADE_NOTE}${side}`;
+    return side;
 }
 
 /**
@@ -165,11 +176,11 @@ export function OrderConfirmSheet() {
     const priceText = request.priceLabel ?? (request.price === null ? '市價' : fmtPrice(request.price));
 
     return (
-        <BottomSheet open onClose={cancel} title={CONFIRM_TEXT.title} layer='confirm' testId='order-confirm-sheet'>
+        <BottomSheet open onClose={cancel} title={CONFIRM_TEXT.title} layer='confirm' testId='order-confirm-sheet' tone={isBuy ? 'buy' : 'sell'}>
             <div className={styles.content}>
                 <strong className={styles.env[envKey]} data-testid='confirm-env'>{confirmEnvText(request.simulation)}</strong>
                 <div className={styles.actionLine[isBuy ? 'up' : 'down']} data-testid='confirm-action'>
-                    <span>{actionText}</span>
+                    <span className={styles.actionBig}>{actionText}</span>
                     <span className={styles.contractName}>{request.name || request.code}</span>
                     {request.name && <span className={styles.contractCode}>{request.code}</span>}
                 </div>

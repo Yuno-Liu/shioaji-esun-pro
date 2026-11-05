@@ -9,7 +9,10 @@
 //   （使用者已動過價格就不帶）；之後不再跟價。
 // - 即時驗證依 §6.3 的 1～7 順序（ticketProblem），回傳第一個原因；有原因就停用「預覽並確認委託」。
 // - 送出一律呼叫 submitMobileOrder()（lib/mobile-order.ts）；結果依 §7.2 分四類處理，結果未知不提供重送。
-// MVP 單位只有整股與盤中零股，信用條件固定現股、不提供當沖先賣（P1）。
+// - 單位：整股、盤中零股（IntradayOdd）、盤後零股（Odd）；信用：現股、融資、融券（借券類不提供，§12）；
+//   現股當沖先賣只限「賣出＋整股＋現股＋contract.day_trade === 'Yes'」。規則比照桌面 src/components/order-ticket.tsx：
+//   切換買賣不改信用條件；openTicket 帶入的 lot／cond／daytradeShort 只在開啟時帶入一次，不合規則時保留並顯示原因。
+//   驗證用「使用者的意圖」（含現股與勾選的當沖）；實際送出只在非現股時送 order_cond、只在可送時送 daytrade_short。
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSnapshotBaseline } from '../../hooks/use-display-book';
@@ -19,9 +22,9 @@ import { useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
 import { isEsunAccount } from '../../lib/esun';
 import { accountMatches } from '../../lib/flash-account';
-import { isOddLot, ODD_LOT_MAX_SHARES, orderQtyUnit, SHARES_PER_LOT, stockOrderProblem } from '../../lib/odd-lot';
+import { creditLabel, isOddLot, ODD_LOT_MAX_SHARES, orderQtyUnit, SHARES_PER_LOT, stockOrderProblem } from '../../lib/odd-lot';
 import { captureSelectedAccount } from '../../lib/order-account';
-import { defaultOrderTypeFor, futuresOrderProblem, orderTypeDisabledReason, priceTypeDisabledReason } from '../../lib/order-conditions';
+import { defaultOrderTypeFor, futuresOrderProblem, orderTypeDisabledReason, PRICE_TYPE_LABEL, priceTypeDisabledReason } from '../../lib/order-conditions';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
 import { esunStockLegProblem } from '../../lib/order-route';
 import { orderStatusWithNumber } from '../../lib/order-status-label';
@@ -29,7 +32,7 @@ import { checkOrderAllowed, useRiskSettings } from '../../lib/risk';
 import { notify, OrderConfirmCancelled } from '../../lib/trade';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Snapshot } from '../../lib/types/market';
-import type { Action, FuturesOCType, FuturesPriceType, OrderType, StockOrderLot, StockOrderReq } from '../../lib/types/order';
+import type { Action, FuturesOCType, FuturesPriceType, OrderType, StockOrderReq } from '../../lib/types/order';
 import type { Account } from '../../lib/types/portfolio';
 import { contractMultiplier } from '../../lib/utils/contract-cost';
 import { roundToTick, stepPrice } from '../../lib/utils/ticksize';
@@ -37,12 +40,12 @@ import { useOrderRoute } from '../components/route-badge';
 import { isNotStarted } from '../lib/errors';
 import { submitMobileOrder } from '../lib/mobile-order';
 import type { MobileOrderInput } from '../lib/mobile-order-types';
-import { closeTicket, getMobileUi, type TicketRequest } from '../lib/mobile-store';
+import { closeTicket, getMobileUi, type TicketCond, type TicketLot, type TicketRequest } from '../lib/mobile-store';
 import { acknowledgeStaleData, assertResumeReady, getResumeGate, retryResume, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import { useResumeGate } from './use-resume-gate';
 
-/** MVP 提供的股票單位（盤後零股屬 P1） */
-export type TicketLot = Extract<StockOrderLot, 'Common' | 'IntradayOdd'>;
+// 單位與信用條件的型別只有一份（lib/mobile-store.ts），這裡轉出方便元件取用
+export type { TicketCond, TicketLot } from '../lib/mobile-store';
 
 export interface TicketFields {
     /** null＝尚未選擇買賣（例如五檔價位只帶價） */
@@ -52,6 +55,10 @@ export interface TicketFields {
     orderType: OrderType;
     /** 期權不使用（固定 Common） */
     orderLot: TicketLot;
+    /** 股票信用條件（期權不使用，固定 Cash）；只限整股，零股只能現股 */
+    orderCond: TicketCond;
+    /** 現股當沖先賣（勾選）；只在 賣出＋整股＋現股＋可當沖 時有效 */
+    daytradeShort: boolean;
     /** 只有期權使用 */
     octype: FuturesOCType;
     /** 價格輸入框的原始文字 */
@@ -87,7 +94,17 @@ export const TICKET_TEXT = {
     staleData: '委託／持倉資料可能過期：請勾選「我了解委託／持倉資料可能過期」或按「重試」',
     failed: '連線未恢復，請重新整理頁面',
     envUnknown: '送單環境未確認（模擬／正式），暫停下單',
+    afterHoursCommon: '盤後定價交易不提供；盤後請改用零股（盤後零股）',
+    oddCreditOnly: '零股只能現股（不可融資券、不可當沖）',
+    oddAfterSession: '盤後零股 13:40–14:30 收單，14:30 一次撮合（沒有即時五檔）',
 } as const;
+
+/** 信用條件文字（買進時融券＝回補） */
+export function condLabel(cond: TicketCond, action: Action | null): string {
+    if (cond === 'MarginTrading') return '融資';
+    if (cond === 'ShortSelling') return action === 'Buy' ? '融券（回補）' : '融券';
+    return '現股';
+}
 
 // ---- 純函式（元件與測試共用）----
 
@@ -194,9 +211,22 @@ export function orderPriceOf(fields: Pick<TicketFields, 'priceType' | 'priceText
     return p > 0 ? p : 0;
 }
 
-/** 股票委託內容：現股時不送 order_cond、不送 daytrade_short（MVP 不提供信用與當沖先賣） */
+/** 實際送出 daytrade_short：只在「賣出＋現股＋整股＋勾選」時（其他組合由驗證擋下，不會走到送出） */
+export function sendsDaytradeShort(fields: Pick<TicketFields, 'orderLot' | 'orderCond' | 'daytradeShort'>, action: Action): boolean {
+    return action === 'Sell' && fields.daytradeShort && fields.orderCond === 'Cash' && fields.orderLot === 'Common';
+}
+
+/** 「現股當沖先賣」可以勾選：賣出＋整股＋現股＋contract.day_trade === 'Yes' */
+export function daytradeShortEligible(contract: Pick<ContractInfo, 'day_trade'>, fields: Pick<TicketFields, 'action' | 'orderLot' | 'orderCond'>): boolean {
+    return fields.action === 'Sell' && fields.orderLot === 'Common' && fields.orderCond === 'Cash' && contract.day_trade === 'Yes';
+}
+
+/**
+ * 股票委託內容（實際送出）：order_cond 只在非現股時送；daytrade_short 只在 sendsDaytradeShort 時送 true。
+ * 兩個欄位不送時不出現在物件上（與桌面 order-ticket.tsx:424-439 相同）。
+ */
 export function stockOrderOf(fields: TicketFields, action: Action): StockOrderReq {
-    return {
+    const order: StockOrderReq = {
         action,
         price: orderPriceOf(fields),
         quantity: fields.quantity,
@@ -204,6 +234,42 @@ export function stockOrderOf(fields: TicketFields, action: Action): StockOrderRe
         order_type: fields.orderType,
         order_lot: fields.orderLot,
     };
+    if (fields.orderCond !== 'Cash') order.order_cond = fields.orderCond;
+    if (sendsDaytradeShort(fields, action)) order.daytrade_short = true;
+    return order;
+}
+
+/**
+ * 驗證用的委託形狀（使用者的意圖）：信用條件一律帶上、勾選的當沖在賣出時一律帶上，
+ * 不合規則的組合（零股＋融資、融資＋當沖…）由 stockOrderProblem／玉山規則擋下並顯示原因，
+ * 而不是在送出時被悄悄拿掉（比照桌面 execute() 的驗證參數）。
+ */
+export function stockOrderIntentOf(fields: TicketFields, action: Action): StockOrderReq {
+    return { ...stockOrderOf(fields, action), order_cond: fields.orderCond, daytrade_short: action === 'Sell' && fields.daytradeShort };
+}
+
+/** 動作文字（含信用名稱）：融資買進、融券買進（回補）、融券賣出、現股當沖賣出、買進、賣出；未選方向回空字串 */
+export function ticketActionText(fields: Pick<TicketFields, 'action' | 'orderLot' | 'orderCond' | 'daytradeShort'>, isFutures: boolean): string {
+    if (!fields.action) return '';
+    const side = fields.action === 'Buy' ? '買進' : '賣出';
+    if (isFutures) return side;
+    if (fields.orderCond === 'ShortSelling' && fields.action === 'Buy') return '融券買進（回補）';
+    const credit = fields.orderCond !== 'Cash' ? creditLabel(fields.action, fields.orderCond) : undefined;
+    if (credit) return `${credit}${side}`;
+    if (fields.action === 'Sell' && fields.daytradeShort && fields.orderLot === 'Common') return '現股當沖賣出';
+    return side;
+}
+
+const fmtNumber = (v: number) => v.toLocaleString('en-US', { maximumFractionDigits: 4 });
+
+/** 預覽鍵文字：「預覽買進委託 · 2330 · 1 張 · 限價 2,240」；未選方向時提示先選 */
+export function previewLabel(contract: Pick<ContractInfo, 'code'>, fields: TicketFields, isFutures: boolean): string {
+    if (!fields.action) return '請先選擇買進或賣出';
+    const unit = orderQtyUnit(isFutures, isFutures ? undefined : fields.orderLot);
+    const qty = Number.isSafeInteger(fields.quantity) && fields.quantity > 0 ? `${fmtNumber(fields.quantity)} ${unit}` : `— ${unit}`;
+    const p = parsePrice(fields.priceText);
+    const price = fields.priceType === 'LMT' ? `限價 ${p > 0 ? fmtNumber(p) : '—'}` : PRICE_TYPE_LABEL[fields.priceType];
+    return `預覽${ticketActionText(fields, isFutures)}委託 · ${contract.code} · ${qty} · ${price}`;
 }
 
 export interface TicketCheck {
@@ -242,7 +308,7 @@ export function ticketProblem(c: TicketCheck): string | null {
         const problem = futuresOrderProblem({ price_type: fields.priceType, order_type: fields.orderType, octype: fields.octype });
         if (problem) return problem;
     } else {
-        const order = stockOrderOf(fields, fields.action);
+        const order = stockOrderIntentOf(fields, fields.action);
         const problem = esunStockLegProblem(account, contract, order)
             ?? stockOrderProblem({ ...order, day_trade: contract.day_trade });
         if (problem) return problem;
@@ -282,8 +348,11 @@ export function estimateAmount(
     return { value: p * shares, byLastPrice };
 }
 
-/** 組出 submitMobileOrder 的輸入（市價 price 0；股票現股不送 order_cond／daytrade_short） */
-export function buildMobileOrderInput(contract: ContractInfo, account: Account, fields: TicketFields & { action: Action }): MobileOrderInput {
+/**
+ * 組出 submitMobileOrder 的輸入（市價 price 0；股票現股不送 order_cond、只在可送時送 daytrade_short）。
+ * creditHint：持倉衝突的信用提醒（只提示、不改條件），附在確認面板的備註。
+ */
+export function buildMobileOrderInput(contract: ContractInfo, account: Account, fields: TicketFields & { action: Action }, creditHint?: string | null): MobileOrderInput {
     const price = orderPriceOf(fields);
     const common = { contract, displayedAccount: account, action: fields.action, quantity: fields.quantity, price, orderType: fields.orderType };
     if (isFuturesContract(contract)) {
@@ -303,7 +372,14 @@ export function buildMobileOrderInput(contract: ContractInfo, account: Account, 
         };
     }
     const stockOrder = stockOrderOf(fields, fields.action);
-    return { ...common, isFutures: false, priceType: stockOrder.price_type, orderLot: fields.orderLot, stockOrder };
+    return {
+        ...common,
+        isFutures: false,
+        priceType: stockOrder.price_type,
+        orderLot: fields.orderLot,
+        stockOrder,
+        ...(creditHint ? { creditHint } : {}),
+    };
 }
 
 export type TicketOutcome = 'cancelled' | 'not-sent' | 'unknown';
@@ -326,6 +402,26 @@ function initialPriceText(contract: ContractInfo, price: number | null): string 
     return price !== null && price > 0 ? String(roundToTick(contract, price)) : '';
 }
 
+/**
+ * 開啟時的欄位：openTicket 帶入的 lot／cond／daytradeShort 只在這裡帶入一次（股票）。
+ * 帶入值不合規則（例如零股＋融資）時照樣保留，由 ticketProblem 顯示原因並停用預覽，絕不自動換成別的條件。
+ * 零股單位只接受限價＋ROD，這兩個本來就是預設值。
+ */
+export function initialTicketFields(ticket: Pick<TicketRequest, 'action' | 'lot' | 'cond' | 'daytradeShort'>, contract: ContractInfo, price: number | null): TicketFields {
+    const stock = !isFuturesContract(contract);
+    return {
+        action: ticket.action,
+        priceType: 'LMT',
+        orderType: 'ROD',
+        orderLot: stock ? ticket.lot ?? 'Common' : 'Common',
+        orderCond: stock ? ticket.cond ?? 'Cash' : 'Cash',
+        daytradeShort: stock && ticket.daytradeShort === true,
+        octype: 'Auto',
+        priceText: initialPriceText(contract, price),
+        quantity: 1,
+    };
+}
+
 // ---- React hook ----
 
 export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
@@ -345,22 +441,16 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
     const { snapshot } = useSnapshotBaseline(contract.code, undefined, contract);
     const commonTrade = useRealTradePrice(quote?.tick);
     const [initialPrice] = useState(() => defaultTicketPrice(ticket.price, commonTrade, snapshot, contract));
-    const [fields, setFields] = useState<TicketFields>(() => ({
-        action: ticket.action,
-        priceType: 'LMT',
-        orderType: 'ROD',
-        orderLot: 'Common',
-        octype: 'Auto',
-        priceText: initialPriceText(contract, initialPrice?.price ?? null),
-        quantity: 1,
-    }));
+    const [fields, setFields] = useState<TicketFields>(() => initialTicketFields(ticket, contract, initialPrice?.price ?? null));
     /** 價格欄自動帶入的來源；使用者動過價格後為 null */
     const [priceSource, setPriceSource] = useState<PriceSource | null>(() => initialPrice?.source ?? null);
     const odd = !isFutures && isOddLot(fields.orderLot);
-    const oddQuote = useQuote(!isFutures && fields.orderLot === 'IntradayOdd' ? contract.code : null, { oddLot: true });
+    const intradayOdd = !isFutures && fields.orderLot === 'IntradayOdd';
+    const oddQuote = useQuote(intradayOdd ? contract.code : null, { oddLot: true });
     const oddTrade = useRealTradePrice(oddQuote?.tick);
-    const activeQuote = odd ? oddQuote : quote;
-    const live = marketPrice(odd ? oddTrade : commonTrade, snapshot);
+    // 盤後零股沒有即時五檔（14:30 一次撮合）；成交價沿用整股
+    const activeQuote = intradayOdd ? oddQuote : odd ? undefined : quote;
+    const live = marketPrice(intradayOdd ? oddTrade : commonTrade, snapshot);
     const lastPrice = live?.price ?? null;
     const bid1 = positivePrice(activeQuote?.bidask?.bid_price?.[0]);
     const ask1 = positivePrice(activeQuote?.bidask?.ask_price?.[0]);
@@ -401,7 +491,8 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         mounted.current = true;
         return () => { mounted.current = false; };
     }, []);
-    const captureContext = useOrderContext(contract, `${fields.orderLot}:${fields.action ?? ''}`);
+    // 單位、信用條件、當沖、方向任一改變 → 確認中的舊流程在 beforeDispatch 失效
+    const captureContext = useOrderContext(contract, `${fields.orderLot}:${fields.orderCond}:${fields.daytradeShort ? 'dt' : ''}:${fields.action ?? ''}`);
 
     const edit = useCallback((patch: Partial<TicketFields>) => {
         if (busyRef.current) return;
@@ -415,6 +506,7 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         setPriceSeq(confirmedPriceSeq(getResumeGate()));
     };
 
+    /** 切換買賣不改信用條件與當沖勾選（比照桌面；不合規則時由驗證顯示原因） */
     const setAction = (action: Action) => edit({ action });
     const setPriceType = (priceType: FuturesPriceType) => {
         if (priceTypeDisabledReason(priceType, odd)) return;
@@ -426,10 +518,23 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         edit({ orderType });
     };
     const setOctype = (octype: FuturesOCType) => edit({ octype });
-    /** 單位切換：數量歸 1；零股強制限價＋ROD（信用固定現股、不當沖） */
+    /** 單位切換（使用者操作）：數量歸 1；零股強制 限價＋ROD＋現股＋不當沖（比照桌面 order-ticket.tsx:1086-1096） */
     const setOrderLot = (orderLot: TicketLot) => {
         if (isFutures || orderLot === fields.orderLot) return;
-        edit(isOddLot(orderLot) ? { orderLot, quantity: 1, priceType: 'LMT', orderType: 'ROD' } : { orderLot, quantity: 1 });
+        edit(isOddLot(orderLot)
+            ? { orderLot, quantity: 1, priceType: 'LMT', orderType: 'ROD', orderCond: 'Cash', daytradeShort: false }
+            : { orderLot, quantity: 1 });
+    };
+    /** 信用條件（只限整股）；選非現股時取消當沖勾選（比照桌面 order-ticket.tsx:1162-1164） */
+    const setOrderCond = (orderCond: TicketCond) => {
+        if (isFutures || odd) return;
+        edit(orderCond === 'Cash' ? { orderCond } : { orderCond, daytradeShort: false });
+    };
+    /** 現股當沖先賣：可勾選的條件見 daytradeShortEligible；取消勾選一律允許（不合規則時才能取消） */
+    const setDaytradeShort = (on: boolean) => {
+        if (isFutures) return;
+        if (on && !daytradeShortEligible(contract, fields)) return;
+        edit({ daytradeShort: on });
     };
     /** 手動輸入價格（視同使用者確認這個價格） */
     const setPriceText = (priceText: string) => {
@@ -473,9 +578,9 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         edit({ quantity: Math.min(qtyMax, Math.max(1, base + delta)) });
     };
 
-    const submit = async (): Promise<void> => {
+    const submit = async (creditHint?: string | null): Promise<void> => {
         if (busyRef.current || problem || !account || !fields.action) return;
-        const input = buildMobileOrderInput(contract, account, { ...fields, action: fields.action });
+        const input = buildMobileOrderInput(contract, account, { ...fields, action: fields.action }, creditHint);
         const isContextCurrent = captureContext();
         busyRef.current = true;
         setBusy(true);
@@ -491,7 +596,7 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
             notify({
                 kind: 'ok',
                 title: '委託已送出',
-                body: `${fields.action === 'Buy' ? '買進' : '賣出'} ${contract.code} ${fields.quantity} ${unit}・${orderStatusWithNumber(trade)}`,
+                body: `${ticketActionText(fields, isFutures)} ${contract.code} ${fields.quantity} ${unit}・${orderStatusWithNumber(trade)}`,
             });
             closeThisTicket();
         } catch (err) {
@@ -520,6 +625,10 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         gate,
         fields,
         quote: { last: lastPrice, lastSource: live?.source ?? null, bid1, ask1 },
+        /** 市場快照（報價列沒有真實成交時用） */
+        snapshot,
+        /** 開啟時的帶入（lot／cond／daytradeShort）：面板可預設展開條件列 */
+        presetConditions: ticket.lot !== undefined || ticket.cond !== undefined || ticket.daytradeShort === true,
         priceSource,
         priceStale,
         canConfirmPrice: canConfirmPrice(gate),
@@ -532,6 +641,11 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         setOrderType,
         setOctype,
         setOrderLot,
+        setOrderCond,
+        setDaytradeShort,
+        daytradeShortEligible: daytradeShortEligible(contract, fields),
+        actionText: ticketActionText(fields, isFutures),
+        previewText: previewLabel(contract, fields, isFutures),
         setPriceText,
         stepPriceBy,
         pickPrice,

@@ -3,6 +3,8 @@
 // - 關閉方式：點背景、在把手／標題區往下滑超過 DISMISS_DRAG_PX、Esc、標題列的「關閉」。
 // - dismissible=false 時以上方式全部停用（例如送出中，避免結果未知時面板消失）。
 // - 底部加 env(safe-area-inset-bottom)；遵守 prefers-reduced-motion（見 styles/sheet.css.ts）。
+// - tone（選填）：'buy'／'sell' 時整個面板以買賣方向色（vars.color.up／down）淡色疊底，並加方向色頂框；
+//   缺省或 null＝中性（既有行為不變）。
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import * as styles from '../styles/sheet.css';
@@ -23,9 +25,11 @@ export interface BottomSheetProps {
     /** 沒有 title 時的無障礙名稱 */
     ariaLabel?: string;
     testId?: string;
+    /** 買賣方向著色：buy＝vars.color.up、sell＝vars.color.down 的淡色底；null／缺省＝中性 */
+    tone?: 'buy' | 'sell' | null;
 }
 
-export function BottomSheet({ open, onClose, title, children, dismissible = true, layer = 'sheet', ariaLabel, testId }: BottomSheetProps) {
+export function BottomSheet({ open, onClose, title, children, dismissible = true, layer = 'sheet', ariaLabel, testId, tone = null }: BottomSheetProps) {
     const titleId = useId();
     const panelRef = useRef<HTMLDivElement | null>(null);
     const drag = useRef<{ pointerId: number; startY: number } | null>(null);
@@ -84,7 +88,8 @@ export function BottomSheet({ open, onClose, title, children, dismissible = true
         >
             <div
                 ref={panelRef}
-                className={styles.panel}
+                className={tone ? `${styles.panel} ${styles.panelTone[tone]}` : styles.panel}
+                data-tone={tone ?? undefined}
                 role='dialog'
                 aria-modal='true'
                 aria-labelledby={title ? titleId : undefined}

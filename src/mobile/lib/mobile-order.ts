@@ -3,13 +3,15 @@
 // 只編排 src/lib 既有函式，不自行組 HTTP 請求；順序比照桌面 src/components/order-ticket.tsx 的 execute()，另加手機閘門：
 //   1) ResumeGate＋串流 LIVE → 2) 記下伺服器模式代次 → 3) 風控 → 4) 商品與券商規則（期權＋玉山帳戶在此拒絕）
 //   → 5) 固定送單帳戶與顯示路由 → 6) 強制確認（不看 confirmManualOrders）→ 7) 確認後重驗
-//   → 8) beforeDispatch（HTTP 送出前最後一刻同步重驗）→ 9) placeStockOrder／placeFuturesOrder。
+//   → 8) beforeDispatch（HTTP 送出前最後一刻同步重驗；現股當沖先賣再以最新合約確認仍可當沖）
+//   → 9) placeStockOrder／placeFuturesOrder。
 // 結果分類（規格 R6、§7.2）：送出前任何閘門擋下都丟出 mutationNotStarted（確定沒有送出）；
 // 送單函式的錯誤原樣丟出（UI 依 mutationNotStarted 判斷，其餘一律「結果未知」）。絕不重送。
 
 import { ORDER_CONTEXT_CHANGED_MESSAGE } from '../../hooks/use-order-context';
+import { getCachedContract } from '../../lib/contracts-cache';
 import { isEsunAccount } from '../../lib/esun';
-import { creditLabel, lotLabel, orderQtyUnit, stockOrderProblem } from '../../lib/odd-lot';
+import { CREDIT_TEXT, creditLabel, lotLabel, orderQtyUnit, stockOrderProblem } from '../../lib/odd-lot';
 import { ACCOUNT_CHANGED_MESSAGE, captureSelectedAccount, isSelectedAccountUnchanged } from '../../lib/order-account';
 import { futuresOrderProblem } from '../../lib/order-conditions';
 import { accountConfirmLabel, requestOrderConfirm } from '../../lib/order-confirm';
@@ -18,6 +20,7 @@ import { checkOrderAllowed } from '../../lib/risk';
 import { captureServerMode, SERVER_MODE_CHANGED_MESSAGE } from '../../lib/server-info-store';
 import { placeFuturesOrder, placeStockOrder } from '../../lib/shioaji';
 import { assertTradingLive, OrderConfirmCancelled } from '../../lib/trade';
+import type { ContractInfo } from '../../lib/types/contract';
 import type { Trade } from '../../lib/types/order';
 import { notStarted } from './errors';
 import type { MobileOrderInput } from './mobile-order-types';
@@ -53,6 +56,15 @@ function routeGate(check: () => void): () => void {
             throw notStarted(String(err));
         }
     };
+}
+
+/**
+ * 確認期間同一檔合約更新成不可當沖：現股當沖先賣就不送（比照桌面 order-ticket.tsx assertDayTradeStillAllowed）。
+ * 以合約快取的最新內容為準（面板的 useContract 讀同一份快取）；快取沒有這檔時用送單當時的合約。
+ */
+export function assertDayTradeStillAllowed(contract: Pick<ContractInfo, 'code' | 'day_trade'>): void {
+    const latest = getCachedContract(contract.code) ?? contract;
+    if (latest.day_trade !== 'Yes') throw notStarted(CREDIT_TEXT.daytradeStock);
 }
 
 /**
@@ -108,6 +120,7 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
         !input.isFutures && orderLot !== 'Common' ? lotLabel(orderLot) : undefined,
         credit,
         daytradeShort ? '現股當沖' : undefined,
+        !input.isFutures ? input.creditHint : undefined,
         routeConfirmNote(orderAccount),
     ].filter(Boolean).join('・');
     const approved = await requestOrderConfirm({
@@ -132,6 +145,7 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
             assertTradingLive();
             if (!guards.isContextCurrent()) throw notStarted(ORDER_CONTEXT_CHANGED_MESSAGE);
             if (!sameServerMode()) throw notStarted(SERVER_MODE_CHANGED_MESSAGE);
+            if (daytradeShort) assertDayTradeStillAllowed(input.contract);
             if (!isSelectedAccountUnchanged(orderAccount)) throw notStarted(ACCOUNT_CHANGED_MESSAGE);
             sameRoute();
         },

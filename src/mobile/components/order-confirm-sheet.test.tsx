@@ -34,7 +34,7 @@ vi.mock('../../lib/privacy', () => ({ usePrivacyMode: () => q.priv }));
 vi.mock('../../lib/trade', () => ({ notify: m.notify }));
 
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
-import { CONFIRM_TEXT, OrderConfirmSheet } from './order-confirm-sheet';
+import { CONFIRM_TEXT, confirmActionText, OrderConfirmSheet } from './order-confirm-sheet';
 
 const base: OrderConfirmRequest = {
     code: '2330',
@@ -264,5 +264,41 @@ describe('OrderConfirmSheet — ResumeGate', () => {
         expect(q.resolve).toHaveBeenCalledWith(false);
         expect(q.resolve).not.toHaveBeenCalledWith(true);
         expect(sheetOpen()).toBe(false);
+    });
+});
+
+describe('OrderConfirmSheet — 依方向著色與動作大字', () => {
+    const panelTone = () => one('order-confirm-sheet').props['data-tone'];
+
+    it('買進：整個面板 tone＝buy；賣出：tone＝sell', async () => {
+        await render();
+        await emit(base);
+        expect(panelTone()).toBe('buy');
+        await emit(null);
+        await emit({ ...base, action: 'Sell' });
+        expect(panelTone()).toBe('sell');
+        expect(text(one('confirm-action'))).toBe('賣出台積電2330');
+    });
+
+    it('動作含信用名稱：融資買進、融券賣出、融券買進（回補）、現股當沖賣出', async () => {
+        await render();
+        await emit({ ...base, credit: '融資', note: 'ROD・融資・送往 永豐 模擬環境' });
+        expect(text(one('confirm-action'))).toBe('融資買進台積電2330');
+        expect(handle().props['aria-label']).toBe('滑動確認 融資買進 2330');
+        await emit(null);
+        await emit({ ...base, action: 'Sell', note: 'ROD・現股當沖・送往 永豐 模擬環境' });
+        expect(text(one('confirm-action'))).toBe('現股當沖賣出台積電2330');
+        expect(panelTone()).toBe('sell');
+    });
+
+    it('confirmActionText 純函式', () => {
+        expect(confirmActionText({ action: 'Buy' })).toBe('買進');
+        expect(confirmActionText({ action: 'Sell', credit: '融券' })).toBe('融券賣出');
+        expect(confirmActionText({ action: 'Buy', credit: '融券' })).toBe('融券買進（回補）');
+        expect(confirmActionText({ action: 'Sell', credit: '融資' })).toBe('融資賣出');
+        expect(confirmActionText({ action: 'Sell', note: 'ROD・現股當沖・送往 永豐 模擬環境' })).toBe('現股當沖賣出');
+        // 只認完整的「現股當沖」段；買進不會是當沖先賣
+        expect(confirmActionText({ action: 'Buy', note: 'ROD・現股當沖' })).toBe('買進');
+        expect(confirmActionText({ action: 'Sell', note: 'ROD・非現股當沖說明' })).toBe('賣出');
     });
 });

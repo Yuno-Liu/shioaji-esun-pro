@@ -27,22 +27,29 @@ vi.mock('../../lib/tick-bands', () => ({ bandTickFor: () => undefined, prefetchT
 vi.mock('../lib/mobile-order', () => ({ submitMobileOrder: vi.fn() }));
 vi.mock('../components/route-badge', () => ({ useOrderRoute: () => null }));
 
+import { CREDIT_TEXT, ODD_LOT_TEXT } from '../../lib/odd-lot';
 import { OrderConfirmCancelled } from '../../lib/trade';
 import { notStarted } from '../lib/errors';
 import {
     buildMobileOrderInput,
     canConfirmPrice,
     classifyTicketOutcome,
+    condLabel,
     confirmedPriceSeq,
+    daytradeShortEligible,
     defaultTicketPrice,
     estimateAmount,
+    initialTicketFields,
     isOnTick,
     marketPrice,
     parsePrice,
+    previewLabel,
     PRICE_UNCONFIRMED,
     realTradePrice,
     seededPriceSeq,
+    stockOrderOf,
     TICKET_TEXT,
+    ticketActionText,
     ticketProblem,
     withinLimits,
     type TicketCheck,
@@ -61,7 +68,7 @@ const stockAccount: Account = { account_type: 'S', broker_id: '9A95', account_id
 const futuresAccount: Account = { account_type: 'F', broker_id: 'F002000', account_id: '7654321', signed: true, person_id: '', username: '' };
 
 const fields = (over: Partial<TicketFields> = {}): TicketFields => ({
-    action: 'Buy', priceType: 'LMT', orderType: 'ROD', orderLot: 'Common', octype: 'Auto', priceText: '100', quantity: 1, ...over,
+    action: 'Buy', priceType: 'LMT', orderType: 'ROD', orderLot: 'Common', orderCond: 'Cash', daytradeShort: false, octype: 'Auto', priceText: '100', quantity: 1, ...over,
 });
 const check = (over: Partial<TicketCheck> = {}): TicketCheck => ({
     contract: stock,
@@ -237,5 +244,91 @@ describe('價格確認與 ResumeGate（A-2）', () => {
         expect(confirmedPriceSeq({ state: 'resyncing', resumeSeq: 2 })).toBe(PRICE_UNCONFIRMED);
         expect(confirmedPriceSeq({ state: 'failed', resumeSeq: 2 })).toBe(PRICE_UNCONFIRMED);
         expect(canConfirmPrice({ state: 'resyncing' })).toBe(false);
+    });
+});
+
+describe('信用交易與盤後零股（Phase 2，比照桌面 order-ticket.tsx）', () => {
+    it('送單參數：order_cond 只在非現股時送；daytrade_short 只在 賣出＋現股＋整股＋勾選 時送 true', () => {
+        expect(stockOrderOf(fields({ orderCond: 'MarginTrading' }), 'Buy')).toEqual({
+            action: 'Buy', price: 100, quantity: 1, price_type: 'LMT', order_type: 'ROD', order_lot: 'Common', order_cond: 'MarginTrading',
+        });
+        expect(stockOrderOf(fields({ orderCond: 'ShortSelling' }), 'Sell').order_cond).toBe('ShortSelling');
+        const dt = stockOrderOf(fields({ daytradeShort: true }), 'Sell');
+        expect(dt.daytrade_short).toBe(true);
+        expect('order_cond' in dt).toBe(false);
+        // 買進時勾選的當沖不送（與桌面相同）
+        expect('daytrade_short' in stockOrderOf(fields({ daytradeShort: true }), 'Buy')).toBe(false);
+        // 零股或信用＋當沖：不送 daytrade_short（驗證會先擋下，見下一個測試）
+        expect('daytrade_short' in stockOrderOf(fields({ daytradeShort: true, orderLot: 'IntradayOdd' }), 'Sell')).toBe(false);
+        expect('daytrade_short' in stockOrderOf(fields({ daytradeShort: true, orderCond: 'MarginTrading' }), 'Sell')).toBe(false);
+    });
+
+    it('驗證用使用者的意圖：不合規則的組合顯示原因（不會被悄悄拿掉後送出）', () => {
+        expect(ticketProblem(check({ fields: fields({ orderLot: 'IntradayOdd', orderCond: 'MarginTrading' }) }))).toBe(ODD_LOT_TEXT.cond);
+        expect(ticketProblem(check({ fields: fields({ orderLot: 'Odd', action: 'Sell', daytradeShort: true }) }))).toBe(ODD_LOT_TEXT.daytrade);
+        expect(ticketProblem(check({ fields: fields({ action: 'Sell', orderCond: 'MarginTrading', daytradeShort: true }) }))).toBe(CREDIT_TEXT.daytradeCond);
+        expect(ticketProblem(check({ contract: { ...stock, day_trade: 'OnlyBuy' } as ContractInfo, fields: fields({ action: 'Sell', daytradeShort: true }) }))).toBe(CREDIT_TEXT.daytradeStock);
+        expect(ticketProblem(check({ fields: fields({ action: 'Sell', daytradeShort: true }) }))).toBeNull();
+        // 融資、融券（含融券買進＝回補）都可以
+        expect(ticketProblem(check({ fields: fields({ orderCond: 'MarginTrading' }) }))).toBeNull();
+        expect(ticketProblem(check({ fields: fields({ orderCond: 'ShortSelling' }) }))).toBeNull();
+        expect(ticketProblem(check({ fields: fields({ action: 'Sell', orderCond: 'ShortSelling' }) }))).toBeNull();
+        // 玉山規則拿到的也是意圖（含現股 order_cond 與 daytrade_short）
+        ticketProblem(check({ fields: fields({ action: 'Sell', daytradeShort: true }) }));
+        expect(m.esunLeg).toHaveBeenLastCalledWith(stockAccount, stock, expect.objectContaining({ order_cond: 'Cash', daytrade_short: true }));
+    });
+
+    it('盤後零股：order_lot Odd、限價 ROD、無 order_cond；風控以零股換算', () => {
+        const odd = fields({ orderLot: 'Odd', quantity: 300 });
+        expect(ticketProblem(check({ fields: odd }))).toBeNull();
+        expect(m.risk).toHaveBeenLastCalledWith(300, 'Odd');
+        const input = buildMobileOrderInput(stock, stockAccount, { ...odd, action: 'Buy' });
+        if (input.isFutures) throw new Error('expected stock input');
+        expect(input.orderLot).toBe('Odd');
+        expect(input.stockOrder).toEqual({ action: 'Buy', price: 100, quantity: 300, price_type: 'LMT', order_type: 'ROD', order_lot: 'Odd' });
+        expect(ticketProblem(check({ fields: fields({ orderLot: 'Odd', priceType: 'MKT', orderType: 'IOC' }) }))).toMatch(/零股/);
+    });
+
+    it('現沖先賣可勾選條件：賣出＋整股＋現股＋day_trade Yes', () => {
+        expect(daytradeShortEligible(stock, fields({ action: 'Sell' }))).toBe(true);
+        expect(daytradeShortEligible(stock, fields({ action: 'Buy' }))).toBe(false);
+        expect(daytradeShortEligible(stock, fields({ action: null }))).toBe(false);
+        expect(daytradeShortEligible(stock, fields({ action: 'Sell', orderLot: 'IntradayOdd' }))).toBe(false);
+        expect(daytradeShortEligible(stock, fields({ action: 'Sell', orderCond: 'MarginTrading' }))).toBe(false);
+        expect(daytradeShortEligible({ day_trade: 'OnlyBuy' }, fields({ action: 'Sell' }))).toBe(false);
+        expect(daytradeShortEligible({ day_trade: 'No' }, fields({ action: 'Sell' }))).toBe(false);
+    });
+
+    it('動作文字與預覽鍵文字', () => {
+        expect(ticketActionText(fields(), false)).toBe('買進');
+        expect(ticketActionText(fields({ action: 'Sell' }), false)).toBe('賣出');
+        expect(ticketActionText(fields({ orderCond: 'MarginTrading' }), false)).toBe('融資買進');
+        expect(ticketActionText(fields({ action: 'Sell', orderCond: 'ShortSelling' }), false)).toBe('融券賣出');
+        expect(ticketActionText(fields({ orderCond: 'ShortSelling' }), false)).toBe('融券買進（回補）');
+        expect(ticketActionText(fields({ action: 'Sell', daytradeShort: true }), false)).toBe('現股當沖賣出');
+        expect(ticketActionText(fields({ action: null }), false)).toBe('');
+        expect(ticketActionText(fields({ action: 'Sell' }), true)).toBe('賣出');
+        expect(condLabel('ShortSelling', 'Buy')).toBe('融券（回補）');
+        expect(condLabel('ShortSelling', 'Sell')).toBe('融券');
+        expect(previewLabel(stock, fields({ priceText: '2240' }), false)).toBe('預覽買進委託 · 2330 · 1 張 · 限價 2,240');
+        expect(previewLabel(stock, fields({ action: 'Sell', orderCond: 'MarginTrading', quantity: 3, priceType: 'MKT' }), false)).toBe('預覽融資賣出委託 · 2330 · 3 張 · 市價');
+        expect(previewLabel(stock, fields({ orderLot: 'IntradayOdd', quantity: 300, priceText: '99.5' }), false)).toBe('預覽買進委託 · 2330 · 300 股 · 限價 99.5');
+        expect(previewLabel(futures, fields({ priceText: '22800', quantity: 2 }), true)).toBe('預覽買進委託 · TXFL6 · 2 口 · 限價 22,800');
+        expect(previewLabel(stock, fields({ action: null }), false)).toBe('請先選擇買進或賣出');
+    });
+
+    it('openTicket 帶入的 lot／cond／daytradeShort 只在開啟時帶入，不合規則也照樣保留（由驗證說明）', () => {
+        const preset = initialTicketFields({ action: 'Sell', lot: 'IntradayOdd', cond: 'MarginTrading', daytradeShort: true }, stock, 100);
+        expect(preset).toMatchObject({ orderLot: 'IntradayOdd', orderCond: 'MarginTrading', daytradeShort: true, priceType: 'LMT', orderType: 'ROD' });
+        expect(ticketProblem(check({ fields: preset }))).toBe(ODD_LOT_TEXT.cond);
+        expect(initialTicketFields({ action: null }, stock, null)).toMatchObject({ orderLot: 'Common', orderCond: 'Cash', daytradeShort: false, priceText: '' });
+        // 期權不帶入股票欄位
+        expect(initialTicketFields({ action: 'Buy', lot: 'Odd', cond: 'ShortSelling', daytradeShort: true }, futures, 22800)).toMatchObject({ orderLot: 'Common', orderCond: 'Cash', daytradeShort: false });
+    });
+
+    it('信用提醒附在送單輸入（確認面板備註用）', () => {
+        const input = buildMobileOrderInput(stock, stockAccount, { ...fields(), action: 'Buy' }, '現股買進不會回補融券');
+        expect(input).toMatchObject({ isFutures: false, creditHint: '現股買進不會回補融券' });
+        expect('creditHint' in buildMobileOrderInput(stock, stockAccount, { ...fields(), action: 'Buy' }, null)).toBe(false);
     });
 });

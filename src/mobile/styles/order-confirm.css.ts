@@ -1,5 +1,6 @@
 // src/mobile/styles/order-confirm.css.ts — 確認面板（order-confirm-sheet.tsx，規格 §6.4、§11）
 // 環境大字：正式＝danger、模擬＝accent、未確認＝amber（與 RouteBadge 同一配色）；買賣一律有文字，方向色用 up／down。
+// 面板背景的方向著色由 BottomSheet 的 tone 處理（styles/sheet.css.ts panelTone）。
 import { style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
 import { TOUCH_MIN } from './metrics';
@@ -39,6 +40,14 @@ const actionBase = style({
 export const actionLine = styleVariants({
     up: [actionBase, { color: vars.color.up }],
     down: [actionBase, { color: vars.color.down }],
+});
+
+/** 動作大字（含信用名稱）；顏色繼承 actionLine 的方向色 */
+export const actionBig = style({
+    fontSize: '2rem',
+    fontWeight: 800,
+    lineHeight: 1.2,
+    letterSpacing: '0.04em',
 });
 
 export const contractName = style({
