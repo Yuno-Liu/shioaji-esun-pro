@@ -3,11 +3,12 @@
 // ┌ 標頭：名稱・市場・［可當沖］／大字成交價・漲跌・漲跌%・［漲停／跌停］［參考價］［試撮］
 // │       統計格（股票）開 高 均 總／參 低 單 額（期權無「額」；顏色相對參考價）
 // │       漲跌停價・非「可當沖」的當沖狀態（股票）或到期月份・時段（期權）
-// ├ 週期列［走勢］［1分］［5分］［15分］［60分］［日］＋交易圖表（委託線、成本線、漲跌停、參考價）
-// ├［五檔］［明細］（五檔買賣同列：委買量｜買價｜賣價｜委賣量、五檔總量、買賣比與內外盤比）
-// ├ 持倉摘要・未成交 N 筆 ›（#/orders）
-// └ sticky［買進］［賣出］→ openTicket()（只開下單面板，送單一律經確認面板）
+// ├ 週期 Segmented（toggle）［走勢］［1分］［5分］［15分］［60分］［日］＋交易圖表（委託線、成本線、漲跌停、參考價）
+// ├ 五檔／明細 Segmented（tabs）（五檔買賣同列：委買量｜買價｜賣價｜委賣量、量條、五檔總量、買賣比與內外盤比）
+// ├ 持倉摘要・未成交 N 筆 ›（#/orders；GroupedSection）
+// └［買 進］［賣 出］→ openTicket()（只開下單面板，送單一律經確認面板）；以 ShellSlot bottom 放進底部 chrome
 //
+// 主價列下緣的哨兵離開 main 頂端時，ShellSlot top 顯示精簡標頭（trade-compact；實心 panel，沒有 IntersectionObserver 時不顯示）。
 // code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。合約解析出的正規代碼與路由不同（小寫、舊指數代碼）時改寫路由。
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -36,6 +37,12 @@ import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type H
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
 import * as styles from '../styles/trade.css';
+import { GroupedSection } from '../ui/grouped';
+import { InlineNote } from '../ui/inline-note';
+import { usePriceFlash } from '../ui/price-flash';
+import * as flash from '../ui/price-flash.css';
+import { Segmented } from '../ui/segmented';
+import { ShellSlot } from '../ui/shell-slots';
 
 // ---- 純函式（標頭文字） ----
 
@@ -141,6 +148,12 @@ function savePeriod(p: ChartPeriod) {
 
 // ---- 元件 ----
 
+const PERIOD_ITEMS = CHART_PERIODS.map(p => ({ value: p.key, label: p.label }));
+const PANEL_ITEMS = [
+    { value: 'depth', label: '五檔' },
+    { value: 'ticks', label: '明細' },
+] as const;
+
 type StatKey = 'open' | 'high' | 'low' | 'reference' | 'avg' | 'total' | 'last' | 'amount';
 
 const STAT_LABEL: Record<StatKey, string> = { open: '開', high: '高', low: '低', reference: '參', avg: '均', total: '總', last: '單', amount: '額' };
@@ -181,6 +194,39 @@ function StatsGrid({ contract, stats }: { contract: ContractInfo; stats: HeaderS
     );
 }
 
+/** 哨兵是否已捲出 main 頂端（在根範圍之上、不相交）；捲到下方看不到時不算 */
+export function scrolledPast(entry: { isIntersecting: boolean; boundingClientRect: { top: number }; rootBounds: { top: number } | null }): boolean {
+    return !entry.isIntersecting && entry.boundingClientRect.top < (entry.rootBounds ? entry.rootBounds.top : 0);
+}
+
+/**
+ * 精簡標頭：哨兵（主價列下緣）離開 main 頂端時顯示。
+ * available＝環境支援 IntersectionObserver 且哨兵已掛上（測試、舊瀏覽器為 false → 不渲染精簡標頭）。
+ */
+function useCompactHeader(sentinel: { current: HTMLElement | null }): { available: boolean; visible: boolean } {
+    const [available, setAvailable] = useState(false);
+    const [visible, setVisible] = useState(false);
+    useEffect(() => {
+        const el = sentinel.current;
+        if (!el || typeof IntersectionObserver !== 'function') return undefined;
+        // main 是唯一的捲動容器（殼層）；找不到時以 viewport 為根
+        const root = typeof el.closest === 'function' ? el.closest('main') : null;
+        let observer: IntersectionObserver;
+        try {
+            observer = new IntersectionObserver(entries => {
+                const last = entries[entries.length - 1];
+                if (last) setVisible(scrolledPast(last));
+            }, { root });
+            observer.observe(el);
+        } catch {
+            return undefined;
+        }
+        setAvailable(true);
+        return () => observer.disconnect();
+    }, [sentinel]);
+    return { available, visible };
+}
+
 function Header({ code, contract }: { code: string; contract: ContractInfo | undefined }) {
     const quote = useQuote(code, { narrow: true });
     const tick = quote?.tick;
@@ -202,21 +248,34 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
     const delivery = contract && isFop ? deliveryMonthText(contract.delivery_month) : null;
     // 只有成交或快照的價格才判斷漲跌停（參考價不算）
     const limit = contract && (q.source === 'tick' || q.source === 'snapshot') ? limitHit(price, contract.limit_up, contract.limit_down) : null;
+    const priceText = price !== null ? fmt(price) : '—';
+    const changeText = chg ? `${arrow}${contract && price !== null ? formatToTick(contract, Math.abs(chg.change), { at: price }) : Math.abs(chg.change)}` : null;
+    const pctText = chg && chg.pct !== null ? ` (${chg.pct > 0 ? '+' : ''}${chg.pct.toFixed(2)}%)` : null;
+    const title = `${code}${contract?.name ? ` ${contract.name}` : ''}`;
+
+    // 主價跳價閃爍（資料來源切換那一筆不閃）
+    const flashRef = useRef<HTMLSpanElement | null>(null);
+    usePriceFlash(flashRef, price, { source: q.source });
+    const sentinelRef = useRef<HTMLDivElement | null>(null);
+    const compact = useCompactHeader(sentinelRef);
 
     return (
         <header className={styles.header}>
             <div className={styles.titleRow}>
-                <h1 className={styles.title}>{code}{contract?.name ? ` ${contract.name}` : ''}</h1>
+                <h1 className={styles.title}>{title}</h1>
                 {contract && <span className={styles.subtle}>{exchangeText(contract.exchange)}</span>}
                 {contract && isStock && contract.day_trade === 'Yes' && <span className={styles.badge} data-testid='trade-daytrade'>可當沖</span>}
             </div>
             <div className={styles.priceRow} data-testid='trade-price'>
-                <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>{price !== null ? fmt(price) : '—'}</span>
+                <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>
+                    <span ref={flashRef} className={flash.overlay} aria-hidden='true' />
+                    {priceText}
+                </span>
                 {q.source === 'reference' && <span className={styles.badge} data-testid='trade-price-reference'>參考價</span>}
                 {chg && (
                     <span className={`${styles.change} ${styles.dirText[chg.dir]}`}>
-                        {arrow}{contract && price !== null ? formatToTick(contract, Math.abs(chg.change), { at: price }) : Math.abs(chg.change)}
-                        {chg.pct !== null && ` (${chg.pct > 0 ? '+' : ''}${chg.pct.toFixed(2)}%)`}
+                        {changeText}
+                        {pctText}
                     </span>
                 )}
                 {limit && (
@@ -230,6 +289,19 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
                     </span>
                 )}
             </div>
+            <div ref={sentinelRef} className={styles.sentinel} aria-hidden='true' />
+            {compact.available && (
+                <ShellSlot slot='top'>
+                    {/* 視覺輔助（與標頭重複）：不進無障礙樹；隱藏時不攔點擊 */}
+                    <div className={styles.compactBar} data-visible={compact.visible ? 'true' : 'false'} aria-hidden='true' data-testid='trade-compact'>
+                        <span className={styles.compactTitle}>{title}</span>
+                        <span className={`${styles.compactPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>{priceText}</span>
+                        {changeText !== null && chg && (
+                            <span className={`${styles.compactChange} ${styles.dirText[chg.dir]}`}>{changeText}{pctText}</span>
+                        )}
+                    </div>
+                </ShellSlot>
+            )}
             {contract && <StatsGrid contract={contract} stats={stats} />}
             {contract && isStock && (contract.limit_up > 0 || contract.limit_down > 0 || dayTrade) && (
                 <div className={styles.infoRow} data-testid='trade-info'>
@@ -304,12 +376,10 @@ function TradeView({ code }: { code: string }) {
         <section className={styles.page} data-testid='page-trade'>
             <Header code={sym} contract={contract} />
 
-            <div className={styles.segmentRow} role='group' aria-label='圖表週期'>
-                {CHART_PERIODS.map(p => (
-                    <button key={p.key} type='button' className={styles.segment} aria-pressed={period === p.key} onClick={() => setPeriod(p.key)}>
-                        {p.label}
-                    </button>
-                ))}
+            <div className={styles.controlRow}>
+                <div className={styles.controlGrow}>
+                    <Segmented items={PERIOD_ITEMS} value={period} onChange={setPeriod} semantics='toggle' ariaLabel='圖表週期' size='compact' />
+                </div>
             </div>
 
             {contract
@@ -329,54 +399,61 @@ function TradeView({ code }: { code: string }) {
                     </div>
                 )}
 
-            <div className={styles.segmentRow} role='tablist' aria-label='五檔與明細'>
-                <button type='button' role='tab' className={styles.segment} aria-selected={panel === 'depth'} onClick={() => setPanel('depth')}>五檔</button>
-                <button type='button' role='tab' className={styles.segment} aria-selected={panel === 'ticks'} onClick={() => setPanel('ticks')}>明細</button>
+            <div className={styles.controlRow}>
+                <div className={styles.controlGrow}>
+                    <Segmented<'depth' | 'ticks'> items={PANEL_ITEMS} value={panel} onChange={setPanel} semantics='tabs' ariaLabel='五檔與明細' size='compact' />
+                </div>
             </div>
             {panel === 'depth'
                 ? <DepthLadder code={sym} contract={contract} trades={trading.trades} />
                 : contract ? <TickList code={sym} contract={contract} /> : null}
 
-            <div className={styles.summary} data-testid='trade-summary'>
-                {summaries.length === 0
-                    ? <span className={styles.subtle}>持倉：無</span>
-                    : summaries.map(s => (
-                        <span key={s.label}>
-                            持倉：{s.label} {maskMoney(s.quantity, privMoney)} · 均價 {formatLinePrice(s.avg)} ·{' '}
-                            <span className={styles.dirText[s.pnl > 0 ? 'up' : s.pnl < 0 ? 'down' : 'flat']}>
-                                {maskMoney(`${s.pnl > 0 ? '+' : ''}${Math.round(s.pnl).toLocaleString('en-US')}`, privMoney)}
+            <div className={styles.summaryWrap}>
+                <GroupedSection testId='trade-summary'>
+                    {summaries.length === 0
+                        ? <span className={`${styles.summaryRow} ${styles.summaryMuted}`}>持倉：無</span>
+                        : summaries.map(s => (
+                            <span key={s.label} className={styles.summaryRow}>
+                                <span>
+                                    持倉：{s.label} {maskMoney(s.quantity, privMoney)} · 均價 {formatLinePrice(s.avg)} ·{' '}
+                                    <span className={styles.dirText[s.pnl > 0 ? 'up' : s.pnl < 0 ? 'down' : 'flat']}>
+                                        {maskMoney(`${s.pnl > 0 ? '+' : ''}${Math.round(s.pnl).toLocaleString('en-US')}`, privMoney)}
+                                    </span>
+                                </span>
                             </span>
-                        </span>
-                    ))}
-                <a className={styles.workingLink} href={formatRoute({ name: 'orders' })} data-testid='trade-working-link'>
-                    未成交：{working} 筆 ›
-                </a>
+                        ))}
+                    <a className={styles.workingLink} href={formatRoute({ name: 'orders' })} data-testid='trade-working-link'>
+                        未成交：{working} 筆 ›
+                    </a>
+                </GroupedSection>
             </div>
 
             {tradable && (
-                <div className={styles.tradeBar}>
-                    {comboNote && <p className={styles.tradeBarNote}>{comboNote}</p>}
-                    <div className={controls.tradeButtonRow}>
-                        <button
-                            type='button'
-                            className={controls.tradeButton.buy}
-                            disabled={!!comboNote}
-                            onClick={() => openTicket({ code: sym, action: 'Buy', source: 'button' })}
-                            data-testid='trade-buy'
-                        >
-                            買 進
-                        </button>
-                        <button
-                            type='button'
-                            className={controls.tradeButton.sell}
-                            disabled={!!comboNote}
-                            onClick={() => openTicket({ code: sym, action: 'Sell', source: 'button' })}
-                            data-testid='trade-sell'
-                        >
-                            賣 出
-                        </button>
+                <ShellSlot slot='bottom'>
+                    <div className={styles.tradeBar}>
+                        {comboNote && <InlineNote tone='warn' role='note'>{comboNote}</InlineNote>}
+                        <div className={controls.tradeButtonRow}>
+                            <button
+                                type='button'
+                                className={`${controls.tradeButton.buy} ${styles.tradeButtonSize}`}
+                                disabled={!!comboNote}
+                                onClick={() => openTicket({ code: sym, action: 'Buy', source: 'button' })}
+                                data-testid='trade-buy'
+                            >
+                                買 進
+                            </button>
+                            <button
+                                type='button'
+                                className={`${controls.tradeButton.sell} ${styles.tradeButtonSize}`}
+                                disabled={!!comboNote}
+                                onClick={() => openTicket({ code: sym, action: 'Sell', source: 'button' })}
+                                data-testid='trade-sell'
+                            >
+                                賣 出
+                            </button>
+                        </div>
                     </div>
-                </div>
+                </ShellSlot>
             )}
         </section>
     );

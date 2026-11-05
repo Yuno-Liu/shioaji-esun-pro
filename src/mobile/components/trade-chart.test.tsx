@@ -71,6 +71,9 @@ const m = vi.hoisted(() => {
         rev: 100,
         tickListeners: new Set<(tk: unknown) => void>(),
         gate: { resumeSeq: 0 },
+        haptic: vi.fn(),
+        // S1：lib 的送單／改單／刪單函式（圖表任何入口都不得呼叫）
+        send: { placeStockOrder: vi.fn(), placeFuturesOrder: vi.fn(), cancelOrder: vi.fn(), updateOrderPrice: vi.fn(), updateOrderQty: vi.fn() },
     };
 });
 
@@ -99,6 +102,8 @@ vi.mock('../../lib/theme-store', () => ({
     getChartColors: () => ({ up: '#f00', upVol: '#f008', down: '#0f0', downVol: '#0f08', text: '#888', grid: '#111', crosshair: '#36f', border: '#222', labelBg: '#000' }),
 }));
 vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, openOrderAction: m.openOrderAction }));
+vi.mock('../motion/haptics', () => ({ haptic: m.haptic }));
+vi.mock('../../lib/shioaji', async importOriginal => ({ ...(await importOriginal<typeof import('../../lib/shioaji')>()), ...m.send }));
 
 import { HISTORY_STALE_MS, resetHistoryEntriesForTest } from '../lib/chart-history-freshness';
 import {
@@ -625,5 +630,113 @@ describe('TradeChart 全螢幕（W2）', () => {
         });
         await render();
         expect(rootNode().props['data-fullscreen']).toBe('false');
+    });
+});
+
+// ---- B3b 交易頁現代化：工具列、選價列、全螢幕列、圖表字型、長按觸覺（設計規格 §7.3、§10 S1） ----
+
+describe('TradeChart B3b', () => {
+    beforeEach(() => {
+        m.haptic.mockReset();
+        Object.values(m.send).forEach(f => f.mockReset());
+    });
+
+    const longPressPick = async (y = 217) => {
+        await act(async () => { wrap().props.onPointerDown(ptr(100, y)); });
+        await tick(LONG_PRESS_MS + 10);
+        await act(async () => { wrap().props.onPointerUp(ptr(100, y)); });
+    };
+
+    it('圖表字型改為系統字族（不再用等寬字族）', async () => {
+        await render();
+        const opts = (m.createChart.mock.calls[0] as unknown[])[1] as { layout: { fontFamily: string } };
+        expect(opts.layout.fontFamily).toBe(cs.CHART_FONT_FAMILY);
+        expect(opts.layout.fontFamily).toContain('system-ui');
+        expect(opts.layout.fontFamily).not.toMatch(/mono/i);
+    });
+
+    it('長按成立時 haptic(longPress)；輕點不觸發', async () => {
+        await render();
+        await act(async () => { wrap().props.onPointerDown(ptr(100, 200)); });
+        await tick(100);
+        await act(async () => { wrap().props.onPointerUp(ptr(100, 200)); });
+        expect(m.haptic).not.toHaveBeenCalled();
+        await longPressPick();
+        expect(m.haptic.mock.calls).toEqual([['longPress']]);
+    });
+
+    it('選價列：選了之後沿原路收回（殘影 aria-hidden＋inert、沒有按鈕），收回時間到即移除', async () => {
+        await render();
+        await longPressPick();
+        await act(async () => { byTestId('chart-pick')[0]!.findAllByType('button')[1]!.props.onClick(); });
+        expect(m.openTicket).toHaveBeenCalledWith({ code: '2330', action: 'Sell', price: 1085, source: 'chart' });
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        const closing = byTestId('chart-pick-closing');
+        expect(closing).toHaveLength(1);
+        expect(closing[0]!.props['aria-hidden']).toBe('true');
+        expect(closing[0]!.props.inert).toBe(true);
+        expect(closing[0]!.findAllByType('button')).toHaveLength(0);
+        expect(textOf(closing[0]!)).toContain('以 1,085 賣出');
+        await tick(300);
+        expect(byTestId('chart-pick-closing')).toHaveLength(0);
+    });
+
+    it('選價列：取消也沿原路收回，不開下單面板', async () => {
+        await render();
+        await longPressPick();
+        const cancel = byTestId('chart-pick')[0]!.findAll(n => n.type === 'button' && n.props['aria-label'] === '取消')[0]!;
+        await act(async () => { cancel.props.onClick(); });
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(byTestId('chart-pick-closing')).toHaveLength(1);
+        expect(m.openTicket).not.toHaveBeenCalled();
+    });
+
+    it('工具列「指標」「全螢幕」為 Chip（動作型，不帶 aria-pressed；testid 不變）', async () => {
+        await render();
+        for (const id of ['chart-indicators', 'chart-fs-enter']) {
+            const b = byTestId(id)[0]!;
+            expect(b.type).toBe('button');
+            expect(b.props['aria-pressed']).toBeUndefined();
+        }
+        expect(textOf(byTestId('chart-indicators')[0]!)).toBe('指標');
+        expect(textOf(byTestId('chart-fs-enter')[0]!)).toBe('全螢幕');
+    });
+
+    it('全螢幕週期改為 Segmented toggle（role=group「圖表週期」）', async () => {
+        const onPeriodChange = vi.fn();
+        await act(async () => {
+            view = create(createElement(TradeChart, { code: '2330', contract, period: '5m', lines: [], onPeriodChange }), { createNodeMock: nodeMock });
+        });
+        await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+        const group = byTestId('chart-fs-bar')[0]!.findAll(n => n.type === 'div' && n.props.role === 'group');
+        expect(group).toHaveLength(1);
+        expect(group[0]!.props['aria-label']).toBe('圖表週期');
+        const pressed = group[0]!.findAll(n => n.type === 'button' && n.props['aria-pressed'] === true);
+        expect(pressed.map(b => textOf(b))).toEqual(['5分']);
+    });
+
+    it('S1：選價列買賣、取消、全螢幕買賣、工具鍵、委託線標籤只呼叫 openTicket／openOrderAction，lib 送出函式 0 次', async () => {
+        await render();
+        await longPressPick();
+        await act(async () => { byTestId('chart-pick')[0]!.findAllByType('button')[0]!.props.onClick(); });
+        await tick(300);
+        await longPressPick();
+        await act(async () => { byTestId('chart-pick')[0]!.findAllByType('button')[1]!.props.onClick(); });
+        await tick(300);
+        await longPressPick();
+        await act(async () => { byTestId('chart-pick')[0]!.findAllByType('button')[2]!.props.onClick(); });
+        await act(async () => { byTestId('chart-order-label')[0]!.props.onClick(); });
+        await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+        await act(async () => { byTestId('chart-fs-buy')[0]!.props.onClick(); });
+        await act(async () => { byTestId('chart-fs-sell')[0]!.props.onClick(); });
+        await act(async () => { byTestId('chart-indicators')[0]!.props.onClick(); });
+        expect(m.openTicket.mock.calls).toEqual([
+            [{ code: '2330', action: 'Buy', price: 1085, source: 'chart' }],
+            [{ code: '2330', action: 'Sell', price: 1085, source: 'chart' }],
+            [{ code: '2330', action: 'Buy', source: 'button' }],
+            [{ code: '2330', action: 'Sell', source: 'button' }],
+        ]);
+        expect(m.openOrderAction.mock.calls).toEqual([['o1', 'menu']]);
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
     });
 });

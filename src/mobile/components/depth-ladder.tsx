@@ -1,14 +1,14 @@
 // src/mobile/components/depth-ladder.tsx — 五檔（買賣同列；規格 §6.2）
 //
-//  內外盤比 ███████░░░░  58%（內盤）／42%（外盤）     ← 只在 variant 'page'、串流有內外盤量時
+//  內外盤比 ███████░░░░  58%（內盤）／42%（外盤）     ← 串流有內外盤量時（交易頁與下單面板內嵌都顯示）
 //  委買量 │ 買價  │ 賣價  │ 委賣量
-//    120  │ 1,084 │ 1,085 │   88     ← 第 i 列＝買 i 與賣 i
+//  ▒▒120  │ 1,084 │ 1,085 │   88▒▒   ← 第 i 列＝買 i 與賣 i；量條（VolumeBar）從中線往外長
 //    …（5 列）
 //    316  │   五檔總量    │  173     ← 買量總和／賣量總和
-//  買 65% ████████░░░░ 35% 賣
+//  買 65% ████████░░░░ 35% 賣        ← RatioBar（scaleX）
 //
 // - 資料：useQuote(code) 的 BidAsk；盤中零股時改用 useQuote(code, { oddLot: true })（量以股計）。
-//   variant 'page'（交易頁）可切換整股／盤中零股；variant 'ticket'（下單面板內嵌）不顯示切換，由 oddLot prop 決定。
+//   variant 'page'（交易頁）可切換整股／盤中零股（Segmented toggle）；variant 'ticket'（下單面板內嵌）不顯示切換，由 oddLot prop 決定。
 // - 買價、賣價各是獨立的點擊目標：onPick(price, side)，缺省＝openTicket({ code, price, source: 'depth' })
 //   ——只帶價，不決定買賣，也不會送單。
 // - 自己的未成交限價委託標在該價位所在的那一側（「我 買2」；整股五檔只算整股委託，零股五檔只算零股委託）。
@@ -24,6 +24,8 @@ import { depthMarkText, depthOrderMarks, priceKey } from '../lib/chart-model';
 import { openTicket } from '../lib/mobile-store';
 import { innerOuterRatio, splitPercent, toneVsReference, volumeUnit, type SplitPercent } from '../lib/quote-display';
 import * as styles from '../styles/trade.css';
+import { RatioBar as RatioTrack, VolumeBar } from '../ui/bars';
+import { Segmented } from '../ui/segmented';
 
 export const DEPTH_LEVELS = 5;
 
@@ -88,14 +90,23 @@ export interface DepthLadderProps {
     oddLot?: boolean;
 }
 
-/** 比例條（左右兩段＋文字百分比；寬度用 inline style，不依賴 color-mix 等新語法） */
+/** 五檔兩側的最大單檔量（量條的分母）；沒有量時為 0 */
+export function depthMaxVolume(book: DepthBook): number {
+    let max = 0;
+    for (const r of book.rows) {
+        if (r.bid && r.bid.volume > max) max = r.bid.volume;
+        if (r.ask && r.ask.volume > max) max = r.ask.volume;
+    }
+    return max;
+}
+
+/** 比例條（左右兩段＋文字百分比；條為 ui/bars 的 RatioBar，scaleX、不依賴 color-mix 等新語法） */
 function RatioBar({ split, leftText, rightText, label, testId }: { split: SplitPercent; leftText: string; rightText: string; label: string; testId: string }) {
     return (
         <div className={styles.ratio} data-testid={testId} role='img' aria-label={`${label}：${leftText} ${split.leftPct}%，${rightText} ${split.rightPct}%`}>
             <span className={`${styles.ratioText} ${styles.dirText.up}`} data-testid={`${testId}-left`}>{leftText} {split.leftPct}%</span>
-            <span className={styles.ratioTrack} aria-hidden='true'>
-                <span className={styles.ratioFill.up} style={{ width: `${split.leftPct}%` }} />
-                <span className={styles.ratioFill.down} style={{ width: `${split.rightPct}%` }} />
+            <span className={styles.ratioTrack}>
+                <RatioTrack left={split.leftPct} right={split.rightPct} leftTone='up' rightTone='down' />
             </span>
             <span className={`${styles.ratioText} ${styles.dirText.down}`} data-testid={`${testId}-right`}>{split.rightPct}% {rightText}</span>
         </div>
@@ -108,14 +119,18 @@ function InnerOuterBar({ split }: { split: SplitPercent }) {
         <div className={styles.innerOuter} data-testid='depth-inner-outer' role='img' aria-label={`內外盤比：內盤 ${split.leftPct}%，外盤 ${split.rightPct}%`}>
             <span className={styles.innerOuterLabel}>內外盤比</span>
             <span className={`${styles.ratioText} ${styles.dirText.down}`} data-testid='depth-inner'>{split.leftPct}%（內盤）</span>
-            <span className={styles.ratioTrack} aria-hidden='true'>
-                <span className={styles.ratioFill.down} style={{ width: `${split.leftPct}%` }} />
-                <span className={styles.ratioFill.up} style={{ width: `${split.rightPct}%` }} />
+            <span className={styles.ratioTrack}>
+                <RatioTrack left={split.leftPct} right={split.rightPct} leftTone='down' rightTone='up' testId='depth-inner-outer-bar' />
             </span>
             <span className={`${styles.ratioText} ${styles.dirText.up}`} data-testid='depth-outer'>{split.rightPct}%（外盤）</span>
         </div>
     );
 }
+
+const ODD_ITEMS = [
+    { value: 'whole', label: '整股' },
+    { value: 'odd', label: '盤中零股', testId: 'depth-odd-toggle' },
+] as const;
 
 export function DepthLadder({ code, contract, trades, onPick, variant = 'page', oddLot: oddLotProp }: DepthLadderProps) {
     const ticket = variant === 'ticket';
@@ -136,8 +151,10 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
     const tick = quote?.tick;
     if (tick && !tick.simtrade) lastReal.current = { code, oddLot, tick };
     const realTick = lastReal.current?.code === code && lastReal.current.oddLot === oddLot ? lastReal.current.tick : undefined;
-    const innerOuter = ticket ? null : innerOuterRatio(realTick);
+    // 下單面板內嵌也顯示（設計規格 §7.3、§7.4-11）
+    const innerOuter = innerOuterRatio(realTick);
     const bidAsk = splitPercent(book.bidTotal, book.askTotal);
+    const maxVolume = depthMaxVolume(book);
 
     // 盤中零股五檔的價位屬零股撮合簿：面板以盤中零股開啟（整股模式不帶 lot，沿用面板預設）
     const pick = (price: number, side: 'bid' | 'ask') => (onPick
@@ -154,7 +171,7 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
         const vol = fmtCompactInt(q.volume);
         const sideText = side === 'bid' ? '委買' : '委賣';
         const priceEl = (
-            <span className={`${styles.depthPrice[side]} ${styles.dirText[toneVsReference(q.price, reference)]}`}>
+            <span className={`${styles.depthPrice[side]} ${level === 1 ? styles.depthBest : ''} ${styles.dirText[toneVsReference(q.price, reference)]}`}>
                 {price}
                 {mine && <span className={styles.ladderMine} data-testid='depth-mine'>{mine}</span>}
             </span>
@@ -169,6 +186,8 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
                 aria-label={`${sideText}第${level}檔 ${price}，量 ${vol}${unit ? ` ${unit}` : ''}${mine ? `，${mine}` : ''}。${ticket ? '帶入價格' : '帶入下單面板'}`}
                 data-testid={testId}
             >
+                {/* 量條從中線往外長：買側 origin right、賣側 origin left（純視覺，aria-hidden） */}
+                <VolumeBar value={q.volume} max={maxVolume} side={side === 'bid' ? 'buy' : 'sell'} />
                 {side === 'bid' ? <>{volEl}{priceEl}</> : <>{priceEl}{volEl}</>}
             </button>
         );
@@ -178,8 +197,16 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
         <div className={ticket ? styles.ladderCompact : styles.ladder} data-testid='depth-ladder' data-variant={variant}>
             {!ticket && oddCapable && (
                 <div className={styles.ladderToolbar}>
-                    <button type='button' className={styles.toggle} aria-pressed={!oddLot} onClick={() => setOddPref(false)}>整股</button>
-                    <button type='button' className={styles.toggle} aria-pressed={oddLot} onClick={() => setOddPref(true)} data-testid='depth-odd-toggle'>盤中零股</button>
+                    <div className={styles.ladderToolbarControl}>
+                        <Segmented
+                            items={ODD_ITEMS}
+                            value={oddLot ? 'odd' : 'whole'}
+                            onChange={v => setOddPref(v === 'odd')}
+                            semantics='toggle'
+                            ariaLabel='五檔：整股或盤中零股'
+                            size='compact'
+                        />
+                    </div>
                 </div>
             )}
             {innerOuter && <InnerOuterBar split={innerOuter} />}

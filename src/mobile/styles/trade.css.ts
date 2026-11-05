@@ -1,18 +1,39 @@
-// src/mobile/styles/trade.css.ts — 交易頁：標頭、圖表、五檔、明細、底部買賣鍵（規格 §6.2、§11）
-import { style, styleVariants } from '@vanilla-extract/css';
+// src/mobile/styles/trade.css.ts — 交易頁：標頭、精簡標頭、圖表、選價列、五檔、明細、持倉摘要、交易鍵列
+// （規格 §6.2、§11；設計規格 docs/fork/mobile-design.md §7.3）
+//
+// - 價量一律系統字 tabular（typography NUM／NUMERIC），不再用 theme 的等寬字族；字重不超過 700。
+// - 漲跌與買賣顏色只用 vars.color.up／down；實心填色以 primitives 的 fill（inkLarge／inkStrong 疊黑）。
+// - 精簡標頭、選價列為不透明 panel（canvas 與捲動內容上方不模糊）；只動畫 transform／opacity。
+// - 量條、比例條用 ui/bars（scaleX），不再以 width 轉場。
+import { keyframes, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
-import { TOUCH_MIN } from './metrics';
+import { fill, focusRing, hairlineBottom, pressable, pressableRow } from './primitives.css';
+import { elevation, sj } from './theme-vars.css';
+import { DUR, EASE, RADIUS, REDUCED_MOTION, SAFE_LEFT, SAFE_RIGHT, SIZE, SPACE, TOUCH_MIN, TRADE_BUTTON_GAP } from './tokens';
+import { NUM, NUMERIC, TEXT } from './typography.css';
 
+/** 字級「大」（§4.7）：統計格 2 欄等版面切換 */
+const FONT_LARGE = 'html[data-sj-font-scale="1.3"] &';
+
+const ellipsis = {
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+} as const;
+
+/** 清單型頁面表面（§4.2 contentBg：深色 background、淺色 panel 白底，漲跌色字對比較高） */
 export const page = style({
     display: 'flex',
     flexDirection: 'column',
     minHeight: '100%',
+    background: sj.contentBg,
 });
 
 // ---- 標頭 ----
 
 export const header = style({
-    padding: `${vars.space.sm} ${vars.space.md} ${vars.space.xs}`,
+    padding: `${SPACE.s2} ${SPACE.s4} ${SPACE.s1}`,
     display: 'flex',
     flexDirection: 'column',
     gap: '2px',
@@ -21,33 +42,36 @@ export const header = style({
 export const titleRow = style({
     display: 'flex',
     alignItems: 'baseline',
-    gap: vars.space.sm,
+    gap: SPACE.s2,
     flexWrap: 'wrap',
 });
 
 export const title = style({
     margin: 0,
-    fontSize: '1.125rem',
-    fontWeight: 700,
+    ...TEXT.sheetTitle,
 });
 
 export const subtle = style({
+    ...TEXT.footnote,
     color: vars.color.mutedForeground,
-    fontSize: '0.8125rem',
 });
 
 export const priceRow = style({
     display: 'flex',
     alignItems: 'baseline',
-    gap: vars.space.sm,
+    gap: `2px ${SPACE.s2}`,
     flexWrap: 'wrap',
-    fontVariantNumeric: 'tabular-nums',
+    ...NUMERIC,
 });
 
+/** 主價（numHero）；同時是跳價閃爍覆蓋層的宿主 */
 export const lastPrice = style({
-    fontSize: '1.625rem',
-    fontWeight: 700,
-    fontFamily: vars.font.mono,
+    position: 'relative',
+    isolation: 'isolate',
+    padding: '0 2px',
+    borderRadius: RADIUS.sm,
+    ...NUM.numHero,
+    ...NUMERIC,
 });
 
 export const dirText = styleVariants({
@@ -57,99 +81,142 @@ export const dirText = styleVariants({
 });
 
 export const change = style({
-    fontSize: '0.9375rem',
-    fontWeight: 600,
-    fontFamily: vars.font.mono,
+    ...NUM.numMd,
+    ...NUMERIC,
 });
 
-/** 價格旁的標示（「參考價」「試撮 X」）：文字標示，不只靠顏色 */
+/** 價格旁的標示（「參考價」「試撮 X」「可當沖」）：外框小膠囊，文字標示不只靠顏色 */
 export const badge = style({
     alignSelf: 'center',
     padding: '0 6px',
-    borderRadius: vars.radius.sm,
-    border: `1px solid ${vars.color.border}`,
+    borderRadius: RADIUS.sm,
+    border: `1px solid ${vars.color.borderBright}`,
     color: vars.color.mutedForeground,
-    fontSize: '0.75rem',
+    ...TEXT.footnote,
+    fontWeight: 500,
     lineHeight: 1.6,
     whiteSpace: 'nowrap',
+    ...NUMERIC,
+});
+
+/** 漲停／跌停：實心 up／down＋inkStrong 白字（小字）；文字本身已標示「漲停」「跌停」 */
+export const badgeTone = styleVariants({
+    up: [fill.up.strong, { borderColor: 'transparent', color: '#ffffff', fontWeight: 700 }],
+    down: [fill.down.strong, { borderColor: 'transparent', color: '#ffffff', fontWeight: 700 }],
 });
 
 export const infoRow = style({
     display: 'flex',
     flexWrap: 'wrap',
-    gap: `2px ${vars.space.sm}`,
-    fontSize: '0.8125rem',
+    gap: `2px ${SPACE.s2}`,
+    ...TEXT.footnote,
     color: vars.color.mutedForeground,
-    fontVariantNumeric: 'tabular-nums',
+    ...NUMERIC,
 });
 
 export const infoUp = style({ color: vars.color.up });
 export const infoDown = style({ color: vars.color.down });
 
-/** 漲停／跌停徽章：沿用 badge 外框，改用漲跌色；文字本身已標示「漲停」「跌停」 */
-export const badgeTone = styleVariants({
-    up: { color: vars.color.up, borderColor: vars.color.up, fontWeight: 700 },
-    down: { color: vars.color.down, borderColor: vars.color.down, fontWeight: 700 },
-});
-
-/** 統計格：開 高 均 總／參 低 單 額（每列 4 格；390px 寬每格約 88px） */
+/** 統計格：開 高 均 總／參 低 單 額（4×2；字級「大」改 2 欄） */
 export const statsGrid = style({
     display: 'grid',
     gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
-    gap: `2px ${vars.space.sm}`,
-    margin: `${vars.space.xs} 0 0`,
-    fontSize: '0.8125rem',
-    fontVariantNumeric: 'tabular-nums',
+    gap: `2px ${SPACE.s3}`,
+    margin: `${SPACE.s1} 0 0`,
+    ...NUMERIC,
+    selectors: {
+        [FONT_LARGE]: { gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' },
+    },
 });
 
 export const statCell = style({
     display: 'flex',
     alignItems: 'baseline',
     justifyContent: 'space-between',
-    gap: vars.space.xs,
+    gap: SPACE.s1,
     minWidth: 0,
 });
 
 export const statLabel = style({
     flex: '0 0 auto',
     margin: 0,
+    ...TEXT.caption,
+    fontWeight: 500,
     color: vars.color.mutedForeground,
 });
 
 export const statValue = style({
     margin: 0,
-    minWidth: 0,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-    fontFamily: vars.font.mono,
+    ...ellipsis,
+    ...NUM.numSm,
+    ...NUMERIC,
 });
 
-// ---- 分段切換（週期列、五檔／明細） ----
+/** 主價列下緣哨兵（IntersectionObserver 偵測離開 main 頂端 → 顯示精簡標頭） */
+export const sentinel = style({
+    height: '1px',
+    marginTop: '-1px',
+    pointerEvents: 'none',
+});
 
-export const segmentRow = style({
+// ---- 精簡標頭（ShellSlot top；實心 panel，不模糊） ----
+
+export const compactBar = style([hairlineBottom, {
     display: 'flex',
-    gap: '2px',
-    padding: `0 ${vars.space.sm}`,
-    overflowX: 'auto',
-    scrollbarWidth: 'none',
-    borderBottom: `1px solid ${vars.color.border}`,
+    alignItems: 'center',
+    gap: SPACE.s2,
+    boxSizing: 'border-box',
+    height: SIZE.compactBarH,
+    padding: `0 calc(${SPACE.s4} + ${SAFE_RIGHT}) 0 calc(${SPACE.s4} + ${SAFE_LEFT})`,
+    background: vars.color.panel,
+    color: vars.color.foreground,
+    opacity: 0,
+    transform: 'translateY(-8px)',
+    transition: `opacity ${DUR.tone}ms ${EASE.out}, transform ${DUR.tone}ms ${EASE.out}`,
+    selectors: {
+        '&[data-visible="true"]': { opacity: 1, transform: 'none' },
+        // 隱藏時不攔點擊（topSlot 的子元素預設可點）
+        '&:not([data-visible="true"])': { pointerEvents: 'none' },
+    },
+    '@media': {
+        [REDUCED_MOTION]: { transition: 'none' },
+    },
+}]);
+
+export const compactTitle = style({
+    flex: '0 1 auto',
+    ...ellipsis,
+    ...TEXT.subhead,
+    fontWeight: 600,
 });
 
-export const segment = style({
-    flex: '1 0 auto',
-    minHeight: TOUCH_MIN,
-    minWidth: TOUCH_MIN,
-    padding: `0 ${vars.space.sm}`,
-    border: 'none',
-    borderBottom: '2px solid transparent',
-    background: 'transparent',
-    color: vars.color.mutedForeground,
-    fontSize: '0.9375rem',
-    selectors: {
-        '&[aria-pressed="true"], &[aria-selected="true"]': { color: vars.color.foreground, fontWeight: 700, borderBottomColor: vars.color.accent },
-        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '-2px' },
-    },
+export const compactPrice = style({
+    flex: '0 0 auto',
+    marginLeft: 'auto',
+    ...NUM.numMd,
+    ...NUMERIC,
+});
+
+export const compactChange = style({
+    flex: '0 0 auto',
+    ...NUM.numSm,
+    ...NUMERIC,
+});
+
+// ---- 分段列（週期、五檔／明細） ----
+
+/** Segmented 外距列：左右 16、上下 4（compact 的擴張點擊區不與相鄰列重疊） */
+export const controlRow = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: SPACE.s3,
+    padding: `${SPACE.s1} ${SPACE.s4}`,
+    minWidth: 0,
+});
+
+export const controlGrow = style({
+    flex: '1 1 auto',
+    minWidth: 0,
 });
 
 // ---- 圖表 ----
@@ -177,9 +244,9 @@ export const chartOverlay = style({
     flexDirection: 'column',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: vars.space.sm,
+    gap: SPACE.s2,
     color: vars.color.mutedForeground,
-    fontSize: '0.875rem',
+    ...TEXT.callout,
     pointerEvents: 'none',
 });
 
@@ -189,15 +256,15 @@ export const chartOverlayAction = style({
 
 export const chartNote = style({
     margin: 0,
-    padding: `2px ${vars.space.md}`,
-    fontSize: '0.75rem',
+    padding: `2px ${SPACE.s4}`,
+    ...TEXT.footnote,
     color: vars.color.mutedForeground,
 });
 
 /** 委託線標籤：可見膠囊較小，但點擊區至少 44px 高 */
-export const orderLabel = style({
+export const orderLabel = style([focusRing, {
     position: 'absolute',
-    left: vars.space.xs,
+    left: SPACE.s1,
     transform: 'translateY(-50%)',
     minHeight: TOUCH_MIN,
     minWidth: TOUCH_MIN,
@@ -207,60 +274,105 @@ export const orderLabel = style({
     display: 'flex',
     alignItems: 'center',
     zIndex: 2,
-    selectors: {
-        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '-2px' },
-    },
-});
+}]);
 
+/** 委託線膠囊：實心 up／down＋inkStrong 白字（小字） */
 const orderPillBase = style({
     padding: '2px 8px',
-    borderRadius: vars.radius.md,
-    fontSize: '0.75rem',
+    borderRadius: RADIUS.sm,
+    ...TEXT.footnote,
     fontWeight: 700,
     whiteSpace: 'nowrap',
     color: '#ffffff',
-    fontVariantNumeric: 'tabular-nums',
+    ...NUMERIC,
 });
 
 export const orderPill = styleVariants({
-    buy: [orderPillBase, { background: vars.color.up }],
-    sell: [orderPillBase, { background: vars.color.down }],
+    buy: [fill.up.strong, orderPillBase],
+    sell: [fill.down.strong, orderPillBase],
 });
 
-/** 長按放開後浮出的「以 X 買進／賣出」 */
-export const pickBar = style({
+// ---- 選價列（長按放開後浮出；實心 panel、不模糊；由圖表底部升起） ----
+
+const pickRise = keyframes({
+    from: { transform: 'translateY(100%)', opacity: 0 },
+    to: { transform: 'none', opacity: 1 },
+});
+
+const pickSink = keyframes({
+    from: { transform: 'none', opacity: 1 },
+    to: { transform: 'translateY(100%)', opacity: 0 },
+});
+
+const pickFadeIn = keyframes({ from: { opacity: 0 }, to: { opacity: 1 } });
+const pickFadeOut = keyframes({ from: { opacity: 1 }, to: { opacity: 0 } });
+
+/** 收回動畫時間（trade-chart 以此移除收回中的選價列） */
+export const PICK_EXIT_MS = 220;
+
+const pickBarBase = style({
     position: 'absolute',
-    left: vars.space.sm,
-    right: vars.space.sm,
-    bottom: vars.space.sm,
+    left: SPACE.s2,
+    right: SPACE.s2,
+    bottom: SPACE.s2,
     zIndex: 3,
     display: 'grid',
-    gridTemplateColumns: '1fr 1fr auto',
-    gap: vars.space.sm,
-    padding: vars.space.sm,
-    borderRadius: vars.radius.lg,
-    background: vars.color.panelRaised,
-    border: `1px solid ${vars.color.borderBright}`,
-    boxShadow: '0 6px 24px rgba(0, 0, 0, 0.35)',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) auto',
+    alignItems: 'center',
+    gap: TRADE_BUTTON_GAP,
+    padding: SPACE.s2,
+    borderRadius: RADIUS.lg,
+    background: vars.color.panel,
+    border: `0.5px solid ${vars.color.borderBright}`,
+    boxShadow: elevation.e2,
 });
 
-const pickButtonBase = style({
-    minHeight: TOUCH_MIN,
-    borderRadius: vars.radius.lg,
+export const pickBar = style([pickBarBase, {
+    animation: `${pickRise} ${PICK_EXIT_MS}ms ${EASE.sheet} both`,
+    '@media': {
+        [REDUCED_MOTION]: { animation: `${pickFadeIn} ${DUR.fade}ms ease-out both` },
+    },
+}]);
+
+/** 沿原路收回（不可點：aria-hidden＋inert＋pointer-events none，內容是 span 不是按鈕） */
+export const pickBarClosing = style([pickBarBase, {
+    pointerEvents: 'none',
+    animation: `${pickSink} ${PICK_EXIT_MS}ms ${EASE.sheet} both`,
+    '@media': {
+        [REDUCED_MOTION]: { animation: `${pickFadeOut} ${DUR.fade}ms ease-out both` },
+    },
+}]);
+
+/** 選價買賣鍵：CONTROL_LARGE、實心＋inkLarge、白字 actionLabel（大字門檻） */
+const pickButtonBase = style([pressable, focusRing, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    boxSizing: 'border-box',
+    minWidth: 0,
+    minHeight: SIZE.controlLarge,
+    padding: `0 ${SPACE.s1_5}`,
+    borderRadius: RADIUS.lg,
     border: 'none',
     color: '#ffffff',
-    fontSize: '0.9375rem',
-    fontWeight: 700,
-    fontVariantNumeric: 'tabular-nums',
-    selectors: {
-        '&:focus-visible': { outline: `2px solid ${vars.color.foreground}`, outlineOffset: '2px' },
-    },
-});
+    ...TEXT.actionLabel,
+    lineHeight: 1.15,
+    textAlign: 'center',
+    ...NUMERIC,
+}]);
 
 export const pickButton = styleVariants({
-    buy: [pickButtonBase, { background: vars.color.up }],
-    sell: [pickButtonBase, { background: vars.color.down }],
-    cancel: [pickButtonBase, { background: 'transparent', color: vars.color.mutedForeground, minWidth: TOUCH_MIN, padding: `0 ${vars.space.sm}` }],
+    buy: [pickButtonBase, fill.up.large],
+    sell: [pickButtonBase, fill.down.large],
+    cancel: [pickButtonBase, {
+        minHeight: TOUCH_MIN,
+        minWidth: TOUCH_MIN,
+        padding: `0 ${SPACE.s2}`,
+        background: 'transparent',
+        color: vars.color.foreground,
+        ...TEXT.callout,
+        fontWeight: 600,
+    }],
 });
 
 // ---- 五檔（買賣同列） ----
@@ -268,8 +380,8 @@ export const pickButton = styleVariants({
 export const ladder = style({
     display: 'flex',
     flexDirection: 'column',
-    padding: `${vars.space.xs} ${vars.space.md}`,
-    fontVariantNumeric: 'tabular-nums',
+    padding: `${SPACE.s1} ${SPACE.s4}`,
+    ...NUMERIC,
 });
 
 /** 下單面板內嵌：不留左右外距（面板自己有），其餘結構相同 */
@@ -277,37 +389,36 @@ export const ladderCompact = style({
     display: 'flex',
     flexDirection: 'column',
     padding: 0,
-    fontVariantNumeric: 'tabular-nums',
+    ...NUMERIC,
 });
 
-const DEPTH_CELL_PAD = vars.space.sm;
+const DEPTH_CELL_PAD = SPACE.s2;
 
-export const depthHead = style({
+export const depthHead = style([hairlineBottom, {
     display: 'grid',
     gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
     columnGap: '1px',
-    fontSize: '0.75rem',
+    ...TEXT.footnote,
     color: vars.color.mutedForeground,
-    padding: `${vars.space.xs} 0`,
-    borderBottom: `1px solid ${vars.color.border}`,
-});
+    padding: `${SPACE.s1} 0`,
+}]);
 
 export const depthHeadVol = style({ paddingLeft: DEPTH_CELL_PAD, textAlign: 'left' });
 export const depthHeadPrice = style({ padding: `0 ${DEPTH_CELL_PAD}`, textAlign: 'center' });
 export const depthHeadVolRight = style({ paddingRight: DEPTH_CELL_PAD, textAlign: 'right' });
 
-export const depthRow = style({
+export const depthRow = style([hairlineBottom, {
     display: 'grid',
     gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
     columnGap: '1px',
-    borderBottom: `1px solid ${vars.color.border}`,
-});
+}]);
 
-const depthCellBase = style({
+/** 每格：量條（VolumeBar，絕對定位）在下，量與價（position: relative）在上 */
+const depthCellBase = style([pressableRow, focusRing, {
     display: 'grid',
     gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
     alignItems: 'center',
-    columnGap: vars.space.xs,
+    columnGap: SPACE.s1,
     minHeight: TOUCH_MIN,
     width: '100%',
     minWidth: 0,
@@ -315,29 +426,22 @@ const depthCellBase = style({
     border: 'none',
     background: 'transparent',
     color: vars.color.foreground,
-    fontSize: '0.9375rem',
-    selectors: {
-        '&:active': { background: vars.color.muted },
-        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '-2px' },
-    },
-});
+    overflow: 'hidden',
+    ...NUM.numSm,
+    ...NUMERIC,
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+}]);
 
-/** 買側：委買量靠左、買價靠右；賣側：賣價靠左、委賣量靠右（兩價在中間相鄰） */
+/** 買側：委買量靠左、買價靠右；賣側：賣價靠左、委賣量靠右（兩價在中間相鄰，量條從中線往外長） */
 export const depthCell = styleVariants({
     bid: [depthCellBase, { textAlign: 'right' }],
     ask: [depthCellBase, { textAlign: 'left' }],
 });
 
-const ellipsis = {
-    minWidth: 0,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-} as const;
-
 const depthVolBase = style({
+    position: 'relative',
     ...ellipsis,
-    fontFamily: vars.font.mono,
 });
 
 /** 量貼外側：買側靠左、賣側靠右 */
@@ -347,12 +451,12 @@ export const depthVol = styleVariants({
 });
 
 const depthPriceBase = style({
+    position: 'relative',
     minWidth: 0,
-    fontFamily: vars.font.mono,
-    fontWeight: 600,
+    ...NUM.numMd,
+    fontWeight: 500,
     display: 'flex',
     flexDirection: 'column',
-    lineHeight: 1.2,
     whiteSpace: 'nowrap',
 });
 
@@ -362,66 +466,55 @@ export const depthPrice = styleVariants({
     ask: [depthPriceBase, { alignItems: 'flex-start' }],
 });
 
-export const depthTotal = style({
+/** 最佳一檔價 600 */
+export const depthBest = style({ fontWeight: 600 });
+
+export const depthTotal = style([hairlineBottom, {
     display: 'grid',
     gridTemplateColumns: 'minmax(0, 1fr) auto minmax(0, 1fr)',
     alignItems: 'center',
-    columnGap: vars.space.sm,
+    columnGap: SPACE.s2,
     minHeight: '36px',
     padding: `0 ${DEPTH_CELL_PAD}`,
-    fontSize: '0.875rem',
-    borderBottom: `1px solid ${vars.color.border}`,
-});
+    ...NUM.numSm,
+    ...NUMERIC,
+}]);
 
-export const depthTotalVol = style({ ...ellipsis, fontFamily: vars.font.mono, fontWeight: 600, textAlign: 'left' });
-export const depthTotalVolRight = style({ ...ellipsis, fontFamily: vars.font.mono, fontWeight: 600, textAlign: 'right' });
-export const depthTotalLabel = style({ color: vars.color.mutedForeground, fontSize: '0.75rem', whiteSpace: 'nowrap' });
+export const depthTotalVol = style({ ...ellipsis, fontWeight: 600, textAlign: 'left' });
+export const depthTotalVolRight = style({ ...ellipsis, fontWeight: 600, textAlign: 'right' });
+export const depthTotalLabel = style({ ...TEXT.footnote, color: vars.color.mutedForeground, whiteSpace: 'nowrap' });
 
-// ---- 比例條（五檔買賣比、內外盤比） ----
+// ---- 比例條（五檔買賣比、內外盤比；條本身是 ui/bars 的 RatioBar） ----
 
 export const ratio = style({
     display: 'flex',
     alignItems: 'center',
-    gap: vars.space.sm,
+    gap: SPACE.s2,
     minHeight: '28px',
     padding: `0 ${DEPTH_CELL_PAD}`,
-    fontSize: '0.75rem',
+    ...TEXT.footnote,
 });
 
 export const ratioText = style({
     flex: '0 0 auto',
-    fontFamily: vars.font.mono,
+    ...NUM.numSm,
     fontWeight: 600,
+    ...NUMERIC,
     whiteSpace: 'nowrap',
 });
 
+/** RatioBar 的外框（軌道寬 100%，由這層決定伸縮） */
 export const ratioTrack = style({
     flex: '1 1 auto',
     minWidth: '40px',
-    display: 'flex',
-    height: '6px',
-    borderRadius: '3px',
-    overflow: 'hidden',
-    background: vars.color.muted,
-});
-
-const ratioFillBase = style({
-    height: '100%',
-    '@media': {
-        '(prefers-reduced-motion: no-preference)': { transition: 'width 0.3s ease-out' },
-    },
-});
-
-export const ratioFill = styleVariants({
-    up: [ratioFillBase, { background: vars.color.up }],
-    down: [ratioFillBase, { background: vars.color.down }],
+    display: 'block',
 });
 
 export const innerOuter = style([ratio, {
     flexWrap: 'wrap',
     rowGap: '2px',
-    paddingTop: vars.space.xs,
-    paddingBottom: vars.space.xs,
+    paddingTop: SPACE.s1,
+    paddingBottom: SPACE.s1,
 }]);
 
 export const innerOuterLabel = style({
@@ -430,45 +523,48 @@ export const innerOuterLabel = style({
     whiteSpace: 'nowrap',
 });
 
+/** 自己的委託「我 買2」：accent 外框小膠囊 */
 export const ladderMine = style({
     display: 'inline-block',
     marginTop: '1px',
-    padding: '0 6px',
-    borderRadius: vars.radius.sm,
+    padding: '0 5px',
+    borderRadius: RADIUS.xs,
     border: `1px solid ${vars.color.accent}`,
     color: vars.color.accent,
-    fontSize: '0.6875rem',
-    fontWeight: 700,
+    ...TEXT.caption,
 });
 
+/** 整股／盤中零股切換（Segmented compact）所在列 */
 export const ladderToolbar = style({
     display: 'flex',
     justifyContent: 'flex-end',
-    gap: vars.space.xs,
-    paddingTop: vars.space.xs,
+    padding: `${SPACE.s1} 0`,
 });
 
-export const toggle = style({
+export const ladderToolbarControl = style({
+    flex: '0 1 13rem',
+    minWidth: 0,
+});
+
+/** 次要動作鍵（重試、重新載入）：elevatedBg＋髮絲框 */
+export const toggle = style([pressable, focusRing, {
     minHeight: TOUCH_MIN,
     minWidth: TOUCH_MIN,
-    padding: `0 ${vars.space.md}`,
-    borderRadius: vars.radius.lg,
-    border: `1px solid ${vars.color.borderBright}`,
-    background: 'transparent',
-    color: vars.color.mutedForeground,
-    fontSize: '0.875rem',
-    selectors: {
-        '&[aria-pressed="true"]': { background: vars.color.accentDim, borderColor: vars.color.accent, color: vars.color.accent, fontWeight: 700 },
-        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '2px' },
-    },
-});
+    padding: `0 ${SPACE.s4}`,
+    borderRadius: RADIUS.md,
+    border: `0.5px solid ${vars.color.borderBright}`,
+    background: sj.elevatedBg,
+    boxShadow: elevation.e1,
+    color: vars.color.foreground,
+    ...TEXT.callout,
+}]);
 
 export const emptyText = style({
     margin: 0,
-    padding: `${vars.space.md} 0`,
+    padding: `${SPACE.s4} 0`,
     textAlign: 'center',
     color: vars.color.mutedForeground,
-    fontSize: '0.875rem',
+    ...TEXT.callout,
 });
 
 // ---- 明細 ----
@@ -476,74 +572,92 @@ export const emptyText = style({
 export const tickList = style({
     listStyle: 'none',
     margin: 0,
-    padding: `0 ${vars.space.md}`,
-    fontVariantNumeric: 'tabular-nums',
-    fontFamily: vars.font.mono,
-    fontSize: '0.875rem',
+    padding: `0 ${SPACE.s4}`,
+    ...NUM.numSm,
+    ...NUMERIC,
 });
 
 /** 390px 寬：時間 8 字、價格、量可收縮（minmax(0, …)＋省略號），內外盤欄固定 */
 const tickGrid = {
     display: 'grid',
     gridTemplateColumns: 'minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 0.8fr) 2em',
-    columnGap: vars.space.sm,
+    columnGap: SPACE.s2,
     alignItems: 'center',
 } as const;
 
-export const tickHead = style({
+export const tickHead = style([hairlineBottom, {
     ...tickGrid,
-    padding: `${vars.space.xs} ${vars.space.md}`,
-    fontSize: '0.75rem',
+    padding: `${SPACE.s1} ${SPACE.s4}`,
+    ...TEXT.footnote,
     color: vars.color.mutedForeground,
-    borderBottom: `1px solid ${vars.color.border}`,
-});
+}]);
 
-export const tickRow = style({
+const tickFadeIn = keyframes({ from: { opacity: 0 }, to: { opacity: 1 } });
+
+export const tickRow = style([hairlineBottom, {
     ...tickGrid,
-    minHeight: '32px',
-    borderBottom: `1px solid ${vars.color.border}`,
-});
+    minHeight: '2rem',
+}]);
+
+/** 最新一列 150ms 淡入（只動畫 opacity；減少動態由全域規則取消） */
+export const tickRowNew = style([tickRow, {
+    animation: `${tickFadeIn} ${DUR.fade}ms ease-out both`,
+    '@media': { [REDUCED_MOTION]: { animation: 'none' } },
+}]);
 
 export const tickTime = style({ ...ellipsis, color: vars.color.mutedForeground });
 export const tickNum = style({ ...ellipsis, textAlign: 'right' });
-export const tickSide = style({ textAlign: 'right', fontSize: '0.75rem', fontFamily: vars.font.body, whiteSpace: 'nowrap' });
+export const tickPrice = style({ fontWeight: 600 });
+export const tickSide = style({ textAlign: 'right', ...TEXT.footnote, fontWeight: 600, whiteSpace: 'nowrap' });
 
-// ---- 持倉摘要、未成交、底部買賣鍵 ----
+// ---- 持倉摘要、未成交（GroupedSection 內的列） ----
 
-export const summary = style({
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '2px',
-    padding: `${vars.space.sm} ${vars.space.md}`,
-    borderTop: `1px solid ${vars.color.border}`,
-    fontSize: '0.875rem',
-    fontVariantNumeric: 'tabular-nums',
+export const summaryWrap = style({
+    padding: `${SPACE.s3} 0`,
 });
 
-export const workingLink = style({
-    display: 'inline-flex',
+export const summaryRow = style({
+    display: 'flex',
     alignItems: 'center',
     minHeight: TOUCH_MIN,
+    boxSizing: 'border-box',
+    padding: `${SIZE.rowPadY} ${SIZE.rowPadX}`,
+    ...TEXT.subhead,
+    ...NUMERIC,
+    color: vars.color.foreground,
+});
+
+export const summaryMuted = style({
+    color: vars.color.mutedForeground,
+});
+
+export const workingLink = style([pressableRow, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    minHeight: TOUCH_MIN,
+    boxSizing: 'border-box',
+    padding: `${SIZE.rowPadY} ${SIZE.rowPadX}`,
     color: vars.color.accent,
     textDecoration: 'none',
+    ...TEXT.subhead,
     fontWeight: 600,
+    WebkitTapHighlightColor: 'transparent',
     selectors: {
-        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '2px' },
+        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '-2px' },
     },
-});
+}]);
+
+// ---- 交易鍵列（ShellSlot bottom → 底部 chrome 的 bar 材質上；本身不另設底色） ----
 
 export const tradeBar = style({
-    position: 'sticky',
-    bottom: 0,
-    zIndex: 5,
-    marginTop: 'auto',
-    padding: `${vars.space.sm} ${vars.space.md}`,
-    background: vars.color.panel,
-    borderTop: `1px solid ${vars.color.border}`,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: SPACE.s2,
+    padding: `8px calc(${SPACE.s4} + ${SAFE_RIGHT}) 8px calc(${SPACE.s4} + ${SAFE_LEFT})`,
 });
 
-export const tradeBarNote = style({
-    margin: `0 0 ${vars.space.xs}`,
-    fontSize: '0.8125rem',
-    color: vars.color.amber,
+/** 交易鍵高度 CONTROL_LARGE（字級大時隨 rem 放大，至少 56px） */
+export const tradeButtonSize = style({
+    minHeight: SIZE.controlLarge,
 });

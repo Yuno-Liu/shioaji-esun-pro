@@ -12,7 +12,7 @@ vi.mock('../../hooks/use-stream', () => quoteMock);
 const storeMock = vi.hoisted(() => ({ openTicket: vi.fn() }));
 vi.mock('../lib/mobile-store', () => storeMock);
 
-import { DepthLadder, depthBook, type DepthLadderProps } from './depth-ladder';
+import { DepthLadder, depthBook, depthMaxVolume, type DepthLadderProps } from './depth-ladder';
 
 const BIDASK = {
     code: '2330',
@@ -209,10 +209,10 @@ describe('DepthLadder（page）', () => {
 });
 
 describe('DepthLadder（ticket）', () => {
-    it('不顯示整股／零股切換與內外盤比，依 oddLot prop 訂閱', async () => {
+    // 設計規格 §7.3：ticket 變體也顯示內外盤比（原本「不顯示內外盤比」的斷言依規格移除，改由下方專門案例驗證）
+    it('不顯示整股／零股切換，依 oddLot prop 訂閱', async () => {
         await render([], { variant: 'ticket', oddLot: true });
         expect(allById('depth-odd-toggle')).toHaveLength(0);
-        expect(allById('depth-inner-outer')).toHaveLength(0);
         expect(quoteMock.useQuote).toHaveBeenLastCalledWith('2330', { oddLot: true });
         expect(byId('depth-ladder').props['data-variant']).toBe('ticket');
 
@@ -233,5 +233,71 @@ describe('DepthLadder（ticket）', () => {
         await act(async () => { byId('depth-ask-1').props.onClick(); });
         expect(onPick).toHaveBeenCalledWith(985, 'ask');
         expect(byId('depth-ask-1').props['aria-label']).toContain('帶入價格');
+    });
+
+    it('B3b：ticket 變體也顯示內外盤比（文字標示內盤／外盤，比例條為 scaleX）', async () => {
+        await render([], { variant: 'ticket', onPick: vi.fn() });
+        expect(allById('depth-inner-outer')).toHaveLength(1);
+        expect(text(byId('depth-inner'))).toBe('58%（內盤）');
+        expect(text(byId('depth-outer'))).toBe('42%（外盤）');
+        expect(byId('depth-inner-outer').props['aria-label']).toBe('內外盤比：內盤 58%，外盤 42%');
+        const fills = byId('depth-inner-outer-bar').findAll(n => typeof n.type === 'string' && n.props.style !== undefined);
+        expect(fills.map(f => f.props.style)).toEqual([{ transform: 'scaleX(0.58)' }, { transform: 'scaleX(0.42)' }]);
+    });
+
+    it('B3b：ticket 變體沒有內外盤量（或試撮）時仍隱藏內外盤比', async () => {
+        quoteMock.useQuote.mockImplementation(() => ({ bidask: BIDASK, tick: { ...TICK, simtrade: true }, lastDir: 0, seq: 1, flashSeq: 0 }));
+        await render([], { variant: 'ticket' });
+        expect(allById('depth-inner-outer')).toHaveLength(0);
+    });
+});
+
+describe('DepthLadder B3b 視覺（設計規格 §7.3）', () => {
+    /** 格內帶 inline style 的量條 span（VolumeBar 是唯一帶 style 的節點） */
+    const barOf = (id: string) => byId(id).findAll(n => n.type === 'span' && n.props.style !== undefined);
+
+    it('depthMaxVolume：兩側最大單檔量', () => {
+        expect(depthMaxVolume(depthBook(BIDASK))).toBe(120);
+        expect(depthMaxVolume(depthBook(undefined))).toBe(0);
+    });
+
+    it('每格量條 scaleX(量 ÷ 五檔最大量)，aria-hidden；文字內容不變', async () => {
+        await render();
+        const [bid1] = barOf('depth-bid-1');
+        expect(bid1!.props.style).toEqual({ transform: 'scaleX(1)' });
+        expect(bid1!.props['aria-hidden']).toBe('true');
+        expect(barOf('depth-ask-1')[0]!.props.style).toEqual({ transform: 'scaleX(0.7333)' });
+        expect(barOf('depth-bid-5')[0]!.props.style).toEqual({ transform: 'scaleX(0.25)' });
+        // 空檔沒有量條
+        expect(barOf('depth-ask-5')).toHaveLength(0);
+    });
+
+    it('五檔買賣比例條改 scaleX（不再用 width）', async () => {
+        await render();
+        const styled = byId('depth-ratio').findAll(n => typeof n.type === 'string' && n.props.style !== undefined).map(n => n.props.style as Record<string, unknown>);
+        expect(styled).toEqual([{ transform: 'scaleX(0.65)' }, { transform: 'scaleX(0.35)' }]);
+        expect(styled.some(s => 'width' in s)).toBe(false);
+    });
+
+    it('整股／盤中零股改為 Segmented toggle（role=group、aria-pressed）', async () => {
+        await render();
+        const toggle = byId('depth-odd-toggle');
+        const group = view!.root.findAll(n => n.type === 'div' && n.props.role === 'group')[0]!;
+        expect(group.props['aria-label']).toContain('盤中零股');
+        expect(toggle.props['aria-pressed']).toBe(false);
+        await act(async () => { toggle.props.onClick(); });
+        expect(byId('depth-odd-toggle').props['aria-pressed']).toBe(true);
+    });
+
+    it('S1：五檔每一格點價都只呼叫 openTicket（只帶價、不帶方向），不送單', async () => {
+        await render();
+        const cells = view!.root.findAll(n => n.type === 'button' && /^depth-(bid|ask)-\d$/.test(String(n.props['data-testid'] ?? '')));
+        expect(cells).toHaveLength(9);
+        for (const c of cells) await act(async () => { c.props.onClick(); });
+        expect(storeMock.openTicket).toHaveBeenCalledTimes(9);
+        for (const [arg] of storeMock.openTicket.mock.calls) {
+            expect(arg).not.toHaveProperty('action');
+            expect(arg).toMatchObject({ code: '2330', source: 'depth' });
+        }
     });
 });

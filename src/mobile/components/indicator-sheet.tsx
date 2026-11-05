@@ -4,6 +4,7 @@
 //   達上限（主圖 4、副圖 2）時停用「加入」並說明原因。
 // - 點已啟用的指標 → 編輯參數：數字輸入（inputmode）、−／＋ 依步進、夾在定義的範圍內、恢復預設、顏色。
 // - 設定由 lib/mobile-indicators.ts 保存（localStorage），圖表即時套用。
+// - 外觀沿用設計規格的元件語彙（elevatedBg 鍵、中性島輸入框、InlineNote 說明）；只改樣式，不改行為與 testid。
 
 import { useEffect, useId, useState } from 'react';
 import { DEF_BY_TYPE, type IndicatorDef, type ParamDef } from '../../lib/indicator-defs';
@@ -23,6 +24,7 @@ import {
     type MobileIndicator,
 } from '../lib/mobile-indicators';
 import * as styles from '../styles/chart.css';
+import { InlineNote } from '../ui/inline-note';
 import { BottomSheet } from './bottom-sheet';
 
 const SECTIONS: { category: IndicatorCategory; title: string }[] = [
@@ -72,7 +74,9 @@ function IndicatorList({ lineMode, onEdit }: { lineMode: boolean; onEdit: (id: s
     return (
         <div data-testid='indicator-list'>
             {lineMode && (
-                <p className={styles.sheetNote}>走勢圖只顯示均價線、當日最高最低與成交量；以下指標套用在 K 線（1 分以上）。</p>
+                <div className={styles.sheetNote}>
+                    <InlineNote tone='info'>走勢圖只顯示均價線、當日最高最低與成交量；以下指標套用在 K 線（1 分以上）。</InlineNote>
+                </div>
             )}
             <div className={styles.toggleRow}>
                 <span>成交量（K 線）</span>

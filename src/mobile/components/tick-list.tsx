@@ -3,6 +3,7 @@
 // 先以 fetchLastTicks(contract, 50) 取最近 50 筆，再接 onAnyTick()（只取目前商品）；
 // 最多保留 200 筆。內外盤以 tick_type 著色並附文字（1 外盤、2 內盤），不只靠顏色。
 // 欄寬以 minmax(0, …)＋省略號收縮，390px 寬不溢出（trade.css.ts tickGrid）。
+// 列高 2rem、系統字 tabular（num 樣式，不用等寬字族）；最新一列 150ms 淡入。
 
 import { useEffect, useRef, useState } from 'react';
 import { retainQuote } from '../../lib/quote-ownership';
@@ -139,12 +140,13 @@ export function TickList({ code, contract }: { code: string; contract: ContractI
                 </div>
             )}
             <ul className={styles.tickList} aria-label={`逐筆明細（量：${unit}）`}>
-                {rows.map(r => {
+                {rows.map((r, i) => {
                     const tone = r.tickType === 1 ? 'up' : r.tickType === 2 ? 'down' : 'flat';
                     return (
-                        <li key={r.id} className={styles.tickRow}>
+                        // 最新一列淡入（新列以新 key 掛載才會播放；只動畫 opacity）
+                        <li key={r.id} className={i === 0 ? styles.tickRowNew : styles.tickRow}>
                             <span className={styles.tickTime}>{r.time}</span>
-                            <span className={`${styles.tickNum} ${styles.dirText[tone]}`}>{formatToTick(contract, r.price)}</span>
+                            <span className={`${styles.tickNum} ${styles.tickPrice} ${styles.dirText[tone]}`}>{formatToTick(contract, r.price)}</span>
                             <span className={styles.tickNum}>{fmtInt(r.volume)}</span>
                             <span className={`${styles.tickSide} ${styles.dirText[tone]}`}>{SIDE_TEXT[r.tickType] ?? ''}</span>
                         </li>

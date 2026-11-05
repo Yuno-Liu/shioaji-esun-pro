@@ -15,6 +15,7 @@
 // - 水平線：由 chart-model.ts 的 PriceLineSpec 畫出（委託、成本、漲跌停、參考價）。
 // - 互動：單指拖曳平移、雙指縮放；長按進入追蹤模式（trackingMode），十字線價以 roundToTick 取整，
 //   放開後浮出「以 X 買進／賣出」→ openTicket({ source: 'chart' })。**只開下單面板，絕不直接送單**。
+//   長按成立時 haptic('longPress')（只在 Android 且使用者開啟介面觸覺時）；選價列由圖表底部升起、選完或取消沿原路收回。
 //   副圖上的十字線不拿來選價（座標不是價格）。點委託線標籤 → openOrderAction(tradeId, 'menu')。
 //   不支援拖曳委託線改價（規格 R7）。可互動區加 data-allow-pinch="true"（平台手勢防護略過這一區）。
 // - 橫向全螢幕：手機轉橫向（lib/chart-fullscreen.ts）或按「全螢幕」→ CSS 固定定位覆蓋全畫面（留安全區），
@@ -68,8 +69,11 @@ import {
     type MobileIndicatorSettings,
 } from '../lib/mobile-indicators';
 import { openOrderAction, openTicket } from '../lib/mobile-store';
+import { haptic } from '../motion/haptics';
 import * as cs from '../styles/chart.css';
 import * as styles from '../styles/trade.css';
+import { Chip } from '../ui/chip';
+import { Segmented } from '../ui/segmented';
 import { IndicatorSheet } from './indicator-sheet';
 
 /** 即時成交合併重畫的間隔（行情 store 的 QUOTE_FLUSH_MS 未匯出，自行節流） */
@@ -78,6 +82,8 @@ export const CHART_FLUSH_MS = 100;
 export const INDICATOR_FLUSH_MS = 500;
 /** 長按進入追蹤模式的時間與容許位移 */
 export const LONG_PRESS_MS = 450;
+/** 全螢幕週期 Segmented 的選項 */
+const PERIOD_ITEMS = CHART_PERIODS.map(p => ({ value: p.key, label: p.label }));
 export const LONG_PRESS_SLOP_PX = 10;
 /** 歷史與即時之間出現斷層時補抓歷史的最短間隔 */
 export const GAP_RELOAD_MIN_MS = 120_000;
@@ -222,6 +228,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const [chartGen, setChartGen] = useState(0);
     const [orderLabels, setOrderLabels] = useState<OrderLabel[]>([]);
     const [pick, setPick] = useState<number | null>(null);
+    // 選價列沿原路收回時的殘影（只剩文字的 span、aria-hidden＋inert，不可點）
+    const [pickClosing, setPickClosing] = useState<string | null>(null);
     const [legend, setLegend] = useState<LegendEntry[]>([]);
     const [paneCount, setPaneCount] = useState(0);
     const [paneTops, setPaneTops] = useState<number[]>([]);
@@ -255,7 +263,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             layout: {
                 background: { type: ColorType.Solid, color: 'transparent' },
                 textColor: c.text,
-                fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                fontFamily: cs.CHART_FONT_FAMILY,
                 fontSize: 11,
                 attributionLogo: false,
             },
@@ -991,7 +999,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             const p = mainH !== null && y - rect.top > mainH ? null : series.coordinateToPrice(y - rect.top);
             crossPriceRef.current = p !== null && Number.isFinite(p) ? p : null;
             setPick(null);
-            try { navigator.vibrate?.(10); } catch { /* iOS 不支援 */ }
+            haptic('longPress');
         }, LONG_PRESS_MS);
         pressRef.current = { x, y, timer };
     };
@@ -1012,10 +1020,20 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     };
 
     const pickText = pick !== null ? formatToTick(contract, pick) : '';
+    /** 使用者關閉選價列（選了買賣或取消）：沿原路收回；換商品、週期、重新長按則直接移除 */
+    const dismissPick = () => {
+        if (pick !== null) setPickClosing(pickText);
+        setPick(null);
+    };
+    useEffect(() => {
+        if (pickClosing === null) return undefined;
+        const t = setTimeout(() => setPickClosing(null), styles.PICK_EXIT_MS);
+        return () => clearTimeout(t);
+    }, [pickClosing]);
     const choose = (action: 'Buy' | 'Sell') => {
         if (pick === null) return;
         openTicket({ code, action, price: pick, source: 'chart' });
-        setPick(null);
+        dismissPick();
     };
 
     const tradable = secType !== 'IND' && !contract.combo;
@@ -1053,16 +1071,12 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             {fullscreen && (
                 <div className={cs.fsBar} data-testid='chart-fs-bar'>
                     <span className={cs.fsTitle}>{contract.name || code}</span>
-                    <div className={cs.fsPeriods} role='group' aria-label='圖表週期'>
+                    <div className={cs.fsPeriods}>
                         {onPeriodChange
-                            ? CHART_PERIODS.map(p => (
-                                <button key={p.key} type='button' className={cs.fsPeriod} aria-pressed={period === p.key} onClick={() => onPeriodChange(p.key)}>
-                                    {p.label}
-                                </button>
-                            ))
+                            ? <Segmented items={PERIOD_ITEMS} value={period} onChange={onPeriodChange} semantics='toggle' ariaLabel='圖表週期' size='compact' />
                             : <span className={cs.fsTitle}>{periodLabel}</span>}
                     </div>
-                    <button type='button' className={cs.toolButton} onClick={() => setSheetOpen(true)} data-testid='chart-indicators'>指標</button>
+                    <Chip label='指標' className={cs.toolButton} onClick={() => setSheetOpen(true)} testId='chart-indicators' />
                     <button type='button' className={cs.exitButton} onClick={exitFullscreen} data-testid='chart-fs-exit'>退出全螢幕</button>
                 </div>
             )}
@@ -1115,7 +1129,14 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                     <div className={styles.pickBar} role='dialog' aria-label={`以 ${pickText} 下單`} data-testid='chart-pick'>
                         <button type='button' className={styles.pickButton.buy} onClick={() => choose('Buy')}>以 {pickText} 買進</button>
                         <button type='button' className={styles.pickButton.sell} onClick={() => choose('Sell')}>以 {pickText} 賣出</button>
-                        <button type='button' className={styles.pickButton.cancel} onClick={() => setPick(null)} aria-label='取消'>取消</button>
+                        <button type='button' className={styles.pickButton.cancel} onClick={dismissPick} aria-label='取消'>取消</button>
+                    </div>
+                )}
+                {pick === null && pickClosing !== null && (
+                    <div className={styles.pickBarClosing} aria-hidden='true' inert data-testid='chart-pick-closing'>
+                        <span className={styles.pickButton.buy}>以 {pickClosing} 買進</span>
+                        <span className={styles.pickButton.sell}>以 {pickClosing} 賣出</span>
+                        <span className={styles.pickButton.cancel}>取消</span>
                     </div>
                 )}
             </div>
@@ -1124,8 +1145,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                     <p className={cs.toolNote}>
                         {isLine ? '長按圖表選價位，放開後可帶價開啟下單面板' : period === '1D' ? '日 K 由 1 分 K 聚合，未含除權息調整' : '長按圖表選價位'}
                     </p>
-                    <button type='button' className={cs.toolButton} onClick={() => setSheetOpen(true)} data-testid='chart-indicators'>指標</button>
-                    <button type='button' className={cs.toolButton} onClick={enterFullscreen} data-testid='chart-fs-enter'>全螢幕</button>
+                    <Chip label='指標' className={cs.toolButton} onClick={() => setSheetOpen(true)} testId='chart-indicators' />
+                    <Chip label='全螢幕' className={cs.toolButton} onClick={enterFullscreen} testId='chart-fs-enter' />
                 </div>
             )}
             {fullscreen && tradable && (

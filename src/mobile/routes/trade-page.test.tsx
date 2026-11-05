@@ -19,6 +19,20 @@ const m = vi.hoisted(() => ({
     snapshot: undefined as unknown,
     snapshotListeners: new Set<() => void>(),
     chartProps: [] as unknown[],
+    // S1：lib 的送單／改單／刪單函式（交易頁任何入口都不得呼叫）
+    send: {
+        placeStockOrder: vi.fn(),
+        placeFuturesOrder: vi.fn(),
+        placeComboOrder: vi.fn(),
+        cancelOrder: vi.fn(),
+        cancelOrders: vi.fn(),
+        cancelVerifiedOrder: vi.fn(),
+        updateOrderPrice: vi.fn(),
+        updateOrderQty: vi.fn(),
+        submitMobileOrder: vi.fn(),
+        placeQuickOrder: vi.fn(),
+        cancelAllOrders: vi.fn(),
+    },
 }));
 vi.mock('../../hooks/use-stream', () => ({ useQuote: m.useQuote }));
 vi.mock('../../lib/contracts-cache', () => ({ useContract: m.useContract, ensureContract: m.ensureContract }));
@@ -27,14 +41,27 @@ vi.mock('../../lib/privacy', () => ({ usePrivacyMoney: m.usePrivacyMoney, maskMo
 vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, setCurrentCode: m.setCurrentCode }));
 vi.mock('../components/trade-chart', () => ({ TradeChart: (props: unknown) => { m.chartProps.push(props); return null; } }));
 vi.mock('../components/tick-list', () => ({ TickList: () => null }));
-vi.mock('../../lib/shioaji', () => ({ fetchSnapshots: m.fetchSnapshots }));
+vi.mock('../../lib/shioaji', () => ({
+    fetchSnapshots: m.fetchSnapshots,
+    placeStockOrder: m.send.placeStockOrder,
+    placeFuturesOrder: m.send.placeFuturesOrder,
+    placeComboOrder: m.send.placeComboOrder,
+    cancelOrder: m.send.cancelOrder,
+    cancelOrders: m.send.cancelOrders,
+    cancelVerifiedOrder: m.send.cancelVerifiedOrder,
+    updateOrderPrice: m.send.updateOrderPrice,
+    updateOrderQty: m.send.updateOrderQty,
+}));
+vi.mock('../lib/mobile-order', () => ({ submitMobileOrder: m.send.submitMobileOrder }));
+vi.mock('../../lib/trade', () => ({ placeQuickOrder: m.send.placeQuickOrder, cancelAllOrders: m.send.cancelAllOrders }));
 vi.mock('../../lib/market-snapshot-store', () => ({
     getMarketSnapshot: () => m.snapshot,
     subscribeMarketSnapshots: (l: () => void) => { m.snapshotListeners.add(l); return () => { m.snapshotListeners.delete(l); }; },
 }));
 vi.mock('../lib/hash-router', async importOriginal => ({ ...(await importOriginal<typeof import('../lib/hash-router')>()), navigate: m.navigate }));
 
-import { dayTradeText, deliveryMonthText, positionSummaries, sessionText, TradePage, workingOrderCount } from './trade-page';
+import { ShellSlotsContext } from '../ui/shell-slots';
+import { dayTradeText, deliveryMonthText, positionSummaries, scrolledPast, sessionText, TradePage, workingOrderCount } from './trade-page';
 
 const stock = {
     exchange: 'TSE', code: '2330', security_type: 'STK', target_code: null, name: '台積電', currency: 'TWD',
@@ -73,6 +100,7 @@ beforeEach(() => {
     m.snapshot = undefined;
     m.snapshotListeners.clear();
     m.chartProps.length = 0;
+    Object.values(m.send).forEach(f => f.mockReset());
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
@@ -300,6 +328,145 @@ describe('TradePage', () => {
     it('正規代碼不改寫路由', async () => {
         await render();
         expect(m.navigate).not.toHaveBeenCalled();
+    });
+});
+
+// ---- B3b 交易頁現代化（設計規格 §7.3、§10 S1） ----
+
+describe('TradePage B3b', () => {
+    const buttons = () => view!.root.findAll(n => n.type === 'button');
+    const btn = (label: string) => buttons().find(b => text(b) === label)!;
+
+    it('S1：交易頁每個按鈕（買賣鍵、週期、五檔／明細、整股／零股、五檔點價）只呼叫 openTicket，lib 送出函式 0 次', async () => {
+        m.useQuote.mockReturnValue({
+            tick: { code: '2330', close: '1085', price_chg: '15', total_volume: 23456 },
+            bidask: { bid_price: ['1080', '1075'], bid_volume: [5, 3], ask_price: ['1085', '1090'], ask_volume: [4, 2] },
+        });
+        await render();
+        // 先點「五檔」相關按鈕，再切到明細（明細列表已 mock），最後點買賣鍵
+        const clickAll = async () => {
+            for (const b of buttons().filter(n => !n.props.disabled)) {
+                if (text(b) === '明細') continue;
+                await act(async () => { b.props.onClick?.(); });
+            }
+        };
+        await clickAll();
+        await act(async () => { btn('明細').props.onClick(); });
+        await clickAll();
+        expect(m.openTicket.mock.calls.length).toBeGreaterThanOrEqual(6);
+        for (const [arg] of m.openTicket.mock.calls) {
+            expect(arg).toMatchObject({ code: '2330' });
+            expect(['button', 'depth']).toContain((arg as { source: string }).source);
+        }
+        for (const [name, fn] of Object.entries(m.send)) {
+            expect(fn, name).not.toHaveBeenCalled();
+        }
+    });
+
+    it('週期改為 Segmented toggle（role=group、aria-pressed），點選後傳給圖表並記住', async () => {
+        await render();
+        const group = view!.root.findAll(n => n.type === 'div' && n.props.role === 'group' && n.props['aria-label'] === '圖表週期');
+        expect(group).toHaveLength(1);
+        const labels = group[0]!.findAllByType('button').map(b => text(b));
+        expect(labels).toEqual(['走勢', '1分', '5分', '15分', '60分', '日']);
+        await act(async () => { btn('5分').props.onClick(); });
+        expect(btn('5分').props['aria-pressed']).toBe(true);
+        expect(btn('走勢').props['aria-pressed']).toBe(false);
+        expect((m.chartProps.at(-1) as { period: string }).period).toBe('5m');
+    });
+
+    it('五檔／明細改為 Segmented tabs（role=tablist／tab＋aria-selected）', async () => {
+        await render();
+        const list = view!.root.findAll(n => n.type === 'div' && n.props.role === 'tablist');
+        expect(list).toHaveLength(1);
+        expect(list[0]!.props['aria-label']).toBe('五檔與明細');
+        expect(btn('五檔').props.role).toBe('tab');
+        expect(btn('五檔').props['aria-selected']).toBe(true);
+        await act(async () => { btn('明細').props.onClick(); });
+        expect(btn('明細').props['aria-selected']).toBe(true);
+        expect(view!.root.findAllByProps({ 'data-testid': 'depth-ladder' })).toHaveLength(0);
+    });
+
+    it('交易鍵列經 ShellSlot bottom：inline 時原地渲染（文字與 testid 不變）；殼層目標未掛上時不落回捲動內容', async () => {
+        // portal 行為本身由 shell-slots.test 驗證；這裡驗證交易鍵確實走 ShellSlot
+        await act(async () => {
+            view = create(createElement(ShellSlotsContext.Provider, { value: 'inline' }, createElement(TradePage, { code: '2330' })));
+        });
+        expect(text(byId('trade-buy'))).toBe('買 進');
+        expect(text(byId('trade-sell'))).toBe('賣 出');
+        await act(async () => { view!.unmount(); });
+        await act(async () => {
+            view = create(createElement(ShellSlotsContext.Provider, { value: { top: null, bottom: null } }, createElement(TradePage, { code: '2330' })));
+        });
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-buy' })).toHaveLength(0);
+        expect(view!.root.findAllByProps({ 'data-testid': 'page-trade' })).toHaveLength(1);
+    });
+
+    it('組合商品：交易鍵停用並以 InlineNote 說明（文字不變）', async () => {
+        m.useContract.mockReturnValue({ ...stock, combo: true });
+        await render();
+        expect(byId('trade-buy').props.disabled).toBe(true);
+        expect(byId('trade-sell').props.disabled).toBe(true);
+        const note = view!.root.findAll(n => n.props['data-tone-note'] === 'warn');
+        expect(note).toHaveLength(1);
+        expect(text(note[0]!)).toContain('組合商品不支援手機下單');
+    });
+
+    it('scrolledPast：只有在根範圍之上且不相交才算捲出', () => {
+        expect(scrolledPast({ isIntersecting: false, boundingClientRect: { top: 40 }, rootBounds: { top: 91 } })).toBe(true);
+        expect(scrolledPast({ isIntersecting: true, boundingClientRect: { top: 120 }, rootBounds: { top: 91 } })).toBe(false);
+        // 在根範圍下方（看不到但還沒捲過）不算
+        expect(scrolledPast({ isIntersecting: false, boundingClientRect: { top: 900 }, rootBounds: { top: 91 } })).toBe(false);
+        expect(scrolledPast({ isIntersecting: false, boundingClientRect: { top: -5 }, rootBounds: null })).toBe(true);
+    });
+
+    it('精簡標頭：沒有 IntersectionObserver 時不渲染', async () => {
+        await render();
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-compact' })).toHaveLength(0);
+    });
+
+    it('精簡標頭：主價列哨兵捲出 main 頂端時顯示（以 main 為根；aria-hidden；不重用其他 testid）', async () => {
+        const observers: { cb: IntersectionObserverCallback; opts: IntersectionObserverInit | undefined; disconnect: ReturnType<typeof vi.fn> }[] = [];
+        class FakeIO {
+            disconnect = vi.fn();
+            constructor(cb: IntersectionObserverCallback, opts?: IntersectionObserverInit) { observers.push({ cb, opts, disconnect: this.disconnect }); }
+            observe() {}
+            unobserve() {}
+        }
+        vi.stubGlobal('IntersectionObserver', FakeIO);
+        const main = { tagName: 'MAIN' };
+        await act(async () => {
+            view = create(createElement(TradePage, { code: '2330' }), {
+                createNodeMock: el => ((el.props as { className?: string }).className === undefined ? null : { closest: (sel: string) => (sel === 'main' ? main : null), nodeType: 1 }),
+            });
+        });
+        const header = observers.find(o => o.opts?.root === main);
+        expect(header).toBeDefined();
+        const bar = () => byId('trade-compact');
+        expect(bar().props['data-visible']).toBe('false');
+        expect(bar().props['aria-hidden']).toBe('true');
+        expect(text(bar())).toContain('2330 台積電');
+        expect(text(bar())).toContain('1,085');
+        await act(async () => {
+            header!.cb([{ isIntersecting: false, boundingClientRect: { top: -2 }, rootBounds: { top: 0 } } as unknown as IntersectionObserverEntry], {} as IntersectionObserver);
+        });
+        expect(bar().props['data-visible']).toBe('true');
+        await act(async () => {
+            header!.cb([{ isIntersecting: true, boundingClientRect: { top: 10 }, rootBounds: { top: 0 } } as unknown as IntersectionObserverEntry], {} as IntersectionObserver);
+        });
+        expect(bar().props['data-visible']).toBe('false');
+        await act(async () => { view!.unmount(); });
+        view = undefined;
+        expect(header!.disconnect).toHaveBeenCalled();
+    });
+
+    it('主價改用 numHero 樣式與系統字（不再用等寬字族）；價格旁有跳價閃爍覆蓋層（aria-hidden）', async () => {
+        await render();
+        const price = byId('trade-price');
+        const hero = price.findAll(n => n.type === 'span' && String(n.props.className ?? '').includes('lastPrice'))[0]!;
+        expect(text(hero)).toBe('1,085');
+        const overlay = hero.findAll(n => n.type === 'span' && n.props['aria-hidden'] === 'true');
+        expect(overlay).toHaveLength(1);
     });
 });
 
