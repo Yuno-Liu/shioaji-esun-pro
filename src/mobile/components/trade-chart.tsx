@@ -3,6 +3,11 @@
 // - 週期：走勢（BaselineSeries，以參考價為基準線）或 K 線（1／5／15／60 分、日）＋成交量＋MA(5／20)。
 // - 資料：fetchChartHistory() → kbarsToCandles() → aggregate()（走勢改挑當日時段）；最多 5,000 根；
 //   最後一根由即時成交（onAnyTick；指數用 quote_idx）更新，每 CHART_FLUSH_MS 合併重畫一次。
+//   試撮（simtrade）揭示價不入圖（與桌面相同），只用來偵測換時段。
+// - 歷史新鮮度：chart-history-freshness.ts 依 (code, period) 決定沿用快取、先顯示快取再背景重抓、或換新 revision；
+//   ResumeGate 的 resumeSeq 改變（回前景）時背景重抓；走勢與 K 線都有缺口偵測（累計量顯示真的漏量才重抓）。
+// - 圖表實例只在商品、週期、配色改變時重建；重抓歷史沿用既有 chart／series 以 setData 更新，
+//   保留可見範圍（以距離最新一根的位置）與長按選價列。
 // - 水平線：由 chart-model.ts 的 PriceLineSpec 畫出（委託、成本、漲跌停、參考價）。
 // - 互動：單指拖曳平移、雙指縮放；長按進入追蹤模式（trackingMode），十字線價以 roundToTick 取整，
 //   放開後浮出「以 X 買進／賣出」→ openTicket({ source: 'chart' })。**只開下單面板，絕不直接送單**。
@@ -26,6 +31,7 @@ import {
 } from 'lightweight-charts';
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { useQuote } from '../../hooks/use-stream';
+import { useResumeGate } from '../hooks/use-resume-gate';
 import { fetchChartHistory, nextChartHistoryRevision } from '../../lib/chart-history';
 import { CLOSE_GRACE, pickIntradayWindow, sessionWindowFor, tickBucket, type SessionWindow } from '../../lib/intraday-session';
 import { onAnyTick } from '../../lib/stream';
@@ -34,6 +40,7 @@ import type { ContractInfo } from '../../lib/types/contract';
 import type { Candle } from '../../lib/types/market';
 import { aggregate, kbarsToCandles, nowWallClockUtc, wallClockToUtc } from '../../lib/utils/kbars';
 import { formatToTick, roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
+import { getHistoryEntry, planHistory, setHistoryEntry } from '../lib/chart-history-freshness';
 import { intradayBars, lastMovingAverage, liveBarTime, movingAverage, priceLinesKey, type PriceLineSpec } from '../lib/chart-model';
 import { capBars, chartQueryRange, MAX_CHART_BARS, periodDef, type ChartPeriod } from '../lib/chart-ranges';
 import { openOrderAction, openTicket } from '../lib/mobile-store';
@@ -45,7 +52,9 @@ export const CHART_FLUSH_MS = 100;
 export const LONG_PRESS_MS = 450;
 export const LONG_PRESS_SLOP_PX = 10;
 /** 歷史與即時之間出現斷層時補抓歷史的最短間隔 */
-const GAP_RELOAD_MIN_MS = 120_000;
+export const GAP_RELOAD_MIN_MS = 120_000;
+/** 走勢：即時成交與最後一根相隔超過這個秒數，且累計量顯示漏量時補抓（與桌面 intraday-chart 相同） */
+export const LINE_GAP_SECONDS = 180;
 /** K 線模式初次顯示的根數（手機寬度） */
 const INITIAL_VISIBLE_BARS = 80;
 const MA_PERIODS = [5, 20] as const;
@@ -101,16 +110,22 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
     const hostRef = useRef<HTMLDivElement | null>(null);
     const chartRef = useRef<IChartApi | null>(null);
     const mainRef = useRef<ISeriesApi<SeriesType> | null>(null);
-    const ingestRef = useRef<((price: number, tickTime: number, volume: number) => void) | null>(null);
+    const ingestRef = useRef<((price: number, tickTime: number, volume: number, total: number | null, sim: boolean) => void) | null>(null);
     const lastReloadAt = useRef(0);
     const layoutRef = useRef<() => void>(() => undefined);
+    /** 載入失敗後「重新載入」：以新 revision 重抓（不重建圖表） */
+    const retryRef = useRef<() => void>(() => undefined);
+    /** ResumeGate 的 resumeSeq 改變時背景重抓 */
+    const resumeRefreshRef = useRef<(seq: number) => void>(() => undefined);
+    const resumeSeq = useResumeGate().resumeSeq;
+    const resumeSeqRef = useRef(resumeSeq);
+    resumeSeqRef.current = resumeSeq;
     // 長按追蹤狀態
     const trackingRef = useRef(false);
     const crossPriceRef = useRef<number | null>(null);
     const pressRef = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
 
     const [status, setStatus] = useState<Status>('loading');
-    const [reloadRev, setReloadRev] = useState(0);
     const [chartGen, setChartGen] = useState(0);
     const [orderLabels, setOrderLabels] = useState<OrderLabel[]>([]);
     const [pick, setPick] = useState<number | null>(null);
@@ -119,7 +134,7 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
     const secType = contract.security_type;
     const reference = contract.reference;
 
-    // ---- 圖表生命週期＋歷史載入＋即時更新（商品、週期、配色、重新載入時整個重建） ----
+    // ---- 圖表生命週期＋歷史載入＋即時更新（只在商品、週期、配色改變時重建；重抓歷史沿用同一個圖表） ----
     useEffect(() => {
         const host = hostRef.current;
         if (!host) return;
@@ -196,6 +211,16 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
         let win: SessionWindow | null = null;
         let dirtyFrom = -1;
         let shownReady = false;
+        /** 已套用過歷史（之後的重抓保留可見範圍） */
+        let shownHistory = false;
+        /** 走勢：目前時段的累計量（缺口偵測） */
+        let cumV = 0;
+        /** K 線：上一筆成交的累計量（缺口偵測） */
+        let lastTotal: number | null = null;
+        /** 有歷史查詢進行中；pendingRefresh＝進行中時又被要求重抓（回前景） */
+        let busy = false;
+        let pendingRefresh = false;
+        let builtSeq = resumeSeqRef.current;
         let flushTimer: ReturnType<typeof setTimeout> | null = null;
         let raf1: number | null = null;
         let raf2: number | null = null;
@@ -261,28 +286,123 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
             scheduleLayout();
         };
 
-        const requestReload = () => {
-            if (Date.now() - lastReloadAt.current < GAP_RELOAD_MIN_MS) return;
-            lastReloadAt.current = Date.now();
-            setReloadRev(nextChartHistoryRevision());
+        const sumVolume = () => bars.reduce((sum, b) => sum + b.volume, 0);
+
+        /** 套用一份歷史：保留比歷史尾端新的即時 K 棒；已顯示過時保留可見範圍（以距離最新一根的位置） */
+        const applyHistory = (raw: Candle[]) => {
+            const ts = chart.timeScale();
+            const prevLen = bars.length;
+            const range = shownHistory && prevLen > 0 ? ts.getVisibleLogicalRange() : null;
+            let live = bars;
+            let next: Candle[];
+            if (isLine) {
+                const nextWin = pickIntradayWindow(ct.security_type, raw.map(b => b.time), 'auto', nowWallClockUtc());
+                if (!win || win.start !== nextWin.start) live = []; // 換時段：舊時段的即時點不帶過去
+                win = nextWin;
+                next = intradayBars(raw, nextWin, CLOSE_GRACE);
+            } else {
+                next = aggregate(raw, minutes);
+            }
+            const tail = next.length ? next[next.length - 1]!.time : -Infinity;
+            for (const b of live) if (b.time > tail) next.push({ ...b });
+            bars = isLine ? next : capBars(next);
+            cumV = sumVolume();
+            dirtyFrom = -1;
+            loaded = true;
+            applyAll();
+            if (range && live.length > 0) {
+                const shift = bars.length - prevLen;
+                ts.setVisibleLogicalRange({ from: range.from + shift, to: range.to + shift });
+            } else if (isLine) ts.fitContent();
+            else if (bars.length > INITIAL_VISIBLE_BARS) ts.setVisibleLogicalRange({ from: bars.length - INITIAL_VISIBLE_BARS, to: bars.length + 2 });
+            else ts.fitContent();
+            shownHistory = true;
+            shownReady = bars.length > 0;
+            setStatus(shownReady ? 'ready' : 'empty');
         };
 
-        const ingest = (price: number, tickTime: number, volume: number) => {
-            if (!loaded || cancelled || !Number.isFinite(price) || price <= 0 || !Number.isFinite(tickTime)) return;
+        /**
+         * 取歷史。mode：
+         * - cache：沿用既有 revision（不改新鮮度紀錄）
+         * - initial：新 revision，失敗顯示「載入失敗」
+         * - refresh：新 revision 背景重抓，失敗保留目前畫面與上次成功的紀錄
+         */
+        const load = (revision: number, mode: 'cache' | 'initial' | 'refresh'): Promise<boolean> => {
+            busy = true;
+            const prev = getHistoryEntry(code, period);
+            if (mode !== 'cache') setHistoryEntry(code, period, { revision, at: Date.now(), resumeSeq: resumeSeqRef.current, failed: false });
+            if (mode === 'initial') setStatus('loading');
+            const { start, end } = chartQueryRange(period, ct.security_type);
+            return fetchChartHistory(ct, start, end, { timeoutMs: 30_000, revision })
+                .then(
+                    k => {
+                        if (cancelled) return false;
+                        applyHistory(kbarsToCandles(k));
+                        return true;
+                    },
+                    () => {
+                        // 新鮮度紀錄不論元件是否還在都要更新：失敗的 revision 不再被沿用
+                        const cur = getHistoryEntry(code, period);
+                        if (cur && cur.revision === revision) {
+                            if (mode === 'refresh' && prev && !prev.failed) setHistoryEntry(code, period, prev);
+                            else setHistoryEntry(code, period, { ...cur, failed: true });
+                        }
+                        if (cancelled || mode === 'refresh') return false;
+                        // 走勢載入失敗時仍以目前時段接即時成交
+                        if (isLine && !win) win = sessionWindowFor(ct.security_type, nowWallClockUtc());
+                        loaded = true;
+                        setStatus('error');
+                        return false;
+                    },
+                )
+                .finally(() => {
+                    busy = false;
+                    if (pendingRefresh && !cancelled) {
+                        pendingRefresh = false;
+                        void load(nextChartHistoryRevision(), 'refresh');
+                    }
+                });
+        };
+
+        /** 缺口或換時段：節流後背景重抓（不重建圖表） */
+        const requestReload = () => {
+            if (busy || Date.now() - lastReloadAt.current < GAP_RELOAD_MIN_MS) return;
+            lastReloadAt.current = Date.now();
+            void load(nextChartHistoryRevision(), 'refresh');
+        };
+        retryRef.current = () => {
+            if (!busy) void load(nextChartHistoryRevision(), 'initial');
+        };
+        resumeRefreshRef.current = seq => {
+            if (cancelled || seq === builtSeq) return;
+            builtSeq = seq;
+            if (busy) pendingRefresh = true;
+            else void load(nextChartHistoryRevision(), 'refresh');
+        };
+
+        const ingest = (price: number, tickTime: number, volume: number, total: number | null, sim: boolean) => {
+            if (!loaded || cancelled || !Number.isFinite(tickTime)) return;
             let time: number;
             if (isLine) {
                 if (!win) return;
                 if (tickTime > win.end + CLOSE_GRACE) {
-                    // 已進入下一個時段（例如日盤收盤後夜盤開盤）：重新挑時段
+                    // 已進入下一個時段（例如日盤收盤後夜盤開盤；試撮也算）：重新挑時段
                     if (sessionWindowFor(ct.security_type, tickTime).start !== win.start) requestReload();
                     return;
                 }
+                if (sim || !Number.isFinite(price) || price <= 0) return;
                 time = tickBucket(win, tickTime);
+                const last = bars[bars.length - 1];
+                // 斷圖超過 3 分鐘：累計量顯示真的漏量（回前景、斷線）才補抓；冷門商品幾分鐘一筆是常態
+                if (last && time > last.time + LINE_GAP_SECONDS && (total === null || total > cumV + volume)) requestReload();
             } else {
+                if (sim || !Number.isFinite(price) || price <= 0) return;
                 time = liveBarTime(minutes, tickTime);
                 const last = bars[bars.length - 1];
-                // 歷史尾端與即時之間斷層超過 3 根（快取的舊歷史、上游晚發布）→ 補抓一次
-                if (last && minutes < 1440 && time - last.time > minutes * 60 * 3) requestReload();
+                // 歷史尾端與即時之間斷層超過 3 根，且累計量顯示漏量（或還不知道）→ 補抓
+                if (last && minutes < 1440 && time - last.time > minutes * 60 * 3
+                    && (total === null || lastTotal === null || total > lastTotal + volume)) requestReload();
+                if (total !== null) lastTotal = total;
             }
             const last = bars[bars.length - 1];
             if (!last || time > last.time) {
@@ -297,6 +417,7 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
             } else {
                 return; // 比最後一根還舊的成交不回頭改
             }
+            cumV += volume;
             if (!shownReady) {
                 shownReady = true;
                 setStatus('ready');
@@ -318,45 +439,30 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
         // 即時成交（只取目前商品；連續月別名由 stream 以別名代碼再送一次）
         const offTick = ct.security_type === 'IND' ? () => undefined : onAnyTick(tk => {
             if (tk.code !== code || tk.intraday_odd) return;
-            ingest(Number(tk.close), wallClockToUtc(`${tk.date}T${tk.time}`), tk.volume);
+            const total = Number(tk.total_volume);
+            ingest(Number(tk.close), wallClockToUtc(`${tk.date}T${tk.time}`), tk.volume, Number.isFinite(total) ? total : null, tk.simtrade === true);
         });
 
         setStatus('loading');
         setPick(null);
         setOrderLabels([]);
         setChartGen(g => g + 1);
-        const { start, end } = chartQueryRange(period, ct.security_type);
-        fetchChartHistory(ct, start, end, { timeoutMs: 30_000, revision: reloadRev })
-            .then(k => {
-                if (cancelled) return;
-                const raw = kbarsToCandles(k);
-                if (isLine) {
-                    win = pickIntradayWindow(ct.security_type, raw.map(b => b.time), 'auto', nowWallClockUtc());
-                    bars = intradayBars(raw, win, CLOSE_GRACE);
-                } else {
-                    bars = capBars(aggregate(raw, minutes));
-                }
-                loaded = true;
-                applyAll();
-                if (isLine) chart.timeScale().fitContent();
-                else if (bars.length > INITIAL_VISIBLE_BARS) chart.timeScale().setVisibleLogicalRange({ from: bars.length - INITIAL_VISIBLE_BARS, to: bars.length + 2 });
-                else chart.timeScale().fitContent();
-                shownReady = bars.length > 0;
-                setStatus(shownReady ? 'ready' : 'empty');
-            })
-            .catch(() => {
-                if (cancelled) return;
-                // 走勢載入失敗時仍以目前時段接即時成交
-                if (isLine) win = sessionWindowFor(ct.security_type, nowWallClockUtc());
-                loaded = true;
-                setStatus('error');
+        const plan = planHistory(getHistoryEntry(code, period), Date.now(), resumeSeqRef.current);
+        if (plan.kind === 'fetch') void load(nextChartHistoryRevision(), 'initial');
+        else {
+            // 先顯示快取；過期（逾 60 秒或回前景過）再背景重抓
+            void load(plan.revision, 'cache').then(ok => {
+                if (ok && plan.refresh && !cancelled && !busy) void load(nextChartHistoryRevision(), 'refresh');
             });
+        }
 
         return () => {
             cancelled = true;
             offTick();
             ingestRef.current = null;
             layoutRef.current = () => undefined;
+            retryRef.current = () => undefined;
+            resumeRefreshRef.current = () => undefined;
             if (flushTimer !== null) clearTimeout(flushTimer);
             if (typeof cancelAnimationFrame === 'function') {
                 if (raf1 !== null) cancelAnimationFrame(raf1);
@@ -366,9 +472,12 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
             mainRef.current = null;
             chart.remove();
         };
-        // 合約、配色以 ref 讀取；只有商品、週期、配色鍵、重新載入才重建
+        // 合約、配色、resumeSeq 以 ref 讀取；只有商品、週期、配色鍵才重建
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [code, secType, period, themeK, reloadRev, isLine]);
+    }, [code, secType, period, themeK, isLine]);
+
+    // 回前景（resumeSeq 改變）：背景重抓歷史，補上背景期間缺的一段
+    useEffect(() => { resumeRefreshRef.current(resumeSeq); }, [resumeSeq]);
 
     // 走勢的參考價基準線：合約資訊晚到或更新時套用，不必重建圖表
     useEffect(() => {
@@ -380,7 +489,7 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
     const index = useQuote(secType === 'IND' ? code : null, { narrow: true })?.index;
     useEffect(() => {
         if (!index) return;
-        ingestRef.current?.(Number(index.close), wallClockToUtc(`${index.date}T${index.time}`), 0);
+        ingestRef.current?.(Number(index.close), wallClockToUtc(`${index.date}T${index.time}`), 0, null, false);
     }, [index]);
 
     // ---- 水平線 ----
@@ -495,7 +604,7 @@ export function TradeChart({ code, contract, period, lines }: { code: string; co
                                 <button
                                     type='button'
                                     className={`${styles.toggle} ${styles.chartOverlayAction}`}
-                                    onClick={() => setReloadRev(nextChartHistoryRevision())}
+                                    onClick={() => retryRef.current()}
                                 >
                                     重新載入
                                 </button>

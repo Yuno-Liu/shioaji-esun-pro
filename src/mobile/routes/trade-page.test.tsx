@@ -14,6 +14,10 @@ const m = vi.hoisted(() => ({
     usePrivacyMoney: vi.fn(() => false),
     openTicket: vi.fn(),
     setCurrentCode: vi.fn(),
+    navigate: vi.fn(),
+    fetchSnapshots: vi.fn(),
+    snapshot: undefined as unknown,
+    snapshotListeners: new Set<() => void>(),
     chartProps: [] as unknown[],
 }));
 vi.mock('../../hooks/use-stream', () => ({ useQuote: m.useQuote }));
@@ -23,8 +27,14 @@ vi.mock('../../lib/privacy', () => ({ usePrivacyMoney: m.usePrivacyMoney, maskMo
 vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, setCurrentCode: m.setCurrentCode }));
 vi.mock('../components/trade-chart', () => ({ TradeChart: (props: unknown) => { m.chartProps.push(props); return null; } }));
 vi.mock('../components/tick-list', () => ({ TickList: () => null }));
+vi.mock('../../lib/shioaji', () => ({ fetchSnapshots: m.fetchSnapshots }));
+vi.mock('../../lib/market-snapshot-store', () => ({
+    getMarketSnapshot: () => m.snapshot,
+    subscribeMarketSnapshots: (l: () => void) => { m.snapshotListeners.add(l); return () => { m.snapshotListeners.delete(l); }; },
+}));
+vi.mock('../lib/hash-router', async importOriginal => ({ ...(await importOriginal<typeof import('../lib/hash-router')>()), navigate: m.navigate }));
 
-import { dayTradeText, deliveryMonthText, positionSummaries, priceChange, sessionText, TradePage, workingOrderCount } from './trade-page';
+import { dayTradeText, deliveryMonthText, positionSummaries, sessionText, TradePage, workingOrderCount } from './trade-page';
 
 const stock = {
     exchange: 'TSE', code: '2330', security_type: 'STK', target_code: null, name: '台積電', currency: 'TWD',
@@ -58,6 +68,10 @@ beforeEach(() => {
     m.usePrivacyMoney.mockReset().mockReturnValue(false);
     m.openTicket.mockReset();
     m.setCurrentCode.mockReset();
+    m.navigate.mockReset();
+    m.fetchSnapshots.mockReset().mockResolvedValue([]);
+    m.snapshot = undefined;
+    m.snapshotListeners.clear();
     m.chartProps.length = 0;
 });
 afterEach(async () => {
@@ -83,12 +97,6 @@ describe('header helpers', () => {
         expect(sessionText('STK', 10 * 3600)).toBe('日盤 09:00–13:30');
     });
 
-    it('priceChange：優先用成交回報，否則以參考價計算', () => {
-        expect(priceChange(1085, 1070, { price_chg: '15', pct_chg: '1.4' })).toEqual({ change: 15, pct: 1.4, dir: 'up' });
-        expect(priceChange(1060, 1070)).toMatchObject({ change: -10, dir: 'down' });
-        expect(priceChange(null, 1070)).toBeNull();
-        expect(priceChange(1070, 0)).toBeNull();
-    });
 });
 
 describe('positionSummaries／workingOrderCount', () => {
@@ -157,4 +165,61 @@ describe('TradePage', () => {
         expect(masked).not.toContain('3張');
         expect(masked).toContain('•••••');
     });
+
+    it('漲跌幅以 price_chg 與參考價計算，不用串流的 pct_chg（B8）', async () => {
+        // 股票串流 pct_chg 單位是 ％×100（140＝1.40%）；直接使用會顯示 140.00%
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '1085', price_chg: '15', pct_chg: '140', total_volume: 23456 } });
+        await render();
+        const price = text(byId('trade-price'));
+        expect(price).toContain('▲15 (+1.40%)');
+        expect(price).not.toContain('140.00%');
+    });
+
+    it('沒有 tick：掛載時取一次快照，以快照收盤與漲跌顯示（B1）', async () => {
+        m.useQuote.mockReturnValue(undefined);
+        await render();
+        expect(m.fetchSnapshots).toHaveBeenCalledTimes(1);
+        expect(m.fetchSnapshots).toHaveBeenCalledWith([stock]);
+        // 尚無快照：參考價並明確標示
+        expect(text(byId('trade-price'))).toContain('1,070');
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-price-reference' })).toHaveLength(1);
+        expect(text(byId('trade-price'))).not.toContain('%');
+
+        // 快照回來（store 通知）→ 改顯示快照的收盤、漲跌、漲跌幅、總量
+        m.snapshot = { code: '2330', datetime: '2026-11-05 13:30:00', close: 1085, change_price: 15, change_rate: 1.4, total_volume: 23456 };
+        await act(async () => { m.snapshotListeners.forEach(l => l()); });
+        const price = text(byId('trade-price'));
+        expect(price).toContain('1,085');
+        expect(price).toContain('▲15 (+1.40%)');
+        expect(price).toContain('量 ');
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-price-reference' })).toHaveLength(0);
+    });
+
+    it('試撮揭示：顯示「試撮」徽章，最新價不採用揭示價（B2）', async () => {
+        m.snapshot = { code: '2330', datetime: '2026-11-05 13:30:00', close: 1085, change_price: 15, change_rate: 1.4, total_volume: 23456 };
+        m.useQuote.mockReturnValue({ tick: { code: '2330', date: '2026-11-06', time: '08:45:00', close: '1175', price_chg: '105', total_volume: 0, simtrade: true } });
+        await render();
+        const price = text(byId('trade-price'));
+        expect(text(byId('trade-simtrade'))).toBe('試撮 1,175');
+        expect(price).toContain('1,085');
+        expect(price).toContain('▲15 (+1.40%)');
+        expect(price).not.toContain('▲105');
+    });
+
+    it('非正規代碼：合約解析後改寫路由，只以正規代碼設定目前商品與比對報價（B9）', async () => {
+        m.useContract.mockReturnValue(stock); // 路由 '02330' 解析成 2330
+        await render('02330');
+        expect(m.navigate).toHaveBeenCalledWith({ name: 'trade', code: '2330' }, { replace: true });
+        expect(m.setCurrentCode.mock.calls).toEqual([['2330']]);
+        expect(m.useQuote.mock.calls.every(c => c[0] === '2330')).toBe(true);
+        expect((m.chartProps.at(-1) as { code: string }).code).toBe('2330');
+        await act(async () => { byId('trade-buy').props.onClick(); });
+        expect(m.openTicket).toHaveBeenCalledWith({ code: '2330', action: 'Buy', source: 'button' });
+    });
+
+    it('正規代碼不改寫路由', async () => {
+        await render();
+        expect(m.navigate).not.toHaveBeenCalled();
+    });
 });
+

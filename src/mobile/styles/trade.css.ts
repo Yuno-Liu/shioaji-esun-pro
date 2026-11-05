@@ -62,6 +62,18 @@ export const change = style({
     fontFamily: vars.font.mono,
 });
 
+/** 價格旁的標示（「參考價」「試撮 X」）：文字標示，不只靠顏色 */
+export const badge = style({
+    alignSelf: 'center',
+    padding: '0 6px',
+    borderRadius: vars.radius.sm,
+    border: `1px solid ${vars.color.border}`,
+    color: vars.color.mutedForeground,
+    fontSize: '0.75rem',
+    lineHeight: 1.6,
+    whiteSpace: 'nowrap',
+});
+
 export const infoRow = style({
     display: 'flex',
     flexWrap: 'wrap',

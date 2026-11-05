@@ -6,12 +6,14 @@
 // ├ 持倉摘要・未成交 N 筆 ›（#/orders）
 // └ sticky［買進］［賣出］→ openTicket()（只開下單面板，送單一律經確認面板）
 //
-// code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。
+// code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。合約解析出的正規代碼與路由不同（小寫、舊指數代碼）時改寫路由。
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useQuote } from '../../hooks/use-stream';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
 import { sessionWindowFor } from '../../lib/intraday-session';
+import { getMarketSnapshot, subscribeMarketSnapshots } from '../../lib/market-snapshot-store';
+import { fetchSnapshots } from '../../lib/shioaji';
 import { maskMoney, usePrivacyMoney } from '../../lib/privacy';
 import { useTradingState } from '../../lib/trading-state';
 import type { ContractInfo, DayTrade, Exchange, SecurityType } from '../../lib/types/contract';
@@ -26,8 +28,9 @@ import { TickList } from '../components/tick-list';
 import { TradeChart } from '../components/trade-chart';
 import { chartPriceLines, formatLinePrice } from '../lib/chart-model';
 import { CHART_PERIODS, DEFAULT_CHART_PERIOD, isChartPeriod, type ChartPeriod } from '../lib/chart-ranges';
-import { formatRoute } from '../lib/hash-router';
+import { formatRoute, navigate } from '../lib/hash-router';
 import { openTicket, setCurrentCode } from '../lib/mobile-store';
+import { headerQuote, type HeaderTick } from '../lib/quote-display';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
 import * as styles from '../styles/trade.css';
@@ -62,27 +65,6 @@ function hm(t: number): string {
 export function sessionText(secType: SecurityType, now: number): string {
     const w = sessionWindowFor(secType, now);
     return `${w.night ? '夜盤' : '日盤'} ${hm(w.start)}–${hm(w.end)}`;
-}
-
-export interface PriceChange {
-    change: number;
-    pct: number;
-    dir: 'up' | 'down' | 'flat';
-}
-
-/** 漲跌與漲跌幅：優先用成交回報的 price_chg／pct_chg，沒有時以參考價計算 */
-export function priceChange(price: number | null, reference: number | undefined, tick?: { price_chg?: string; pct_chg?: string }): PriceChange | null {
-    if (price === null || !Number.isFinite(price)) return null;
-    let change = tick?.price_chg === undefined ? NaN : Number(tick.price_chg);
-    let pct = tick?.pct_chg === undefined ? NaN : Number(tick.pct_chg);
-    if (!Number.isFinite(change)) {
-        if (!reference || reference <= 0) return null;
-        change = price - reference;
-        pct = (change / reference) * 100;
-    } else if (!Number.isFinite(pct)) {
-        pct = reference && reference > 0 ? (change / reference) * 100 : 0;
-    }
-    return { change, pct, dir: change > 0 ? 'up' : change < 0 ? 'down' : 'flat' };
 }
 
 export interface PositionSummary {
@@ -153,10 +135,13 @@ function savePeriod(p: ChartPeriod) {
 function Header({ code, contract }: { code: string; contract: ContractInfo | undefined }) {
     const quote = useQuote(code, { narrow: true });
     const tick = quote?.tick;
-    const index = quote?.index;
-    const live = tick ? Number(tick.close) : index ? Number(index.close) : NaN;
-    const price = Number.isFinite(live) && live > 0 ? live : contract && contract.reference > 0 ? contract.reference : null;
-    const chg = priceChange(price, contract?.reference, tick);
+    // 試撮期間仍以本頁看過的上一筆真實成交為最新價
+    const lastReal = useRef<HeaderTick | undefined>(undefined);
+    if (tick && !tick.simtrade) lastReal.current = tick;
+    const snapshot = useSyncExternalStore(subscribeMarketSnapshots, () => (contract ? getMarketSnapshot(contract) : undefined));
+    const q = headerQuote({ reference: contract?.reference, tick, index: quote?.index, lastRealTick: lastReal.current, snapshot });
+    const price = q.price;
+    const chg = q.change !== null ? { change: q.change, pct: q.pct, dir: q.dir } : null;
     const isStock = contract?.security_type === 'STK';
     const isFop = contract?.security_type === 'FUT' || contract?.security_type === 'OPT';
     const fmt = (p: number) => (contract ? formatToTick(contract, p) : String(p));
@@ -173,12 +158,19 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
             </div>
             <div className={styles.priceRow} data-testid='trade-price'>
                 <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>{price !== null ? fmt(price) : '—'}</span>
+                {q.source === 'reference' && <span className={styles.badge} data-testid='trade-price-reference'>參考價</span>}
                 {chg && (
                     <span className={`${styles.change} ${styles.dirText[chg.dir]}`}>
-                        {arrow}{contract && price !== null ? formatToTick(contract, Math.abs(chg.change), { at: price }) : Math.abs(chg.change)} ({chg.pct > 0 ? '+' : ''}{chg.pct.toFixed(2)}%)
+                        {arrow}{contract && price !== null ? formatToTick(contract, Math.abs(chg.change), { at: price }) : Math.abs(chg.change)}
+                        {chg.pct !== null && ` (${chg.pct > 0 ? '+' : ''}${chg.pct.toFixed(2)}%)`}
                     </span>
                 )}
-                {tick && <span className={styles.subtle}>量 {fmtCompactInt(tick.total_volume)}{unit && ` ${unit}`}</span>}
+                {q.totalVolume !== null && <span className={styles.subtle}>量 {fmtCompactInt(q.totalVolume)}{unit && ` ${unit}`}</span>}
+                {q.sim && (
+                    <span className={styles.badge} title='試撮揭示價，非成交價' data-testid='trade-simtrade'>
+                        試撮 {fmt(q.sim.price)}
+                    </span>
+                )}
             </div>
             {contract && isStock && (
                 <div className={styles.infoRow} data-testid='trade-info'>
@@ -200,8 +192,6 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
 }
 
 function TradeView({ code }: { code: string }) {
-    useEffect(() => { setCurrentCode(code); }, [code]);
-
     // 載入合約（也讓狀態列能依商品判斷市場）
     const contract = useContract(code);
     const [loadError, setLoadError] = useState(false);
@@ -213,21 +203,41 @@ function TradeView({ code }: { code: string }) {
         return () => { active = false; };
     }, [code, retry]);
 
+    // 路由接受小寫、舊指數代碼等非正規寫法：合約解析後改用正規代碼（報價、成交、目前商品都以正規代碼比對）
+    const canonical = contract?.code;
+    useEffect(() => {
+        if (!canonical) return;
+        if (canonical !== code) navigate({ name: 'trade', code: canonical }, { replace: true });
+        setCurrentCode(canonical);
+    }, [canonical, code]);
+    const sym = canonical ?? code;
+
+    // 報價快照：沒有即時成交（夜間、週末、冷門商品、試撮中）時標頭以它顯示最新價。
+    // 回前景後由 ResumeGate ④ 以目前商品（正規代碼）重新取快照、寫入同一個快照 store，這裡不重複查詢。
+    const contractRef = useRef(contract);
+    contractRef.current = contract;
+    useEffect(() => {
+        const ct = contractRef.current;
+        // 非正規代碼的頁面會改寫路由後以正規代碼重新掛載，由那一頁查詢
+        if (!canonical || !ct || canonical !== code) return;
+        fetchSnapshots([ct]).catch(() => undefined);
+    }, [canonical, code]);
+
     const trading = useTradingState();
     const privMoney = usePrivacyMoney();
     const [period, setPeriodState] = useState<ChartPeriod>(loadPeriod);
     const setPeriod = (p: ChartPeriod) => { setPeriodState(p); savePeriod(p); };
     const [panel, setPanel] = useState<'depth' | 'ticks'>('depth');
 
-    const orderable = contract ? contract.target_code || contract.code : code;
+    const orderable = contract ? contract.target_code || contract.code : sym;
     const isStock = contract?.security_type === 'STK';
     const lines = useMemo(
         () => (contract ? chartPriceLines({ contract, trades: trading.trades, positions: trading.positions }) : []),
         [contract, trading.trades, trading.positions],
     );
     const summaries = useMemo(
-        () => positionSummaries(orderable, code, trading.positions, isStock),
-        [orderable, code, trading.positions, isStock],
+        () => positionSummaries(orderable, sym, trading.positions, isStock),
+        [orderable, sym, trading.positions, isStock],
     );
     const working = useMemo(() => workingOrderCount(orderable, trading.trades), [orderable, trading.trades]);
     const tradable = contract ? contract.security_type !== 'IND' : true;
@@ -235,7 +245,7 @@ function TradeView({ code }: { code: string }) {
 
     return (
         <section className={styles.page} data-testid='page-trade'>
-            <Header code={code} contract={contract} />
+            <Header code={sym} contract={contract} />
 
             <div className={styles.segmentRow} role='group' aria-label='圖表週期'>
                 {CHART_PERIODS.map(p => (
@@ -246,7 +256,7 @@ function TradeView({ code }: { code: string }) {
             </div>
 
             {contract
-                ? <TradeChart code={code} contract={contract} period={period} lines={lines} />
+                ? <TradeChart code={sym} contract={contract} period={period} lines={lines} />
                 : (
                     <div className={styles.chartWrap}>
                         <div className={styles.chartOverlay}>
@@ -267,8 +277,8 @@ function TradeView({ code }: { code: string }) {
                 <button type='button' role='tab' className={styles.segment} aria-selected={panel === 'ticks'} onClick={() => setPanel('ticks')}>明細</button>
             </div>
             {panel === 'depth'
-                ? <DepthLadder code={code} contract={contract} trades={trading.trades} />
-                : contract ? <TickList code={code} contract={contract} /> : null}
+                ? <DepthLadder code={sym} contract={contract} trades={trading.trades} />
+                : contract ? <TickList code={sym} contract={contract} /> : null}
 
             <div className={styles.summary} data-testid='trade-summary'>
                 {summaries.length === 0
@@ -294,7 +304,7 @@ function TradeView({ code }: { code: string }) {
                             type='button'
                             className={controls.tradeButton.buy}
                             disabled={!!comboNote}
-                            onClick={() => openTicket({ code, action: 'Buy', source: 'button' })}
+                            onClick={() => openTicket({ code: sym, action: 'Buy', source: 'button' })}
                             data-testid='trade-buy'
                         >
                             買 進
@@ -303,7 +313,7 @@ function TradeView({ code }: { code: string }) {
                             type='button'
                             className={controls.tradeButton.sell}
                             disabled={!!comboNote}
-                            onClick={() => openTicket({ code, action: 'Sell', source: 'button' })}
+                            onClick={() => openTicket({ code: sym, action: 'Sell', source: 'button' })}
                             data-testid='trade-sell'
                         >
                             賣 出
