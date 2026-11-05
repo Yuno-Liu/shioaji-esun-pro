@@ -16,7 +16,8 @@ const m = vi.hoisted(() => ({
     wakeLockMounts: 0,
 }));
 vi.mock('../../lib/boot', () => ({ bootstrap: m.bootstrap }));
-vi.mock('../../lib/theme-store', () => ({ initTheme: m.initTheme }));
+// useThemeSettings：殼層的 useHtmlAttributes 讀字級寫入 html[data-sj-font-scale]（設計規格 §6.6）
+vi.mock('../../lib/theme-store', () => ({ initTheme: m.initTheme, useThemeSettings: () => ({ mode: 'dark', convention: 'tw', fontScale: 1 }) }));
 vi.mock('../../lib/risk', () => ({
     getRiskSettings: () => m.risk,
     setRiskSettings: (next: object) => { m.setRiskSettings(next); Object.assign(m.risk, next); },

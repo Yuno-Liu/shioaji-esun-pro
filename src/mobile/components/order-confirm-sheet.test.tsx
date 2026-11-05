@@ -35,6 +35,9 @@ vi.mock('../../lib/trade', () => ({ notify: m.notify }));
 
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
 import { CONFIRM_TEXT, confirmActionText, OrderConfirmSheet } from './order-confirm-sheet';
+import type { ReactElement } from 'react';
+import { setMotionClockForTest } from '../motion/spring';
+import { SlideToConfirm } from './slide-to-confirm';
 
 const base: OrderConfirmRequest = {
     code: '2330',
@@ -300,5 +303,210 @@ describe('OrderConfirmSheet — 依方向著色與動作大字', () => {
         // 只認完整的「現股當沖」段；買進不會是當沖先賣
         expect(confirmActionText({ action: 'Buy', note: 'ROD・現股當沖' })).toBe('買進');
         expect(confirmActionText({ action: 'Sell', note: 'ROD・非現股當沖說明' })).toBe('賣出');
+    });
+});
+
+describe('OrderConfirmSheet — S6 環境橫幅（confirm-env）', () => {
+    const envNode = () => one('confirm-env');
+    const hasIcon = () => envNode().findAll(n => n.type === 'svg').length > 0;
+
+    it('正式：danger 實心＋ShieldAlert；模擬：accent 無圖示；未確認：amber；文字仍為 confirmEnvText()', async () => {
+        await render();
+        await emit({ ...base, simulation: false });
+        expect(text(envNode())).toBe('正式環境');
+        expect(envNode().props['data-env']).toBe('production');
+        expect(hasIcon()).toBe(true);
+        await emit(null);
+        await emit(base);
+        expect(text(envNode())).toBe('模擬環境');
+        expect(envNode().props['data-env']).toBe('simulation');
+        expect(hasIcon()).toBe(false);
+        await emit(null);
+        await emit({ ...base, simulation: null });
+        expect(text(envNode())).toBe('環境未確認');
+        expect(envNode().props['data-env']).toBe('unknown');
+        expect(slideDisabled()).toBe(true);
+    });
+
+    it('同一筆的環境改變（模式更新換掉 request）時橫幅跟著更新', async () => {
+        await render();
+        await emit({ ...base, simulation: null, awaitingMode: true });
+        expect(envNode().props['data-env']).toBe('unknown');
+        await emit({ ...base, simulation: false });
+        expect(text(envNode())).toBe('正式環境');
+        expect(envNode().props['data-env']).toBe('production');
+        expect(slideDisabled()).toBe(false);
+    });
+
+    it('S6：環境橫幅在不捲動的 pinned 固定區（不在可捲動的 body 內）、早於動作列；滑塊與取消在 footer', async () => {
+        await render();
+        await emit(base);
+        const isHost = (n: ReactTestInstance) => typeof n.type === 'string';
+        const body = view!.root.find(n => n.props['data-sheet-body'] !== undefined && isHost(n));
+        // 視窗很矮時 body 會捲動：環境橫幅不能在 body 內（滑塊在固定 footer 仍可操作，環境必須一直看得到）
+        expect(body.findAll(n => n.props['data-testid'] === 'confirm-env')).toHaveLength(0);
+        expect(body.findAll(n => n.props['data-testid'] === 'confirm-action' && isHost(n))).toHaveLength(1);
+        const pinned = view!.root.find(n => n.props['data-sheet-pinned'] !== undefined && isHost(n));
+        expect(pinned.findAll(n => n.props['data-testid'] === 'confirm-env' && isHost(n))).toHaveLength(1);
+        // pinned 是 panel 的直接子元素、文件順序在 body 之前（畫面上在動作列之上）
+        expect(pinned.parent!.props.role).toBe('dialog');
+        const order = pinned.parent!.findAll(n => isHost(n) && (n.props['data-sheet-pinned'] !== undefined || n.props['data-sheet-body'] !== undefined));
+        expect(order).toEqual([pinned, body]);
+        const footer = view!.root.find(n => n.props['data-sheet-footer'] !== undefined && typeof n.type === 'string');
+        expect(footer.findAll(n => n.props['data-testid'] === 'confirm-slide-handle')).toHaveLength(1);
+        expect(footer.findAll(n => n.type === 'button' && text(n) === '取消')).toHaveLength(1);
+    });
+});
+
+describe('OrderConfirmSheet — S4 退場凍結（createNodeMock＋假時鐘）', () => {
+    let now = 0;
+    let frames = new Map<number, (t: number) => void>();
+    let nextFrameId = 1;
+    const createNodeMock = (_el: ReactElement) => ({
+        style: {},
+        isConnected: true,
+        getBoundingClientRect: () => ({ height: 420, width: 390 }),
+        focus: vi.fn(),
+        contains: () => false,
+    });
+    const step = async (ms = 16) => {
+        await act(async () => {
+            now += ms;
+            const fs = Array.from(frames.values());
+            frames = new Map();
+            fs.forEach(f => f(now));
+        });
+    };
+    const settle = async (ms = 1500) => { for (let t = 0; t < ms; t += 16) await step(); };
+    const renderAnimated = async () => {
+        await act(async () => { view = create(createElement(OrderConfirmSheet), { createNodeMock }); });
+    };
+    const slide = () => view!.root.find(n => n.type === SlideToConfirm);
+    const panel = (id: string) => byTestId(id).find(n => n.props.role === 'dialog');
+    const track = () => view!.root.find(n => typeof n.type === 'string' && n.props['data-armed'] !== undefined);
+    const ptr = (clientX: number) => ({ pointerId: 1, clientX, currentTarget: { setPointerCapture: vi.fn() } });
+
+    beforeEach(() => {
+        now = 1000;
+        frames = new Map();
+        nextFrameId = 1;
+        setMotionClockForTest({
+            now: () => now,
+            frame: cb => { const id = nextFrameId++; frames.set(id, cb); return id; },
+            cancel: id => { frames.delete(id); },
+        });
+    });
+    afterEach(async () => {
+        await act(async () => view?.unmount());
+        view = undefined;
+        setMotionClockForTest(null);
+    });
+
+    it('核准後立即退場：testId 改 -closing、inert＋aria-hidden、滑塊 disabled、再觸發 onConfirm 不會第二次 resolve(true)', async () => {
+        await renderAnimated();
+        await emit(base);
+        await settle();
+        expect(panel('order-confirm-sheet')!.props['data-phase']).toBe('open');
+        const firstConfirm = slide().props.onConfirm as () => void;
+
+        await slideToEnd();
+        expect(q.resolve.mock.calls).toEqual([[true]]);
+        // lib 已清空 pending：立即沿原路退場，不等待 lib
+        expect(sheetOpen()).toBe(false);
+        const closing = panel('order-confirm-sheet-closing')!;
+        expect(closing.props.inert).toBe(true);
+        expect(closing.props['aria-hidden']).toBe('true');
+        expect(closing.props['data-phase']).toBe('exiting');
+        // 退場中仍顯示最後一筆（lastEntryRef）
+        expect(text(one('confirm-action'))).toBe('買進台積電2330');
+        expect(text(one('confirm-env'))).toBe('模擬環境');
+        // open 為假 → 滑塊 disabled（即使 BottomSheet 凍結了 children／footer）
+        expect(slide().props.disabled).toBe(true);
+        expect(slideDisabled()).toBe(true);
+
+        // 第二次觸發：舊的 onConfirm、目前的 onConfirm、鍵盤、取消鈕都不會再 resolve
+        await act(async () => { firstConfirm(); });
+        await act(async () => { (slide().props.onConfirm as () => void)(); });
+        await slideToEnd();
+        const cancelBtn = view!.root.findAll(n => n.type === 'button' && text(n) === '取消')[0]!;
+        await act(async () => { cancelBtn.props.onClick(); });
+        expect(q.resolve.mock.calls).toEqual([[true]]);
+
+        await step(64);
+        expect(panel('order-confirm-sheet-closing')).toBeDefined();
+        await settle();
+        expect(view!.toJSON()).toBeNull();
+        expect(q.resolve.mock.calls).toEqual([[true]]);
+    });
+
+    it('取消後同樣退場；退場中點暗化幕、取消鈕不會重複 resolve', async () => {
+        await renderAnimated();
+        await emit(base);
+        await settle();
+        const cancelBtn = () => view!.root.findAll(n => n.type === 'button' && text(n) === '取消')[0]!;
+        await act(async () => { cancelBtn().props.onClick(); });
+        expect(q.resolve.mock.calls).toEqual([[false]]);
+        expect(panel('order-confirm-sheet-closing')).toBeDefined();
+        await act(async () => { cancelBtn().props.onClick(); });
+        await act(async () => { one('order-confirm-sheet-closing-backdrop').props.onClick({ target: 1, currentTarget: 1 }); });
+        expect(q.resolve.mock.calls).toEqual([[false]]);
+        await settle();
+        expect(view!.toJSON()).toBeNull();
+    });
+
+    it('退場中新請求到達：新 entry id、滑塊重置、armDelay 重新計時；舊畫面的 onConfirm 不會核准新的一筆', async () => {
+        await renderAnimated();
+        await emit(base);
+        await settle();
+        await slideToEnd();
+        expect(q.resolve.mock.calls).toEqual([[true]]);
+        await step(48);
+        const oldKey = slide().props.resetKey;
+        const oldConfirm = slide().props.onConfirm as () => void;
+        expect(panel('order-confirm-sheet-closing')).toBeDefined();
+
+        await emit({ ...base, code: '2317', name: '鴻海' });
+        const reopened = panel('order-confirm-sheet')!;
+        expect(reopened).toBeDefined();
+        expect(reopened.props['data-phase']).toBe('entering');
+        expect(reopened.props.inert).toBeUndefined();
+        expect(text(one('confirm-action'))).toBe('買進鴻海2317');
+        // 新 entry：resetKey 不同、滑塊歸零並重新啟用
+        expect(slide().props.resetKey).not.toBe(oldKey);
+        expect(slide().props.disabled).toBe(false);
+        expect(handle().props['aria-valuenow']).toBe(0);
+        expect(slideDisabled()).toBe(false);
+        expect(text(one('confirm-slide'))).not.toContain('已確認');
+        // armDelay 重新計時：進場中且未滿 300ms → 按下無效
+        expect(track().props['data-armed']).toBe('false');
+        await act(async () => { handle().props.onPointerDown(ptr(0)); });
+        expect(handle().props['data-dragging']).toBe('false');
+
+        // 舊畫面的 approve（舊 entry id）不會核准新的一筆
+        await act(async () => { oldConfirm(); });
+        expect(q.resolve.mock.calls).toEqual([[true]]);
+
+        await settle();
+        expect(panel('order-confirm-sheet')!.props['data-phase']).toBe('open');
+        expect(track().props['data-armed']).toBe('true');
+        await slideToEnd();
+        expect(q.resolve.mock.calls).toEqual([[true], [true]]);
+        await settle();
+        expect(view!.toJSON()).toBeNull();
+    });
+
+    it('退場結束後清空快取：下一筆從頭進場（entering），內容為新的一筆', async () => {
+        await renderAnimated();
+        await emit(base);
+        await settle();
+        await emit(null);
+        expect(panel('order-confirm-sheet-closing')).toBeDefined();
+        await settle();
+        expect(view!.toJSON()).toBeNull();
+        await emit({ ...base, action: 'Sell', simulation: false });
+        expect(panel('order-confirm-sheet')!.props['data-phase']).toBe('entering');
+        expect(panel('order-confirm-sheet')!.props['data-tone']).toBe('sell');
+        expect(text(one('confirm-env'))).toBe('正式環境');
+        expect(slideDisabled()).toBe(false);
     });
 });

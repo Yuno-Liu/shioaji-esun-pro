@@ -1,21 +1,30 @@
-// src/mobile/components/order-confirm-sheet.tsx — requestOrderConfirm() 的手機確認面板 host（規格 §6.4）
+// src/mobile/components/order-confirm-sheet.tsx — requestOrderConfirm() 的手機確認面板 host（規格 §6.4；設計規格 §7.5、§10 S4／S6）
 //
 // 必須掛在 App 根層（無 props）：否則 requestOrderConfirm() 的 promise 永遠不會結束。
 // 這個佇列同時服務手機新單與持倉平倉（placeStockExitByShares、placeQuickOrder 內部的確認），
 // 所以內容只依 OrderConfirmRequest 呈現，不假設來源。
 //
-// - 送出手勢：SlideToConfirm（resetKey 依每筆 request 區分）；取消：點背景、下滑、「取消」→ resolveOrderConfirm(false)。
+// - 送出手勢：SlideToConfirm（resetKey 依每筆 request 區分；放在面板固定 footer）；
+//   取消：取消鈕、X、點暗化幕、下拉、Esc → 全部只呼叫 cancel()（resolveOrderConfirm(false)）。
 // - 停用條件與桌面 src/components/order-confirm-dialog.tsx 相同：
 //   (livePriceCode 且無即時價) || awaitingMode || simulation === null || serverChanged。
 // - ResumeGate：面板開著時 resumeSeq 與這筆出現時不同、或 resumeAllowsNewOrders() 為 false，立即取消並提示。
 //   T2 進入 resyncing 時也會 resolveOrderConfirm(false)；lib 在沒有待確認時直接 return，重複呼叫無害。
 // - 同一筆只 resolve(true) 一次；元件卸載時若仍有待確認就 resolve(false)，不讓 promise 懸置。
+// - 退場（設計規格 §7.5）：lastEntryRef 快取最後一筆，shown = current ?? lastEntryRef；BottomSheet 的 open 只看
+//   current（lib 一 resolve 就清空 pending → 核准或取消後立即沿原路退場，不停留等待 lib）；退場中顯示 shown 的內容、
+//   滑塊 disabled（以 context 傳遞，BottomSheet 凍結 children／footer 也能生效），onExited 後清空快取。
+//   approve()／cancel() 仍以 entry id 與 approvedIds 檢查（第二道防線：退場中的舊畫面不能核准或取消下一筆）。
+//   同步模式（測試、無 DOM）下關閉即卸載。
 // - 依 request.action 著色整個面板（BottomSheet tone：買進 vars.color.up、賣出 vars.color.down），
 //   並以大字顯示動作（含信用名稱：融資買進、融券賣出、融券買進（回補）、現股當沖賣出）。
+// - 環境橫幅（confirm-env）放在 BottomSheet 的 pinned 固定區（標題列下方、不隨 body 捲動）：視窗再矮、body 捲到底，
+//   環境仍與固定 footer 的滑塊同時看得到（§10 S6）。全寬實心：正式 danger＋ShieldAlert、模擬 accent、未確認 amber 黑字（文字為 confirmEnvText()）。
 // - 即時價：桌面取自 trigger-engine 的 usePendingPrices()，但 livePriceCode 只有觸價單會帶，手機不載入
 //   trigger-engine（載入即啟動觸價執行器，違反 R7）；因此有 livePriceCode 時一律視為「行情中斷」並停用（fail-closed）。
 
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { ShieldAlert } from 'lucide-react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
     getPendingOrderConfirm,
     privacyAccountLabel,
@@ -29,8 +38,10 @@ import { fmtPrice } from '../../lib/utils/format';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { getResumeGate, subscribeResumeGate } from '../lib/resume-gate-runtime';
 import * as styles from '../styles/order-confirm.css';
+import { pressable } from '../styles/primitives.css';
+import { ValueRow } from '../ui/grouped';
 import { BottomSheet } from './bottom-sheet';
-import { SlideToConfirm } from './slide-to-confirm';
+import { SlideToConfirm, type SlideToConfirmProps } from './slide-to-confirm';
 
 export const CONFIRM_TEXT = {
     title: '委託確認',
@@ -114,6 +125,18 @@ function gateStillAllows(e: ConfirmEntry): boolean {
     return g.resumeSeq === e.resumeSeq && resumeAllowsNewOrders(g.state, g.staleAcknowledged);
 }
 
+/**
+ * 面板是否仍開著（current !== null）。BottomSheet 退場時凍結 children／footer 的 React 元素，
+ * 所以「open 為假時滑塊 disabled」以 context 傳遞：context 變動仍會傳到凍結元素裡的消費者。
+ */
+const ConfirmOpenContext = createContext(true);
+
+/** 確認滑塊：面板退場中（open 為假）一律停用、不顯示停用原因 */
+function ConfirmSlide(props: SlideToConfirmProps) {
+    const open = useContext(ConfirmOpenContext);
+    return <SlideToConfirm {...props} disabled={!open || props.disabled} disabledReason={open ? props.disabledReason : null} />;
+}
+
 export function OrderConfirmSheet() {
     const current = useSyncExternalStore(subscribeEntry, syncEntry);
     const priv = usePrivacyMode();
@@ -121,6 +144,9 @@ export function OrderConfirmSheet() {
     const gateCancelledIds = useRef(new Set<number>());
     // 滑動完成但 lib 沒有接受（狀態剛好改變）時重新啟用滑動元件
     const [rearm, setRearm] = useState(0);
+    // 退場動畫期間沿用最後一筆的內容（onExited 後清空）
+    const lastEntryRef = useRef<ConfirmEntry | null>(null);
+    if (current) lastEntryRef.current = current;
 
     // ResumeGate：兩個 store 任一變動都同步檢查（在 T2 的 resolveOrderConfirm(false) 之前就能提示原因）
     useEffect(() => {
@@ -145,8 +171,15 @@ export function OrderConfirmSheet() {
         if (syncEntry()) resolveOrderConfirm(false);
     }, []);
 
-    if (!current) return null;
-    const { id, request } = current;
+    // 退場結束：只在仍沒有待確認時清空快取（退場中又來新的一筆時由 current 接手）
+    const onExited = useCallback(() => {
+        if (!syncEntry()) lastEntryRef.current = null;
+    }, []);
+
+    const shown = current ?? lastEntryRef.current;
+    if (!shown) return null;
+    const open = current !== null;
+    const { id, request } = shown;
     const blockReason = confirmBlockReason(request, NO_LIVE_PRICE);
     const actionText = confirmActionText(request);
     const isBuy = request.action === 'Buy';
@@ -175,46 +208,56 @@ export function OrderConfirmSheet() {
     const envKey = request.simulation === true ? 'simulation' : request.simulation === false ? 'production' : 'unknown';
     const priceText = request.priceLabel ?? (request.price === null ? '市價' : fmtPrice(request.price));
 
+    const footer = (
+        <div className={styles.footer}>
+            <ConfirmSlide
+                label={`滑動確認 ${actionText} ${request.code}`}
+                onConfirm={approve}
+                disabled={blockReason !== null}
+                disabledReason={blockReason}
+                tone={isBuy ? 'buy' : 'sell'}
+                resetKey={`${id}:${rearm}`}
+                testId='confirm-slide'
+            />
+            <button type='button' className={`${styles.cancelButton} ${pressable}`} onClick={cancel}>{CONFIRM_TEXT.cancel}</button>
+        </div>
+    );
+
     return (
-        <BottomSheet open onClose={cancel} title={CONFIRM_TEXT.title} layer='confirm' testId='order-confirm-sheet' tone={isBuy ? 'buy' : 'sell'}>
-            <div className={styles.content}>
-                <strong className={styles.env[envKey]} data-testid='confirm-env'>{confirmEnvText(request.simulation)}</strong>
-                <div className={styles.actionLine[isBuy ? 'up' : 'down']} data-testid='confirm-action'>
-                    <span className={styles.actionBig}>{actionText}</span>
-                    <span className={styles.contractName}>{request.name || request.code}</span>
-                    {request.name && <span className={styles.contractCode}>{request.code}</span>}
+        <ConfirmOpenContext.Provider value={open}>
+            <BottomSheet
+                open={open}
+                onClose={cancel}
+                onExited={onExited}
+                title={CONFIRM_TEXT.title}
+                layer='confirm'
+                detent='fit'
+                testId='order-confirm-sheet'
+                tone={isBuy ? 'buy' : 'sell'}
+                footer={footer}
+                pinned={(
+                    <strong className={styles.env[envKey]} data-testid='confirm-env' data-env={envKey}>
+                        {envKey === 'production' && <ShieldAlert className={styles.envIcon} aria-hidden='true' focusable='false' />}
+                        {confirmEnvText(request.simulation)}
+                    </strong>
+                )}
+            >
+                <div className={styles.content}>
+                    <div className={styles.actionLine[isBuy ? 'up' : 'down']} data-testid='confirm-action'>
+                        <span className={styles.actionBig}>{actionText}</span>
+                        <span className={styles.contractName}>{request.name || request.code}</span>
+                        {request.name && <span className={styles.contractCode}>{request.code}</span>}
+                    </div>
+                    <div className={styles.details}>
+                        <ValueRow label='價格' value={priceText} testId='confirm-price' />
+                        {/* 手機沒有觸價單即時價來源（見檔頭）：一律顯示行情中斷 */}
+                        {request.livePriceCode && <ValueRow label='最新成交價' value={CONFIRM_TEXT.liveDown} tone='warn' testId='confirm-live-price' />}
+                        <ValueRow label='數量' value={`${request.quantity.toLocaleString()} ${request.unit}`} testId='confirm-qty' />
+                        {request.accountLabel && <ValueRow label='帳戶' value={privacyAccountLabel(request.accountLabel, priv)} testId='confirm-account' />}
+                    </div>
+                    {request.note && <p className={styles.note} data-testid='confirm-note'>{request.note}</p>}
                 </div>
-                <dl className={styles.details}>
-                    <dt className={styles.detailLabel}>價格</dt>
-                    <dd className={styles.detailValue} data-testid='confirm-price'>{priceText}</dd>
-                    {request.livePriceCode && (
-                        <>
-                            <dt className={styles.detailLabel}>最新成交價</dt>
-                            {/* 手機沒有觸價單即時價來源（見檔頭）：一律顯示行情中斷 */}
-                            <dd className={styles.detailValueWarn} data-testid='confirm-live-price' aria-live='polite'>{CONFIRM_TEXT.liveDown}</dd>
-                        </>
-                    )}
-                    <dt className={styles.detailLabel}>數量</dt>
-                    <dd className={styles.detailValue} data-testid='confirm-qty'>{request.quantity.toLocaleString()} {request.unit}</dd>
-                    {request.accountLabel && (
-                        <>
-                            <dt className={styles.detailLabel}>帳戶</dt>
-                            <dd className={styles.detailValue} data-testid='confirm-account'>{privacyAccountLabel(request.accountLabel, priv)}</dd>
-                        </>
-                    )}
-                </dl>
-                {request.note && <p className={styles.note} data-testid='confirm-note'>{request.note}</p>}
-                <SlideToConfirm
-                    label={`滑動確認 ${actionText} ${request.code}`}
-                    onConfirm={approve}
-                    disabled={blockReason !== null}
-                    disabledReason={blockReason}
-                    tone={isBuy ? 'buy' : 'sell'}
-                    resetKey={`${id}:${rearm}`}
-                    testId='confirm-slide'
-                />
-                <button type='button' className={styles.cancelButton} onClick={cancel}>{CONFIRM_TEXT.cancel}</button>
-            </div>
-        </BottomSheet>
+            </BottomSheet>
+        </ConfirmOpenContext.Provider>
     );
 }

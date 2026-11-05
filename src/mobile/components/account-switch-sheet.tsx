@@ -5,6 +5,7 @@
 // - 選取呼叫 selectAccount(account)（src/lib/account-store.ts）。
 // - 下單面板開啟或確認進行中時不允許切換（避免路由變更；即使切換，captureDisplayedRoute() 也會擋下）。
 
+import { Check, TriangleAlert } from 'lucide-react';
 import { useSyncExternalStore } from 'react';
 import { selectAccount, useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
@@ -16,7 +17,7 @@ import { usePrivacyMode } from '../../lib/privacy';
 import { useServerInfo } from '../../lib/server-info-store';
 import type { Account } from '../../lib/types/portfolio';
 import { useMobileUi } from '../lib/mobile-store';
-import * as controls from '../styles/controls.css';
+import * as routeStyles from '../styles/route-badge.css';
 import * as styles from '../styles/status-bar.css';
 import { BottomSheet } from './bottom-sheet';
 import { routeTone } from './route-badge';
@@ -56,34 +57,42 @@ export function AccountSwitchSheet({ open, onClose }: { open: boolean; onClose: 
                 return (
                     <section key={group.type} className={styles.group}>
                         <h3 className={styles.groupTitle}>{group.title}</h3>
-                        {list.map(account => {
-                            const tradable = canTrade(account);
-                            const selected = accountMatches(group.selected, account);
-                            const route = orderRouteOf(account, live);
-                            const tone = routeTone(route);
-                            return (
-                                <button
-                                    key={`${account.account_type}:${account.broker_id}:${account.account_id}`}
-                                    type='button'
-                                    className={styles.accountRow}
-                                    aria-pressed={selected}
-                                    disabled={locked || !tradable}
-                                    data-testid='account-option'
-                                    onClick={() => {
-                                        if (locked || !tradable) return;
-                                        selectAccount(account);
-                                        onClose();
-                                    }}
-                                >
-                                    <span className={styles.accountMain}>
-                                        <span>{isEsunAccount(account) ? '玉山' : '永豐'} {mobileAccountLabel(account, priv)}</span>
-                                        {!tradable && <span className={styles.accountWarn}>不可交易（未簽署）</span>}
-                                        {selected && <span className={styles.accountSub}>目前使用中</span>}
-                                    </span>
-                                    <span className={controls.routeBadge[tone]}>{routeEnvText(route.simulation)}</span>
-                                </button>
-                            );
-                        })}
+                        <div className={styles.groupCard}>
+                            {list.map(account => {
+                                const tradable = canTrade(account);
+                                const selected = accountMatches(group.selected, account);
+                                const route = orderRouteOf(account, live);
+                                const tone = routeTone(route);
+                                return (
+                                    <button
+                                        key={`${account.account_type}:${account.broker_id}:${account.account_id}`}
+                                        type='button'
+                                        className={styles.accountRow}
+                                        aria-pressed={selected}
+                                        disabled={locked || !tradable}
+                                        data-testid='account-option'
+                                        onClick={() => {
+                                            if (locked || !tradable) return;
+                                            selectAccount(account);
+                                            onClose();
+                                        }}
+                                    >
+                                        <span className={styles.accountMain}>
+                                            <span className={styles.accountName}>{isEsunAccount(account) ? '玉山' : '永豐'} {mobileAccountLabel(account, priv)}</span>
+                                            {!tradable && (
+                                                <span className={styles.accountWarn}>
+                                                    <TriangleAlert className={styles.warnIcon} size={14} aria-hidden='true' focusable='false' />
+                                                    不可交易（未簽署）
+                                                </span>
+                                            )}
+                                            {selected && <span className={styles.accountSub}>目前使用中</span>}
+                                        </span>
+                                        <span className={routeStyles.envPill[tone]}>{routeEnvText(route.simulation)}</span>
+                                        {selected && <Check className={styles.selectedIcon} size={18} strokeWidth={2.5} aria-hidden='true' focusable='false' />}
+                                    </button>
+                                );
+                            })}
+                        </div>
                     </section>
                 );
             })}

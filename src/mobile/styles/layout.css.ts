@@ -1,7 +1,11 @@
-// src/mobile/styles/layout.css.ts — 手機殼層版面：100dvh、安全區、底部分頁（規格 §5.1、§11）
-import { globalStyle, style } from '@vanilla-extract/css';
+// src/mobile/styles/layout.css.ts — 手機殼層版面：100dvh、安全區、底部 chrome 與分頁（規格 §5.1、§11；設計規格 §6.6、§7.1）
+import { globalStyle, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
+import * as material from './material.css';
 import { INPUT_FONT_SIZE, REDUCED_MOTION, SAFE_BOTTOM, SAFE_LEFT, SAFE_RIGHT, TOUCH_MIN, Z } from './metrics';
+import { fill, focusRing, hairlineTop } from './primitives.css';
+import { RADIUS, SHELL_VAR, SHELL_VAR_DEFAULTS } from './tokens';
+import { TEXT } from './typography.css';
 
 // 只由手機入口載入：不影響桌面 index.html
 globalStyle('html', {
@@ -59,7 +63,26 @@ globalStyle('*, *::before, *::after', {
     },
 });
 
+// ---- 殼層（設計規格 §6.6、§7.1） ----
+//
+// .shell（relative；100% → 100dvh；flex column；overflow hidden；--sj-* 變數；data-sheet-open）
+// ├ .statusWrap（不透明狀態列，不在捲動容器內）
+// ├ .mainWrap（flex 1）
+// │   ├ main（absolute inset 0、唯一捲動容器；底部內距讓出底部 chrome，內容從 chrome 下方捲過）
+// │   └ .topSlot（交易頁精簡標頭等，疊在內容上）
+// ├ .bottomStack（absolute bottom；bar 材質一片：配件槽＋分頁列）
+// ├ ToastHost
+// └ #sj-sheet-root（面板 portal 目標）
+//
+// 重要：.shell、.mainWrap、main 不得有 transform／filter／backdrop-filter／will-change／contain:paint，
+// 否則 main 內 position:fixed 的全螢幕圖表（chart.css.ts）與面板會改以該祖先定位而無法覆蓋全頁。
+// 材質（backdrop-filter、isolation）只放在 .bottomStack（main 的兄弟節點）。
+
+/** 底部 chrome 讓出的高度：分頁列＋配件槽（交易鍵列） */
+const BOTTOM_CHROME = `calc(var(${SHELL_VAR.tabbarH}) + var(${SHELL_VAR.accessoryH}))`;
+
 export const shell = style({
+    position: 'relative',
     display: 'flex',
     flexDirection: 'column',
     // 不用 100vh（行動瀏覽器網址列會讓 100vh 超出可視區）；不支援 dvh 時退回 100%
@@ -68,64 +91,139 @@ export const shell = style({
     overflow: 'hidden',
     background: vars.color.background,
     color: vars.color.foreground,
+    vars: { ...SHELL_VAR_DEFAULTS },
+});
+
+/** 狀態列容器（面板開啟時 inert＋aria-hidden 的目標）；不設 z-index：全螢幕圖表（z 50）仍可蓋過 */
+export const statusWrap = style({
+    position: 'relative',
+    flex: '0 0 auto',
+});
+
+/** 內容區容器（inert 目標）：只提供 absolute main 的定位基準 */
+export const mainWrap = style({
+    position: 'relative',
+    flex: '1 1 auto',
+    minHeight: 0,
 });
 
 export const main = style({
-    flex: '1 1 auto',
-    minHeight: 0,
+    position: 'absolute',
+    inset: 0,
     overflowY: 'auto',
     overflowX: 'hidden',
     WebkitOverflowScrolling: 'touch',
     paddingLeft: SAFE_LEFT,
     paddingRight: SAFE_RIGHT,
+    paddingBottom: BOTTOM_CHROME,
+    scrollPaddingBottom: BOTTOM_CHROME,
+    outline: 'none',
+});
+
+/** 疊在內容上方的插槽（交易頁精簡標頭）：本身不攔點擊，子元素才可點 */
+export const topSlot = style({
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: Z.compactBar,
+    pointerEvents: 'none',
+});
+
+globalStyle(`${topSlot} > *`, { pointerEvents: 'auto' });
+
+/** 底部 chrome：配件槽（交易鍵列）＋分頁列共用一片 bar 材質，頂端一條髮絲線 */
+export const bottomStack = style([material.bar, hairlineTop, {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: Z.bars,
+}]);
+
+/** 配件槽：ResizeObserver 量實際高度寫入 --sj-accessory-h；沒有內容時高度 0 */
+export const accessorySlot = style({
+    position: 'relative',
+    zIndex: Z.accessory,
+});
+
+/** 面板 portal 目標（面板本身 position:fixed，這個節點高度為 0、不佔版面；不設 z-index 以免形成疊層脈絡） */
+export const sheetRoot = style({
+    flex: '0 0 auto',
 });
 
 export const tabBar = style({
-    position: 'sticky',
-    bottom: 0,
-    zIndex: Z.bars,
-    flex: '0 0 auto',
     display: 'grid',
     gridTemplateColumns: 'repeat(5, 1fr)',
-    background: vars.color.panel,
-    borderTop: `1px solid ${vars.color.border}`,
+    boxSizing: 'border-box',
+    height: `var(${SHELL_VAR.tabbarH})`,
     paddingBottom: SAFE_BOTTOM,
     paddingLeft: SAFE_LEFT,
     paddingRight: SAFE_RIGHT,
 });
 
-export const tab = style({
+/** 分頁：材質上的文字一律 foreground、字重加一級；active 用 accent（另以圖示線寬與 aria-current 區分） */
+export const tab = style([focusRing, {
     position: 'relative',
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
     justifyContent: 'center',
     gap: '2px',
-    minHeight: '52px',
     minWidth: TOUCH_MIN,
-    color: vars.color.mutedForeground,
+    minHeight: TOUCH_MIN,
+    color: vars.color.foreground,
     textDecoration: 'none',
-    fontSize: '0.75rem',
+    fontSize: TEXT.caption.fontSize,
+    fontWeight: 600,
+    lineHeight: TEXT.caption.lineHeight,
+    letterSpacing: TEXT.caption.letterSpacing,
     selectors: {
-        '&[aria-current="page"]': { color: vars.color.accent, fontWeight: 600 },
-        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '-2px' },
+        '&[aria-current="page"]': { color: vars.color.accent, fontWeight: 700 },
+        '&:focus-visible': { outlineOffset: '-2px' },
     },
+}]);
+
+/** 圖示外框：徽章與待對帳點以它定位 */
+export const tabIcon = style({
+    position: 'relative',
+    display: 'inline-flex',
+    width: '24px',
+    height: '24px',
 });
 
-export const tabBadge = style({
+/** 未成交徽章：danger＋inkStrong 白字（§4.8 規則 3），>99 顯示 99+ */
+export const tabBadge = style([fill.danger.strong, {
     position: 'absolute',
-    top: '4px',
-    left: 'calc(50% + 6px)',
+    top: '-5px',
+    left: 'calc(100% - 7px)',
+    boxSizing: 'border-box',
     minWidth: '18px',
     height: '18px',
     padding: '0 5px',
-    borderRadius: '9px',
-    background: vars.color.danger,
-    color: '#ffffff',
-    fontSize: '0.6875rem',
+    borderRadius: RADIUS.pill,
+    fontSize: TEXT.caption.fontSize,
     fontWeight: 700,
     lineHeight: '18px',
+    letterSpacing: 0,
     textAlign: 'center',
+    fontVariantNumeric: 'tabular-nums',
+    boxShadow: `0 0 0 1.5px ${vars.color.panel}`,
+}]);
+
+const dotBase = style({
+    position: 'absolute',
+    width: '8px',
+    height: '8px',
+    borderRadius: '50%',
+    background: vars.color.amber,
+    boxShadow: `0 0 0 1.5px ${vars.color.panel}`,
+});
+
+/** 待對帳 amber 點：沒有徽章時在右上，有徽章時移到左上避免重疊 */
+export const tabDot = styleVariants({
+    alone: [dotBase, { top: '-2px', right: '-3px' }],
+    withBadge: [dotBase, { top: '-2px', left: '-3px' }],
 });
 
 export const page = style({

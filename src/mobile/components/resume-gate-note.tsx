@@ -5,6 +5,7 @@
 // 持倉頁 banner、平倉說明面板與狀態列連線面板共用，文案一致。
 // 只在 stale-data 時顯示；其他狀態回傳 null。
 
+import { TriangleAlert } from 'lucide-react';
 import type { ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import { acknowledgeStaleData, retryResume } from '../lib/resume-gate-runtime';
 import * as controls from '../styles/controls.css';
@@ -29,7 +30,12 @@ export function ResumeGateNote({ gate, disabled = false, showReason = true, test
     if (gate.state !== 'stale-data') return null;
     return (
         <div className={styles.box} role='status' data-testid={testId}>
-            {showReason && <p className={styles.reason} data-testid={`${testId}-reason`}>⚠ {gate.message ?? RESUME_NOTE_TEXT.fallbackReason}</p>}
+            {showReason && (
+                <p className={styles.reason} data-testid={`${testId}-reason`}>
+                    <TriangleAlert className={styles.icon} size={16} aria-hidden='true' focusable='false' />
+                    <span>{gate.message ?? RESUME_NOTE_TEXT.fallbackReason}</span>
+                </p>
+            )}
             <div className={styles.actions}>
                 <label className={styles.checkboxLabel}>
                     <input

@@ -1,16 +1,20 @@
-// src/mobile/components/status-bar.tsx — 全域狀態列（每頁頂端，sticky；規格 §5.2）
+// src/mobile/components/status-bar.tsx — 全域狀態列 v2（每頁頂端、位於捲動容器之外；規格 §5.2、設計規格 §6.5）
 //
-// ┌──────────────────────────────────────────────┐
-// │ ● LIVE │ 永豐 正式 · 9A95-***4567 ▾ │ 🔓 風控 │
-// └──────────────────────────────────────────────┘
+// ┌────────────────────────────────────────────────────┐
+// │ (● LIVE) │ 永豐 [正式] · 9A95-***4567 ⌄ │ 🔓 風控 │
+// └────────────────────────────────────────────────────┘
+// - 不透明 panel（承載連線、環境、鎖單，不用半透明材質）；非 LIVE 或 ResumeGate 非 ready 時整條淡染狀態色；
+//   正式環境下緣 2px danger。
 // - 連線燈號：useStreamStatus() 與 ResumeGate。ResumeGate 非 ready 時優先顯示（同步中／資料過期／未恢復）。
 //   點擊展開連線詳情；stale-data 時詳情面板提供 ResumeGateNote（勾選「我了解委託／持倉資料可能過期」＋「重試同步」）。
 // - 券商＋環境＋帳戶：依目前商品的市場槽位（股票 selectedStock／期權 selectedFutures；該槽位未選擇時
 //   顯示「未選擇證券帳戶」／「未選擇期貨帳戶」，不借用另一個市場的帳戶）；商品未知時才先看證券、再看期貨；
-//   「正式」用 danger 色框、「模擬」用 accent、環境未知顯示「環境未確認」。點擊開啟帳戶切換面板。
-// - 風控鎖：鎖定時顯示紅色「🔒 已鎖單」；未鎖定時點擊立即鎖定，解鎖需滑動確認。此鎖只對本裝置有效。
+//   環境實心小膠囊：「正式」danger、「模擬」accent、「環境未確認」amber。點擊開啟帳戶切換面板。
+// - 風控鎖：鎖定時 danger 實心「已鎖單」（lucide 鎖頭）；未鎖定時點擊立即鎖定，解鎖需滑動確認。此鎖只對本裝置有效。
+//   鎖單改變與連線狀態（維持 2 秒以上）以視覺隱藏的 aria-live 宣告。
 
-import { useState } from 'react';
+import { ChevronDown, Lock, LockOpen } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import { useAccounts } from '../../lib/account-store';
 import { useContract } from '../../lib/contracts-cache';
 import { getEsunStreamStatus } from '../../lib/esun/stream';
@@ -25,6 +29,8 @@ import type { ResumeGateState } from '../lib/resume-gate';
 import type { ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import { useMobileUi } from '../lib/mobile-store';
 import * as controls from '../styles/controls.css';
+import { fill, srOnly } from '../styles/primitives.css';
+import * as routeStyles from '../styles/route-badge.css';
 import * as styles from '../styles/status-bar.css';
 import { AccountSwitchSheet, mobileAccountLabel } from './account-switch-sheet';
 import { BottomSheet } from './bottom-sheet';
@@ -121,6 +127,45 @@ function RiskUnlockSheet({ open, onClose }: { open: boolean; onClose: () => void
     );
 }
 
+/** 連線狀態維持這麼久才宣告（避免閃斷時連續播報） */
+export const CONNECTION_ANNOUNCE_DELAY_MS = 2_000;
+/**
+ * 鎖單變化稍後才宣告：從「解除鎖單」面板解除時，面板關閉與殼層移除 inert／aria-hidden 在下一次提交才發生，
+ * 立即更新的 live region 仍在 aria-hidden 之下，報讀器不會念。
+ */
+export const LOCK_ANNOUNCE_DELAY_MS = 300;
+
+export const LOCK_ANNOUNCE_TEXT = { locked: '已鎖單（只對本裝置有效）', unlocked: '已解除鎖單' } as const;
+
+/**
+ * 視覺隱藏的 aria-live 文字：鎖單狀態「改變」時宣告；連線狀態改變且維持 CONNECTION_ANNOUNCE_DELAY_MS 以上才宣告。
+ * 首次渲染不宣告；即時價格不放 aria-live（設計規格 §11）。
+ */
+function useStatusAnnouncements(locked: boolean, connectionLabel: string): { lockText: string; connectionText: string } {
+    const [lockText, setLockText] = useState('');
+    const [connectionText, setConnectionText] = useState('');
+    const lastLocked = useRef(locked);
+    const announcedLabel = useRef(connectionLabel);
+
+    useEffect(() => {
+        if (lastLocked.current === locked) return undefined;
+        lastLocked.current = locked;
+        const timer = setTimeout(() => setLockText(locked ? LOCK_ANNOUNCE_TEXT.locked : LOCK_ANNOUNCE_TEXT.unlocked), LOCK_ANNOUNCE_DELAY_MS);
+        return () => clearTimeout(timer);
+    }, [locked]);
+
+    useEffect(() => {
+        if (announcedLabel.current === connectionLabel) return undefined;
+        const timer = setTimeout(() => {
+            announcedLabel.current = connectionLabel;
+            setConnectionText(`連線狀態：${connectionLabel}`);
+        }, CONNECTION_ANNOUNCE_DELAY_MS);
+        return () => clearTimeout(timer);
+    }, [connectionLabel]);
+
+    return { lockText, connectionText };
+}
+
 export function StatusBar() {
     const stream = useStreamStatus();
     const resume = useResumeGate();
@@ -135,11 +180,14 @@ export function StatusBar() {
     const route = useOrderRoute(account);
     const tone = routeTone(route);
     const light = connectionLight(stream, resume.state);
+    const announce = useStatusAnnouncements(risk.locked, light.label);
     const close = () => setSheet(null);
+    // 正式環境：狀態列下緣 2px danger（目前路由 simulation === false；沒有帳戶或環境未知不標示）
+    const env = account && route ? tone : undefined;
 
     return (
         <>
-            <header className={styles.bar} data-testid='mobile-status-bar'>
+            <header className={styles.bar} data-testid='mobile-status-bar' data-tone={light.tone} data-env={env}>
                 <button
                     type='button'
                     className={styles.connection}
@@ -148,8 +196,10 @@ export function StatusBar() {
                     data-testid='status-connection'
                     data-tone={light.tone}
                 >
-                    <span className={styles.dot[light.tone]} aria-hidden='true' />
-                    <span className={styles.lightText[light.tone]}>{light.label}</span>
+                    <span className={styles.connectionPill[light.tone]}>
+                        <span className={light.tone === 'syncing' ? styles.syncRing : styles.dot[light.tone]} aria-hidden='true' />
+                        <span>{light.label}</span>
+                    </span>
                 </button>
                 <button
                     type='button'
@@ -160,13 +210,25 @@ export function StatusBar() {
                 >
                     {account && route
                         ? (
-                            <span className={`${controls.routeBadge[tone]} ${styles.routeText}`}>
-                                {route.broker} {routeEnvText(route.simulation)}
-                                {' · '}
-                                {mobileAccountLabel(account, priv)} ▾
+                            <span className={styles.routePill}>
+                                <span>{route.broker}</span>
+                                {' '}
+                                <span className={routeStyles.envPill[tone]}>{routeEnvText(route.simulation)}</span>
+                                <span className={styles.routeText}>
+                                    {' · '}
+                                    {mobileAccountLabel(account, priv)}
+                                </span>
+                                <ChevronDown className={styles.chevron} size={14} aria-hidden='true' focusable='false' />
                             </span>
                         )
-                        : <span className={styles.routeText} data-testid='status-route-empty'>{accounts.loaded ? `${emptyText} ▾` : '帳戶載入中…'}</span>}
+                        : accounts.loaded
+                            ? (
+                                <span className={styles.routeEmpty} data-testid='status-route-empty'>
+                                    <span className={styles.routeText}>{emptyText}</span>
+                                    <ChevronDown className={styles.chevron} size={14} aria-hidden='true' focusable='false' />
+                                </span>
+                            )
+                            : <span className={styles.routeLoading} data-testid='status-route-empty'>帳戶載入中…</span>}
                 </button>
                 <button
                     type='button'
@@ -174,11 +236,24 @@ export function StatusBar() {
                     onClick={() => (risk.locked ? setSheet('unlock') : setRiskSettings({ locked: true }))}
                     aria-label={risk.locked ? '已鎖單，點擊解除' : '風控：點擊立即鎖單'}
                     data-testid='status-risk'
+                    data-locked={risk.locked ? 'true' : 'false'}
                 >
                     {risk.locked
-                        ? <span className={styles.riskLocked}>🔒 已鎖單</span>
-                        : <span className={styles.riskOpen}>🔓 風控</span>}
+                        ? (
+                            <span className={`${styles.riskLocked} ${fill.danger.strong}`}>
+                                <Lock size={14} strokeWidth={2.25} aria-hidden='true' focusable='false' />
+                                已鎖單
+                            </span>
+                        )
+                        : (
+                            <span className={styles.riskOpen}>
+                                <LockOpen size={16} aria-hidden='true' focusable='false' />
+                                風控
+                            </span>
+                        )}
                 </button>
+                <span className={srOnly} aria-live='polite' data-testid='status-lock-live'>{announce.lockText}</span>
+                <span className={srOnly} aria-live='polite' data-testid='status-connection-live'>{announce.connectionText}</span>
             </header>
             <ConnectionDetails open={sheet === 'connection'} onClose={close} stream={stream} gate={resume} />
             <AccountSwitchSheet open={sheet === 'account'} onClose={close} />

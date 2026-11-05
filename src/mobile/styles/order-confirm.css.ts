@@ -1,40 +1,71 @@
-// src/mobile/styles/order-confirm.css.ts — 確認面板（order-confirm-sheet.tsx，規格 §6.4、§11）
-// 環境大字：正式＝danger、模擬＝accent、未確認＝amber（與 RouteBadge 同一配色）；買賣一律有文字，方向色用 up／down。
-// 面板背景的方向著色由 BottomSheet 的 tone 處理（styles/sheet.css.ts panelTone）。
-import { style, styleVariants } from '@vanilla-extract/css';
+// src/mobile/styles/order-confirm.css.ts — 確認面板（order-confirm-sheet.tsx；設計規格 §7.5、§4.7、§4.8）
+// - 環境橫幅（envBanner）：全寬實心。正式＝danger＋inkLarge 白字、模擬＝accent＋inkLarge 白字、未確認＝amber 實心＋黑字。
+//   狀態色不隨台灣／國際配色翻轉；白字只用 #ffffff；疊黑用 linear-gradient（不用 color-mix，iOS 15.4 相容）。
+// - 動作字（confirmAction 700）用方向色 vars.color.up／down（大字，§4.8 對比表 ≥3:1）；名稱與代碼用 foreground。
+// - 含 mutedForeground 標籤的明細放在 islandBg 中性島（ValueRow）；著色面板上直接承載的文字只用 foreground。
+// - 字重只用 400／500／600／700（禁用 800）；數字用同字族 tabular（不換 mono）。
+import { globalStyle, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
-import { TOUCH_MIN } from './metrics';
+import { island, inkLayer } from './primitives.css';
+import { LOW_DPR, MORE_CONTRAST, RADIUS, SPACE, TOUCH_MIN } from './tokens';
+import { NUMERIC, TEXT } from './typography.css';
 
 export const content = style({
     display: 'flex',
     flexDirection: 'column',
-    gap: vars.space.sm,
+    gap: SPACE.s3,
 });
 
+// ---- 環境橫幅 ----
+
 const envBase = style({
-    display: 'block',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: SPACE.s2,
+    width: '100%',
+    boxSizing: 'border-box',
+    padding: `${SPACE.s2} ${SPACE.s3}`,
+    borderRadius: RADIUS.lg,
     textAlign: 'center',
-    padding: '8px 12px',
-    borderRadius: vars.radius.lg,
-    border: '2px solid',
-    fontSize: '1.5rem',
-    fontWeight: 800,
-    letterSpacing: '0.08em',
+    ...TEXT.envBanner,
+    '@media': {
+        // 提高對比：實心底再加 1px 框
+        [MORE_CONTRAST]: { boxShadow: `inset 0 0 0 1px ${vars.color.borderBright}` },
+    },
 });
 
 export const env = styleVariants({
-    production: [envBase, { borderColor: vars.color.danger, color: vars.color.danger, background: vars.color.dangerDim }],
-    simulation: [envBase, { borderColor: vars.color.accent, color: vars.color.accent, background: vars.color.accentDim }],
-    unknown: [envBase, { borderColor: vars.color.amber, color: vars.color.amber, background: 'transparent' }],
+    production: [envBase, {
+        backgroundColor: vars.color.danger,
+        backgroundImage: inkLayer.large,
+        color: '#ffffff',
+    }],
+    simulation: [envBase, {
+        backgroundColor: vars.color.accent,
+        backgroundImage: inkLayer.large,
+        color: '#ffffff',
+    }],
+    unknown: [envBase, {
+        backgroundColor: vars.color.amber,
+        color: '#000000',
+    }],
 });
+
+export const envIcon = style({
+    flex: '0 0 auto',
+    width: '1.25rem',
+    height: '1.25rem',
+});
+
+// ---- 動作列 ----
 
 const actionBase = style({
     display: 'flex',
     alignItems: 'baseline',
     flexWrap: 'wrap',
-    gap: '0 8px',
-    fontSize: '1.375rem',
-    fontWeight: 800,
+    gap: `0 ${SPACE.s2}`,
+    minWidth: 0,
 });
 
 export const actionLine = styleVariants({
@@ -44,69 +75,76 @@ export const actionLine = styleVariants({
 
 /** 動作大字（含信用名稱）；顏色繼承 actionLine 的方向色 */
 export const actionBig = style({
-    fontSize: '2rem',
-    fontWeight: 800,
-    lineHeight: 1.2,
-    letterSpacing: '0.04em',
+    ...TEXT.confirmAction,
 });
 
 export const contractName = style({
+    ...TEXT.sheetTitle,
     color: vars.color.foreground,
-    fontSize: '1.125rem',
-    fontWeight: 700,
+    overflowWrap: 'anywhere',
 });
 
 export const contractCode = style({
-    color: vars.color.mutedForeground,
-    fontSize: '0.9375rem',
-    fontWeight: 600,
-    fontFamily: vars.font.mono,
+    ...TEXT.subhead,
+    ...NUMERIC,
+    color: vars.color.foreground,
 });
 
-export const details = style({
-    display: 'grid',
-    gridTemplateColumns: 'auto 1fr',
-    gap: '6px 16px',
+// ---- 中性島明細 ----
+
+export const details = style([island, {
+    display: 'flex',
+    flexDirection: 'column',
     margin: 0,
-    padding: '10px 12px',
-    borderRadius: vars.radius.lg,
-    background: vars.color.inset,
+    overflow: 'hidden',
+}]);
+
+// 列間髮絲線（低密度螢幕 1px、提高對比 1px borderBright）
+globalStyle(`${details} > * + *`, {
+    borderTop: `0.5px solid ${vars.color.border}`,
+    '@media': {
+        [LOW_DPR]: { borderTopWidth: '1px' },
+        [MORE_CONTRAST]: { borderTop: `1px solid ${vars.color.borderBright}` },
+    },
 });
 
-export const detailLabel = style({
-    margin: 0,
-    color: vars.color.mutedForeground,
-    fontSize: '0.9375rem',
-});
-
-export const detailValue = style({
-    margin: 0,
-    textAlign: 'right',
-    fontSize: '1.0625rem',
-    fontWeight: 700,
-    fontVariantNumeric: 'tabular-nums',
+// 帳戶、priceLabel 可能較長：數值可縮可換行，不撐破島
+globalStyle(`${details} > * > :last-child`, {
+    flexShrink: 1,
+    minWidth: 0,
     overflowWrap: 'anywhere',
 });
 
-export const detailValueWarn = style([detailValue, { color: vars.color.amber }]);
-
+/** 備註：footnote、foreground（著色面板上直接承載的文字只用 foreground） */
 export const note = style({
     margin: 0,
-    color: vars.color.mutedForeground,
-    fontSize: '0.9375rem',
+    ...TEXT.footnote,
+    color: vars.color.foreground,
     overflowWrap: 'anywhere',
+});
+
+// ---- footer：滑塊＋取消 ----
+
+export const footer = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: SPACE.s2,
 });
 
 export const cancelButton = style({
     minHeight: TOUCH_MIN,
     width: '100%',
-    borderRadius: vars.radius.lg,
+    borderRadius: RADIUS.lg,
     border: `1px solid ${vars.color.borderBright}`,
     background: 'transparent',
     color: vars.color.foreground,
-    fontSize: '1rem',
+    ...TEXT.callout,
     fontWeight: 600,
     selectors: {
-        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '2px' },
+        // 著色面板上焦點環用 foreground
+        '&:focus-visible': { outline: `2px solid ${vars.color.foreground}`, outlineOffset: '2px' },
+    },
+    '@media': {
+        [MORE_CONTRAST]: { selectors: { '&:focus-visible': { outlineWidth: '3px' } } },
     },
 });
