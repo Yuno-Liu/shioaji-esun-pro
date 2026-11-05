@@ -14,8 +14,12 @@
 //   「未送出」（mutationNotStarted）面板保留可修改後重試；其餘＝結果未知，關閉面板，不自動重送、不提供重送鍵。
 // - 面板開啟期間該委託已不在未成交（成交或已刪）時，顯示「此委託已不在未成交」並停用所有動作。
 // - OrderLines（委託頁列、本面板摘要共用）：類別徽章、成交均價、成交進度條、已取消／原始委託量、券商訊息（遮蔽身分證號）。
+// - 版面（設計規格 §7.5，流程不變）：頂部 GroupedSection 摘要 → 選單 ListRow（改價／減量／刪單，按鈕文字恰為動作名，
+//   不可用原因在按鈕外）或子畫面（Stepper）→ 固定 footer：未送出回饋＋SlideToConfirm（改價、減量 neutral；刪單 danger）＋「返回」。
+//   kind 為 price／qty／cancel 時直接進入對應子畫面。樣式在 styles/order-action.css.ts（OrderLines 仍用 orders.css.ts）。
 
-import { useEffect, useRef, useState } from 'react';
+import { Minus, Pencil, Trash2 } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { mutationErrorNotice, isEsunReservationTrade } from '../../components/esun-order-meta';
 import { useTradingLive } from '../../hooks/use-stream';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
@@ -41,9 +45,15 @@ import { avgFillPrice, avgPriceDigits, fillProgress, orderBadges } from '../lib/
 import { closeOrderAction, useMobileUi, type OrderActionKind } from '../lib/mobile-store';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { acknowledgeStaleData, assertResumeReady, getResumeGate, retryResume, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
+import * as a from '../styles/order-action.css';
 import * as styles from '../styles/orders.css';
+import { focusRing, pressable } from '../styles/primitives.css';
+import { ProgressBar } from '../ui/bars';
+import { GroupedSection, ListRow, ValueRow } from '../ui/grouped';
+import { InlineNote } from '../ui/inline-note';
+import { Stepper } from '../ui/stepper';
 import { mobileAccountLabel } from './account-switch-sheet';
-import { BottomSheet } from './bottom-sheet';
+import { BottomSheet, SheetFooter } from './bottom-sheet';
 import { routeBadgeText, useOrderRoute } from './route-badge';
 import { SlideToConfirm } from './slide-to-confirm';
 
@@ -222,14 +232,14 @@ export function OrderBadges({ trade }: { trade: Trade }) {
     );
 }
 
-/** 成交進度條（成交量 ÷ 減量後的委託量）；數字另有文字 */
+/** 成交進度條（成交量 ÷ 減量後的委託量）；數字另有文字。填色以 ProgressBar 的 scaleX 呈現（不做 width 轉場） */
 export function FillBar({ trade }: { trade: Trade }) {
     const p = fillProgress(trade);
     const unit = orderUnitOf(trade);
     const pct = Math.round(p.ratio * 100);
     return (
         <span
-            className={styles.progressTrack}
+            className={a.progress}
             role='progressbar'
             aria-label={`成交進度 ${fmtInt(p.filled)}／${fmtInt(p.effective)} ${unit}`}
             aria-valuemin={0}
@@ -237,7 +247,7 @@ export function FillBar({ trade }: { trade: Trade }) {
             aria-valuenow={pct}
             data-testid='order-progress'
         >
-            <span className={styles.progressFill[p.ratio >= 1 ? 'done' : 'partial']} style={{ width: `${pct}%` }} />
+            <ProgressBar percent={pct} tone={p.ratio >= 1 ? 'success' : 'amber'} />
         </span>
     );
 }
@@ -318,7 +328,7 @@ export function OrderActionSheet() {
         <BottomSheet open={orderAction !== null} onClose={closeOrderAction} dismissible={!busy} title={title} testId='order-action-sheet'>
             {orderAction && (trade
                 ? <ActionBody key={orderAction.seq} kind={orderAction.kind} trade={trade} working={!!found && isWorkingTrade(found)} onBusyChange={setBusy} />
-                : <p className={styles.problem} role='status'>{ORDER_ACTION_TEXT.notFound}</p>)}
+                : <InlineNote tone='warn' role='status'>{ORDER_ACTION_TEXT.notFound}</InlineNote>)}
         </BottomSheet>
     );
 }
@@ -378,6 +388,26 @@ function useMutationRunner(onBusyChange: (busy: boolean) => void): MutationRunne
     return { busy, resetKey, feedback, run };
 }
 
+/** 「未送出」回饋（role=alert；只分未送出，結果未知已關閉面板並通知） */
+function NotSentNote({ text }: { text: string }) {
+    return <InlineNote tone='danger' role='alert' testId='order-action-feedback'>{text}</InlineNote>;
+}
+
+/** 子畫面的固定 footer：回饋 → 滑動確認 → 「返回」（測試與無 portal 時原地渲染） */
+function ActionFooter({ feedback, busy, onBack, children }: { feedback: string | null; busy: boolean; onBack: () => void; children?: ReactNode }) {
+    return (
+        <SheetFooter>
+            <div className={a.footerStack}>
+                {feedback && <NotSentNote text={feedback} />}
+                {children}
+                <button type='button' className={`${a.backButton} ${pressable} ${focusRing}`} disabled={busy} onClick={onBack}>
+                    返回
+                </button>
+            </div>
+        </SheetFooter>
+    );
+}
+
 function ActionBody({ kind, trade, working, onBusyChange }: { kind: OrderActionKind; trade: Trade; working: boolean; onBusyChange: (busy: boolean) => void }) {
     const [view, setView] = useState<OrderActionKind>(kind);
     const meta = useEsunOrderMeta(trade);
@@ -387,64 +417,74 @@ function ActionBody({ kind, trade, working, onBusyChange }: { kind: OrderActionK
     const avail = orderActionAvailability(trade, meta);
     const gateReason = mutationGateReason(live, gate);
     const { busy } = runner;
+    const back = () => setView('menu');
+    const editDisabled = busy || !working || !!gateReason;
 
     return (
-        <div className={styles.sheetBody} data-testid='order-action-body' data-view={view}>
-            <div className={styles.summary}>
-                <OrderLines trade={trade} meta={meta} />
-            </div>
-            {!working && <p className={styles.problem} role='status' data-testid='order-action-gone'>{ORDER_ACTION_TEXT.gone}</p>}
+        <div className={a.body} data-testid='order-action-body' data-view={view}>
+            <GroupedSection testId='order-action-summary'>
+                <div className={a.summary}>
+                    <OrderLines trade={trade} meta={meta} />
+                </div>
+            </GroupedSection>
+            {!working && <InlineNote tone='warn' role='status' testId='order-action-gone'>{ORDER_ACTION_TEXT.gone}</InlineNote>}
 
             {view === 'menu' && (
                 <>
-                    <div className={styles.menu} role='group' aria-label='委託操作'>
-                        {avail.price && (
-                            <button type='button' className={styles.menuButton.neutral} disabled={busy || !working || !!gateReason} onClick={() => setView('price')}>
-                                改價
-                            </button>
-                        )}
-                        {avail.qty && (
-                            <button type='button' className={styles.menuButton.neutral} disabled={busy || !working || !!gateReason} onClick={() => setView('qty')}>
-                                減量
-                            </button>
-                        )}
-                        <button type='button' className={styles.menuButton.danger} disabled={busy || !working} onClick={() => setView('cancel')}>
-                            刪單
-                        </button>
+                    <div role='group' aria-label='委託操作'>
+                        <GroupedSection>
+                            {avail.price && (
+                                <ListRow title='改價' leading={<Pencil className={a.rowIcon} />} chevron disabled={editDisabled} onClick={() => setView('price')} />
+                            )}
+                            {avail.qty && (
+                                <ListRow title='減量' leading={<Minus className={a.rowIcon} />} chevron disabled={editDisabled} onClick={() => setView('qty')} />
+                            )}
+                            <div className={a.dangerRow}>
+                                <ListRow title='刪單' leading={<Trash2 className={a.rowIconDanger} />} chevron disabled={busy || !working} onClick={() => setView('cancel')} />
+                            </div>
+                        </GroupedSection>
                     </div>
                     {working && (avail.price || avail.qty) && gateReason && <GateNote reason={gateReason} gate={gate} busy={busy} />}
+                    {runner.feedback && <NotSentNote text={runner.feedback} />}
                 </>
             )}
 
             {view === 'price' && (avail.price
-                ? <PriceForm trade={trade} working={working} gateReason={gateReason} gate={gate} runner={runner} />
-                : <p className={styles.problem}>{ORDER_ACTION_TEXT.noPrice}</p>)}
+                ? <PriceForm trade={trade} working={working} gateReason={gateReason} gate={gate} runner={runner} onBack={back} />
+                : (
+                    <>
+                        <p className={a.problem}>{ORDER_ACTION_TEXT.noPrice}</p>
+                        <ActionFooter feedback={runner.feedback} busy={busy} onBack={back} />
+                    </>
+                ))}
             {view === 'qty' && (avail.qty
-                ? <QtyForm trade={trade} working={working} gateReason={gateReason} gate={gate} runner={runner} />
-                : <p className={styles.problem}>{ORDER_ACTION_TEXT.noQty}</p>)}
-            {view === 'cancel' && <CancelForm trade={trade} working={working} runner={runner} />}
-
-            {runner.feedback && <p className={styles.notSent} role='alert' data-testid='order-action-feedback'>{runner.feedback}</p>}
-
-            {view !== 'menu' && (
-                <button type='button' className={styles.button.neutral} disabled={busy} onClick={() => setView('menu')}>
-                    返回
-                </button>
-            )}
+                ? <QtyForm trade={trade} working={working} gateReason={gateReason} gate={gate} runner={runner} onBack={back} />
+                : (
+                    <>
+                        <p className={a.problem}>{ORDER_ACTION_TEXT.noQty}</p>
+                        <ActionFooter feedback={runner.feedback} busy={busy} onBack={back} />
+                    </>
+                ))}
+            {view === 'cancel' && <CancelForm trade={trade} working={working} runner={runner} onBack={back} />}
         </div>
     );
 }
 
 /** ResumeGate／LIVE 停用說明；stale-data 時可重試或勾選「我了解資料可能過期」 */
 function GateNote({ reason, gate, busy }: { reason: string; gate: ResumeGateSnapshot; busy: boolean }) {
+    const canRetry = gate.state === 'stale-data' || gate.state === 'failed';
     return (
-        <div className={styles.gateRow} data-testid='order-action-gate'>
-            <span>{reason}</span>
+        <InlineNote
+            tone='warn'
+            testId='order-action-gate'
+            action={canRetry ? { label: '重試', onClick: () => retryResume(), disabled: busy } : undefined}
+        >
+            <span className={a.gateText}>{reason}</span>
             {gate.state === 'stale-data' && (
-                <label className={styles.gateRow}>
+                <label className={a.checkboxLabel}>
                     <input
                         type='checkbox'
-                        className={styles.checkbox}
+                        className={a.checkbox}
                         checked={gate.staleAcknowledged}
                         disabled={busy || gate.staleAcknowledged}
                         onChange={() => acknowledgeStaleData()}
@@ -452,10 +492,7 @@ function GateNote({ reason, gate, busy }: { reason: string; gate: ResumeGateSnap
                     我了解資料可能過期
                 </label>
             )}
-            {(gate.state === 'stale-data' || gate.state === 'failed') && (
-                <button type='button' className={styles.button.neutral} disabled={busy} onClick={() => retryResume()}>重試</button>
-            )}
-        </div>
+        </InlineNote>
     );
 }
 
@@ -465,9 +502,10 @@ interface FormProps {
     gateReason: string | null;
     gate: ResumeGateSnapshot;
     runner: MutationRunner;
+    onBack: () => void;
 }
 
-function PriceForm({ trade, working, gateReason, gate, runner }: FormProps) {
+function PriceForm({ trade, working, gateReason, gate, runner, onBack }: FormProps) {
     const cached = useContract(trade.contract.code);
     const contract: PriceContract = cached ?? trade.contract;
     const [text, setText] = useState(() => String(currentOrderPrice(trade)));
@@ -485,52 +523,58 @@ function PriceForm({ trade, working, gateReason, gate, runner }: FormProps) {
         const next = stepPrice(contract, base, steps);
         if (next > 0) setText(String(next));
     };
+    // 股票的漲跌停界限（期權不檢查，與 priceProblem 一致）：到界限時步進鍵只回彈並說明
+    const stock = !isFuturesTrade(trade);
+    const up = Number(contract.limit_up);
+    const down = Number(contract.limit_down);
     const disabledReason = !working ? ORDER_ACTION_TEXT.gone : busy ? ORDER_ACTION_TEXT.busy : gateReason ?? problem;
     const tradeId = trade.order.id;
 
     return (
         <>
-            <div className={styles.fieldRow}>
-                <span className={styles.fieldLabel}>目前價格</span>
-                <span>{orderPriceText(trade)}</span>
+            <GroupedSection>
+                <ValueRow label='目前價格' value={orderPriceText(trade)} testId='order-action-current-price' />
+            </GroupedSection>
+            <div className={a.fieldBlock}>
+                <span className={a.fieldLabel}>新價格</span>
+                <Stepper
+                    value={text}
+                    onChange={setText}
+                    onStep={d => step(d)}
+                    inputMode='decimal'
+                    ariaLabel='新的委託價格'
+                    decLabel='價格減一檔'
+                    incLabel='價格加一檔'
+                    testId='order-action-price'
+                    disabled={busy}
+                    invalid={!!problem}
+                    atMax={stock && up > 0 && price >= up}
+                    atMin={stock && down > 0 && price > 0 && price <= down}
+                    maxText='已到漲停'
+                    minText='已到跌停'
+                />
             </div>
-            <div className={styles.fieldRow}>
-                <span className={styles.fieldLabel}>新價格</span>
-                <div className={styles.stepper}>
-                    <button type='button' className={styles.stepButton} aria-label='價格減一檔' disabled={busy} onClick={() => step(-1)}>－</button>
-                    <input
-                        className={styles.input}
-                        aria-label='新的委託價格'
-                        data-testid='order-action-price'
-                        inputMode='decimal'
-                        autoComplete='off'
-                        disabled={busy}
-                        aria-invalid={problem ? true : undefined}
-                        value={text}
-                        onChange={e => setText(e.target.value)}
-                    />
-                    <button type='button' className={styles.stepButton} aria-label='價格加一檔' disabled={busy} onClick={() => step(1)}>＋</button>
-                </div>
-            </div>
-            {problem && <p className={styles.problem} data-testid='order-action-problem'>{problem}</p>}
+            {problem && <p className={a.problem} data-testid='order-action-problem'>{problem}</p>}
             {gateReason && working && <GateNote reason={gateReason} gate={gate} busy={busy} />}
-            <SlideToConfirm
-                label={`滑動確認 改價 → ${Number.isFinite(price) ? fmtPrice(price) : '—'}`}
-                testId='order-action-slide'
-                disabled={!!disabledReason}
-                disabledReason={disabledReason}
-                resetKey={runner.resetKey}
-                onConfirm={() => {
-                    void runner.run('改價', () => updateOrderPrice(tradeId, price), () => {
-                        notify({ kind: 'ok', title: '改價已送出', body: `${trade.contract.code} → ${fmtPrice(price)}；等待回報確認，請在委託頁核對` });
-                    }, { gated: true });
-                }}
-            />
+            <ActionFooter feedback={runner.feedback} busy={busy} onBack={onBack}>
+                <SlideToConfirm
+                    label={`滑動確認 改價 → ${Number.isFinite(price) ? fmtPrice(price) : '—'}`}
+                    testId='order-action-slide'
+                    disabled={!!disabledReason}
+                    disabledReason={disabledReason}
+                    resetKey={runner.resetKey}
+                    onConfirm={() => {
+                        void runner.run('改價', () => updateOrderPrice(tradeId, price), () => {
+                            notify({ kind: 'ok', title: '改價已送出', body: `${trade.contract.code} → ${fmtPrice(price)}；等待回報確認，請在委託頁核對` });
+                        }, { gated: true });
+                    }}
+                />
+            </ActionFooter>
         </>
     );
 }
 
-function QtyForm({ trade, working, gateReason, gate, runner }: FormProps) {
+function QtyForm({ trade, working, gateReason, gate, runner, onBack }: FormProps) {
     const remaining = remainingWorkingOrderQuantity(trade);
     const unit = orderUnitOf(trade);
     const [text, setText] = useState(() => String(Math.max(1, remaining - 1)));
@@ -552,76 +596,81 @@ function QtyForm({ trade, working, gateReason, gate, runner }: FormProps) {
 
     return (
         <>
-            <div className={styles.fieldRow}>
-                <span className={styles.fieldLabel}>目前剩餘</span>
-                <span data-testid='order-action-remaining'>{fmtInt(remaining)} {unit}</span>
+            <GroupedSection>
+                <ValueRow label='目前剩餘' value={`${fmtInt(remaining)} ${unit}`} testId='order-action-remaining' />
+            </GroupedSection>
+            <div className={a.fieldBlock}>
+                <span className={a.fieldLabel}>新的剩餘數量</span>
+                <Stepper
+                    value={text}
+                    onChange={v => setText(v.replace(/[^\d]/g, ''))}
+                    onStep={d => step(d)}
+                    inputMode='numeric'
+                    ariaLabel={`新的剩餘數量（${unit}）`}
+                    decLabel='數量減一'
+                    incLabel='數量加一'
+                    testId='order-action-qty'
+                    disabled={busy}
+                    invalid={!!problem}
+                    atMin={Number.isInteger(n) && n <= 1}
+                    atMax={Number.isInteger(n) && n >= remaining - 1}
+                    minText='已達最小數量'
+                    maxText='須小於目前剩餘（全部取消請刪單）'
+                    unit={unit}
+                />
             </div>
-            <div className={styles.fieldRow}>
-                <span className={styles.fieldLabel}>新的剩餘數量</span>
-                <div className={styles.stepper}>
-                    <button type='button' className={styles.stepButton} aria-label='數量減一' disabled={busy} onClick={() => step(-1)}>－</button>
-                    <input
-                        className={styles.input}
-                        aria-label={`新的剩餘數量（${unit}）`}
-                        data-testid='order-action-qty'
-                        inputMode='numeric'
-                        autoComplete='off'
-                        disabled={busy}
-                        aria-invalid={problem ? true : undefined}
-                        value={text}
-                        onChange={e => setText(e.target.value.replace(/[^\d]/g, ''))}
-                    />
-                    <button type='button' className={styles.stepButton} aria-label='數量加一' disabled={busy} onClick={() => step(1)}>＋</button>
-                </div>
-            </div>
-            <p className={problem ? styles.problem : styles.sub} data-testid={problem ? 'order-action-problem' : 'order-action-reduction'}>
+            <p className={problem ? a.problem : a.note} data-testid={problem ? 'order-action-problem' : 'order-action-reduction'}>
                 {problem ?? `將減少 ${fmtInt(reduction!)} ${unit}，剩餘 ${fmtInt(n)} ${unit}${odd ? '（零股以股計）' : ''}`}
             </p>
             {gateReason && working && <GateNote reason={gateReason} gate={gate} busy={busy} />}
-            <SlideToConfirm
-                label={reduction === null ? '滑動確認 減量' : `滑動確認 減量 ${fmtInt(reduction)} ${unit}`}
-                testId='order-action-slide'
-                disabled={!!disabledReason}
-                disabledReason={disabledReason}
-                resetKey={runner.resetKey}
-                onConfirm={() => {
-                    // 以送出當下的剩餘量換算減少量（期間部分成交時仍維持使用者要的「新的剩餘數量」）
-                    const now = remainingWorkingOrderQuantity(latest.current);
-                    void runner.run('改量', () => {
-                        const p = newRemainingProblem(n, now);
-                        if (p) return Promise.reject(notStarted(p));
-                        return updateOrderQty(tradeId, qtyReduction(now, n));
-                    }, () => {
-                        notify({ kind: 'ok', title: '減量已送出', body: `${trade.contract.code} 剩餘 ${now} → ${n} ${unit}；等待回報確認，請在委託頁核對` });
-                    }, { gated: true });
-                }}
-            />
+            <ActionFooter feedback={runner.feedback} busy={busy} onBack={onBack}>
+                <SlideToConfirm
+                    label={reduction === null ? '滑動確認 減量' : `滑動確認 減量 ${fmtInt(reduction)} ${unit}`}
+                    testId='order-action-slide'
+                    disabled={!!disabledReason}
+                    disabledReason={disabledReason}
+                    resetKey={runner.resetKey}
+                    onConfirm={() => {
+                        // 以送出當下的剩餘量換算減少量（期間部分成交時仍維持使用者要的「新的剩餘數量」）
+                        const now = remainingWorkingOrderQuantity(latest.current);
+                        void runner.run('改量', () => {
+                            const p = newRemainingProblem(n, now);
+                            if (p) return Promise.reject(notStarted(p));
+                            return updateOrderQty(tradeId, qtyReduction(now, n));
+                        }, () => {
+                            notify({ kind: 'ok', title: '減量已送出', body: `${trade.contract.code} 剩餘 ${now} → ${n} ${unit}；等待回報確認，請在委託頁核對` });
+                        }, { gated: true });
+                    }}
+                />
+            </ActionFooter>
         </>
     );
 }
 
-function CancelForm({ trade, working, runner }: { trade: Trade; working: boolean; runner: MutationRunner }) {
+function CancelForm({ trade, working, runner, onBack }: { trade: Trade; working: boolean; runner: MutationRunner; onBack: () => void }) {
     const remaining = remainingWorkingOrderQuantity(trade);
     const unit = orderUnitOf(trade);
     const tradeId = trade.order.id;
     const disabledReason = !working ? ORDER_ACTION_TEXT.gone : runner.busy ? ORDER_ACTION_TEXT.busy : null;
     return (
         <>
-            <p className={styles.sub}>刪除剩餘 {fmtInt(remaining)} {unit}。刪單送出後以券商回讀確認結果；若委託其實已成交，刪單不會成立。</p>
-            <SlideToConfirm
-                label='滑動確認 刪單'
-                tone='danger'
-                testId='order-action-slide'
-                disabled={!!disabledReason}
-                disabledReason={disabledReason}
-                resetKey={runner.resetKey}
-                onConfirm={() => {
-                    // 刪單不受 ResumeGate、LIVE 與風控鎖限制（降低風險的動作）
-                    void runner.run('刪單', () => cancelOrder(tradeId), (result: Trade) => {
-                        notify({ title: '刪單結果', ...cancellationSummary([{ status: 'fulfilled', value: result }]) });
-                    }, { gated: false });
-                }}
-            />
+            <p className={a.note}>刪除剩餘 {fmtInt(remaining)} {unit}。刪單送出後以券商回讀確認結果；若委託其實已成交，刪單不會成立。</p>
+            <ActionFooter feedback={runner.feedback} busy={runner.busy} onBack={onBack}>
+                <SlideToConfirm
+                    label='滑動確認 刪單'
+                    tone='danger'
+                    testId='order-action-slide'
+                    disabled={!!disabledReason}
+                    disabledReason={disabledReason}
+                    resetKey={runner.resetKey}
+                    onConfirm={() => {
+                        // 刪單不受 ResumeGate、LIVE 與風控鎖限制（降低風險的動作）
+                        void runner.run('刪單', () => cancelOrder(tradeId), (result: Trade) => {
+                            notify({ title: '刪單結果', ...cancellationSummary([{ status: 'fulfilled', value: result }]) });
+                        }, { gated: false });
+                    }}
+                />
+            </ActionFooter>
         </>
     );
 }

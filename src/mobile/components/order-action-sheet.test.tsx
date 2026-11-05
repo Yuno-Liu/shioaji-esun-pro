@@ -46,7 +46,8 @@ import type { AccountedTrade } from '../../lib/types/order';
 import { notStarted } from '../lib/errors';
 import { closeOrderAction, getMobileUi, openOrderAction, resetMobileUiForTest } from '../lib/mobile-store';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
-import { BottomSheet } from './bottom-sheet';
+import { ListRow } from '../ui/grouped';
+import { BottomSheet, SheetFooter } from './bottom-sheet';
 import {
     newRemainingProblem,
     ORDER_ACTION_TEXT,
@@ -340,5 +341,78 @@ describe('OrderActionSheet — 刪單', () => {
         expect(byTestId('order-action-gone')).toHaveLength(1);
         await press('返回');
         expect(button('刪單')!.props.disabled).toBe(true);
+    });
+});
+
+// ---- B3a 委託操作面板 v2（設計規格 §7.5、§10 S1）----
+
+describe('OrderActionSheet — v2 版面與 S1', () => {
+    const byLabel = (aria: string) => root().findAll(n => n.type === 'button' && n.props['aria-label'] === aria)[0];
+
+    it('頂部摘要＋選單 ListRow；瀏覽各子畫面與步進都不呼叫 lib 改刪單函式（只有滑動確認會）', async () => {
+        await open('o1', 'menu');
+        expect(byTestId('order-action-summary')).toHaveLength(1);
+        expect(text(byTestId('order-action-summary')[0]!)).toContain('2330');
+        expect(root().findAll(n => n.type === ListRow).map(n => n.props.title)).toEqual(['改價', '減量', '刪單']);
+        for (const label of ['改價', '減量', '刪單']) {
+            await press(label);
+            for (const aria of ['價格加一檔', '價格減一檔', '數量加一', '數量減一']) {
+                const key = byLabel(aria);
+                if (key) await act(async () => { key.props.onClick(); });
+            }
+            expect(slide()).toBeDefined();
+            await press('返回');
+            expect(byTestId('order-action-body')[0]!.props['data-view']).toBe('menu');
+        }
+        expect(m.updatePrice).not.toHaveBeenCalled();
+        expect(m.updateQty).not.toHaveBeenCalled();
+        expect(m.cancelOrder).not.toHaveBeenCalled();
+        expect(m.assertLive).not.toHaveBeenCalled();
+        expect(getMobileUi().orderAction).not.toBeNull();
+    });
+
+    it('滑塊與「返回」在 SheetFooter；改價、減量 neutral，刪單 danger', async () => {
+        await open('o1', 'price');
+        const footerHas = () => {
+            const footer = root().findAll(n => n.type === SheetFooter)[0]!;
+            return {
+                slide: footer.findAll(n => n.type === SlideToConfirm).length,
+                back: footer.findAll(n => n.type === 'button' && text(n) === '返回').length,
+            };
+        };
+        expect(footerHas()).toEqual({ slide: 1, back: 1 });
+        expect(slide()!.props.tone ?? 'neutral').toBe('neutral');
+        await press('返回');
+        await press('減量');
+        expect(footerHas()).toEqual({ slide: 1, back: 1 });
+        expect(slide()!.props.tone ?? 'neutral').toBe('neutral');
+        await press('返回');
+        await press('刪單');
+        expect(footerHas()).toEqual({ slide: 1, back: 1 });
+        expect(slide()!.props.tone).toBe('danger');
+    });
+
+    it('減量 Stepper 界限：新的剩餘數量已是剩餘−1 時按＋不再增加並說明', async () => {
+        await open('o1', 'qty');
+        expect(byTestId('order-action-qty')[0]!.props.value).toBe('4');
+        await act(async () => { byLabel('數量加一')!.props.onClick(); });
+        expect(byTestId('order-action-qty')[0]!.props.value).toBe('4');
+        expect(text(byTestId('order-action-qty-bound')[0]!)).toContain('須小於目前剩餘');
+        await act(async () => { byLabel('數量減一')!.props.onClick(); });
+        expect(byTestId('order-action-qty')[0]!.props.value).toBe('3');
+        expect(text(byTestId('order-action-remaining')[0]!)).toBe('5 張');
+        expect(m.updateQty).not.toHaveBeenCalled();
+    });
+
+    it('成交進度改以 ProgressBar 的 scaleX 呈現（沒有 width），progressbar 語意不變', async () => {
+        h.trades = [trade('o1', { status: { status: 'PartFilled', deal_quantity: 2 } })];
+        await open('o1', 'menu');
+        const bar = byTestId('order-progress')[0]!;
+        expect(bar.props.role).toBe('progressbar');
+        expect(bar.props['aria-valuenow']).toBe(40);
+        expect(bar.props['aria-label']).toBe('成交進度 2／5 張');
+        const styled = bar.findAll(n => typeof n.type === 'string' && n.props.style);
+        expect(styled.map(n => n.props.style.transform)).toEqual(['scaleX(0.4)']);
+        expect(styled.some(n => 'width' in n.props.style)).toBe(false);
     });
 });

@@ -107,7 +107,18 @@ import { NOT_SENT_TITLE, OUTCOME_UNKNOWN_TITLE, TICKET_TEXT } from '../hooks/use
 import { notStarted } from '../lib/errors';
 import { closeTicket, getMobileUi, openTicket, resetMobileUiForTest } from '../lib/mobile-store';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
-import { OrderTicketSheet } from './order-ticket-sheet';
+import {
+    ACCOUNT_LOCK_NOTE,
+    blurFocusedField,
+    OrderTicketSheet,
+    PRICE_DEVIATION_WARN,
+    priceDeviationText,
+    ticketSummaryText,
+} from './order-ticket-sheet';
+import { orderTypeNote } from './ticket/ticket-conditions';
+import { SheetFooter } from './bottom-sheet';
+import { fill, srOnly } from '../styles/primitives.css';
+import { Stepper } from '../ui/stepper';
 
 const stock = {
     code: '2330', name: '台積電', security_type: 'STK', exchange: 'TSE', target_code: null,
@@ -1047,5 +1058,222 @@ describe('OrderTicketSheet — 內嵌五檔與信用提醒', () => {
         await act(async () => { btn('改用融券（回補）').props.onClick(); });
         expect(text(one('ticket-direction'))).toBe('融券買進（回補）');
         expect(byTestId('ticket-credit-hint')).toHaveLength(0);
+    });
+});
+
+// ---- B3a 下單面板 v2（設計規格 §7.4、§10）----
+
+describe('B3a 下單面板 v2 — 純函式', () => {
+    it('priceDeviationText：只在限價、最新價為真實成交且超過門檻時提醒（股票 3%、期權 1.5%）', () => {
+        expect(PRICE_DEVIATION_WARN).toEqual({ stock: 0.03, derivative: 0.015 });
+        const base = { priceType: 'LMT' as const, last: 100 as number | null, lastSource: 'trade' as const, isFutures: false };
+        expect(priceDeviationText({ ...base, price: 104.2 })).toBe('偏離成交價 +4.2%');
+        expect(priceDeviationText({ ...base, price: 95 })).toBe('偏離成交價 -5.0%');
+        expect(priceDeviationText({ ...base, price: 103 })).toBeNull(); // 恰為 3% 不提醒
+        expect(priceDeviationText({ ...base, price: 104, lastSource: 'snapshot' })).toBeNull();
+        expect(priceDeviationText({ ...base, price: 104, lastSource: 'oddQuote' })).toBeNull();
+        expect(priceDeviationText({ ...base, price: 104, lastSource: null })).toBeNull();
+        expect(priceDeviationText({ ...base, price: 104, priceType: 'MKT' })).toBeNull();
+        expect(priceDeviationText({ ...base, price: 104, last: null })).toBeNull();
+        expect(priceDeviationText({ ...base, price: Number.NaN })).toBeNull();
+        expect(priceDeviationText({ ...base, isFutures: true, price: 101.6 })).toBe('偏離成交價 +1.6%');
+        expect(priceDeviationText({ ...base, isFutures: true, price: 101.4 })).toBeNull();
+    });
+
+    it('ticketSummaryText：限價 × 數量 ≈ 金額；期權為名目；遮蔽金額；沒有估值只到數量', () => {
+        expect(ticketSummaryText({ priceType: 'LMT', priceText: '1085', quantity: 1, orderLot: 'Common' }, false, { value: 1_085_000 }, false))
+            .toBe('限價 1,085 × 1 張 ≈ 1,085,000 元');
+        expect(ticketSummaryText({ priceType: 'LMT', priceText: '1085', quantity: 1, orderLot: 'Common' }, false, { value: 1_085_000 }, true))
+            .toBe('限價 1,085 × 1 張 ≈ ••••• 元');
+        expect(ticketSummaryText({ priceType: 'LMT', priceText: '100.5', quantity: 300, orderLot: 'IntradayOdd' }, false, { value: 30_150 }, false))
+            .toBe('限價 100.5 × 300 股 ≈ 30,150 元');
+        expect(ticketSummaryText({ priceType: 'MKP', priceText: '', quantity: 2, orderLot: 'Common' }, true, { value: 9_120_000 }, false))
+            .toBe('範圍市價 × 2 口 ≈ 名目 9,120,000 元');
+        expect(ticketSummaryText({ priceType: 'LMT', priceText: '', quantity: 0, orderLot: 'Common' }, false, { value: null }, false))
+            .toBe('限價 — × — 張');
+    });
+
+    it('blurFocusedField：只讓輸入類欄位失焦；沒有 document 不丟錯', () => {
+        const blur = vi.fn();
+        vi.stubGlobal('document', { activeElement: { tagName: 'INPUT', blur } });
+        blurFocusedField();
+        expect(blur).toHaveBeenCalledTimes(1);
+        vi.stubGlobal('document', { activeElement: { tagName: 'BUTTON', blur } });
+        blurFocusedField();
+        expect(blur).toHaveBeenCalledTimes(1);
+        vi.stubGlobal('document', undefined);
+        expect(() => blurFocusedField()).not.toThrow();
+    });
+
+    it('orderTypeNote：零股時寫出效期停用原因，整股沒有', () => {
+        expect(orderTypeNote(false)).toBeNull();
+        expect(orderTypeNote(true)).toBeTruthy();
+    });
+});
+
+describe('B3a 下單面板 v2 — 版面', () => {
+    const stepperOf = (testId: string) => root().findAll(n => n.type === Stepper && n.props.testId === testId)[0]!;
+    const byLabel = (aria: string) => root().findAll(n => n.type === 'button' && n.props['aria-label'] === aria)[0]!;
+
+    it('large detent；精簡報價不重複商品名；方向為視覺隱藏的 aria-live 宣告', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        expect(panel().props['data-detent']).toBe('large');
+        expect(text(one('ticket-quote'))).not.toContain('台積電');
+        const dir = one('ticket-direction');
+        expect(dir.type).toBe('p');
+        expect(dir.props['aria-live']).toBe('polite');
+        expect(dir.props.className).toBe(srOnly);
+    });
+
+    it('S6：方向鍵 aria-pressed、面板 tone、方向宣告與 CTA 文字／填色同步', async () => {
+        await open({ code: '2330', action: null, price: 100, source: 'depth' });
+        expect(btn('買進').props['aria-pressed']).toBe(false);
+        expect(btn('賣出').props['aria-pressed']).toBe(false);
+        expect(preview().props.className).not.toContain(fill.up.large);
+        expect(preview().props.className).not.toContain(fill.down.large);
+        await click('買進');
+        expect(btn('買進').props['aria-pressed']).toBe(true);
+        expect(btn('賣出').props['aria-pressed']).toBe(false);
+        expect(panel().props['data-tone']).toBe('buy');
+        expect(text(one('ticket-direction'))).toBe('買進');
+        expect(text(preview())).toBe('預覽買進委託 · 2330 · 1 張 · 限價 100');
+        expect(preview().props.className).toContain(fill.up.large);
+        await click('賣出');
+        expect(btn('賣出').props['aria-pressed']).toBe(true);
+        expect(panel().props['data-tone']).toBe('sell');
+        expect(preview().props.className).toContain(fill.down.large);
+        expect(preview().props.className).not.toContain(fill.up.large);
+    });
+
+    it('狀態行與 CTA 在 SheetFooter 內；摘要只在沒有回饋與停用原因時出現', async () => {
+        m.submit.mockRejectedValue(new OrderConfirmCancelled());
+        await open({ code: '2330', action: 'Buy' });
+        const footer = root().findAll(n => n.type === SheetFooter)[0]!;
+        expect(footer.findAll(n => n.props['data-testid'] === 'ticket-preview' && n.type === 'button')).toHaveLength(1);
+        expect(footer.findAll(n => n.props['data-testid'] === 'ticket-summary' && typeof n.type === 'string')).toHaveLength(1);
+        expect(text(one('ticket-summary'))).toBe('限價 100 × 1 張 ≈ 100,000 元');
+        await typeQty('3');
+        expect(text(one('ticket-summary'))).toBe('限價 100 × 3 張 ≈ 300,000 元');
+        await typePrice('111');
+        expect(byTestId('ticket-summary')).toHaveLength(0);
+        expect(problemText()).toContain(TICKET_TEXT.priceRange);
+        await typePrice('100');
+        expect(byTestId('ticket-summary')).toHaveLength(1);
+        await pressPreview();
+        expect(text(one('ticket-feedback'))).toBe('已取消');
+        expect(byTestId('ticket-summary')).toHaveLength(0);
+    });
+
+    it('摘要金額在遮蔽金額模式下遮蔽', async () => {
+        h.privMoney = true;
+        await open({ code: '2330', action: 'Buy' });
+        expect(text(one('ticket-summary'))).toBe('限價 100 × 1 張 ≈ ••••• 元');
+    });
+
+    it('限價偏離提醒：只提醒、不阻擋、不改價；市價與快照來源不提醒', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        expect(byTestId('ticket-deviation')).toHaveLength(0);
+        await typePrice('104');
+        expect(text(one('ticket-deviation'))).toBe('偏離成交價 +4.0%');
+        expect(priceInput().props.value).toBe('104');
+        expect(preview().props.disabled).toBe(false);
+        expect(problemText()).toBeNull();
+        await typePrice('103');
+        expect(byTestId('ticket-deviation')).toHaveLength(0);
+        await typePrice('96.5');
+        expect(text(one('ticket-deviation'))).toBe('偏離成交價 -3.5%');
+        await choosePriceType('MKT');
+        expect(byTestId('ticket-deviation')).toHaveLength(0);
+        await act(async () => { closeTicket(); });
+        h.quote = undefined;
+        h.snapshot = { code: '2330', close: 98 };
+        await open({ code: '2330', action: 'Buy' });
+        await typePrice('104');
+        expect(byTestId('ticket-deviation')).toHaveLength(0);
+    });
+
+    it('帳戶鎖說明：預設不常駐，按鎖鍵切換一行說明，不影響送單', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        const lock = () => byLabel('帳戶已固定，說明');
+        expect(byTestId('ticket-account-note')).toHaveLength(0);
+        expect(lock().props['aria-pressed']).toBe(false);
+        await act(async () => { lock().props.onClick(); });
+        expect(text(one('ticket-account-note'))).toBe(ACCOUNT_LOCK_NOTE);
+        expect(lock().props['aria-pressed']).toBe(true);
+        await act(async () => { lock().props.onClick(); });
+        expect(byTestId('ticket-account-note')).toHaveLength(0);
+        expect(m.submit).not.toHaveBeenCalled();
+    });
+
+    it('數量標籤列：1 張＝1,000 股；零股以股計；期權不顯示', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        expect(text(one('ticket-qty-note'))).toBe('1 張＝1,000 股');
+        await click('零股');
+        expect(text(one('ticket-qty-note'))).toBe('以股計（1～999 股）');
+        await act(async () => { closeTicket(); });
+        h.contract = futures;
+        h.quote = { tick: { close: '22800' } };
+        await open({ code: 'TXFL6', action: 'Buy' });
+        expect(byTestId('ticket-qty-note')).toHaveLength(0);
+    });
+
+    it('Stepper 界限：漲停時按＋不步進並說明；數量 1 時按－說明最小數量', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        await click('漲停');
+        expect(priceInput().props.value).toBe('110');
+        expect(stepperOf('ticket-price').props.atMax).toBe(true);
+        await click('＋');
+        expect(priceInput().props.value).toBe('110');
+        expect(text(one('ticket-price-bound'))).toBe('已到漲停');
+        expect(stepperOf('ticket-qty').props.atMin).toBe(true);
+        await act(async () => { byLabel('數量減一').props.onClick(); });
+        expect(qtyInput().props.value).toBe('1');
+        expect(text(one('ticket-qty-bound'))).toBe('已達最小數量');
+    });
+
+    it('快捷價與五檔點價帶入價格時遞增 Stepper flashKey；快捷價第二行價格在 data-price', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        const k0 = stepperOf('ticket-price').props.flashKey;
+        expect(btn('買一').props['data-price']).toMatch(/^99\.50?$/);
+        await click('買一');
+        const k1 = stepperOf('ticket-price').props.flashKey;
+        expect(k1).not.toBe(k0);
+        await act(async () => { (h.ladder!.onPick as (p: number, s: 'bid' | 'ask') => void)(99, 'bid'); });
+        expect(stepperOf('ticket-price').props.flashKey).not.toBe(k1);
+        expect(priceInput().props.value).toBe('99');
+    });
+
+    it('按 CTA 先讓聚焦的輸入欄位失焦，再進入既有送出流程', async () => {
+        const order: string[] = [];
+        const blur = vi.fn(() => { order.push('blur'); });
+        m.submit.mockImplementation(async () => { order.push('submit'); throw new OrderConfirmCancelled(); });
+        await open({ code: '2330', action: 'Buy' });
+        vi.stubGlobal('document', { activeElement: { tagName: 'INPUT', blur } });
+        await pressPreview();
+        expect(order).toEqual(['blur', 'submit']);
+    });
+});
+
+describe('B3a 下單面板 v2 — S1 送出只有一條路', () => {
+    it('CTA 以外的每個按鈕、快捷價、步進、五檔點價都不送單；CTA 只呼叫 submitMobileOrder 一次', async () => {
+        m.submit.mockResolvedValue({ status: { status: 'Submitted' }, order: { id: 'o1', seqno: '1' } });
+        await open({ code: '2330', action: 'Sell' });
+        await expand();
+        let clicked = 0;
+        for (let i = 0; i < 80; i++) {
+            const list = buttons().filter(b => b.props['data-testid'] !== 'ticket-preview' && b.props['aria-label'] !== '關閉' && !b.props.disabled);
+            if (i >= list.length) break;
+            await act(async () => { list[i]!.props.onClick?.(); });
+            clicked += 1;
+        }
+        await act(async () => { (h.ladder!.onPick as (p: number, s: 'bid' | 'ask') => void)(99, 'bid'); });
+        expect(clicked).toBeGreaterThan(15);
+        expect(m.submit).not.toHaveBeenCalled();
+        expect(getMobileUi().ticket).not.toBeNull();
+
+        await act(async () => { closeTicket(); });
+        await open({ code: '2330', action: 'Buy' });
+        await pressPreview();
+        expect(m.submit).toHaveBeenCalledTimes(1);
     });
 });
