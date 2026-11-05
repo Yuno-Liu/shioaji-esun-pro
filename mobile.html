@@ -5,10 +5,29 @@
         <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
         <link rel="alternate icon" type="image/x-icon" href="/favicon.ico" />
         <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-        <!-- viewport-fit=cover：版面延伸到瀏海／Home 指示條區域，由 env(safe-area-inset-*) 留白 -->
+        <!--
+            PWA（規格 §13 Phase 3）：只有 manifest，不註冊 service worker、不快取任何 API。
+            mobile.webmanifest 由 vite.fork.config.ts 產生；crossorigin="use-credentials"：
+            開啟 Basic Auth 時 manifest 請求也帶上已驗證的憑證（預設不帶，會被 401）。
+        -->
+        <link
+            rel="manifest"
+            href="/mobile.webmanifest"
+            crossorigin="use-credentials"
+        />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="mobile-web-app-capable" content="yes" />
+        <!-- black：狀態列固定黑底白字，深色與淺色主題都清楚（black-translucent 在淺色主題會看不到字） -->
+        <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+        <meta name="apple-mobile-web-app-title" content="SJ Pro" />
+        <!--
+            viewport-fit=cover：版面延伸到瀏海／Home 指示條區域，由 env(safe-area-inset-*) 留白。
+            maximum-scale=1, user-scalable=no：使用者要求禁止手勢縮放（Android Chrome 生效；
+            iOS Safari 會忽略，改由 src/mobile/lib/gesture-guard.ts 與全域 touch-action 處理）。
+        -->
         <meta
             name="viewport"
-            content="width=device-width, initial-scale=1, viewport-fit=cover"
+            content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
         />
         <!-- 網址列顏色：與 src/theme.css.ts 的深色／淺色背景一致（App 內主題由 initTheme 套用） -->
         <meta

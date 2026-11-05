@@ -21,10 +21,10 @@ def _read(path: str) -> str:
         return fh.read().replace("\r\n", "\n")
 
 
-def location_block(prefix: str) -> str:
-    """`location ^~ <prefix> { ... }` 的內容（以大括號配對取出，忽略註解中的大括號）。"""
+def location_block(prefix: str, modifier: str = "^~") -> str:
+    """`location <modifier> <prefix> { ... }` 的內容（以大括號配對取出，忽略註解中的大括號）。"""
     text = _read(TEMPLATE)
-    m = re.search(r"location \^~ " + re.escape(prefix) + r" \{", text)
+    m = re.search(r"location " + re.escape(modifier) + " " + re.escape(prefix) + r" \{", text)
     assert m, prefix
     depth, i = 1, m.end()
     body_start = i
@@ -82,6 +82,27 @@ class HostAllowlistTest(unittest.TestCase):
         self.assertRegex(text, r"listen \$\{PORT\} default_server;\s*\n\s*server_name _;\s*\n\s*server_tokens off;\s*\n\s*return 444;")
         self.assertIn("server_name localhost 127.0.0.1 ${WEB_SERVER_NAMES};", text)
         self.assertIn('"~*^https?://([^/|]+)\\|\\1$" 0;', text)
+
+
+class MobileManifestLocationTest(unittest.TestCase):
+    """手機版 PWA manifest：明確的 MIME、不快取，且仍有安全標頭與 Basic Auth。"""
+
+    def setUp(self) -> None:
+        self.lines = directives(location_block("/mobile.webmanifest", "="))
+
+    def test_served_as_manifest_json(self) -> None:
+        self.assertIn("types { }", self.lines)
+        self.assertIn("default_type application/manifest+json;", self.lines)
+        self.assertIn("try_files $uri =404;", self.lines)
+
+    def test_keeps_security_headers_and_no_cache(self) -> None:
+        # location 內有 add_header 就不繼承 server 層級的安全標頭，必須再 include
+        self.assertIn('add_header Cache-Control "no-cache" always;', self.lines)
+        self.assertIn("include /etc/nginx/snippets/security-headers.conf;", self.lines)
+
+    def test_does_not_bypass_basic_auth_or_proxy(self) -> None:
+        self.assertFalse([ln for ln in self.lines if ln.startswith("auth_basic")])
+        self.assertFalse([ln for ln in self.lines if ln.startswith("proxy_pass")])
 
 
 if __name__ == "__main__":

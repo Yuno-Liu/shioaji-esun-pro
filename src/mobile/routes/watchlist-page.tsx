@@ -10,6 +10,8 @@
 // - 點一列 → #/trade/:code；長按（或編輯模式的「更多」鍵）→ 開交易、上移、下移、移到最上、移除。
 // - 搜尋：search-sheet.tsx（searchProducts(query, 10)）。
 // - 試撮（tick.simtrade）：比照桌面，價格前加「試撮」徽章，不當成真實成交顯示。
+// - 分段「自選｜排行」（§13 Phase 3）：排行見 components/ranking-list.tsx，只在「排行」分段掛載時讀取；
+//   「排行」分段不掛載自選列，自選列的行情訂閱隨之釋放。分段選擇在模組層保留（切換分頁再回來不變）。
 
 import { MoreHorizontal, Pencil, Search } from 'lucide-react';
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
@@ -21,6 +23,7 @@ import type { ContractInfo } from '../../lib/types/contract';
 import type { Snapshot } from '../../lib/types/market';
 import { fmtPct, fmtPrice } from '../../lib/utils/format';
 import { BottomSheet } from '../components/bottom-sheet';
+import { RankingList } from '../components/ranking-list';
 import { SearchSheet } from '../components/search-sheet';
 import { navigate } from '../lib/hash-router';
 import { useMobileWatchlist } from '../lib/watchlist-context';
@@ -347,12 +350,33 @@ function RowActionsSheet({ code, items, onClose, onOpen, onRemove, onMove }: {
 // ---------------------------------------------------------------------------
 // 頁面
 
+export type WatchSegment = 'watchlist' | 'ranking';
+
+const SEGMENTS: { key: WatchSegment; label: string }[] = [
+    { key: 'watchlist', label: '自選' },
+    { key: 'ranking', label: '排行' },
+];
+
+/** 上次選的分段（切換分頁再回來保留） */
+let lastSegment: WatchSegment = 'watchlist';
+
+/** 測試用：分段回到「自選」 */
+export function resetWatchlistSegmentForTest(): void {
+    lastSegment = 'watchlist';
+}
+
 export function WatchlistPage() {
     const wl = useMobileWatchlist();
     const [tracker, setTracker] = useState<VisibilityTracker | null>(null);
     const [searchOpen, setSearchOpen] = useState(false);
     const [editing, setEditing] = useState(false);
     const [actionCode, setActionCode] = useState<string | null>(null);
+    const [segment, setSegmentState] = useState<WatchSegment>(lastSegment);
+    const setSegment = useCallback((next: WatchSegment) => {
+        lastSegment = next;
+        setSegmentState(next);
+        if (next === 'ranking') setEditing(false);
+    }, []);
 
     useEffect(() => {
         const t = createVisibilityTracker();
@@ -371,9 +395,13 @@ export function WatchlistPage() {
         await addSymbol(s.code, s.security_type, s.contract);
     }, [addSymbol]);
     const onRemove = useCallback(async (code: string) => { await removeSymbol(code); }, [removeSymbol]);
+    // 排行都是上市櫃股票：以 STK 解析合約後加入目前清單
+    const onAddRanked = useCallback(async (code: string) => { await addSymbol(code, 'STK'); }, [addSymbol]);
+    const canAdd = !wl.loading && !wl.structureBusy && !wl.loadError;
 
     const activeList = wl.serverLists.find(l => l.id === wl.activeListId);
-    const showList = wl.items.length > 0;
+    const ranking = segment === 'ranking';
+    const showList = !ranking && wl.items.length > 0;
 
     return (
         <section className={layout.page} data-testid='page-watchlist'>
@@ -382,19 +410,37 @@ export function WatchlistPage() {
                 <button type='button' className={styles.iconButton} aria-label='搜尋商品' onClick={() => setSearchOpen(true)} data-testid='watch-search'>
                     <Search size={22} aria-hidden='true' />
                 </button>
-                <button
-                    type='button'
-                    className={styles.iconButton}
-                    aria-label='編輯自選'
-                    aria-pressed={editing}
-                    onClick={() => setEditing(v => !v)}
-                    data-testid='watch-edit'
-                >
-                    <Pencil size={20} aria-hidden='true' />
-                </button>
+                {!ranking && (
+                    <button
+                        type='button'
+                        className={styles.iconButton}
+                        aria-label='編輯自選'
+                        aria-pressed={editing}
+                        onClick={() => setEditing(v => !v)}
+                        data-testid='watch-edit'
+                    >
+                        <Pencil size={20} aria-hidden='true' />
+                    </button>
+                )}
             </div>
 
-            {wl.serverLists.length > 1 ? (
+            <div className={styles.segments} role='tablist' aria-label='自選或排行'>
+                {SEGMENTS.map(sg => (
+                    <button
+                        key={sg.key}
+                        type='button'
+                        role='tab'
+                        aria-selected={segment === sg.key}
+                        className={segment === sg.key ? styles.segment.on : styles.segment.off}
+                        onClick={() => setSegment(sg.key)}
+                        data-testid={`watch-segment-${sg.key}`}
+                    >
+                        {sg.label}
+                    </button>
+                ))}
+            </div>
+
+            {ranking ? null : wl.serverLists.length > 1 ? (
                 <select
                     className={styles.listPicker}
                     aria-label='切換自選清單'
@@ -409,9 +455,11 @@ export function WatchlistPage() {
                 <p className={styles.listName}>{activeList.name}</p>
             ) : null}
 
-            {editing && <p className={styles.listName}>按「⋯」或長按一列可調整順序或移除。</p>}
+            {!ranking && editing && <p className={styles.listName}>按「⋯」或長按一列可調整順序或移除。</p>}
 
-            {wl.loadError && (
+            {ranking && <RankingList watchedCodes={watchedCodes} canAdd={canAdd} onAdd={onAddRanked} onOpen={openTrade} />}
+
+            {!ranking && wl.loadError && (
                 <div role='alert'>
                     <p className={styles.error}>自選清單載入失敗。</p>
                     <div className={styles.stateActions}>
@@ -419,8 +467,8 @@ export function WatchlistPage() {
                     </div>
                 </div>
             )}
-            {!showList && wl.loading && !wl.loadError && <p className={styles.state} role='status'>自選清單載入中…</p>}
-            {!showList && !wl.loading && !wl.loadError && (
+            {!ranking && !showList && wl.loading && !wl.loadError && <p className={styles.state} role='status'>自選清單載入中…</p>}
+            {!ranking && !showList && !wl.loading && !wl.loadError && (
                 <div className={styles.state}>
                     <p>這份清單還沒有商品。</p>
                     <div className={styles.stateActions}>
@@ -449,7 +497,7 @@ export function WatchlistPage() {
                 open={searchOpen}
                 onClose={() => setSearchOpen(false)}
                 watchedCodes={watchedCodes}
-                canAdd={!wl.loading && !wl.structureBusy && !wl.loadError}
+                canAdd={canAdd}
                 onAdd={onAdd}
                 onOpenTrade={code => {
                     setSearchOpen(false);

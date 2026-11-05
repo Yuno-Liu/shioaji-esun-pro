@@ -1,6 +1,6 @@
 // src/mobile/start.ts — 手機入口的啟動副作用（規格 §4.5；由 main.tsx 呼叫，獨立成檔方便單元測試）
 //
-// 1) 主題（深淺色、紅漲綠跌、字級）沿用桌面設定。
+// 1) 主題（深淺色、紅漲綠跌、字級）沿用桌面設定；手機第一次啟動時字級預設「小」（lib/font-default.ts，只套用一次）。
 // 2) 一律開啟「手動下單確認」：placeQuickOrder／placeStockExitByShares 內部依 confirmManualOrders 決定是否跳確認
 //    （src/lib/trade.ts）；新單由 mobile-order.ts 直接呼叫 requestOrderConfirm，不受此設定影響。
 //    同源的其他視窗（例如桌面）關掉時，risk.ts 的 storage 同步會把設定帶進來，這裡立即改回開啟。
@@ -13,6 +13,7 @@
 import { bootstrap } from '../lib/boot';
 import { getRiskSettings, setRiskSettings, subscribeRiskSettings } from '../lib/risk';
 import { initTheme } from '../lib/theme-store';
+import { applyMobileFontDefault } from './lib/font-default';
 
 let confirmPinned = false;
 
@@ -28,6 +29,8 @@ export function pinManualOrderConfirm(): void {
 
 export function startMobile(secure: boolean): void {
     initTheme();
+    // 非 secure context 也執行（純畫面設定，不建立連線）
+    applyMobileFontDefault();
     pinManualOrderConfirm();
     if (secure) bootstrap();
 }

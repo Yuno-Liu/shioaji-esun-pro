@@ -9,10 +9,30 @@ globalStyle('html', {
     textSizeAdjust: '100%',
 });
 
+// 使用者需求「手勢縮放或選取到文字可以禁止嗎」：
+// - touch-action: manipulation：保留捲動與雙指手勢，但停用雙擊放大（頁面雙指縮放由 lib/gesture-guard.ts 擋）。
+//   瀏覽器以元素與祖先的 touch-action 取交集，圖表容器自己的 touch-action（例如 none）仍然生效。
+// - -webkit-user-select（iOS 15.4 只認前綴）＋user-select：整頁不可選取文字；
+//   -webkit-touch-callout: none：長按不跳出 iOS 的拷貝／查詢選單。輸入欄位與 .selectable 在下方恢復。
+globalStyle('html, body', {
+    touchAction: 'manipulation',
+});
+
 globalStyle('body', {
     overscrollBehavior: 'none',
     WebkitTapHighlightColor: 'transparent',
     fontFamily: "system-ui, -apple-system, 'Segoe UI', 'PingFang TC', 'Noto Sans TC', sans-serif",
+    WebkitUserSelect: 'none',
+    userSelect: 'none',
+    WebkitTouchCallout: 'none',
+});
+
+// 可輸入與明確標示可選取（className 加 selectable）的區域恢復選取與長按選單；
+// iOS 在祖先為 -webkit-user-select: none 時輸入框可能無法定位游標，需明確設回 text
+globalStyle('input, textarea, [contenteditable]:not([contenteditable="false"]), .selectable, .selectable *', {
+    WebkitUserSelect: 'text',
+    userSelect: 'text',
+    WebkitTouchCallout: 'default',
 });
 
 // iOS Safari 對字級 < 16px 的輸入欄位聚焦時會自動放大
@@ -111,5 +131,13 @@ export const pageTitle = style({
 
 export const placeholder = style({
     margin: 0,
+    color: vars.color.mutedForeground,
+});
+
+/** 分頁模組第一次載入時的佔位（app.tsx 的 Suspense fallback） */
+export const routeLoading = style({
+    margin: 0,
+    padding: '32px 16px',
+    textAlign: 'center',
     color: vars.color.mutedForeground,
 });

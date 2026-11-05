@@ -271,3 +271,92 @@ export const resultMessage = style({
     fontSize: '0.8125rem',
     color: vars.color.amber,
 });
+
+// ---- 自選／排行分段（watchlist-page.tsx）----
+
+export const segments = style({
+    display: 'flex',
+    gap: '6px',
+    marginBottom: vars.space.sm,
+});
+
+const pillBase = style({
+    flex: '1 1 0',
+    minWidth: 0,
+    minHeight: TOUCH_MIN,
+    padding: `0 ${vars.space.sm}`,
+    borderRadius: vars.radius.lg,
+    border: `1px solid ${vars.color.borderBright}`,
+    background: vars.color.panelRaised,
+    color: vars.color.foreground,
+    fontSize: '0.9375rem',
+    fontWeight: 600,
+    selectors: {
+        '&:disabled': { opacity: 0.45 },
+        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '2px' },
+    },
+});
+
+/** 選中狀態除了底色也以 aria-selected 與粗框標示（不只靠顏色） */
+export const segment = styleVariants({
+    on: [pillBase, { background: vars.color.accentDim, borderColor: vars.color.accent, borderWidth: '2px', color: vars.color.accent }],
+    off: [pillBase],
+});
+
+// ---- 排行（ranking-list.tsx）----
+
+/** 五種排行：窄螢幕可橫向捲動 */
+export const rankKinds = style({
+    display: 'flex',
+    gap: '6px',
+    overflowX: 'auto',
+    WebkitOverflowScrolling: 'touch',
+    paddingBottom: '2px',
+    marginBottom: vars.space.xs,
+});
+
+export const rankKind = styleVariants({
+    on: [pillBase, { flex: '1 0 auto', background: vars.color.accentDim, borderColor: vars.color.accent, borderWidth: '2px', color: vars.color.accent }],
+    off: [pillBase, { flex: '1 0 auto' }],
+});
+
+export const rankMeta = style({
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: vars.space.sm,
+    marginBottom: vars.space.xs,
+});
+
+export const rankMetaText = style({
+    flex: '1 1 auto',
+    minWidth: 0,
+    fontSize: '0.8125rem',
+    color: vars.color.mutedForeground,
+});
+
+/** 排行列：名次｜名稱代碼｜成交價＋量｜漲跌＋漲跌% */
+export const rankRow = style([row, {
+    gridTemplateColumns: '1.75rem minmax(0, 1fr) auto auto',
+}]);
+
+export const rankNo = style({
+    fontVariantNumeric: 'tabular-nums',
+    fontWeight: 700,
+    fontSize: '0.875rem',
+    color: vars.color.mutedForeground,
+    textAlign: 'center',
+});
+
+export const rankPriceCell = style({
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'flex-end',
+});
+
+export const rankVolume = style({
+    fontVariantNumeric: 'tabular-nums',
+    fontSize: '0.75rem',
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+});

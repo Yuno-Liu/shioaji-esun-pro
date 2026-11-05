@@ -76,6 +76,18 @@ server {
         return 302 /mobile.html;
     }
 
+    # 手機版 PWA manifest（由 vite.fork.config.ts 產生，無雜湊）：明確以 application/manifest+json 提供，
+    # 不依賴映像內 mime.types 是否收錄 .webmanifest（未收錄時會變成 application/octet-stream，
+    # 搭配 nosniff 可能被瀏覽器忽略）。不快取；Basic Auth 照常套用（mobile.html 以 crossorigin="use-credentials" 取得）。
+    # 此 location 有 add_header，安全標頭需再 include 一次。
+    location = /mobile.webmanifest {
+        types { }
+        default_type application/manifest+json;
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/security-headers.conf;
+        try_files $uri =404;
+    }
+
     # 只有 Vite 產出的帶雜湊資產（vite.config.ts 設 assetsDir: ''，檔名形如 main-D_2YXx_3.js）
     # 才可長期快取；public/ 內無雜湊的檔案走下方 location / 的 no-cache。
     # /api/、/esun/ 使用 ^~，不會被這個 regex 搶先比對。

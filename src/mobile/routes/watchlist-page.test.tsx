@@ -19,6 +19,7 @@ const m = vi.hoisted(() => {
         setActiveList: vi.fn(),
         retryLoad: vi.fn(),
         searchProducts: vi.fn(async () => []),
+        fetchScanner: vi.fn(async (..._args: unknown[]): Promise<unknown[]> => []),
         wl: {} as Record<string, unknown>,
         /** useWatchlist() 掛載次數（每次掛載＝一次完整讀取清單、合約與快照） */
         watchlistLoads: 0,
@@ -46,9 +47,20 @@ vi.mock('../../hooks/use-watchlist', async () => {
 });
 vi.mock('../../lib/product-search', () => ({ searchProducts: m.searchProducts }));
 vi.mock('../lib/hash-router', () => ({ navigate: m.navigate }));
+vi.mock('../../lib/shioaji', () => ({ fetchScanner: m.fetchScanner }));
 
+import { resetRankingForTest } from '../components/ranking-list';
 import { WatchlistProvider } from '../lib/watchlist-context';
-import { createVisibilityTracker, LONG_PRESS_MS, rowQuoteView, SIM_LABEL, WATCH_REPAINT_MS, WatchlistPage, WatchQuoteProbe } from './watchlist-page';
+import {
+    createVisibilityTracker,
+    LONG_PRESS_MS,
+    resetWatchlistSegmentForTest,
+    rowQuoteView,
+    SIM_LABEL,
+    WATCH_REPAINT_MS,
+    WatchlistPage,
+    WatchQuoteProbe,
+} from './watchlist-page';
 
 // ---- 假的 IntersectionObserver：測試手動決定哪些元素可見 ----
 type Entry = { target: object; isIntersecting: boolean };
@@ -108,6 +120,11 @@ beforeEach(() => {
     m.reorderSymbol.mockClear();
     m.setActiveList.mockClear();
     m.watchlistLoads = 0;
+    m.addSymbol.mockClear();
+    m.fetchScanner.mockReset();
+    m.fetchScanner.mockResolvedValue([]);
+    resetRankingForTest();
+    resetWatchlistSegmentForTest();
     m.wl = {
         items,
         loading: false,
@@ -311,5 +328,59 @@ describe('WatchlistPage 常駐自選狀態（B4）', () => {
         expect(m.watchlistLoads).toBe(0);
         spy.mockRestore();
         view = undefined;
+    });
+});
+
+describe('WatchlistPage 自選｜排行分段', () => {
+    const scannerItem = (code: string, close: number, change: number) => ({
+        code, name: `名稱${code}`, close, change_price: change, high: close, low: close, total_volume: 100, total_amount: 1,
+    });
+    const segmentButton = (key: string) => view!.root.find(n => n.props['data-testid'] === `watch-segment-${key}` && n.type === 'button');
+    const findAll = (id: string) => view!.root.findAll(n => n.props['data-testid'] === id && typeof n.type === 'string');
+
+    it('預設在「自選」分段：不讀取排行', async () => {
+        await render();
+        expect(segmentButton('watchlist').props['aria-selected']).toBe(true);
+        expect(m.fetchScanner).not.toHaveBeenCalled();
+        expect(findAll('ranking')).toHaveLength(0);
+    });
+
+    it('切到「排行」才讀取；自選列卸載（行情訂閱釋放）、編輯鍵與清單切換隱藏', async () => {
+        m.fetchScanner.mockResolvedValue([scannerItem('3008', 2500, 100)]);
+        await render();
+        await setVisible('2330', true);
+        expect(probes()).toEqual(['2330']);
+        await act(async () => { segmentButton('ranking').props.onClick(); });
+        await act(async () => { await Promise.resolve(); });
+        expect(m.fetchScanner).toHaveBeenCalledTimes(1);
+        expect(findAll('ranking-row')).toHaveLength(1);
+        expect(probes()).toEqual([]);
+        expect(findAll('watch-list')).toHaveLength(0);
+        expect(findAll('watch-edit')).toHaveLength(0);
+        expect(findAll('watch-list-picker')).toHaveLength(0);
+    });
+
+    it('排行點一列開交易頁；「＋」以 STK 加入目前自選清單；已在自選的列停用', async () => {
+        m.fetchScanner.mockResolvedValue([scannerItem('3008', 2500, 100), scannerItem('2330', 1100, 10)]);
+        await render();
+        await act(async () => { segmentButton('ranking').props.onClick(); });
+        await act(async () => { await Promise.resolve(); });
+        const rows = findAll('ranking-row-button');
+        await act(async () => { rows[0]!.props.onClick(); });
+        expect(m.navigate).toHaveBeenCalledWith({ name: 'trade', code: '3008' });
+        const adds = findAll('ranking-add');
+        expect(adds[1]!.props.disabled).toBe(true); // 2330 已在自選
+        await act(async () => { adds[0]!.props.onClick(); });
+        expect(m.addSymbol).toHaveBeenCalledWith('3008', 'STK');
+    });
+
+    it('分段選擇在切換分頁後保留', async () => {
+        await render();
+        await act(async () => { segmentButton('ranking').props.onClick(); });
+        await act(async () => view!.unmount());
+        await render();
+        expect(segmentButton('ranking').props['aria-selected']).toBe(true);
+        // 30 秒快取：重新掛載不再讀取
+        expect(m.fetchScanner).toHaveBeenCalledTimes(1);
     });
 });

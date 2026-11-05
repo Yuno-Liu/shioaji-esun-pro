@@ -7,6 +7,7 @@ import { StrictMode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import '../index.css';
 import { MobileApp } from './app';
+import { installGestureGuard } from './lib/gesture-guard';
 import { isMobileSecure, readSecureContextDiagnostics } from './lib/secure-context';
 import { startMobile } from './start';
 
@@ -18,6 +19,10 @@ const secure = isMobileSecure(diagnostics);
 // 主題 → 強制下單確認 → （secure 才）bootstrap()；不啟動觸價／括號／條件單／背景執行等前端引擎。
 // 注意：手機頁不得帶 ?popout=（會被視為鏡像視窗，交易狀態不會自行讀取）。
 startMobile(secure);
+
+// 禁止頁面雙指縮放（iOS 忽略 user-scalable=no）；圖表容器 data-allow-pinch="true" 內不擋。
+// 不論是否 secure 都安裝；重複執行（HMR）只會有一組監聽器。
+installGestureGuard();
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {
