@@ -24,6 +24,14 @@ startMobile(secure);
 // 不論是否 secure 都安裝；重複執行（HMR）只會有一組監聽器。
 installGestureGuard();
 
+// iOS Safari 要文件上有 touchstart 監聽，按鈕的 :active 按壓狀態才會生效（設計規格 §6.14）。
+// 被動監聽：不呼叫 preventDefault、不延遲捲動；HMR 重跑入口時只掛一次。
+const activeHost = document as Document & { __sjActiveTouch?: true };
+if (!activeHost.__sjActiveTouch) {
+    activeHost.__sjActiveTouch = true;
+    document.addEventListener('touchstart', () => undefined, { passive: true });
+}
+
 const rootElement = document.getElementById('root');
 if (!rootElement) {
     throw new Error('Root element #root not found');
