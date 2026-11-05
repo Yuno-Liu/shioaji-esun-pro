@@ -359,7 +359,7 @@ export function retryResume(): void {
  * 新單、改價、減量送出前的 ResumeGate 閘門；不通過就丟出 mutationNotStarted 錯誤（確定沒有送出）。
  * - ready：通過。
  * - stale-data：只有 opts.allowStale === true 且使用者已 acknowledgeStaleData() 才通過
- *   （新單在使用者勾選後傳 allowStale: true；改價／減量建議不傳，要求先重試同步）。
+ *   （新單、改價、減量、平倉都只在使用者勾選「我了解資料可能過期」後才傳 allowStale: true）。
  * - resyncing、failed：一律不通過。
  * 刪單與全部刪單是降低風險的動作，**不呼叫**這個閘門（規格 §7.3）。
  */
