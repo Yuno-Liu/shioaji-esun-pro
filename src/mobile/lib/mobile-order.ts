@@ -13,7 +13,7 @@ import { getCachedContract } from '../../lib/contracts-cache';
 import { isEsunAccount } from '../../lib/esun';
 import { CREDIT_TEXT, creditLabel, lotLabel, orderQtyUnit, stockOrderProblem } from '../../lib/odd-lot';
 import { ACCOUNT_CHANGED_MESSAGE, captureSelectedAccount, isSelectedAccountUnchanged } from '../../lib/order-account';
-import { futuresOrderProblem } from '../../lib/order-conditions';
+import { futuresOrderProblem, octypeLabel, PRICE_TYPE_LABEL } from '../../lib/order-conditions';
 import { accountConfirmLabel, requestOrderConfirm } from '../../lib/order-confirm';
 import { captureDisplayedRoute, esunStockLegProblem, routeConfirmNote } from '../../lib/order-route';
 import { checkOrderAllowed } from '../../lib/risk';
@@ -115,8 +115,12 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
     const cond = input.isFutures ? undefined : input.stockOrder.order_cond;
     const credit = !input.isFutures && cond && cond !== 'Cash' ? creditLabel(order.action, cond) : undefined;
     const daytradeShort = !input.isFutures && input.stockOrder.daytrade_short === true && order.action === 'Sell';
+    // 期權：價別＋效期以實際送出的 price_type／order_type 組字（不用 quickOrderNote：它對市價一律寫 IOC），
+    // 倉別一律列出（自動／新倉／平倉／當沖）；範圍市價另以 priceLabel 顯示，不顯示成「市價」
+    const futuresPriceType = input.isFutures ? input.futuresOrder.price_type : undefined;
     const note = [
-        order.order_type,
+        futuresPriceType ? `${PRICE_TYPE_LABEL[futuresPriceType]} ${order.order_type}` : order.order_type,
+        input.isFutures ? `倉別 ${octypeLabel(input.futuresOrder.octype)}` : undefined,
         !input.isFutures && orderLot !== 'Common' ? lotLabel(orderLot) : undefined,
         credit,
         daytradeShort ? '現股當沖' : undefined,
@@ -129,6 +133,7 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
         action: order.action,
         credit,
         price: limit ? order.price : null,
+        ...(futuresPriceType === 'MKP' ? { priceLabel: PRICE_TYPE_LABEL.MKP } : {}),
         quantity: order.quantity,
         unit: orderQtyUnit(input.isFutures, orderLot),
         note,

@@ -59,9 +59,13 @@ export function BottomSheet({ open, onClose, title, children, dismissible = true
         drag.current = { pointerId: e.pointerId, startY: e.clientY };
         e.currentTarget.setPointerCapture?.(e.pointerId);
     };
+    const cancelDrag = () => { drag.current = null; setOffset(0); };
+    // 拖曳開始後才變成不可關閉（例如拖曳中按了預覽、進入送出中）：移動與放開都依「當下」的 dismissible，
+    // 放開時不關閉（handler 每次 render 重建，讀到的是最新的 dismissible）
     const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
         const d = drag.current;
         if (!d || d.pointerId !== e.pointerId) return;
+        if (!dismissible) { cancelDrag(); return; }
         setOffset(Math.max(0, e.clientY - d.startY));
     };
     const endDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -70,9 +74,8 @@ export function BottomSheet({ open, onClose, title, children, dismissible = true
         drag.current = null;
         const dy = Math.max(0, e.clientY - d.startY);
         setOffset(0);
-        if (dy >= DISMISS_DRAG_PX) onCloseRef.current();
+        if (dismissible && dy >= DISMISS_DRAG_PX) onCloseRef.current();
     };
-    const cancelDrag = () => { drag.current = null; setOffset(0); };
 
     const onBackdropKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
         // Esc 由 document 監聽處理；這裡只阻止事件冒泡到頁面

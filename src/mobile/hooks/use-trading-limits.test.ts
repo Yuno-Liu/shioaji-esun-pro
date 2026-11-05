@@ -70,6 +70,15 @@ describe('loadTradingLimits', () => {
     });
 });
 
+describe('limitsAreCapsOnly', () => {
+    it('E.SUN accounts only report caps', async () => {
+        const { limitsAreCapsOnly } = await import('./use-trading-limits');
+        expect(limitsAreCapsOnly({ broker_id: 'ESUN' })).toBe(true);
+        expect(limitsAreCapsOnly({ broker_id: 'BRK' })).toBe(false);
+        expect(limitsAreCapsOnly(null)).toBe(false);
+    });
+});
+
 describe('availableLimitFor / limitsLookEmpty', () => {
     it('picks the limit that matches the credit condition', () => {
         expect(availableLimitFor(LIMITS)).toBe(300_000);

@@ -324,8 +324,34 @@ describe('submitMobileOrder — 送出', () => {
         expect(account).toBe(sinoFutures);
         expect(typeof opts.beforeDispatch).toBe('function');
         const [req] = m.confirm.mock.calls[0] as unknown as [Record<string, unknown>];
-        expect(req).toMatchObject({ action: 'Sell', unit: '口', price: 22850, note: 'ROD・送往 永豐 模擬環境' });
+        expect(req).toMatchObject({ action: 'Sell', unit: '口', price: 22850, note: '限價 ROD・倉別 自動・送往 永豐 模擬環境' });
+        expect(req).not.toHaveProperty('priceLabel');
         expect(m.placeStock).not.toHaveBeenCalled();
+    });
+
+    it('期權確認內容與實際送出一致：範圍市價（priceLabel）、實際效期（FOK 不寫成 IOC）、倉別', async () => {
+        const base = futuresInput(sinoFutures);
+        if (!base.isFutures) throw new Error('unreachable');
+        const mkp: MobileOrderInput = {
+            ...base, price: 0, orderType: 'FOK', priceType: 'MKP', octype: 'Cover',
+            futuresOrder: { ...base.futuresOrder, price: 0, price_type: 'MKP', order_type: 'FOK', octype: 'Cover' },
+        };
+        await submitMobileOrder(mkp, guards);
+        const [req] = m.confirm.mock.calls[0] as unknown as [Record<string, unknown>];
+        expect(req).toMatchObject({ price: null, priceLabel: '範圍市價', note: '範圍市價 FOK・倉別 平倉・送往 永豐 模擬環境' });
+        const [, order] = m.placeFutures.mock.calls[0] as unknown as [unknown, Record<string, unknown>];
+        expect(order).toMatchObject({ price_type: 'MKP', order_type: 'FOK', octype: 'Cover' });
+
+        vi.clearAllMocks();
+        m.confirm.mockImplementation(async () => true);
+        const mkt: MobileOrderInput = {
+            ...base, price: 0, orderType: 'IOC', priceType: 'MKT', octype: 'DayTrade',
+            futuresOrder: { ...base.futuresOrder, price: 0, price_type: 'MKT', order_type: 'IOC', octype: 'DayTrade' },
+        };
+        await submitMobileOrder(mkt, guards);
+        const [req2] = m.confirm.mock.calls[0] as unknown as [Record<string, unknown>];
+        expect(req2).toMatchObject({ price: null, note: '市價 IOC・倉別 當沖・送往 永豐 模擬環境' });
+        expect(req2).not.toHaveProperty('priceLabel');
     });
 
     it('傳給送單函式的 beforeDispatch 在 ResumeGate 非 ready 時丟出 mutationNotStarted', async () => {

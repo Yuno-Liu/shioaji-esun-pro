@@ -7,6 +7,7 @@
 // - 只讀取，不送任何委託；查詢經由 src/lib 的 fetchTradingLimits（玉山帳戶由 lib 自動轉往 bridge）。
 
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
+import { isEsunAccount } from '../../lib/esun/order-mapping';
 import { fetchTradingLimits, type TradingLimits } from '../../lib/shioaji';
 import type { Account } from '../../lib/types/portfolio';
 import type { TicketCond } from '../lib/mobile-store';
@@ -117,6 +118,15 @@ export function availableLimitFor(limits: TradingLimits | null | undefined, cond
     if (!limits) return null;
     const value = cond === 'MarginTrading' ? limits.margin_available : cond === 'ShortSelling' ? limits.short_available : limits.trading_available;
     return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * 玉山 get_trade_status 只提供額度「上限」；lib 在沒有可用／已用欄位時把可用填成上限、已用填 0
+ * （src/lib/esun/order-mapping.ts fromEsunTradeStatusToLimits）。玉山帳戶的畫面只能稱為「上限」，
+ * 不可顯示成「剩餘」或「可用」。
+ */
+export function limitsAreCapsOnly(account: Pick<Account, 'broker_id'> | null | undefined): boolean {
+    return isEsunAccount(account);
 }
 
 /** 上限與可用都是 0（模擬環境或非 08:30–15:00）：畫面應顯示「—」並說明，而不是「剩餘 0 元」 */

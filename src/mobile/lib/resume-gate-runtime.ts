@@ -62,6 +62,11 @@ export interface ResumeGateSnapshot {
      * 之後不同就標示「價格可能過期」，需重新點選快捷價或手動確認後才能預覽。
      */
     resumeSeq: number;
+    /**
+     * 最近一次開始重新同步（進入 resyncing）的時間（deps.now()，預設 Date.now()）；缺省＝本次執行尚未重新同步過。
+     * 下單面板以此與 openTicket 的時間比較：帶入價格之後才開始的同步，即使面板掛載時已 ready，價格也要重新確認。
+     */
+    resyncStartedAt?: number;
     /** 給狀態列／banner 的說明（failed、stale-data 時的原因）；ready 時為 null */
     message: string | null;
 }
@@ -351,7 +356,7 @@ function beginResync(rt: Runtime, baselineEpoch: number, opts: { carryActivity?:
     };
     rt.cycle = cycle;
     if (!carry) rt.activeEpoch = null;
-    publish({ state: 'resyncing', since: startedAt, checks: cycle.checks, staleAcknowledged: false, resumeSeq: snapshot.resumeSeq + 1, message: RESYNC_MESSAGE });
+    publish({ state: 'resyncing', since: startedAt, checks: cycle.checks, staleAcknowledged: false, resumeSeq: snapshot.resumeSeq + 1, resyncStartedAt: startedAt, message: RESYNC_MESSAGE });
     // 進行中的確認面板一律取消（確認時看到的價格與資料可能已過期）
     try { deps.resolveOrderConfirm(false); } catch { /* 取消失敗不影響閘門：送單仍會被 assertResumeReady 擋下 */ }
     if (rt.cycle !== cycle) return;

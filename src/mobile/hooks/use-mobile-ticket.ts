@@ -7,6 +7,8 @@
 // - 帶入價與即時價：真實成交（排除試撮 simtrade tick；試撮時沿用上一筆真實成交）→ 市場快照收盤 → 參考價，
 //   面板標示價格來源。開啟時只有參考價（或沒有價格）時，第一筆真實成交或快照到達時補帶一次
 //   （使用者已動過價格就不帶）；之後不再跟價。
+// - 盤中零股（#204）：即時價與「成交」快捷價只看零股行情（oddLotMarketPrice），沒有零股行情時停用「成交」；
+//   不以整股成交／快照補帶；切到盤中零股時自動帶入的價格清空（使用者輸入或確認過的保留）。
 // - 即時驗證依 §6.3 的 1～7 順序（ticketProblem），回傳第一個原因；有原因就停用「預覽並確認委託」。
 // - 送出一律呼叫 submitMobileOrder()（lib/mobile-order.ts）；結果依 §7.2 分四類處理，結果未知不提供重送。
 // - 單位：整股、盤中零股（IntradayOdd）、盤後零股（Odd）；信用：現股、融資、融券（借券類不提供，§12）；
@@ -22,7 +24,7 @@ import { useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
 import { isEsunAccount } from '../../lib/esun';
 import { accountMatches } from '../../lib/flash-account';
-import { creditLabel, isOddLot, ODD_LOT_MAX_SHARES, orderQtyUnit, SHARES_PER_LOT, stockOrderProblem } from '../../lib/odd-lot';
+import { creditLabel, isOddLot, ODD_LOT_MAX_SHARES, oddLotReferencePrice, orderQtyUnit, SHARES_PER_LOT, stockOrderProblem, type OddBaseQuote } from '../../lib/odd-lot';
 import { captureSelectedAccount } from '../../lib/order-account';
 import { defaultOrderTypeFor, futuresOrderProblem, orderTypeDisabledReason, PRICE_TYPE_LABEL, priceTypeDisabledReason } from '../../lib/order-conditions';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
@@ -74,6 +76,8 @@ export const ODD_QTY_PRESETS: readonly number[] = [10, 50, 100, 500];
 export const COMMON_LOT_INPUT_MAX = 499;
 
 export const OUTCOME_UNKNOWN_TITLE = '結果未知：請到委託頁按『更新』核對，勿重送';
+/** 面板已關閉時「未送出」改以通知告知的標題 */
+export const NOT_SENT_TITLE = '委託未送出';
 
 export const TICKET_TEXT = {
     unsupported: '這個商品無法下單',
@@ -138,13 +142,17 @@ export function realTradePrice(tick: { close?: string | number | null; simtrade?
     return positivePrice(tick.close);
 }
 
-/** 價格來源：ticket＝開啟時帶入（例如五檔）、trade＝真實成交、snapshot＝市場快照收盤、reference＝參考價 */
-export type PriceSource = 'ticket' | 'trade' | 'snapshot' | 'reference';
+/**
+ * 價格來源：ticket＝開啟時帶入（例如五檔）、trade＝真實成交、snapshot＝市場快照收盤、reference＝參考價、
+ * oddQuote＝盤中零股沒有成交時的零股委買／委賣（中價或單邊，oddLotReferencePrice）
+ */
+export type PriceSource = 'ticket' | 'trade' | 'snapshot' | 'reference' | 'oddQuote';
 
 export const PRICE_SOURCE_LABEL: Record<Exclude<PriceSource, 'ticket'>, string> = {
     trade: '成交',
     snapshot: '快照收盤',
     reference: '參考價',
+    oddQuote: '零股買賣價',
 };
 
 export interface SourcedPrice {
@@ -174,6 +182,36 @@ export function defaultTicketPrice(
     return reference !== null ? { price: reference, source: 'reference' } : null;
 }
 
+/**
+ * 盤中零股的即時價（#204，比照桌面 order-ticket.tsx）：只看零股行情——零股真實成交（排除試撮），
+ * 否則零股委買／委賣的中價或單邊（oddLotReferencePrice）；都沒有回 null（等待零股行情），**絕不退回整股價格或整股快照**。
+ */
+export function oddLotMarketPrice(
+    oddTrade: number | null,
+    oddQuote: Pick<OddBaseQuote, 'bidask'> | null | undefined,
+    round: (p: number) => number,
+): SourcedPrice | null {
+    if (oddTrade !== null && oddTrade > 0) return { price: oddTrade, source: 'trade' };
+    // 只把委買賣交給 oddLotReferencePrice：零股 tick（可能是試撮）已由 oddTrade 處理
+    const p = oddLotReferencePrice(oddQuote?.bidask ? { bidask: oddQuote.bidask } : undefined, round);
+    return p !== null ? { price: p, source: 'oddQuote' } : null;
+}
+
+/** 開啟時的預設價：帶入盤中零股時只用帶入價，不以整股成交／快照／參考價帶入零股限價（#204） */
+export function openingTicketPrice(
+    ticket: Pick<TicketRequest, 'price' | 'lot'>,
+    isFutures: boolean,
+    trade: number | null,
+    snapshot: Pick<Snapshot, 'close'> | null | undefined,
+    contract: Pick<ContractInfo, 'reference'>,
+): SourcedPrice | null {
+    if (!isFutures && ticket.lot === 'IntradayOdd') {
+        const given = positivePrice(ticket.price);
+        return given !== null ? { price: given, source: 'ticket' } : null;
+    }
+    return defaultTicketPrice(ticket.price, trade, snapshot, contract);
+}
+
 /** 價格確認哨兵：resumeSeq 一律 >= 0，所以記成這個值的價格一律視為「價格可能過期」 */
 export const PRICE_UNCONFIRMED = -1;
 
@@ -190,6 +228,23 @@ export function seededPriceSeq(gate: Pick<ResumeGateSnapshot, 'state' | 'resumeS
 /** 使用者確認價格時記下的 resumeSeq：同步中或失敗時的確認不算，恢復後須再確認 */
 export function confirmedPriceSeq(gate: Pick<ResumeGateSnapshot, 'state' | 'resumeSeq'>): number {
     return canConfirmPrice(gate) ? gate.resumeSeq : PRICE_UNCONFIRMED;
+}
+
+/**
+ * 面板掛載時的價格基準（M-PLAT-4）：openTicket 帶入的價格以「帶入當下」為準——
+ * 帶入之後（ticket.openedAt 起）ResumeGate 開始過重新同步（resyncStartedAt），即使掛載時已回到 ready，
+ * 也記為未確認（價格可能過期）。面板自己帶入的價格（成交、快照、參考價）以掛載當下的 gate 為準。
+ * 兩個時間都是 Date.now()（mobile-store 與 ResumeGate 預設時鐘）。
+ */
+export function openingPriceSeq(
+    gate: Pick<ResumeGateSnapshot, 'state' | 'resumeSeq' | 'resyncStartedAt'>,
+    openedAt: number | undefined,
+    carriedPrice: boolean,
+): number {
+    if (carriedPrice && openedAt !== undefined && gate.resyncStartedAt !== undefined && gate.resyncStartedAt >= openedAt) {
+        return PRICE_UNCONFIRMED;
+    }
+    return seededPriceSeq(gate);
 }
 
 export function isOnTick(contract: ContractInfo, price: number): boolean {
@@ -440,7 +495,7 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
     // 沒有真實成交時以市場快照收盤為準（store 已有快照就不再讀取；沒有時 fetchSnapshots 一次）
     const { snapshot } = useSnapshotBaseline(contract.code, undefined, contract);
     const commonTrade = useRealTradePrice(quote?.tick);
-    const [initialPrice] = useState(() => defaultTicketPrice(ticket.price, commonTrade, snapshot, contract));
+    const [initialPrice] = useState(() => openingTicketPrice(ticket, isFutures, commonTrade, snapshot, contract));
     const [fields, setFields] = useState<TicketFields>(() => initialTicketFields(ticket, contract, initialPrice?.price ?? null));
     /** 價格欄自動帶入的來源；使用者動過價格後為 null */
     const [priceSource, setPriceSource] = useState<PriceSource | null>(() => initialPrice?.source ?? null);
@@ -450,26 +505,30 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
     const oddTrade = useRealTradePrice(oddQuote?.tick);
     // 盤後零股沒有即時五檔（14:30 一次撮合）；成交價沿用整股
     const activeQuote = intradayOdd ? oddQuote : odd ? undefined : quote;
-    const live = marketPrice(intradayOdd ? oddTrade : commonTrade, snapshot);
+    // 盤中零股的即時價與「成交」快捷價只看零股行情（#204）；沒有零股行情時為 null（等待零股行情）
+    const live = intradayOdd
+        ? oddLotMarketPrice(oddTrade, oddQuote, p => roundToTick(contract, p))
+        : marketPrice(commonTrade, snapshot);
     const lastPrice = live?.price ?? null;
     const bid1 = positivePrice(activeQuote?.bidask?.bid_price?.[0]);
     const ask1 = positivePrice(activeQuote?.bidask?.ask_price?.[0]);
 
-    // 價格帶入當時的 resumeSeq；不同（或 PRICE_UNCONFIRMED）＝價格可能過期
-    const [priceSeq, setPriceSeq] = useState(() => seededPriceSeq(gate));
-    // 開啟時只有參考價或沒有價格：第一次收到真實成交或快照時補帶一次（使用者已動過價格就不帶）；之後不再跟價
+    // 價格帶入當時的 resumeSeq；不同（或 PRICE_UNCONFIRMED）＝價格可能過期。openTicket 帶入的價格以帶入當下為準
+    const [priceSeq, setPriceSeq] = useState(() => openingPriceSeq(gate, ticket.openedAt, initialPrice?.source === 'ticket'));
+    // 開啟時只有參考價或沒有價格：第一次收到真實成交或快照時補帶一次（使用者已動過價格就不帶）；之後不再跟價。
+    // 盤中零股不補帶（整股成交／快照不是零股價格，#204）
     const seeded = useRef(initialPrice !== null && initialPrice.source !== 'reference');
     const busyRef = useRef(false);
     const better = marketPrice(commonTrade, snapshot);
     const betterPrice = better?.price ?? null;
     const betterSource = better?.source ?? null;
     useEffect(() => {
-        if (seeded.current || busyRef.current || betterPrice === null || betterSource === null) return;
+        if (intradayOdd || seeded.current || busyRef.current || betterPrice === null || betterSource === null) return;
         seeded.current = true;
         setFields(f => ({ ...f, priceText: initialPriceText(contract, betterPrice) }));
         setPriceSource(betterSource);
         setPriceSeq(seededPriceSeq(getResumeGate()));
-    }, [betterPrice, betterSource, contract]);
+    }, [betterPrice, betterSource, contract, intradayOdd]);
 
     const priceStale = fields.priceType === 'LMT' && fields.priceText !== '' && priceSeq !== gate.resumeSeq;
 
@@ -518,12 +577,22 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         edit({ orderType });
     };
     const setOctype = (octype: FuturesOCType) => edit({ octype });
-    /** 單位切換（使用者操作）：數量歸 1；零股強制 限價＋ROD＋現股＋不當沖（比照桌面 order-ticket.tsx:1086-1096） */
+    /**
+     * 單位切換（使用者操作）：數量歸 1；零股強制 限價＋ROD＋現股＋不當沖（比照桌面 order-ticket.tsx:1086-1096）。
+     * 切到盤中零股時，價格若仍是自動帶入（使用者沒有手動輸入或確認）就清空（比照桌面 order-ticket.tsx:258-263，
+     * 絕不以整股價格帶入零股限價，#204）；之後切回整股／盤後零股時可再補帶一次整股價。使用者自己輸入的價格保留。
+     */
     const setOrderLot = (orderLot: TicketLot) => {
-        if (isFutures || orderLot === fields.orderLot) return;
-        edit(isOddLot(orderLot)
+        if (isFutures || busyRef.current || orderLot === fields.orderLot) return;
+        const clearAuto = orderLot === 'IntradayOdd' && priceSource !== null;
+        const patch: Partial<TicketFields> = isOddLot(orderLot)
             ? { orderLot, quantity: 1, priceType: 'LMT', orderType: 'ROD', orderCond: 'Cash', daytradeShort: false }
-            : { orderLot, quantity: 1 });
+            : { orderLot, quantity: 1 };
+        edit(clearAuto ? { ...patch, priceText: '' } : patch);
+        if (clearAuto) {
+            seeded.current = false;
+            setPriceSource(null);
+        }
     };
     /** 信用條件（只限整股）；選非現股時取消當沖勾選（比照桌面 order-ticket.tsx:1162-1164） */
     const setOrderCond = (orderCond: TicketCond) => {
@@ -604,7 +673,9 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
             if (outcome === 'cancelled') {
                 if (mounted.current) setFeedback({ kind: 'cancelled', text: '已取消' });
             } else if (outcome === 'not-sent') {
+                // 面板在送出中被卸載（例如被關閉）：改用通知告知，不可靜默丟棄「未送出」
                 if (mounted.current) setFeedback({ kind: 'not-sent', text: `未送出：${errorText(err)}` });
+                else notify({ kind: 'err', title: NOT_SENT_TITLE, body: errorText(err) });
             } else {
                 // 結果未知：禁止重送，關閉面板並提示到委託頁核對（R6、§7.2）
                 notify({ kind: 'err', title: OUTCOME_UNKNOWN_TITLE, body: errorText(err) });
@@ -620,6 +691,8 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
     return {
         isFutures,
         odd,
+        /** 盤中零股：即時價與「成交」只看零股行情 */
+        intradayOdd,
         account,
         route,
         gate,

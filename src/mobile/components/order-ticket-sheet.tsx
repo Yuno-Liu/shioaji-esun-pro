@@ -16,7 +16,7 @@
 import { useEffect, useState } from 'react';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
 import { isEsunAccount } from '../../lib/esun';
-import { orderQtyUnit } from '../../lib/odd-lot';
+import { ODD_LOT_WAITING, orderQtyUnit } from '../../lib/odd-lot';
 import { FUTURES_OCTYPES, ORDER_TYPES, orderTypeDisabledReason, PRICE_TYPE_LABEL, priceTypeDisabledReason, priceTypesFor } from '../../lib/order-conditions';
 import { usePrivacyMode } from '../../lib/privacy';
 import { manualStockCreditHint } from '../../lib/stock-exit-cond';
@@ -126,10 +126,16 @@ function TicketForm({ ticket, contract, onBusyChange, onToneChange }: TicketForm
     const last = t.quote.last;
     const lastDir = last === null || reference === null ? 'flat' : last > reference ? 'up' : last < reference ? 'down' : 'flat';
     const lastSign = lastDir === 'up' ? '▲' : lastDir === 'down' ? '▼' : '';
-    const quick: { label: string; price: number | null }[] = [
+    // 盤中零股：「成交」只用零股行情（#204）；沒有零股成交時用零股委買賣（標示「零股價」），都沒有就停用並顯示等待零股行情
+    const oddWaiting = t.intradayOdd && last === null;
+    const lastSource = t.quote.lastSource;
+    const liveLabel = lastSource === 'oddQuote'
+        ? PRICE_SOURCE_LABEL.oddQuote
+        : `${t.intradayOdd ? '零股' : ''}${lastSource === 'snapshot' ? PRICE_SOURCE_LABEL.snapshot : PRICE_SOURCE_LABEL.trade}`;
+    const quick: { label: string; price: number | null; note?: string }[] = [
         { label: '買一', price: t.quote.bid1 },
         { label: '賣一', price: t.quote.ask1 },
-        { label: '成交', price: last },
+        { label: lastSource === 'oddQuote' ? '零股價' : '成交', price: last, note: oddWaiting ? ODD_LOT_WAITING : undefined },
         { label: '漲停', price: positivePrice(contract.limit_up) },
         { label: '跌停', price: positivePrice(contract.limit_down) },
         { label: '平盤', price: reference },
@@ -269,8 +275,8 @@ function TicketForm({ ticket, contract, onBusyChange, onToneChange }: TicketForm
                     </div>
                 </div>
                 <span className={styles.livePrice[lastDir]} data-testid='ticket-live-price'>
-                    {t.quote.lastSource === 'snapshot' ? PRICE_SOURCE_LABEL.snapshot : PRICE_SOURCE_LABEL.trade}{' '}
-                    {last === null ? '—' : `${lastSign}${formatToTick(contract, last)}`}
+                    {liveLabel}{' '}
+                    {last === null ? (oddWaiting ? `— ${ODD_LOT_WAITING}` : '—') : `${lastSign}${formatToTick(contract, last)}`}
                 </span>
             </div>
             {!market && (t.priceSource === 'snapshot' || t.priceSource === 'reference') && (
@@ -294,7 +300,7 @@ function TicketForm({ ticket, contract, onBusyChange, onToneChange }: TicketForm
                         type='button'
                         className={styles.quickButton}
                         disabled={busy || q.price === null}
-                        aria-label={q.price === null ? `${q.label}（無資料）` : `${q.label} ${formatToTick(contract, q.price)}`}
+                        aria-label={q.price === null ? `${q.label}（${q.note ?? '無資料'}）` : `${q.label} ${formatToTick(contract, q.price)}`}
                         onClick={() => t.pickPrice(q.price)}
                     >
                         {q.label}

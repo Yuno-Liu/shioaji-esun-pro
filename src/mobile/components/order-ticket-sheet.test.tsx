@@ -102,7 +102,8 @@ vi.mock('./depth-ladder', () => ({
 }));
 
 import { OrderConfirmCancelled } from '../../lib/trade';
-import { OUTCOME_UNKNOWN_TITLE, TICKET_TEXT } from '../hooks/use-mobile-ticket';
+import { ODD_LOT_WAITING } from '../../lib/odd-lot';
+import { NOT_SENT_TITLE, OUTCOME_UNKNOWN_TITLE, TICKET_TEXT } from '../hooks/use-mobile-ticket';
 import { notStarted } from '../lib/errors';
 import { closeTicket, getMobileUi, openTicket, resetMobileUiForTest } from '../lib/mobile-store';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
@@ -265,13 +266,17 @@ describe('OrderTicketSheet — 欄位規則', () => {
         expect(btn('ROD').props['aria-pressed']).toBe(true);
         // 盤中零股看盤中零股五檔
         expect(h.ladder).toMatchObject({ variant: 'ticket', oddLot: true, code: '2330' });
+        // 開啟時自動帶入的整股價（100）切到盤中零股時清空（#204）；「成交」帶零股成交價
+        expect(priceInput().props.value).toBe('');
+        await click('成交');
+        expect(priceInput().props.value).toBe('100.5');
         await typeQty('300');
         await pressPreview();
         expect(m.submit).toHaveBeenCalledTimes(1);
         const input = m.submit.mock.calls[0]![0];
         expect(input.isFutures).toBe(false);
         expect(input.orderLot).toBe('IntradayOdd');
-        expect(input.stockOrder).toEqual({ action: 'Buy', price: 100, quantity: 300, price_type: 'LMT', order_type: 'ROD', order_lot: 'IntradayOdd' });
+        expect(input.stockOrder).toEqual({ action: 'Buy', price: 100.5, quantity: 300, price_type: 'LMT', order_type: 'ROD', order_lot: 'IntradayOdd' });
         expect('order_cond' in input.stockOrder).toBe(false);
         expect('daytrade_short' in input.stockOrder).toBe(false);
     });
@@ -856,6 +861,164 @@ describe('OrderTicketSheet — openTicket 帶入 lot／cond／daytradeShort', ()
         expect(preview().props.disabled).toBe(true);
         await act(async () => { one('ticket-daytrade').props.onClick(); });
         expect(problemText()).toBeNull();
+    });
+});
+
+describe('OrderTicketSheet — 盤中零股絕不以整股價格帶入（T1、#204）', () => {
+    it('沒有零股行情：清掉自動帶入的整股價、「成交」停用並顯示等待零股行情，不退回整股成交或快照', async () => {
+        h.oddQuote = undefined;
+        h.snapshot = { code: '2330', close: 98 };
+        await open({ code: '2330', action: 'Buy' });
+        expect(priceInput().props.value).toBe('100');
+        await click('零股');
+        expect(priceInput().props.value).toBe('');
+        expect(btn('成交').props.disabled).toBe(true);
+        expect(btn('成交').props['aria-label']).toBe(`成交（${ODD_LOT_WAITING}）`);
+        const live = text(one('ticket-live-price'));
+        expect(live).toContain(ODD_LOT_WAITING);
+        expect(live).not.toContain('100');
+        expect(live).not.toContain('98');
+        expect(btn('買一').props.disabled).toBe(true);
+        expect(problemText()).toContain(TICKET_TEXT.priceRequired);
+        // 價格步進的起點不用整股成交價（用平盤價）
+        await click('＋');
+        expect(priceInput().props.value).toBe('100');
+    });
+
+    it('零股沒有成交時用零股委買賣（標示零股買賣價），零股試撮不算成交', async () => {
+        h.oddQuote = { tick: { close: '105', simtrade: true }, bidask: { bid_price: ['100'], ask_price: ['101'] } };
+        await open({ code: '2330', action: 'Buy' });
+        await click('零股');
+        expect(text(one('ticket-live-price'))).toContain('零股買賣價');
+        expect(text(one('ticket-live-price'))).not.toContain('105');
+        await click('零股價');
+        expect(priceInput().props.value).toBe('100.5');
+    });
+
+    it('零股有成交：即時價標示零股成交', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        await click('零股');
+        expect(text(one('ticket-live-price'))).toContain('零股成交');
+        expect(text(one('ticket-live-price'))).toContain('100.5');
+    });
+
+    it('使用者自己輸入的價格切到零股時保留', async () => {
+        await open({ code: '2330', action: 'Buy' });
+        await typePrice('99.5');
+        await click('零股');
+        expect(priceInput().props.value).toBe('99.5');
+    });
+
+    it('盤中零股不以整股成交／快照補帶；切回整股才補帶整股價', async () => {
+        h.quote = undefined;
+        h.oddQuote = undefined;
+        h.contract = { ...stock, reference: 0 };
+        await open({ code: '2330', action: 'Buy' });
+        await click('零股');
+        h.snapshot = { code: '2330', close: 98 };
+        h.quote = { tick: { close: '101' } };
+        await rerender();
+        expect(priceInput().props.value).toBe('');
+        await click('整股');
+        expect(priceInput().props.value).toBe('101');
+    });
+
+    it('帶入盤中零股開啟：不以整股成交帶價', async () => {
+        h.oddQuote = undefined;
+        await open({ code: '2330', action: 'Buy', lot: 'IntradayOdd' });
+        expect(btn('零股').props['aria-pressed']).toBe(true);
+        expect(priceInput().props.value).toBe('');
+        h.quote = { tick: { close: '102' } };
+        await rerender();
+        expect(priceInput().props.value).toBe('');
+    });
+});
+
+describe('OrderTicketSheet — 額度顯示（T5 了結單、F4:F1 玉山只有上限）', () => {
+    it('融券買進（回補）與融資賣出不顯示信用剩餘額度，改說明不占額度；開倉方向照常', async () => {
+        h.limits = { data: stockLimits({ short_available: 0, margin_available: 123_000 }), error: null, loading: false, updatedAt: 1 };
+        await open({ code: '2330', action: 'Buy', cond: 'ShortSelling' });
+        let limit = text(one('ticket-limit'));
+        expect(limit).toContain('了結信用部位不占融資／融券額度');
+        expect(limit).not.toContain('剩餘');
+        expect(limit).not.toContain('0 元');
+        await click('賣出');
+        limit = text(one('ticket-limit'));
+        expect(limit).toContain('融券剩餘額度');
+        expect(limit).toContain('0 元');
+        await click('融資');
+        expect(text(one('ticket-limit'))).toContain('了結信用部位不占融資／融券額度');
+        await click('買進');
+        limit = text(one('ticket-limit'));
+        expect(limit).toContain('融資剩餘額度');
+        expect(limit).toContain('123,000 元');
+    });
+
+    it('玉山帳戶只顯示額度上限並註明不提供剩餘額度，不稱剩餘或可用；永豐照舊', async () => {
+        const esun = { ...h.stockAccount, broker_id: '8840-SIM' };
+        h.esunBrokers.add('8840-SIM');
+        h.captured.S = esun;
+        h.selected.S = esun;
+        // lib 對玉山把可用補成等於上限
+        h.limits = { data: stockLimits({ trading_available: 500_000 }), error: null, loading: false, updatedAt: 1 };
+        await open({ code: '2330', action: 'Buy' });
+        const limit = text(one('ticket-limit'));
+        expect(limit).toContain('交易額度上限');
+        expect(limit).toContain('500,000 元');
+        expect(limit).toContain('玉山不提供剩餘額度');
+        expect(limit).not.toContain('剩餘交易額度');
+        expect(limit).not.toContain('可用');
+    });
+});
+
+describe('OrderTicketSheet — 送出中面板被卸載（T6）', () => {
+    it('「未送出」結果改以通知告知，不靜默丟棄', async () => {
+        let reject!: (err: unknown) => void;
+        m.submit.mockImplementation(() => new Promise((_r, j) => { reject = j; }));
+        await open({ code: '2330', action: 'Buy' });
+        await act(async () => { void preview().props.onClick(); });
+        await act(async () => { closeTicket(); });
+        expect(byTestId('order-ticket-form')).toHaveLength(0);
+        await act(async () => { reject(notStarted('商品、交易單位或信用條件已變更，已停止後續下單')); });
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: NOT_SENT_TITLE, body: '商品、交易單位或信用條件已變更，已停止後續下單' });
+        expect(m.reconcile).not.toHaveBeenCalled();
+    });
+
+    it('取消（使用者自己取消）在卸載後不另外通知', async () => {
+        let reject!: (err: unknown) => void;
+        m.submit.mockImplementation(() => new Promise((_r, j) => { reject = j; }));
+        await open({ code: '2330', action: 'Buy' });
+        await act(async () => { void preview().props.onClick(); });
+        await act(async () => { closeTicket(); });
+        await act(async () => { reject(new OrderConfirmCancelled()); });
+        expect(m.notify).not.toHaveBeenCalled();
+    });
+});
+
+describe('OrderTicketSheet — 帶入價格的過期基準是 openTicket 當下（M-PLAT-4）', () => {
+    it('帶價開啟後、面板掛載前經過一次重新同步（掛載時已 ready）：價格標示可能過期', async () => {
+        h.contract = null;
+        await open({ code: '2330', action: 'Buy', price: 99.5, source: 'chart' });
+        expect(byTestId('order-ticket-form')).toHaveLength(0);
+        await act(async () => { setResumeGateForTest({ state: 'ready', resumeSeq: 1, resyncStartedAt: Date.now() }); });
+        h.contract = stock;
+        await rerender();
+        expect(priceInput().props.value).toBe('99.5');
+        expect(byTestId('ticket-price-stale')).toHaveLength(1);
+        expect(problemText()).toContain(TICKET_TEXT.priceStale);
+        expect(preview().props.disabled).toBe(true);
+        await click('使用此價格');
+        expect(preview().props.disabled).toBe(false);
+    });
+
+    it('重新同步發生在帶價之前：不標示過期', async () => {
+        await act(async () => { setResumeGateForTest({ state: 'ready', resumeSeq: 1, resyncStartedAt: Date.now() - 60_000 }); });
+        h.contract = null;
+        await open({ code: '2330', action: 'Buy', price: 99.5, source: 'chart' });
+        h.contract = stock;
+        await rerender();
+        expect(byTestId('ticket-price-stale')).toHaveLength(0);
+        expect(preview().props.disabled).toBe(false);
     });
 });
 

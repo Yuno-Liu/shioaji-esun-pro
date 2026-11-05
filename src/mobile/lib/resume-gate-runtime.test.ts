@@ -186,6 +186,23 @@ describe('觸發（§14.1）', () => {
         expect(notStartedOrPass(() => assertResumeReady({ allowStale: true }))).toBe('not-started');
     });
 
+    it('記下最近一次開始重新同步的時間（resyncStartedAt），回到 ready 後保留；下一次同步更新（M-PLAT-4）', async () => {
+        const h = harness();
+        stop = h.start();
+        expect(getResumeGate().resyncStartedAt).toBeUndefined();
+        h.away(HIDDEN_THRESHOLD_MS);
+        const first = h.now();
+        expect(getResumeGate()).toMatchObject({ state: 'resyncing', resyncStartedAt: first });
+        h.settle();
+        h.emit(h.tick);
+        await flush();
+        expect(getResumeGate().state).toBe('ready');
+        expect(getResumeGate().resyncStartedAt).toBe(first);
+        h.away(HIDDEN_THRESHOLD_MS);
+        expect(getResumeGate().resyncStartedAt).toBe(h.now());
+        expect(getResumeGate().resyncStartedAt).toBeGreaterThan(first);
+    });
+
     it('pagehide 也算進入背景', () => {
         const h = harness();
         stop = h.start();

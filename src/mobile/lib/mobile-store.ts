@@ -27,6 +27,11 @@ export interface TicketRequest {
     /** 每次開啟遞增；面板以此判斷「這是一次新的開啟」並重新初始化欄位 */
     seq: number;
     /**
+     * openTicket 的時間（Date.now()）。面板與 ResumeGate 的 resyncStartedAt 比較：帶入之後開始過重新同步，
+     * 帶入的價格一律標示「價格可能過期」（面板可能延後掛載，不能以掛載當下為準）。缺省＝不比較。
+     */
+    openedAt?: number;
+    /**
      * 只在開啟時帶入一次的股票預設（持倉「加碼」用）；缺省＝面板自己的預設（整股、現股、不當沖）。
      * 面板仍須依規則驗證（例如融券／當沖先賣只限整股、當沖先賣只限賣出＋現股＋可當沖），不合規則時不得送出。
      */
@@ -124,6 +129,7 @@ export function openTicket(req: {
         price: req.price ?? null,
         source: req.source ?? 'other',
         seq: ++seq,
+        openedAt: Date.now(),
     };
     if (req.lot) ticket.lot = req.lot;
     if (req.cond) ticket.cond = req.cond;

@@ -38,6 +38,9 @@ import {
     confirmedPriceSeq,
     daytradeShortEligible,
     defaultTicketPrice,
+    oddLotMarketPrice,
+    openingPriceSeq,
+    openingTicketPrice,
     estimateAmount,
     initialTicketFields,
     isOnTick,
@@ -227,6 +230,22 @@ describe('價格來源（B1、B2）', () => {
         expect(defaultTicketPrice(null, null, undefined, stock)).toEqual({ price: 100, source: 'reference' });
         expect(defaultTicketPrice(null, null, undefined, { reference: 0 } as ContractInfo)).toBeNull();
     });
+
+    it('盤中零股只看零股行情：零股成交 → 零股委買賣中價／單邊 → null，絕不退回整股（T1、#204）', () => {
+        const round = (p: number) => Math.round(p * 2) / 2;
+        expect(oddLotMarketPrice(100.5, { bidask: { bid_price: ['99'], ask_price: ['101'] } }, round)).toEqual({ price: 100.5, source: 'trade' });
+        expect(oddLotMarketPrice(null, { bidask: { bid_price: ['100'], ask_price: ['101'] } }, round)).toEqual({ price: 100.5, source: 'oddQuote' });
+        expect(oddLotMarketPrice(null, { bidask: { bid_price: [], ask_price: ['101'] } }, round)).toEqual({ price: 101, source: 'oddQuote' });
+        expect(oddLotMarketPrice(null, undefined, round)).toBeNull();
+        expect(oddLotMarketPrice(null, { bidask: { bid_price: [], ask_price: [] } }, round)).toBeNull();
+    });
+
+    it('帶入盤中零股開啟時不以整股成交／快照／參考價帶價，只用帶入價（T1）', () => {
+        expect(openingTicketPrice({ price: null, lot: 'IntradayOdd' }, false, 101, { close: 98 }, stock)).toBeNull();
+        expect(openingTicketPrice({ price: 100.5, lot: 'IntradayOdd' }, false, 101, { close: 98 }, stock)).toEqual({ price: 100.5, source: 'ticket' });
+        expect(openingTicketPrice({ price: null, lot: 'Odd' }, false, 101, { close: 98 }, stock)).toEqual({ price: 101, source: 'trade' });
+        expect(openingTicketPrice({ price: null }, false, null, { close: 98 }, stock)).toEqual({ price: 98, source: 'snapshot' });
+    });
 });
 
 describe('價格確認與 ResumeGate（A-2）', () => {
@@ -236,6 +255,18 @@ describe('價格確認與 ResumeGate（A-2）', () => {
         expect(seededPriceSeq({ state: 'stale-data', resumeSeq: 3 })).toBe(PRICE_UNCONFIRMED);
         expect(seededPriceSeq({ state: 'failed', resumeSeq: 3 })).toBe(PRICE_UNCONFIRMED);
         expect(PRICE_UNCONFIRMED).toBeLessThan(0);
+    });
+
+    it('openTicket 帶入的價格以帶入當下為準：帶入後才開始的重新同步，掛載時已 ready 也是未確認（M-PLAT-4）', () => {
+        // 帶入後（openedAt 1000）在 1500 開始同步、掛載時已回 ready → 未確認
+        expect(openingPriceSeq({ state: 'ready', resumeSeq: 1, resyncStartedAt: 1500 }, 1000, true)).toBe(PRICE_UNCONFIRMED);
+        expect(openingPriceSeq({ state: 'ready', resumeSeq: 1, resyncStartedAt: 1000 }, 1000, true)).toBe(PRICE_UNCONFIRMED);
+        // 帶入前就開始的同步、從未同步過、或面板自己帶入的價格 → 以掛載當下的 gate 為準
+        expect(openingPriceSeq({ state: 'ready', resumeSeq: 1, resyncStartedAt: 900 }, 1000, true)).toBe(1);
+        expect(openingPriceSeq({ state: 'ready', resumeSeq: 0 }, 1000, true)).toBe(0);
+        expect(openingPriceSeq({ state: 'ready', resumeSeq: 1, resyncStartedAt: 1500 }, 1000, false)).toBe(1);
+        expect(openingPriceSeq({ state: 'ready', resumeSeq: 1, resyncStartedAt: 1500 }, undefined, true)).toBe(1);
+        expect(openingPriceSeq({ state: 'resyncing', resumeSeq: 1, resyncStartedAt: 900 }, 1000, true)).toBe(PRICE_UNCONFIRMED);
     });
 
     it('user confirmation counts only when the stream has recovered (ready / stale-data)', () => {
