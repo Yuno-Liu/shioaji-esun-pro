@@ -1086,8 +1086,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 <div className={cs.fsBar} data-testid='chart-fs-bar'>
                     <span className={cs.fsTitle}>{contract.name || code}</span>
                     <div className={cs.fsPeriods}>
+                        {/* 全螢幕上列空間窄（直向手動全螢幕只剩約一半寬）：用可橫向捲動的膠囊，不用等寬 thumb（會擠成文字重疊） */}
                         {onPeriodChange
-                            ? <Segmented items={PERIOD_ITEMS} value={period} onChange={onPeriodChange} semantics='toggle' ariaLabel='圖表週期' size='compact' />
+                            ? <Segmented items={PERIOD_ITEMS} value={period} onChange={onPeriodChange} semantics='toggle' ariaLabel='圖表週期' size='compact' variant='scroll' />
                             : <span className={cs.fsTitle}>{periodLabel}</span>}
                     </div>
                     <Chip label='指標' className={cs.toolButton} onClick={() => setSheetOpen(true)} testId='chart-indicators' />

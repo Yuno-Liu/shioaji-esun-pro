@@ -116,6 +116,7 @@ import {
 } from '../lib/mobile-indicators';
 import * as cs from '../styles/chart.css';
 import * as tradeStyles from '../styles/trade.css';
+import * as segmentedStyles from '../ui/segmented.css';
 import { GAP_RELOAD_MIN_MS, INDICATOR_FLUSH_MS, LONG_PRESS_MS, TradeChart } from './trade-chart';
 
 const contract = {
@@ -714,6 +715,8 @@ describe('TradeChart B3b', () => {
         expect(group[0]!.props['aria-label']).toBe('圖表週期');
         const pressed = group[0]!.findAll(n => n.type === 'button' && n.props['aria-pressed'] === true);
         expect(pressed.map(b => textOf(b))).toEqual(['5分']);
+        // 全螢幕上列窄（直向手動全螢幕）：用可橫向捲動的膠囊（scroller），不用等寬 thumb 軌道（會擠成文字重疊）
+        expect(String(group[0]!.props.className)).toContain(segmentedStyles.scroller);
     });
 
     it('S1：選價列買賣、取消、全螢幕買賣、工具鍵、委託線標籤只呼叫 openTicket／openOrderAction，lib 送出函式 0 次', async () => {
