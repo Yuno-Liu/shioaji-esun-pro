@@ -55,6 +55,9 @@ jobs:
       - name: Build web (nginx) image
         run: docker build --target runner -t shioaji-pro-web:ci .
 
+      - name: Web image contains the mobile entry (mobile.html)
+        run: docker run --rm --entrypoint test shioaji-pro-web:ci -f /usr/share/nginx/html/mobile.html
+
       - name: nginx -t with rendered template
         run: |
           docker run --rm \

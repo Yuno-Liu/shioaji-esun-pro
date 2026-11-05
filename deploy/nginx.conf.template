@@ -68,6 +68,14 @@ server {
         try_files /approval.html =404;
     }
 
+    # 手機版短網址（選配）：/m → /mobile.html；mobile.html 本身由下方 location / 以 no-cache 提供。
+    # absolute_redirect off：Location 只送相對路徑，前面接 TLS 前端時不會被改寫成 http:// 或帶上 :8080。
+    # 此 location 不自訂 add_header，安全標頭沿用 server 層級設定。
+    location = /m {
+        absolute_redirect off;
+        return 302 /mobile.html;
+    }
+
     # 只有 Vite 產出的帶雜湊資產（vite.config.ts 設 assetsDir: ''，檔名形如 main-D_2YXx_3.js）
     # 才可長期快取；public/ 內無雜湊的檔案走下方 location / 的 no-cache。
     # /api/、/esun/ 使用 ^~，不會被這個 regex 搶先比對。

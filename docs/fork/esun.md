@@ -189,6 +189,10 @@ nginx 透過 `host.docker.internal` 代理到宿主機。若容器連不到宿�
    ```
 4. `docker compose up -d`。Basic Auth 走明文 HTTP，跨出可信任網段時請在前面加 TLS 反向代理。
 
+> **手機下單必須經 HTTPS（secure context）。** 區網 HTTP 只能開啟頁面、**無法下單**：非 secure context 沒有 Web Locks，
+> 行情與回報串流不會連線，下單閘門會一直擋單。手機請依 [mobile.md](mobile.md) 在 nginx 前面加 TLS 前端
+> （Tailscale 或 Caddy），原因與實測見 [手機版規格 §3](mobile-trading-spec.md#3--phase-0https-存取層硬性前置)。
+
 容器 healthcheck 使用免驗證的 `/healthz`，啟用 Basic Auth 不影響健康狀態。
 
 ## 非 root 與檔案權限
