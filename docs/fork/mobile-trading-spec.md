@@ -32,7 +32,7 @@
 | # | 規則 | 依據 |
 |---|---|---|
 | R1 | 手機只能經 **HTTPS（secure context）** 使用。非 secure context 時只顯示「需要 HTTPS」說明頁，不建立任何連線、不顯示交易畫面。 | 沒有 Web Locks 時串流會 fail-closed，`assertTradingLive()` 永遠擋單（§3.1 實測） |
-| R2 | **只新增檔案**：`mobile.html`、`vite.fork.config.ts`、`src/mobile/**`；部署相關只動 fork 擁有的檔案。上游檔案（`vite.config.ts`、`index.html`、`src/App.tsx`、`src/main.tsx`、`src/lib/**`…）零修改。 | `docs/fork/upstream-sync.md`（`vite.config.ts` 標記「不再加入 fork 邏輯」） |
+| R2 | **上游檔案零修改，既有檔案只改白名單**。<br>• 可新增：`mobile.html`、`vite.fork.config.ts`、`src/mobile/**`，以及 `deploy/**`、`docs/fork/**` 下的部署範例與文件。<br>• 可修改的既有檔案只限 §4.3 表列的 fork 擁有檔案：`Dockerfile`、`deploy/nginx.conf.template`、`.github/workflows/fork-ci.yml`、`docs/fork/**`。<br>• 其餘一律不改：上游檔案（`vite.config.ts`、`index.html`、`src/App.tsx`、`src/main.tsx`…）與整個 `src/lib/**`（含 fork 擁有的 `src/lib/esun/**`，見 R3、R10）。 | `docs/fork/upstream-sync.md:52`（`vite.config.ts` 標記「不再加入 fork 邏輯」）、`:57-58`（fork 自有檔案清單） |
 | R3 | **不重寫交易邏輯**。新單、改價、減量、刪單、全部刪單、平倉一律呼叫 §7、§8 列出的 `src/lib` 既有函式。 | 這些函式內含帳戶、伺服器模式、券商路由、零股與信用規則等多層閘門 |
 | R4 | **每一筆手動委託都必須經過確認面板**（`requestOrderConfirm()`），手機版不允許關閉。 | 行動裝置誤觸率高；確認面板開啟時會重新讀 `/info` 確認模擬／正式（`src/lib/order-confirm.ts:181-230`） |
 | R5 | 新單、改價、減量受三道閘門控制：`useTradingLive()`、**ResumeGate**（§7.4）、風控 `checkOrderAllowed()`。 | 手機切到背景後串流可能已斷，但看門狗的恢復寬限期內狀態仍是 `live`（`src/lib/stream.ts:612-634`） |
@@ -290,7 +290,7 @@ src/mobile/
 | `deploy/nginx.conf.template` | 選配：`location = /m { return 302 /mobile.html; }`（`/mobile.html` 已由 `location /` 以 no-cache 提供，不加也可用） |
 | `.github/workflows/fork-ci.yml` | 「Build web (nginx) image」之後新增一步：`docker run --rm --entrypoint test shioaji-pro-web:ci -f /usr/share/nginx/html/mobile.html`（確認映像內有手機入口） |
 | `docs/fork/upstream-sync.md` | fork 自有檔案清單加入 `mobile.html`、`vite.fork.config.ts`、`src/mobile/**` |
-| `docs/fork/esun.md` | 「區網存取」加註：手機下單需 HTTPS，連到本文件 §3 |
+| `docs/fork/esun.md` | 已完成（與本文件一起提交）：「區網存取」加註手機下單需 HTTPS，並連到本文件 §3。實作時不需再改 |
 
 ```ts
 // vite.fork.config.ts — fork 擁有：不修改上游 vite.config.ts，加入手機入口
@@ -1159,8 +1159,8 @@ K 線端點只回 1 分 K，資料量與天數成正比（股票每日約 270 �
 | T6 | 委託頁與操作面板 | `orders-page.test.tsx` | code-worker |
 | T7 | 持倉頁（平倉）＋`use-risk-pnl-feed.ts` | `positions-page.test.tsx`、`use-risk-pnl-feed.test.tsx` | code-worker |
 | T8 | 自選＋搜尋、帳戶頁 | 手動驗收 | code-worker |
-| T9 | 文件更新（`upstream-sync.md`、`esun.md`） | 審查 | fast-reader 查核連結 |
-| T10 | 整合審查：閘門順序、錯誤分類、無上游檔案修改 | `git diff --stat` 只含允許檔案 | deep-reviewer |
+| T9 | 文件更新：`upstream-sync.md` 的 fork 自有檔案清單（`esun.md` 已完成，只需查核連結） | 審查 | fast-reader 查核連結 |
+| T10 | 整合審查：閘門順序、錯誤分類、無上游檔案修改 | `git diff --stat` 只含 R2 允許的檔案 | deep-reviewer |
 
 依賴：T0 → T1 → (T2, T4, T5, T8 可平行) → T3（需 T2） → T6、T7 → T10。
 
@@ -1171,7 +1171,7 @@ K 線端點只回 1 分 K，資料量與天數成正比（股票每日約 270 �
 
 ### 15.3 停止並回報（升級條件）
 
-- 需要修改 `src/lib/**`、`src/App.tsx`、`vite.config.ts` 或任何上游檔案。
+- 需要修改 R2 白名單以外的既有檔案（例如 `src/lib/**`、`src/App.tsx`、`vite.config.ts` 或任何上游檔案）。
 - 同一測試連續兩次修正仍失敗。
 - 發現本文件與程式碼行為不一致（例如函式簽章不同）。
 - 任何可能讓委託在未確認、非 LIVE、帳戶不符時送出的路徑。
