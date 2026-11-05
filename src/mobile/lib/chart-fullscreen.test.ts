@@ -25,4 +25,13 @@ describe('chart-fullscreen', () => {
         expect(shouldAutoFullscreen({ screen: { width: 390, height: 844, orientation: { type: 'portrait-primary' } } })).toBe(false);
         expect(shouldAutoFullscreen(undefined)).toBe(false);
     });
+
+    it('裝置方向說橫向但視窗是直的：不自動全螢幕（方向資訊與版面不一致時不蓋掉直向畫面）', () => {
+        const portraitViewport = { innerWidth: 390, innerHeight: 844 };
+        expect(shouldAutoFullscreen({ screen: { width: 390, height: 844, orientation: { type: 'landscape-primary' } }, ...portraitViewport })).toBe(false);
+        // 真正橫向：裝置方向與視窗比例一致 → 全螢幕
+        expect(shouldAutoFullscreen({ screen: { width: 844, height: 390, orientation: { type: 'landscape-primary' } }, innerWidth: 844, innerHeight: 390 })).toBe(true);
+        // Android 直向叫出鍵盤：視窗變扁但裝置方向仍是直向 → 不全螢幕
+        expect(shouldAutoFullscreen({ screen: { width: 390, height: 844, orientation: { type: 'portrait-primary' } }, innerWidth: 390, innerHeight: 300 })).toBe(false);
+    });
 });

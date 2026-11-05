@@ -38,10 +38,22 @@ export function isPhoneSized(env: OrientationEnv): boolean {
     return short > 0 && short < PHONE_SHORT_SIDE_MAX;
 }
 
-/** 手機轉橫向時自動全螢幕 */
+/**
+ * 視窗本身也要是橫的。裝置方向資訊與實際版面不一致時（例如瀏覽器只模擬視窗尺寸、或方向事件晚到），
+ * 不因單一訊號就把直向畫面整個蓋掉。Android 叫出鍵盤時裝置方向仍是直向，這個情境由 isLandscape 擋下，不受影響。
+ * 不知道視窗尺寸時不擋。
+ */
+export function viewportLooksLandscape(env: OrientationEnv): boolean {
+    const w = env.innerWidth;
+    const h = env.innerHeight;
+    if (!w || !h) return true;
+    return w > h;
+}
+
+/** 手機轉橫向時自動全螢幕（裝置方向與視窗比例都要是橫向） */
 export function shouldAutoFullscreen(env: OrientationEnv | undefined): boolean {
     if (!env) return false;
-    return isPhoneSized(env) && isLandscape(env);
+    return isPhoneSized(env) && isLandscape(env) && viewportLooksLandscape(env);
 }
 
 export function currentOrientationEnv(): OrientationEnv | undefined {
