@@ -82,6 +82,13 @@ WEB_SERVER_NAMES=trade.lan
 
 撤銷存取：在 tailnet 管理介面移除或停用遺失的手機。
 
+> ⚠️ **只給自己用**：nginx 會替通過 Host／Origin 檢查的請求代填玉山 token，方案 A 沒有另外的使用者驗證，
+> 能連到這台主機 443 的 tailnet 裝置都能下單、刪單（安全稽核 F1，2026-11-06）。
+>
+> - **不要**執行 `tailscale funnel`：funnel 會把頁面公開到網際網路。
+> - 不要把這台主機分享給其他 tailnet 或其他使用者。
+> - 在 Tailscale 管理介面的存取控制（ACL／grants）只允許自己的帳號或裝置連到這台主機的 443。
+
 ## 方案 B：Caddy（`tls internal`）
 
 同機執行 Caddy，以 Caddy 內建 CA 簽發憑證；Caddy 預設保留 `Host`，SSE 可即時 flush。
@@ -103,6 +110,38 @@ WEB_SERVER_NAMES=trade.lan
 在 `deploy/nginx.conf.template` 增加 TLS listener（`listen <port> ssl;`、`ssl_certificate`、`ssl_certificate_key`），
 並以 `docker-compose.override.yml` 唯讀掛載憑證。少一個元件，但需要修改 fork 的部署檔，憑證信任問題同方案 B。
 修改時須保留既有的 Host 白名單、Origin／`Sec-Fetch-Site` 檢查與安全標頭，並以 `nginx -t` 驗證。
+
+## nginx 安全設定（2026-11-06 安全稽核後補強）
+
+`deploy/nginx.conf.template` 與 `deploy/nginx-security-headers.conf`，靜態檢查在 `deploy/test_nginx_template.py`：
+
+- **安全標頭**：所有回應都有 `X-Frame-Options`、`frame-ancestors 'none'`、`nosniff`、`Referrer-Policy`，另加
+  `Permissions-Policy`（停用相機、麥克風、定位、付款、USB；**不**限制螢幕常亮 `screen-wake-lock`）。
+  `/mobile.html` 另加 `Cross-Origin-Opener-Policy: same-origin`。有自己 `add_header` 的 location 都重新 include 安全標頭
+  （nginx 的 `add_header` 不繼承外層）。
+- **HSTS 只送給 `*.ts.net`**（`max-age=31536000`，不含 `includeSubDomains`、`preload`）。
+  ⚠️ 瀏覽器收過一次後，一年內都會把 `http://<機器>.<tailnet>.ts.net:8080` 這類網址強制改成 HTTPS，請一律用 `https://` 開啟。
+  localhost、區網主機名不送 HSTS。
+- **`/api/` 回應一律 `Cache-Control: no-store`**：帳務、持倉 JSON 不留在瀏覽器 HTTP 快取。
+- **不把帳密與 cookie 轉給上游**：`/api/`、`/esun/` 轉送前清掉 `Authorization`（Basic Auth 帳密）與 `Cookie`。
+  玉山 token 照常由 nginx 注入。
+- **方法白名單與大小上限**：
+  - `/api/` 只接受 GET、POST、PUT、DELETE，其他方法回 403；body 上限 256 KiB。
+  - `/api/` 的 POST、PUT 以及帶 body 的 DELETE 必須是 `application/json`，表單、`text/plain` 都回 415，不轉給 sidecar。
+  - `/esun/` 只接受 GET、POST（其他回 403），body 上限 64 KiB（與 bridge 相同），超過回 413。
+  - 前端（`src/lib/api.ts`、`src/lib/esun/http-driver.ts`）只用這些方法與 JSON，桌面網頁版與手機版都不受影響。
+- **長快取**：帶雜湊的資產（含 rolldown 為避開同名而產生的 9 碼雜湊，例如 `vendor-CjBHE94L2.js`）一年 immutable；
+  `public/` 內無雜湊的檔案（`apple-touch-icon.png` 等）每次重新驗證。建置後可用實際輸出檢查：
+  `SHIOAJI_WEB_DIST=<dist 目錄> python -I -m unittest discover -s deploy -p test_nginx_template.py`。
+
+部署後在主機上驗證（只讀取，不會下單）：
+
+```powershell
+# 預期有 Cross-Origin-Opener-Policy、Permissions-Policy；ts.net 主機另有 Strict-Transport-Security
+curl.exe -sI https://<機器>.<tailnet>.ts.net/mobile.html
+# 預期 200 且有 Cache-Control: no-store（以 GET 讀取標頭，不下載內容）
+curl.exe -s -D - -o NUL -H "Origin: https://<機器>.<tailnet>.ts.net" https://<機器>.<tailnet>.ts.net/api/v1/info
+```
 
 ## 驗收清單（Phase 0）
 

@@ -36,7 +36,7 @@
 | R2 | **上游檔案零修改，既有檔案只改白名單**。<br>• 可新增：`mobile.html`、`vite.fork.config.ts`、`src/mobile/**`，以及 `deploy/**`、`docs/fork/**` 下的部署範例與文件。<br>• 可修改的既有檔案只限 §4.3 表列的 fork 擁有檔案：`Dockerfile`、`deploy/nginx.conf.template`、`.github/workflows/fork-ci.yml`、`docs/fork/**`。<br>• 其餘一律不改：上游檔案（`vite.config.ts`、`index.html`、`src/App.tsx`、`src/main.tsx`…）與整個 `src/lib/**`（含 fork 擁有的 `src/lib/esun/**`，見 R3、R10）。 | `docs/fork/upstream-sync.md:52`（`vite.config.ts` 標記「不再加入 fork 邏輯」）、`:57-58`（fork 自有檔案清單） |
 | R3 | **不重寫交易邏輯**。新單、改價、減量、刪單、全部刪單、平倉一律呼叫 §7、§8 列出的 `src/lib` 既有函式。 | 這些函式內含帳戶、伺服器模式、券商路由、零股與信用規則等多層閘門 |
 | R4 | **每一筆手動委託都必須經過確認面板**（`requestOrderConfirm()`），手機版不允許關閉。 | 行動裝置誤觸率高；確認面板開啟時會重新讀 `/info` 確認模擬／正式（`src/lib/order-confirm.ts:181-230`） |
-| R5 | 新單、改價、減量受三道閘門控制：`useTradingLive()`、**ResumeGate**（§7.4）、風控 `checkOrderAllowed()`。 | 手機切到背景後串流可能已斷，但看門狗的恢復寬限期內狀態仍是 `live`（`src/lib/stream.ts:612-634`） |
+| R5 | 新單受三道閘門控制：`useTradingLive()`、**ResumeGate**（§7.4）、風控 `checkOrderAllowed()`。改價、減量受 `useTradingLive()` 與 ResumeGate 控制，風控鎖不擋（與桌面一致，§7.3）；刪單與全部刪單不受這些閘門限制（降低風險的動作）。 | 手機切到背景後串流可能已斷，但看門狗的恢復寬限期內狀態仍是 `live`（`src/lib/stream.ts:612-634`） |
 | R6 | 錯誤一律分兩類呈現：**確定未成立**（`mutationNotStarted`）與**結果未知**（其餘，含 `mutationOutcomeUnknown`）。結果未知**禁止自動重送**，也不提供「再送一次」按鈕。 | `src/lib/api.ts:180-295`、`src/lib/esun/http-driver.ts:230-265`、`src/components/esun-order-meta.tsx:91-97` |
 | R7 | 不提供：一鍵（閃電）下單、圖上拖曳改價、觸價／括號／條件單、背景執行、期權組合單、玉山環境切換、強制重新登入。 | §12 |
 | R8 | 玉山帳戶只能下**台股現貨**；期貨、選擇權只走永豐帳戶。 | `src/lib/shioaji.ts:878`、`src/lib/esun/order-mapping.ts:163-241` |
@@ -800,11 +800,13 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
     // 7) 確認後重驗（確認可能停留很久）
     if (!sameServerMode()) throw notStarted(SERVER_MODE_CHANGED_MESSAGE);
     if (!isSelectedAccountUnchanged(orderAccount)) throw notStarted(ACCOUNT_CHANGED_MESSAGE);
+    assertRiskAllowed(); // 風控再檢查（確認期間可能鎖單或虧損越過上限；安全稽核 F5）
     // 8) beforeDispatch：HTTP 送出前最後一刻同步重驗，丟出就不送
     const dispatch = {
         beforeDispatch: () => {
             guards.assertResumeReady();
             assertTradingLive();
+            assertRiskAllowed(); // checkOrderAllowed 被擋時丟 notStarted（確定未送出）
             if (!guards.isContextCurrent()) throw notStarted(ORDER_CONTEXT_CHANGED_MESSAGE);
             if (!sameServerMode()) throw notStarted(SERVER_MODE_CHANGED_MESSAGE);
             if (!isSelectedAccountUnchanged(orderAccount)) throw notStarted(ACCOUNT_CHANGED_MESSAGE);
@@ -1090,9 +1092,11 @@ K 線端點只回 1 分 K，資料量與天數成正比（股票每日約 270 �
 1. **信任邊界不變**：能連到 nginx 的人就能操作交易端點（`docs/fork/esun.md:162`）。手機存取讓這個邊界延伸到手機，因此：
    - 只在私有網路或 tailnet 使用；不轉埠、不公開。
    - 方案 A 以 tailnet 裝置管理作為「遺失手機時撤銷存取」的手段；方案 B／C 建議同時啟用 Basic Auth。
-2. **瀏覽器不持有密鑰**：玉山 token 由 nginx 注入（`deploy/nginx.conf.template:104-107`）；永豐金鑰只在 sidecar 環境變數。手機 localStorage 只有風控、主題、帳戶選擇等非機密設定。
+2. **瀏覽器不持有密鑰**：玉山 token 由 nginx 注入（`deploy/nginx.conf.template:104-107`）；永豐金鑰只在 sidecar 環境變數。手機 localStorage 只有風控、主題、帳戶選擇等非機密設定。例外：手機的平倉與全部刪單會經 lib（`src/lib/trade.ts` 的 `trackActivity`）把委託摘要寫進桌面 Agent 的活動紀錄 `sj-agent-activity-v1`；手機啟動時一律清除這份紀錄（`src/mobile/start.ts`，不動與桌面共用的 `sj-agent-observe`），所以只會留到下次開啟手機版為止（安全稽核 F7）。
 3. **跨來源防護沿用**：Origin 必須等於 Host、`Sec-Fetch-Site` 只接受同源或 none（`deploy/nginx.conf.template:7-19`）；bridge 另有 Host 白名單與 token 檢查（`server/esun_trade_server.py:5389`）。
 4. **防點擊劫持**：`X-Frame-Options: DENY`、`frame-ancestors 'none'`（`deploy/nginx-security-headers.conf`）。
+   2026-11-06 安全稽核後另加：Permissions-Policy、`/mobile.html` 的 COOP、只對 `*.ts.net` 送的 HSTS、`/api/` 的 `no-store`、
+   轉給上游前移除 `Authorization` 與 `Cookie`、方法白名單、body 上限，以及 `/api/` 寫入請求限 JSON（細節見 [mobile.md](mobile.md#nginx-安全設定2026-11-06-安全稽核後補強)）。
 5. **無第三方腳本**：手機頁不載入 GA、不載入 Google Fonts。
 6. **風控只在本機**：手機的鎖單只影響手機這個瀏覽器；**沒有伺服器端總開關**（❌）。帳戶頁需明示「此鎖定只對本裝置有效」。伺服器端 kill switch 列入後續提案（需修改 bridge／nginx，不在本期）。
 7. **不記錄敏感資料**：正式建置不得 `console.log` 委託內容或帳號。
@@ -1157,7 +1161,7 @@ K 線端點只回 1 分 K，資料量與天數成正比（股票每日約 270 �
 | 測試檔 | 必測情境 |
 |---|---|
 | `resume-gate.test.ts` | 隱藏 < 5 秒不觸發；≥ 5 秒進入 `resyncing`；四個條件全成立才 `ready`；讀取失敗 → `stale-data`；45 秒逾時 → `failed`；`pageshow(persisted)` 視同回前景 |
-| `mobile-order.test.ts` | 風控擋下時**不呼叫** `requestOrderConfirm`；玉山規則錯誤（例如零股 1,000 股）不送出；期權＋玉山帳戶在確認前拒絕；確認取消不送出；確認期間帳戶改變、伺服器模式改變、路由改變皆不送出；`beforeDispatch` 在 ResumeGate 非 ready 時丟出；成功路徑以正確參數呼叫 `placeStockOrder`（永豐、玉山帳戶各一）與 `placeFuturesOrder` |
+| `mobile-order.test.ts` | 風控擋下時**不呼叫** `requestOrderConfirm`；玉山規則錯誤（例如零股 1,000 股）不送出；期權＋玉山帳戶在確認前拒絕；確認取消不送出；確認期間帳戶改變、伺服器模式改變、路由改變皆不送出；確認期間鎖單或當日虧損越過上限、`beforeDispatch` 時鎖單皆不送出（`mutationNotStarted`）；`beforeDispatch` 在 ResumeGate 非 ready 時丟出；成功路徑以正確參數呼叫 `placeStockOrder`（永豐、玉山帳戶各一）與 `placeFuturesOrder` |
 | `order-ticket-sheet.test.tsx` | 零股強制限價＋ROD＋現股；單位切換數量歸 1；價格不符升降單位時停用預覽；超出漲跌停停用預覽；環境未確認停用預覽；開啟後不自動跟價 |
 | `order-confirm-sheet.test.tsx` | `awaitingMode`、`simulation === null`、`serverChanged` 時滑動確認停用；顯示環境與路由；ResumeGate 離開 ready 時自動取消 |
 | `orders-page.test.tsx` | 減量把「新的剩餘數量」換成減少量；零股與玉山預約單不顯示改價；刪單結果未確認顯示「勿自動重送」；全部刪單需確認；更新鍵冷卻 |

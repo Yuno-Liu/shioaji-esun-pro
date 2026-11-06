@@ -289,6 +289,24 @@ describe('submitMobileOrder — 確認與確認後重驗', () => {
         expect(err.mutationNotStarted).toBe(true);
         noOrderSent();
     });
+
+    it('確認期間開啟風控鎖：確認後重驗擋下，未送出（帶風控原因）', async () => {
+        const locked = '風控鎖啟動中 — 所有下單已封鎖';
+        m.confirm.mockImplementation(async () => { m.risk.mockImplementation(() => locked); return true; });
+        const err = await rejection(submitMobileOrder(stockInput(sinoStock), guards));
+        expect(err).toMatchObject({ message: locked, mutationNotStarted: true });
+        expect(m.confirm).toHaveBeenCalledTimes(1);
+        noOrderSent();
+    });
+
+    it('確認期間當日虧損越過上限（期權）：未送出', async () => {
+        const blocked = '當日虧損 -10,000 已達上限 -5,000，下單封鎖';
+        m.confirm.mockImplementation(async () => { m.risk.mockImplementation(() => blocked); return true; });
+        const err = await rejection(submitMobileOrder(futuresInput(sinoFutures), guards));
+        expect(err).toMatchObject({ message: blocked, mutationNotStarted: true });
+        expect(m.risk).toHaveBeenLastCalledWith(1, undefined);
+        noOrderSent();
+    });
 });
 
 describe('submitMobileOrder — 送出', () => {
@@ -371,6 +389,47 @@ describe('submitMobileOrder — 送出', () => {
         let thrown: unknown;
         try { opts.beforeDispatch(); } catch (err) { thrown = err; }
         expect(thrown).toMatchObject({ mutationNotStarted: true, tradingGateRejected: true });
+    });
+
+    it('傳給送單函式的 beforeDispatch 在送出前一刻鎖單時丟出 mutationNotStarted（帶風控原因）', async () => {
+        await submitMobileOrder(stockInput(sinoStock, { lot: 'IntradayOdd', quantity: 300 }), guards);
+        const [, , , opts] = m.placeStock.mock.calls[0] as unknown as [unknown, unknown, unknown, { beforeDispatch: () => void }];
+        expect(() => opts.beforeDispatch()).not.toThrow();
+        const locked = '風控鎖啟動中 — 所有下單已封鎖';
+        m.risk.mockImplementation(() => locked);
+        let thrown: unknown;
+        try { opts.beforeDispatch(); } catch (err) { thrown = err; }
+        expect(thrown).toMatchObject({ message: locked, mutationNotStarted: true });
+        expect(m.risk).toHaveBeenLastCalledWith(300, 'IntradayOdd');
+    });
+
+    it('送單函式在送出前呼叫 beforeDispatch 被風控擋下：確定未送出（不是結果未知）', async () => {
+        // 模擬 lib 送單函式：先呼叫 beforeDispatch，丟出就不發 HTTP、錯誤原樣往上
+        let httpSent = false;
+        m.placeStock.mockImplementation(async (...args: unknown[]) => {
+            (args[3] as { beforeDispatch: () => void }).beforeDispatch();
+            httpSent = true;
+            return { order: { id: 's1' } };
+        });
+        // 第 1 次（確認前）、第 2 次（確認後）、第 3 次（submit 內先跑一次 beforeDispatch）放行，第 4 次（送出前一刻）鎖單
+        let calls = 0;
+        m.risk.mockImplementation(() => (++calls >= 4 ? '超過單筆上限 1（本筆 2）' : null));
+        const err = await rejection(submitMobileOrder(stockInput(sinoStock), guards));
+        expect(err).toMatchObject({ message: '超過單筆上限 1（本筆 2）', mutationNotStarted: true });
+        expect(httpSent).toBe(false);
+        expect(m.placeStock).toHaveBeenCalledTimes(1);
+    });
+
+    it('風控一直放行：確認前、確認後、beforeDispatch 都檢查，照常送出', async () => {
+        m.placeStock.mockImplementation(async (...args: unknown[]) => {
+            (args[3] as { beforeDispatch: () => void }).beforeDispatch();
+            return { order: { id: 's1' } };
+        });
+        const trade = await submitMobileOrder(stockInput(sinoStock), guards);
+        expect(trade).toEqual({ order: { id: 's1' } });
+        expect(m.risk).toHaveBeenCalledTimes(4);
+        for (const call of m.risk.mock.calls) expect(call).toEqual([2, 'Common']);
+        expect(m.placeStock).toHaveBeenCalledTimes(1);
     });
 
     it('送單函式的錯誤原樣丟出、不重送（結果未知由 UI 判斷）', async () => {
