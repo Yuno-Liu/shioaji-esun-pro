@@ -461,6 +461,15 @@ export const resultItem = style({
     },
 });
 
+/**
+ * 搜尋面板 sticky 搜尋欄（searchBar）的高度：上內距＋輸入框（TOUCH_MIN）＋下內距。
+ * 結果列的鍵以 scroll-margin-top 讓出這段，scrollIntoView 與焦點移動才不會把列停在搜尋欄底下
+ * （遮擋檢查：橫向 844×390 時面板矮，「目前商品」列曾被搜尋欄蓋住）。自選搜尋與切換商品面板共用。
+ */
+export const SEARCH_BAR_H = `calc(${TOUCH_MIN} + ${SPACE.s1} + ${SPACE.s2})`;
+
+globalStyle(`${resultItem} button`, { scrollMarginTop: SEARCH_BAR_H });
+
 export const resultRow = style({
     display: 'flex',
     alignItems: 'center',
