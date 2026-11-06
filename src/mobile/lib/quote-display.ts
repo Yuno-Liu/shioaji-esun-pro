@@ -258,6 +258,8 @@ export function innerOuterRatio(tick: HeaderTick | undefined): SplitPercent | nu
 /** 量的單位：股票整股以張、零股以股、期權以口；指數等無單位 */
 export function volumeUnit(securityType: string | null | undefined, oddLot = false): '張' | '股' | '口' | '' {
     if (securityType === 'STK') return oddLot ? '股' : '張';
+    // 權證走股票路徑、沒有零股：一律以張
+    if (securityType === 'WRT') return '張';
     if (securityType === 'FUT' || securityType === 'OPT') return '口';
     return '';
 }

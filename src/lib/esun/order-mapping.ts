@@ -164,6 +164,10 @@ export function validateEsunStockOrder(
     contract: ContractBase,
     order: StockOrderReq,
 ): string | null {
+    // 權證（上游 2026-11 起與股票同一條下單路徑）：玉山 API 是否支援尚未在模擬環境驗證，先在送出前拒絕
+    if (contract.security_type === 'WRT') {
+        return '本 App 的玉山證券帳戶尚未支援權證委託，請使用玉山官方 App';
+    }
     if (contract.security_type !== 'STK') {
         return '玉山證券僅支援台股現貨交易，不支援期貨、選擇權或指數商品';
     }

@@ -20,6 +20,7 @@ import { ChevronDown } from 'lucide-react';
 import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type Ref } from 'react';
 import { flushSync } from 'react-dom';
 import { useQuote } from '../../hooks/use-stream';
+import { contractMarket } from '../../lib/contract-market';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
 import { sessionWindowFor } from '../../lib/intraday-session';
 import { getMarketSnapshot, subscribeMarketSnapshots } from '../../lib/market-snapshot-store';
@@ -182,9 +183,14 @@ const STAT_NAME: Record<StatKey, string> = { open: '開盤', high: '最高', low
 
 /** 統計格的欄位與順序（4 欄、列優先）：股票 開 高 均 總／參 低 單 額；期權 開 高 均 總／參 低 單；指數 開 高 低 參 */
 export function statKeys(secType: SecurityType | undefined): StatKey[] {
-    if (secType === 'STK') return ['open', 'high', 'avg', 'total', 'reference', 'low', 'last', 'amount'];
+    if (secType === 'STK' || secType === 'WRT') return ['open', 'high', 'avg', 'total', 'reference', 'low', 'last', 'amount'];
     if (secType === 'FUT' || secType === 'OPT') return ['open', 'high', 'avg', 'total', 'reference', 'low', 'last'];
     return ['open', 'high', 'low', 'reference'];
+}
+
+/** 交易頁持倉摘要是否以股票單位（張／股、現股／融資／融券）顯示：證券市場商品（STK、WRT，lib contractMarket） */
+export function summaryUsesStockUnits(secType: SecurityType | undefined): boolean {
+    return contractMarket(secType) === 'S';
 }
 
 const fmtAvg = (v: number) => formatNumber(v, 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -502,7 +508,7 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
     const [oddLot, setOddLot] = useState(false);
 
     const orderable = contract ? contract.target_code || contract.code : sym;
-    const isStock = contract?.security_type === 'STK';
+    const isStock = summaryUsesStockUnits(contract?.security_type);
     const tradable = contract ? contract.security_type !== 'IND' : true;
     const comboNote = contract?.combo ? '組合商品不支援手機下單' : null;
 

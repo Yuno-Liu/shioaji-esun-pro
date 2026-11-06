@@ -304,7 +304,7 @@ export function searchStocks(
     const numericQuery = /^\d+$/.test(q);
     // fork（頂欄與手機快速切換的模糊搜尋）：上游比不到的候選，再以去除前導 0 的代碼、代碼片段、
     // 多關鍵字、名稱子序列補上，排在上游命中之後（rank 3），不改變上游命中之間的順序。
-    // 純數字查詢等於去除前導 0 的代碼（50 → 0050、878 → 00878）視同代碼相符（rank 0）。
+    // 純數字查詢等於去除前導 0 的代碼（50 → 0050、878 → 00878）視同代碼相符，排在真正的代碼相符之後（rank 0.5）。
     const tokens = query.split(/\s+/).map(t => normalizeStockSearchText(t)).filter(Boolean);
     const scored: { s: StockMeta; code: string; score: number; rank: number; letterSuffix: boolean }[] = [];
     for (const s of index) {
@@ -328,7 +328,7 @@ export function searchStocks(
         const zeroStrippedExact = numericQuery && code !== q && codeNoZero.length >= 2 && codeNoZero === q;
         if (!codeHit && !nameHit) {
             const fuzzy = forkFuzzyScore(s, code, codeNoZero, name, q, tokens, numericQuery);
-            if (fuzzy !== null) scored.push({ s, code, score: fuzzy, rank: zeroStrippedExact ? 0 : 3, letterSuffix: false });
+            if (fuzzy !== null) scored.push({ s, code, score: fuzzy, rank: zeroStrippedExact ? 0.5 : 3, letterSuffix: false });
             continue;
         }
         let score = 0;
@@ -339,7 +339,7 @@ export function searchStocks(
         score += s.code.length === 4 || s.kind === 'ETF' ? 0 : 50;
         score += s.name.length; // shorter names first
         // Code identity and known ETF series outrank incidental name matches.
-        const rank = code === q || zeroStrippedExact ? 0 : numericQuery && s.kind === 'ETF' && codeHit ? 1 : 2;
+        const rank = code === q ? 0 : zeroStrippedExact ? 0.5 : numericQuery && s.kind === 'ETF' && codeHit ? 1 : 2;
         scored.push({ s, code, score, rank, letterSuffix: rank === 1 && /^[A-Z]/.test(code.slice(q.length)) });
     }
     scored.sort((a, b) => a.rank - b.rank ||

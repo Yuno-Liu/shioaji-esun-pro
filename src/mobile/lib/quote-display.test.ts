@@ -144,6 +144,9 @@ describe('splitPercent／innerOuterRatio', () => {
         expect(volumeUnit('STK')).toBe('張');
         expect(volumeUnit('STK', true)).toBe('股');
         expect(volumeUnit('FUT')).toBe('口');
+        // 權證沒有零股：一律以張
+        expect(volumeUnit('WRT')).toBe('張');
+        expect(volumeUnit('WRT', true)).toBe('張');
         expect(volumeUnit('OPT', true)).toBe('口');
         expect(volumeUnit('IND')).toBe('');
     });

@@ -226,6 +226,47 @@ describe('HeaderSymbolSearch', () => {
         return () => view!.root.findByType('input');
     };
 
+    it('搜尋失敗時不說「找不到」而是提示重試，Enter 會重新搜尋（上游搜尋在目錄改版時要求重查）', async () => {
+        mocks.searchProducts.mockRejectedValueOnce(new Error('商品搜尋期間伺服器已切換或商品目錄已更新，請重新搜尋'));
+        const onSelectCode = vi.fn();
+        await act(async () => {
+            view = create(createElement(HeaderSymbolSearch, { selected: tsmc, watchlistItems: [{ contract: tsmc }], onSelectCode }));
+        });
+        const input = view!.root.findByType('input');
+        await act(async () => {
+            input.props.onFocus();
+            input.props.onChange({ target: { value: '台積' } });
+        });
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(120);
+        });
+        const text = JSON.stringify(view!.toJSON());
+        expect(text).toContain('搜尋失敗，按 Enter 重試');
+        expect(text).not.toContain('找不到相符商品');
+        mocks.searchProducts.mockResolvedValueOnce([{ code: '2330', name: '台積電', security_type: 'STK', exchange: 'TSE', detail: '股票' }]);
+        await act(async () => {
+            input.props.onKeyDown({ key: 'Enter' });
+        });
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(mocks.searchProducts).toHaveBeenCalledTimes(2);
+        expect(onSelectCode).toHaveBeenCalledWith('2330', 'STK');
+    });
+
+    it('空白時的範例不再用「小台」（上游搜尋已不支援期貨根簡稱）', async () => {
+        await act(async () => {
+            view = create(createElement(HeaderSymbolSearch, { selected: tsmc, watchlistItems: [], onSelectCode: vi.fn() }));
+        });
+        const input = view!.root.findByType('input');
+        await act(async () => {
+            input.props.onFocus();
+        });
+        const text = JSON.stringify(view!.toJSON());
+        expect(text).toContain('台指');
+        expect(text).not.toContain('小台');
+    });
+
     it('combobox 以 aria-activedescendant 指向目前選項，option 都有 id', async () => {
         const input = await openWithQuery('鴻海');
         const options = view!.root.findAll(

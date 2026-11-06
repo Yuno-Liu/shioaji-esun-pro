@@ -8,7 +8,10 @@
 //   結果與狀態維持原樣（退場中的畫面不變回空白，晚到的結果也不會換掉它）。
 
 import { useEffect, useState } from 'react';
+import { useProductNamesVersion } from '../../hooks/use-product-names-version';
+import { useProductCatalogVersion } from '../../lib/product-catalog-version';
 import { searchProducts, type ProductSuggestion } from '../../lib/product-search';
+import { loadStockCatalog } from '../../lib/stock-index';
 
 /** 輸入停頓多久才查詢（ms） */
 export const SEARCH_DEBOUNCE_MS = 250;
@@ -17,7 +20,7 @@ export const SEARCH_LIMIT = 10;
 
 export type SearchStatus = 'idle' | 'loading' | 'done' | 'error';
 
-const TYPE_TEXT: Record<string, string> = { STK: '股票', FUT: '期貨', OPT: '選擇權', IND: '指數' };
+const TYPE_TEXT: Record<string, string> = { STK: '股票', FUT: '期貨', OPT: '選擇權', IND: '指數', WRT: '權證' };
 
 /** 商品種類文字（未知種類原樣） */
 export function securityTypeText(type: string | null | undefined): string {
@@ -37,6 +40,15 @@ export function useProductSearch(
     const [results, setResults] = useState<ProductSuggestion[]>([]);
     const [status, setStatus] = useState<SearchStatus>('idle');
     const paused = options?.paused === true;
+    // 上游搜尋（2026-11 同步）：商品目錄或名稱目錄改版時，進行中的查詢會失敗並要求重新搜尋；版本一變就自動重查
+    const catalogVersion = useProductCatalogVersion();
+    const namesVersion = useProductNamesVersion();
+
+    // 開啟時預熱股票目錄（不帶 signal）：每次搜尋讀目錄有 1.2 秒期限，期限到會取消唯一的讀取者；
+    // 預熱讓共享請求能完成並寫入快取，高延遲網路下名稱搜尋才不會一直失敗（同桌面頂欄 focus 時的預熱）
+    useEffect(() => {
+        if (active && !paused) void loadStockCatalog().catch(() => undefined);
+    }, [active, paused]);
 
     useEffect(() => {
         // 暫停：上一次 effect 的 cleanup 已 clearTimeout＋abort；這裡不動結果與狀態
@@ -67,7 +79,7 @@ export function useProductSearch(
             clearTimeout(timer);
             controller.abort();
         };
-    }, [query, active, paused]);
+    }, [query, active, paused, catalogVersion, namesVersion]);
 
     return { results, status };
 }
