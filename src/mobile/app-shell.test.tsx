@@ -64,7 +64,8 @@ vi.mock('./lib/watchlist-context', () => ({ WatchlistProvider: ({ children }: { 
 
 import { MobileShell, tabAriaLabel } from './app';
 import { registerSheet, resetSheetStackForTest } from './lib/sheet-stack';
-import { resetMobileUiForTest } from './lib/mobile-store';
+import { getMobileUi, resetMobileUiForTest } from './lib/mobile-store';
+import { navigate } from './lib/hash-router';
 
 /** 假的 DOM 元素：讓殼層把它當成真實節點（instanceof HTMLElement）而啟用 portal 與背景隔離 */
 class FakeElement {
@@ -306,5 +307,20 @@ describe('切換分頁：舊頁 portal 不殘留', () => {
         expect(byTestId('trade-page')[0]!.children).toEqual(['2317']);
         expect(m.tradeMounts).toBe(1);
         expect(portaled('shell-accessory-slot')).toEqual(['trade-buy', 'trade-sell']);
+    });
+
+    it('交易頁切換商品（navigate replace）：不新增歷史紀錄、目前商品跟著更新、頁面不重掛', async () => {
+        const replaceState = vi.fn((_s: unknown, _t: string, url: string) => {
+            (location as { hash: string }).hash = url.slice(url.indexOf('#'));
+        });
+        vi.stubGlobal('history', { state: null, replaceState });
+        await mountTrade();
+        expect(getMobileUi().currentCode).toBe('2330');
+        await act(async () => { navigate({ name: 'trade', code: '2317' }, { replace: true }); });
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+        expect(replaceState).toHaveBeenCalledWith(null, '', '/mobile.html#/trade/2317');
+        expect(byTestId('trade-page')[0]!.children).toEqual(['2317']);
+        expect(getMobileUi().currentCode).toBe('2317');
+        expect(m.tradeMounts).toBe(1);
     });
 });

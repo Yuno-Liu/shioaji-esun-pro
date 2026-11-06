@@ -10,9 +10,13 @@
 // └［買 進］［賣 出］→ openTicket()（只開下單面板，送單一律經確認面板）；以 ShellSlot bottom 放進底部 chrome
 //
 // 主價列下緣的哨兵離開 main 頂端時，ShellSlot top 顯示精簡標頭（trade-compact；實心 panel，沒有 IntersectionObserver 時不顯示）。
+// 標頭的「代碼 名稱」是切換商品鍵（trade-switch；精簡標頭顯示時另有 trade-compact-switch）：開 TradeSwitchSheet 搜尋並切換，
+// 以 replace 導覽（返回鍵回到進交易頁之前的畫面）；只做查詢與導覽，不開下單面板。合約載入後記入「最近查看」（lib/recent-codes）。
 // code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。合約解析出的正規代碼與路由不同（小寫、舊指數代碼）時改寫路由。
 
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { ChevronDown } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type Ref } from 'react';
+import { flushSync } from 'react-dom';
 import { useQuote } from '../../hooks/use-stream';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
 import { sessionWindowFor } from '../../lib/intraday-session';
@@ -30,13 +34,17 @@ import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity'
 import { DepthLadder, depthOddCapable, DepthOddToggle } from '../components/depth-ladder';
 import { TickList } from '../components/tick-list';
 import { TradeChart } from '../components/trade-chart';
+import { TradeSwitchSheet } from '../components/trade-switch-sheet';
 import { chartPriceLines, formatLinePrice } from '../lib/chart-model';
 import { CHART_PERIODS, DEFAULT_CHART_PERIOD, isChartPeriod, type ChartPeriod } from '../lib/chart-ranges';
+import { createFocusProxy, type FocusProxy } from '../lib/focus-proxy';
 import { formatRoute, navigate } from '../lib/hash-router';
 import { openTicket, setCurrentCode } from '../lib/mobile-store';
 import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
+import { recordRecentCode } from '../lib/recent-codes';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
+import { focusRing, pressable } from '../styles/primitives.css';
 import { SIZE } from '../styles/tokens';
 import * as styles from '../styles/trade.css';
 import { GroupedSection } from '../ui/grouped';
@@ -239,7 +247,15 @@ function useCompactHeader(sentinel: { current: HTMLElement | null }): { availabl
     return { available, visible };
 }
 
-function Header({ code, contract }: { code: string; contract: ContractInfo | undefined }) {
+interface SwitchEntry {
+    /** 開切換商品面板（必須在點擊的同步呼叫內：代理輸入框要在手勢內聚焦） */
+    onOpenSwitch?: () => void;
+    switchOpen?: boolean;
+    /** 標頭切換鍵（trade-switch）的 ref：選了其他商品、面板退場結束後把焦點放回新頁的這顆鍵 */
+    switchRef?: Ref<HTMLButtonElement>;
+}
+
+function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef }: { code: string; contract: ContractInfo | undefined } & SwitchEntry) {
     const quote = useQuote(code, { narrow: true });
     const tick = quote?.tick;
     // 試撮期間仍以本頁看過的上一筆真實成交為最新價
@@ -264,6 +280,7 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
     const changeText = chg ? `${arrow}${contract && price !== null ? formatToTick(contract, Math.abs(chg.change), { at: price }) : Math.abs(chg.change)}` : null;
     const pctText = chg && chg.pct !== null ? ` (${chg.pct > 0 ? '+' : ''}${chg.pct.toFixed(2)}%)` : null;
     const title = `${code}${contract?.name ? ` ${contract.name}` : ''}`;
+    const switchLabel = `切換商品，目前 ${title}`;
 
     // 主價跳價閃爍（資料來源切換那一筆不閃）
     const flashRef = useRef<HTMLSpanElement | null>(null);
@@ -274,7 +291,25 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
     return (
         <header className={styles.header}>
             <div className={styles.titleRow}>
-                <h1 className={styles.title}>{title}</h1>
+                <h1 className={styles.title}>
+                    {onOpenSwitch
+                        ? (
+                            <button
+                                ref={switchRef}
+                                type='button'
+                                className={`${styles.titleButton} ${pressable} ${focusRing}`}
+                                onClick={() => onOpenSwitch()}
+                                aria-haspopup='dialog'
+                                aria-expanded={switchOpen}
+                                aria-label={switchLabel}
+                                data-testid='trade-switch'
+                            >
+                                {title}
+                                <ChevronDown className={styles.titleIcon} aria-hidden='true' focusable='false' />
+                            </button>
+                        )
+                        : title}
+                </h1>
                 {contract && <span className={styles.subtle}>{exchangeText(contract.exchange)}</span>}
                 {contract && isStock && contract.day_trade === 'Yes' && <span className={styles.badge} data-testid='trade-daytrade'>可當沖</span>}
             </div>
@@ -307,11 +342,24 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
                     {/* 視覺輔助（與標頭重複）：不進無障礙樹；隱藏時不攔點擊 */}
                     <div className={styles.compactBar} data-visible={compact.visible ? 'true' : 'false'} aria-hidden='true' data-testid='trade-compact'>
                         <span className={styles.compactTitle}>{title}</span>
+                        {onOpenSwitch && <ChevronDown className={styles.compactIcon} aria-hidden='true' focusable='false' />}
                         <span className={`${styles.compactPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>{priceText}</span>
                         {changeText !== null && chg && (
                             <span className={`${styles.compactChange} ${styles.dirText[chg.dir]}`}>{changeText}{pctText}</span>
                         )}
                     </div>
+                    {/* 切換商品鍵在 aria-hidden 的精簡標頭之外（可被輔助技術讀到）；精簡標頭隱藏時不渲染（不可聚焦、不可點） */}
+                    {onOpenSwitch && compact.visible && (
+                        <button
+                            type='button'
+                            className={styles.compactSwitch}
+                            onClick={() => onOpenSwitch()}
+                            aria-haspopup='dialog'
+                            aria-expanded={switchOpen}
+                            aria-label={switchLabel}
+                            data-testid='trade-compact-switch'
+                        />
+                    )}
                 </ShellSlot>
             )}
             {contract && <StatsGrid contract={contract} stats={stats} />}
@@ -332,7 +380,7 @@ function Header({ code, contract }: { code: string; contract: ContractInfo | und
     );
 }
 
-function TradeView({ code }: { code: string }) {
+function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string } & SwitchEntry) {
     // 載入合約（也讓狀態列能依商品判斷市場）
     const contract = useContract(code);
     const [loadError, setLoadError] = useState(false);
@@ -352,6 +400,14 @@ function TradeView({ code }: { code: string }) {
         setCurrentCode(canonical);
     }, [canonical, code]);
     const sym = canonical ?? code;
+
+    // 最近查看：合約資訊載入後記錄目前商品（非正規代碼的頁面會改寫路由後重新掛載，由那一頁記錄）
+    const contractName = contract?.name ?? '';
+    const contractType = contract?.security_type ?? undefined;
+    useEffect(() => {
+        if (!canonical || canonical !== code) return;
+        recordRecentCode({ code: canonical, name: contractName, securityType: contractType });
+    }, [canonical, code, contractName, contractType]);
 
     // 報價快照：沒有即時成交（夜間、週末、冷門商品、試撮中）時標頭以它顯示最新價。
     // 回前景後由 ResumeGate ④ 以目前商品（正規代碼）重新取快照、寫入同一個快照 store，這裡不重複查詢。
@@ -388,7 +444,7 @@ function TradeView({ code }: { code: string }) {
 
     return (
         <section className={styles.page} data-testid='page-trade'>
-            <Header code={sym} contract={contract} />
+            <Header code={sym} contract={contract} onOpenSwitch={onOpenSwitch} switchOpen={switchOpen} switchRef={switchRef} />
 
             <div className={styles.controlRow}>
                 <div className={styles.controlGrow}>
@@ -490,6 +546,117 @@ export function TradePage({ code }: { code: string | null }) {
             </section>
         );
     }
-    // 換商品時整頁重建（圖表、五檔、明細內部狀態一併重設）
-    return <TradeView key={code} code={code} />;
+    return <TradeWithSwitch code={code} />;
+}
+
+function activeElementOrNull(): Element | null {
+    try {
+        return typeof document === 'undefined' ? null : document.activeElement;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * 選了其他商品、面板退場結束後把焦點放到新頁的切換鍵：目標要仍連到文件、不在 inert／aria-hidden 區；
+ * 焦點已被使用者移到別處就不搶（只在焦點落在 body、已卸載的節點或已關閉面板之內時移動）。
+ */
+function focusSwitchKey(el: HTMLButtonElement | null): void {
+    const t = el as (HTMLButtonElement & { isConnected?: boolean }) | null;
+    if (!t || t.isConnected !== true || t.closest?.('[inert], [aria-hidden="true"]')) return;
+    const active = activeElementOrNull() as (Element & { isConnected?: boolean }) | null;
+    const bodyEl = typeof document === 'undefined' ? null : document.body;
+    const stray = !active || active === bodyEl || active.isConnected === false || !!active.closest?.('[inert], [aria-hidden="true"]');
+    if (!stray) return;
+    try {
+        t.focus({ preventScroll: true });
+    } catch {
+        // 忽略
+    }
+}
+
+/**
+ * 交易頁＋切換商品面板。面板放在 TradeView 之外：切換後 TradeView 以新代碼重建，面板照常播放退場動畫。
+ * 焦點：選了其他商品時，BottomSheet 記下的觸發鍵（舊頁的切換鍵）已隨舊 TradeView 卸載、無法還原；改在面板退場結束
+ * （onExited，殼層已解除 inert）且頁面已換成新代碼後，把焦點移到新頁的切換鍵。取消、點暗化幕、點目前商品沿用 BottomSheet 的還原。
+ */
+function TradeWithSwitch({ code }: { code: string }) {
+    const [switchOpen, setSwitchOpen] = useState(false);
+    const [sheetMounted, setSheetMounted] = useState(false);
+    const openRef = useRef(false);
+    const proxyRef = useRef<FocusProxy | null>(null);
+    const switchRef = useRef<HTMLButtonElement | null>(null);
+    // 選了其他商品：記下原代碼；退場結束（exited）且已換成新代碼才移焦點（兩者先後不定：同步模式退場先結束）
+    const refocusRef = useRef<{ from: string; exited: boolean } | null>(null);
+    const codeRef = useRef(code);
+
+    const tryRefocus = useCallback(() => {
+        const r = refocusRef.current;
+        if (!r || !r.exited || codeRef.current === r.from) return;
+        refocusRef.current = null;
+        focusSwitchKey(switchRef.current);
+    }, []);
+    useEffect(() => {
+        codeRef.current = code;
+        tryRefocus();
+    }, [code, tryRefocus]);
+    const onSheetExited = useCallback(() => {
+        const r = refocusRef.current;
+        if (!r) return;
+        r.exited = true;
+        tryRefocus();
+    }, [tryRefocus]);
+
+    const releaseProxy = useCallback(() => {
+        const proxy = proxyRef.current;
+        proxyRef.current = null;
+        proxy?.release();
+    }, []);
+    // 卸載時移除仍在的代理輸入框
+    useEffect(() => releaseProxy, [releaseProxy]);
+
+    const openSwitch = useCallback(() => {
+        if (openRef.current) return;
+        openRef.current = true;
+        refocusRef.current = null; // 退場中又開啟：不再移焦點（BottomSheet 從目前位置反向進場）
+        releaseProxy();
+        const proxy = createFocusProxy();
+        proxyRef.current = proxy;
+        // 先同步提交面板（BottomSheet 進場時會把焦點放到標題），再於同一個手勢內聚焦代理輸入框，iOS 才會叫出鍵盤
+        flushSync(() => {
+            setSheetMounted(true);
+            setSwitchOpen(true);
+        });
+        proxy?.engage();
+    }, [releaseProxy]);
+
+    const closeSwitch = useCallback(() => {
+        openRef.current = false;
+        releaseProxy();
+        setSwitchOpen(false);
+    }, [releaseProxy]);
+
+    // replace：返回鍵回到進交易頁之前的畫面；目前商品（ui.currentCode）由 app.tsx 的路由 effect 與 TradeView 的正規代碼 effect 更新
+    const selectCode = useCallback((next: string) => {
+        refocusRef.current = { from: code, exited: false };
+        closeSwitch();
+        navigate({ name: 'trade', code: next }, { replace: true });
+    }, [closeSwitch, code]);
+
+    return (
+        <>
+            {/* 換商品時整頁重建（圖表、五檔、明細內部狀態一併重設） */}
+            <TradeView key={code} code={code} onOpenSwitch={openSwitch} switchOpen={switchOpen} switchRef={switchRef} />
+            {sheetMounted && (
+                <TradeSwitchSheet
+                    open={switchOpen}
+                    onClose={closeSwitch}
+                    currentCode={code}
+                    onSelect={selectCode}
+                    focusProxy={proxyRef}
+                    onExited={onSheetExited}
+                />
+            )}
+        </>
+    );
 }

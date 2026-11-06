@@ -26,3 +26,8 @@ export function useMobileWatchlist(): MobileWatchlist {
     if (!wl) throw new Error('useMobileWatchlist 必須在 WatchlistProvider（MobileShell）之內使用');
     return wl;
 }
+
+/** 同 useMobileWatchlist，但不在 WatchlistProvider 內時回傳 null（交易頁切換商品面板：沒有自選資料就不顯示自選區與加入鍵） */
+export function useOptionalMobileWatchlist(): MobileWatchlist | null {
+    return useContext(WatchlistContext);
+}

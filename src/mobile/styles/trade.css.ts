@@ -7,6 +7,7 @@
 // - 量條、比例條用 ui/bars（scaleX），不再以 width 轉場。
 import { keyframes, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
+import { expandHit } from '../ui/chip.css';
 import { fill, focusRing, hairlineBottom, pressable, pressableRow } from './primitives.css';
 import { elevation, sj } from './theme-vars.css';
 import { DUR, EASE, RADIUS, REDUCED_MOTION, SAFE_LEFT, SAFE_RIGHT, SIZE, SPACE, TOUCH_MIN, TRADE_BUTTON_GAP } from './tokens';
@@ -49,6 +50,37 @@ export const titleRow = style({
 export const title = style({
     margin: 0,
     ...TEXT.sheetTitle,
+});
+
+/**
+ * 標題內的「切換商品」鍵：文字沿用 h1（字型、字級、換行不變），只去掉按鈕外觀；名稱後接小 ChevronDown。
+ * 點擊區以 expandHit（ui/chip.css）上下擴到 TOUCH_MIN；zIndex 1 讓擴張區畫在後面的主價列（position relative）之上。
+ */
+export const titleButton = style([expandHit, {
+    display: 'inline-block',
+    maxWidth: '100%',
+    zIndex: 1,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    borderRadius: RADIUS.sm,
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    letterSpacing: 'inherit',
+    textAlign: 'start',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+}]);
+
+export const titleIcon = style({
+    display: 'inline-block',
+    width: '0.875em',
+    height: '0.875em',
+    marginLeft: '0.125em',
+    verticalAlign: '-0.0625em',
+    color: vars.color.mutedForeground,
 });
 
 export const subtle = style({
@@ -189,6 +221,60 @@ export const compactTitle = style({
     ...TEXT.subhead,
     fontWeight: 600,
 });
+
+/** 精簡標頭的 ChevronDown（裝飾，提示可點） */
+export const compactIcon = style({
+    flex: '0 0 auto',
+    width: '0.875rem',
+    height: '0.875rem',
+    marginLeft: `calc(-1 * ${SPACE.s1})`,
+    color: vars.color.mutedForeground,
+});
+
+/** 精簡標頭切換鍵的點擊區高度：固定 44px（44pt），不隨 rem 放大 */
+const COMPACT_SWITCH_HIT_H = '44px';
+
+/**
+ * 精簡標頭上的「切換商品」鍵：只在精簡標頭顯示時渲染（隱藏時不在無障礙樹、不可聚焦或點擊）。
+ * 疊在 aria-hidden 的精簡標頭上（topSlot 內絕對定位、整條可點）；外觀 SIZE.compactBarH（固定 40px），::before 從頂端起高
+ * COMPACT_SWITCH_HIT_H（固定 44px）：只往下多 4px、不往上擴（上方是狀態列）。不用 TOUCH_MIN：它隨 rem 放大，字級 1.15／1.3 時
+ * 精簡標頭下緣之外會多攔 10.6／17.2px，吃掉週期、圖表、五檔價格格的點擊。
+ * 按壓時 ::after 淡淡加深（與 pressableRow 同值，只動畫 opacity）。
+ */
+export const compactSwitch = style([focusRing, {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    height: SIZE.compactBarH,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&::before': {
+            content: '""',
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            top: 0,
+            height: COMPACT_SWITCH_HIT_H,
+        },
+        '&::after': {
+            content: '""',
+            position: 'absolute',
+            inset: 0,
+            background: vars.color.foreground,
+            opacity: 0,
+            pointerEvents: 'none',
+            transition: `opacity ${DUR.fade}ms ease-out`,
+        },
+        '&:active::after': { opacity: 0.08, transition: 'none' },
+    },
+}]);
 
 export const compactPrice = style({
     flex: '0 0 auto',

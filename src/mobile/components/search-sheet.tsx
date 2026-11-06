@@ -1,7 +1,7 @@
 // src/mobile/components/search-sheet.tsx — 商品搜尋面板（規格 §6.1；設計規格 §7.2）
 //
 // - searchProducts(query, 10)：輸入以 SEARCH_DEBOUNCE_MS debounce；新的輸入會 abort 前一次查詢（signal），
-//   晚到的舊結果不會蓋掉新結果。
+//   晚到的舊結果不會蓋掉新結果（hooks/use-product-search.ts，與交易頁切換商品面板共用）。
 // - 每筆結果可「加入自選」（由父層呼叫 useWatchlist().addSymbol）或直接開交易頁。
 // - 只做查詢與導覽，不會下單。
 // - 版面：面板 large；搜尋框在 body 內 position: sticky; top: 0（不透明、不模糊）；結果列與自選列同樣式
@@ -9,19 +9,16 @@
 //   按鈕文字節點恰為標籤）。
 
 import { useEffect, useRef, useState } from 'react';
-import { searchProducts, type ProductSuggestion } from '../../lib/product-search';
+import type { ProductSuggestion } from '../../lib/product-search';
+import { suggestionSubText, useProductSearch } from '../hooks/use-product-search';
 import { focusRing, pressable, pressableRow } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
 import { chip } from '../ui/chip.css';
 import { InlineNote } from '../ui/inline-note';
 import { BottomSheet } from './bottom-sheet';
 
-/** 輸入停頓多久才查詢（ms） */
-export const SEARCH_DEBOUNCE_MS = 250;
-/** 每次查詢的結果上限（規格 §6.1） */
-export const SEARCH_LIMIT = 10;
-
-type SearchStatus = 'idle' | 'loading' | 'done' | 'error';
+// debounce 與上限沿用共用 hook（交易頁切換商品面板同一套）；保留從這裡匯出
+export { SEARCH_DEBOUNCE_MS, SEARCH_LIMIT } from '../hooks/use-product-search';
 
 export interface SearchSheetProps {
     open: boolean;
@@ -36,12 +33,9 @@ export interface SearchSheetProps {
     onOpenTrade: (code: string) => void;
 }
 
-const TYPE_TEXT: Record<string, string> = { STK: '股票', FUT: '期貨', OPT: '選擇權', IND: '指數' };
-
 export function SearchSheet({ open, onClose, watchedCodes, canAdd, onAdd, onOpenTrade }: SearchSheetProps) {
     const [query, setQuery] = useState('');
-    const [results, setResults] = useState<ProductSuggestion[]>([]);
-    const [status, setStatus] = useState<SearchStatus>('idle');
+    const { results, status } = useProductSearch(query, open);
     const [adding, setAdding] = useState<string | null>(null);
     const [messages, setMessages] = useState<Record<string, string>>({});
     const mounted = useRef(true);
@@ -51,40 +45,9 @@ export function SearchSheet({ open, onClose, watchedCodes, canAdd, onAdd, onOpen
     useEffect(() => {
         if (open) return;
         setQuery('');
-        setResults([]);
-        setStatus('idle');
         setMessages({});
         setAdding(null);
     }, [open]);
-
-    useEffect(() => {
-        const q = query.trim();
-        if (!open || !q) {
-            setResults([]);
-            setStatus('idle');
-            return;
-        }
-        const controller = new AbortController();
-        setStatus('loading');
-        const timer = setTimeout(() => {
-            searchProducts(q, SEARCH_LIMIT, { signal: controller.signal }).then(
-                rows => {
-                    if (controller.signal.aborted) return;
-                    setResults(rows);
-                    setStatus('done');
-                },
-                () => {
-                    if (controller.signal.aborted) return;
-                    setResults([]);
-                    setStatus('error');
-                },
-            );
-        }, SEARCH_DEBOUNCE_MS);
-        return () => {
-            clearTimeout(timer);
-            controller.abort();
-        };
-    }, [query, open]);
 
     const add = async (s: ProductSuggestion) => {
         if (adding) return;
@@ -142,7 +105,7 @@ export function SearchSheet({ open, onClose, watchedCodes, canAdd, onAdd, onOpen
                                             <span className={styles.rowCode}>{s.code}</span>
                                             <span className={styles.resultName}>{s.name}</span>
                                         </span>
-                                        <span className={styles.rowSub}>{[TYPE_TEXT[s.security_type] ?? s.security_type, s.detail].filter(Boolean).join(' · ')}</span>
+                                        <span className={styles.rowSub}>{suggestionSubText(s)}</span>
                                     </button>
                                     <button
                                         type='button'

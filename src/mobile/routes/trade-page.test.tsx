@@ -1,5 +1,5 @@
 // 交易頁（規格 §6.2）：標頭文字、持倉摘要（遮金額）、未成交筆數、買進／賣出只開下單面板
-import { createElement } from 'react';
+import { createElement, type ReactElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractInfo } from '../../lib/types/contract';
@@ -13,7 +13,9 @@ const m = vi.hoisted(() => ({
     useTradingState: vi.fn(),
     usePrivacyMoney: vi.fn(() => false),
     openTicket: vi.fn(),
+    openOrderAction: vi.fn(),
     setCurrentCode: vi.fn(),
+    searchProducts: vi.fn(),
     navigate: vi.fn(),
     fetchSnapshots: vi.fn(),
     snapshot: undefined as unknown,
@@ -38,7 +40,8 @@ vi.mock('../../hooks/use-stream', () => ({ useQuote: m.useQuote }));
 vi.mock('../../lib/contracts-cache', () => ({ useContract: m.useContract, ensureContract: m.ensureContract }));
 vi.mock('../../lib/trading-state', () => ({ useTradingState: m.useTradingState }));
 vi.mock('../../lib/privacy', () => ({ usePrivacyMoney: m.usePrivacyMoney, maskMoney: (t: string, p: boolean) => (p ? '•••••' : t) }));
-vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, setCurrentCode: m.setCurrentCode }));
+vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, openOrderAction: m.openOrderAction, setCurrentCode: m.setCurrentCode }));
+vi.mock('../../lib/product-search', () => ({ searchProducts: m.searchProducts }));
 vi.mock('../components/trade-chart', () => ({ TradeChart: (props: unknown) => { m.chartProps.push(props); return null; } }));
 vi.mock('../components/tick-list', () => ({ TickList: () => null }));
 vi.mock('../../lib/shioaji', () => ({
@@ -60,7 +63,9 @@ vi.mock('../../lib/market-snapshot-store', () => ({
 }));
 vi.mock('../lib/hash-router', async importOriginal => ({ ...(await importOriginal<typeof import('../lib/hash-router')>()), navigate: m.navigate }));
 
-import { pressableRow } from '../styles/primitives.css';
+import { SEARCH_DEBOUNCE_MS } from '../hooks/use-product-search';
+import { setMotionClockForTest } from '../motion/spring';
+import { pressable, pressableRow } from '../styles/primitives.css';
 import { SIZE } from '../styles/tokens';
 import * as tradeStyles from '../styles/trade.css';
 import { card as groupedCard } from '../ui/grouped.css';
@@ -98,6 +103,8 @@ beforeEach(() => {
     });
     m.usePrivacyMoney.mockReset().mockReturnValue(false);
     m.openTicket.mockReset();
+    m.openOrderAction.mockReset();
+    m.searchProducts.mockReset().mockResolvedValue([]);
     m.setCurrentCode.mockReset();
     m.navigate.mockReset();
     m.fetchSnapshots.mockReset().mockResolvedValue([]);
@@ -621,6 +628,332 @@ describe('TradePage 五檔整股／盤中零股切換', () => {
         await act(async () => { view!.update(createElement(TradePage, { code: '2317' })); });
         expect(byId('depth-odd-toggle').props['aria-pressed']).toBe(false);
         expect(depthQuoteCalls().at(-1)).toBe(false);
+    });
+});
+
+// ---- 切換商品（點標頭代碼／名稱開搜尋；設計規格 §7.2、§7.3）----
+
+describe('TradePage 切換商品', () => {
+    const tradeHon = { code: '2317', name: '鴻海', security_type: 'STK', exchange: 'TSE', detail: '上市' };
+    const sheetOpen = () => view!.root.findAll(n => typeof n.type === 'string' && n.props['data-testid'] === 'trade-switch-sheet').length > 0;
+    const switchBtn = () => byId('trade-switch');
+    const typeQuery = async (q: string) => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        try {
+            await act(async () => { byId('trade-switch-input').props.onChange({ target: { value: q } }); });
+            await act(async () => { vi.advanceTimersByTime(SEARCH_DEBOUNCE_MS); });
+        } finally {
+            vi.useRealTimers();
+        }
+    };
+    const ancestors = (n: { parent: unknown }) => {
+        const out: { props: Record<string, unknown> }[] = [];
+        let p = n.parent as { props: Record<string, unknown>; parent: unknown } | null;
+        while (p) { out.push(p); p = p.parent as typeof p; }
+        return out;
+    };
+    let store: Map<string, string>;
+    beforeEach(() => {
+        store = new Map();
+        vi.stubGlobal('localStorage', { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => { store.set(k, v); } });
+    });
+
+    it('入口：h1 內的按鈕（type=button、aria-haspopup=dialog、aria-expanded、aria-label 含代碼名稱）；文字維持「代碼 名稱」', async () => {
+        await render();
+        const btn = switchBtn();
+        expect(btn.type).toBe('button');
+        expect(btn.props.type).toBe('button');
+        expect(btn.parent!.type).toBe('h1');
+        expect(btn.parent!.props.className).toBe(tradeStyles.title);
+        expect(btn.props['aria-haspopup']).toBe('dialog');
+        expect(btn.props['aria-expanded']).toBe(false);
+        expect(btn.props['aria-label']).toBe('切換商品，目前 2330 台積電');
+        expect(text(btn)).toBe('2330 台積電');
+        expect(btn.props.className).toContain(tradeStyles.titleButton);
+        expect(btn.props.className).toContain(pressable);
+        expect(sheetOpen()).toBe(false);
+    });
+
+    it('點擊開面板；搜尋後點結果以 replace 導覽到該商品並關閉面板；S1：openTicket／openOrderAction 與 lib 送出函式 0 次', async () => {
+        m.searchProducts.mockResolvedValue([tradeHon]);
+        await render();
+        await act(async () => { switchBtn().props.onClick(); });
+        expect(sheetOpen()).toBe(true);
+        expect(switchBtn().props['aria-expanded']).toBe(true);
+        await typeQuery('鴻');
+        expect(m.searchProducts.mock.calls[0]![0]).toBe('鴻');
+        const pick = view!.root.find(n => n.props['data-testid'] === 'trade-switch-pick' && n.props['data-code'] === '2317');
+        await act(async () => { pick.props.onClick(); });
+        expect(m.navigate).toHaveBeenCalledWith({ name: 'trade', code: '2317' }, { replace: true });
+        expect(sheetOpen()).toBe(false);
+        expect(switchBtn().props['aria-expanded']).toBe(false);
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.openOrderAction).not.toHaveBeenCalled();
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
+    });
+
+    it('路由換成新代碼後整頁重建並設定目前商品（ui.currentCode 由正規代碼 effect 更新）', async () => {
+        await render();
+        m.setCurrentCode.mockClear();
+        m.useContract.mockReturnValue({ ...stock, code: '2317', name: '鴻海' });
+        await act(async () => { view!.update(createElement(TradePage, { code: '2317' })); });
+        expect(m.setCurrentCode).toHaveBeenCalledWith('2317');
+        expect(switchBtn().props['aria-label']).toBe('切換商品，目前 2317 鴻海');
+    });
+
+    it('點目前商品只關閉面板，不導覽', async () => {
+        store.set('sj-mobile-recent-codes', JSON.stringify([{ code: '2330', name: '台積電', securityType: 'STK' }]));
+        await render();
+        await act(async () => { switchBtn().props.onClick(); });
+        const current = view!.root.find(n => n.props['data-testid'] === 'trade-switch-pick' && n.props['data-code'] === '2330');
+        expect(current.props['aria-current']).toBe('true');
+        await act(async () => { current.props.onClick(); });
+        expect(sheetOpen()).toBe(false);
+        expect(m.navigate).not.toHaveBeenCalled();
+    });
+
+    it('合約載入後記入最近查看（正規代碼；非正規代碼的頁面不記錄）', async () => {
+        await render();
+        expect(JSON.parse(store.get('sj-mobile-recent-codes')!)).toEqual([{ code: '2330', name: '台積電', securityType: 'STK' }]);
+        await act(async () => { view!.unmount(); });
+        store.clear();
+        await render('tsmc'); // 路由代碼與正規代碼（2330）不同：改寫路由，由重新掛載的正規頁記錄
+        expect(m.navigate).toHaveBeenCalledWith({ name: 'trade', code: '2330' }, { replace: true });
+        expect(store.get('sj-mobile-recent-codes')).toBeUndefined();
+    });
+
+    it('精簡標頭：顯示時才有切換鍵（在 aria-hidden 的精簡標頭之外）；隱藏時不渲染；點擊開面板', async () => {
+        const observers: { cb: IntersectionObserverCallback; opts: IntersectionObserverInit | undefined }[] = [];
+        class FakeIO {
+            constructor(cb: IntersectionObserverCallback, opts?: IntersectionObserverInit) { observers.push({ cb, opts }); }
+            observe() {}
+            unobserve() {}
+            disconnect() {}
+        }
+        vi.stubGlobal('IntersectionObserver', FakeIO);
+        const main = { tagName: 'MAIN' };
+        await act(async () => {
+            view = create(createElement(TradePage, { code: '2330' }), {
+                createNodeMock: el => ((el.props as { className?: string }).className === undefined ? null : { closest: (sel: string) => (sel === 'main' ? main : null), nodeType: 1 }),
+            });
+        });
+        const compactSwitch = () => view!.root.findAll(n => typeof n.type === 'string' && n.props['data-testid'] === 'trade-compact-switch');
+        expect(compactSwitch()).toHaveLength(0);
+        const header = observers.find(o => o.opts?.root === main)!;
+        await act(async () => {
+            header.cb([{ isIntersecting: false, boundingClientRect: { top: -2 }, rootBounds: { top: 0 } } as unknown as IntersectionObserverEntry], {} as IntersectionObserver);
+        });
+        expect(compactSwitch()).toHaveLength(1);
+        const btn = compactSwitch()[0]!;
+        expect(btn.props.type).toBe('button');
+        expect(btn.props['aria-label']).toBe('切換商品，目前 2330 台積電');
+        expect(btn.props['aria-haspopup']).toBe('dialog');
+        expect(ancestors(btn).some(a => a.props?.['aria-hidden'] === 'true')).toBe(false);
+        expect(byId('trade-compact').props['aria-hidden']).toBe('true');
+        await act(async () => { btn.props.onClick(); });
+        expect(sheetOpen()).toBe(true);
+        await act(async () => {
+            header.cb([{ isIntersecting: true, boundingClientRect: { top: 10 }, rootBounds: { top: 0 } } as unknown as IntersectionObserverEntry], {} as IntersectionObserver);
+        });
+        expect(compactSwitch()).toHaveLength(0);
+    });
+
+    describe('代理輸入框', () => {
+        interface FakeEl {
+            tag: string; style: Record<string, string>; tabIndex: number; type: string; isConnected: boolean;
+            setAttribute: (k: string, v: string) => void;
+            focus: ReturnType<typeof vi.fn>; blur: ReturnType<typeof vi.fn>; remove: ReturnType<typeof vi.fn>;
+        }
+        let body: FakeEl[];
+        let doc: {
+            activeElement: unknown; body: unknown; visibilityState: string;
+            createElement: (t: string) => FakeEl; addEventListener: () => void; removeEventListener: () => void;
+        };
+        const inputNode = { focus: vi.fn(() => { doc.activeElement = inputNode; }) };
+        beforeEach(() => {
+            body = [];
+            inputNode.focus.mockClear();
+            doc = {
+                activeElement: null,
+                visibilityState: 'visible',
+                body: { appendChild: (el: FakeEl) => { body.push(el); el.isConnected = true; return el; } },
+                createElement: (tag: string) => {
+                    const el: FakeEl = {
+                        tag, style: {}, tabIndex: 0, type: '', isConnected: false,
+                        setAttribute: () => undefined,
+                        focus: vi.fn(() => { doc.activeElement = el; }),
+                        blur: vi.fn(() => { if (doc.activeElement === el) doc.activeElement = null; }),
+                        remove: vi.fn(() => { body.splice(body.indexOf(el), 1); el.isConnected = false; }),
+                    };
+                    return el;
+                },
+                addEventListener: () => undefined,
+                removeEventListener: () => undefined,
+            };
+            vi.stubGlobal('document', doc);
+            // 假時鐘不前進：可動畫的面板停在進場中
+            setMotionClockForTest({ now: () => 0, frame: () => 1, cancel: () => undefined });
+        });
+        afterEach(() => { setMotionClockForTest(null); });
+
+        /** 面板可動畫（進場中）；搜尋框是可聚焦的假節點 */
+        const animMock = (el: ReactElement) => {
+            const p = el.props as Record<string, unknown>;
+            if (p['data-testid'] === 'trade-switch-input') return inputNode;
+            if (p.role === 'dialog') return { style: {}, isConnected: true, getBoundingClientRect: () => ({ height: 600, width: 390 }), focus: vi.fn(), contains: () => false };
+            return null;
+        };
+        const renderWith = async (createNodeMock: (el: ReactElement) => unknown) => {
+            await act(async () => { view = create(createElement(TradePage, { code: '2330' }), { createNodeMock }); });
+        };
+
+        it('同步模式：點擊建立並聚焦暫時 input，面板就緒後焦點移到搜尋框、暫時 input 移除', async () => {
+            await renderWith(el => ((el.props as Record<string, unknown>)['data-testid'] === 'trade-switch-input' ? inputNode : null));
+            await act(async () => { switchBtn().props.onClick(); });
+            expect(inputNode.focus).toHaveBeenCalledTimes(1);
+            expect(doc.activeElement).toBe(inputNode);
+            expect(body).toHaveLength(0);
+        });
+
+        it('進場中暫時 input 持有焦點；進場前關閉：暫時 input 失焦並移除，搜尋框不被聚焦', async () => {
+            await renderWith(animMock);
+            await act(async () => { switchBtn().props.onClick(); });
+            expect(body).toHaveLength(1);
+            const proxy = body[0]!;
+            expect(proxy.tag).toBe('input');
+            expect(proxy.style).toMatchObject({ position: 'fixed', top: '0', opacity: '0', fontSize: '16px' });
+            expect(doc.activeElement).toBe(proxy);
+            const close = view!.root.find(n => n.type === 'button' && n.props['aria-label'] === '關閉');
+            await act(async () => { close.props.onClick(); });
+            expect(proxy.blur).toHaveBeenCalled();
+            expect(body).toHaveLength(0);
+            expect(inputNode.focus).not.toHaveBeenCalled();
+        });
+
+        it('進場中卸載交易頁：暫時 input 失焦並移除', async () => {
+            await renderWith(animMock);
+            await act(async () => { switchBtn().props.onClick(); });
+            expect(body).toHaveLength(1);
+            await act(async () => { view!.unmount(); });
+            view = undefined;
+            expect(body).toHaveLength(0);
+            expect(doc.activeElement).toBeNull();
+        });
+    });
+
+    describe('選了其他商品後的焦點', () => {
+        interface KeyNode { focus: ReturnType<typeof vi.fn>; isConnected: boolean; closest: (s: string) => unknown }
+        let keys: KeyNode[];
+        let inertKeys: boolean;
+        let now = 0;
+        let frames = new Map<number, (t: number) => void>();
+        let nextId = 1;
+        const step = async (ms = 16) => {
+            await act(async () => {
+                now += ms;
+                const fs = Array.from(frames.values());
+                frames = new Map();
+                fs.forEach(f => f(now));
+            });
+        };
+        const keyMock = (el: ReactElement) => {
+            if ((el.props as Record<string, unknown>)['data-testid'] !== 'trade-switch') return null;
+            const node: KeyNode = { focus: vi.fn(), isConnected: true, closest: () => (inertKeys ? {} : null) };
+            keys.push(node);
+            return node;
+        };
+        /** 面板可動畫（退場有動畫）；切換鍵是可聚焦的假節點 */
+        const animMock = (el: ReactElement) => {
+            const p = el.props as Record<string, unknown>;
+            if (p.role === 'dialog') return { style: {}, isConnected: true, getBoundingClientRect: () => ({ height: 600, width: 390 }), focus: vi.fn(), contains: () => false };
+            if (p['data-testid'] === 'trade-switch-input') return { focus: vi.fn() };
+            return keyMock(el);
+        };
+        const renderWith = async (createNodeMock: (el: ReactElement) => unknown) => {
+            await act(async () => { view = create(createElement(TradePage, { code: '2330' }), { createNodeMock }); });
+        };
+        const settle = async () => { for (let t = 0; t < 1500 && frames.size > 0; t += 16) await step(); };
+        const pickHon = async () => {
+            await act(async () => { switchBtn().props.onClick(); });
+            await settle(); // 進場跑完（否則面板還在起點，退場彈簧立即到位）
+            await typeQuery('鴻');
+            const pick = view!.root.find(n => n.props['data-testid'] === 'trade-switch-pick' && n.props['data-code'] === '2317');
+            await act(async () => { pick.props.onClick(); });
+            expect(m.navigate).toHaveBeenCalledWith({ name: 'trade', code: '2317' }, { replace: true });
+        };
+        /** 模擬 hash 路由換成新代碼（navigate 是 mock） */
+        const routeTo = async (code: string) => {
+            m.useContract.mockReturnValue({ ...stock, code, name: '鴻海' });
+            await act(async () => { view!.update(createElement(TradePage, { code })); });
+        };
+        const closing = () => view!.root.findAll(n => typeof n.type === 'string' && n.props['data-testid'] === 'trade-switch-sheet-closing');
+        beforeEach(() => {
+            keys = [];
+            inertKeys = false;
+            now = 1000;
+            frames = new Map();
+            nextId = 1;
+            m.searchProducts.mockResolvedValue([tradeHon]);
+            setMotionClockForTest({
+                now: () => now,
+                frame: cb => { const id = nextId++; frames.set(id, cb); return id; },
+                cancel: id => { frames.delete(id); },
+            });
+        });
+        afterEach(() => { setMotionClockForTest(null); });
+
+        it('可動畫：路由先換、退場還沒結束不移焦點；退場結束後焦點移到新頁的切換鍵（preventScroll）', async () => {
+            await renderWith(animMock);
+            await pickHon();
+            expect(closing()).toHaveLength(1);
+            await routeTo('2317');
+            expect(keys.length).toBeGreaterThanOrEqual(2);
+            const fresh = keys[keys.length - 1]!;
+            expect(fresh.focus).not.toHaveBeenCalled(); // 面板仍在退場（殼層可能仍 inert）
+            for (let t = 0; t < 3000 && closing().length > 0; t += 16) await step();
+            expect(closing()).toHaveLength(0);
+            expect(fresh.focus).toHaveBeenCalledTimes(1);
+            expect(fresh.focus).toHaveBeenCalledWith({ preventScroll: true });
+            keys.slice(0, -1).forEach(k => expect(k.focus).not.toHaveBeenCalled());
+        });
+
+        it('同步模式：退場先結束、路由後換；新頁切換鍵掛上後才聚焦', async () => {
+            await renderWith(keyMock);
+            await pickHon();
+            keys.forEach(k => expect(k.focus).not.toHaveBeenCalled()); // 舊頁的鍵不聚焦（即將卸載）
+            await routeTo('2317');
+            const fresh = keys[keys.length - 1]!;
+            expect(fresh.focus).toHaveBeenCalledWith({ preventScroll: true });
+            keys.slice(0, -1).forEach(k => expect(k.focus).not.toHaveBeenCalled());
+        });
+
+        it('目標在 inert／aria-hidden 內：不聚焦', async () => {
+            await renderWith(keyMock);
+            await pickHon();
+            inertKeys = true;
+            await routeTo('2317');
+            keys.forEach(k => expect(k.focus).not.toHaveBeenCalled());
+        });
+
+        it('一般關閉（關閉鈕）、點目前商品：不由這裡移焦點；之後換路由也不聚焦', async () => {
+            store.set('sj-mobile-recent-codes', JSON.stringify([{ code: '2330', name: '台積電', securityType: 'STK' }]));
+            await renderWith(animMock);
+            await act(async () => { switchBtn().props.onClick(); });
+            await settle();
+            const close = view!.root.find(n => n.type === 'button' && n.props['aria-label'] === '關閉');
+            await act(async () => { close.props.onClick(); });
+            expect(closing()).toHaveLength(1);
+            for (let t = 0; t < 3000 && closing().length > 0; t += 16) await step();
+            await act(async () => { switchBtn().props.onClick(); });
+            await settle();
+            const current = view!.root.find(n => n.props['data-testid'] === 'trade-switch-pick' && n.props['data-code'] === '2330');
+            await act(async () => { current.props.onClick(); });
+            for (let t = 0; t < 3000 && closing().length > 0; t += 16) await step();
+            expect(closing()).toHaveLength(0);
+            expect(m.navigate).not.toHaveBeenCalled();
+            await routeTo('2317');
+            keys.forEach(k => expect(k.focus).not.toHaveBeenCalled());
+        });
     });
 });
 
