@@ -690,7 +690,7 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 - 內嵌五檔顯示內外盤比後，`depth-ladder.test.tsx` 原本「ticket 變體不顯示內外盤比」的斷言與本節衝突，已刪除，改由新增案例驗證「ticket 變體顯示內外盤比」與「沒有內外盤量（或試撮）時仍隱藏」（§14 刻意更新 3）。
 - 長按（圖表與自選列）呼叫 `haptic('longPress')`：只在 Android 且使用者開啟「介面觸覺回饋」時震動，iOS 不震（`motion/haptics.ts`）。
 - 選價列收回：另渲染一個 `chart-pick-closing` 殘影節點（`aria-hidden`＋`inert`）播放沿原路收回的動畫，`chart-pick` 本身在選完或取消時立即移除，測試與輔助技術不會看到兩份選價列。
-- 精簡標頭（`trade-compact`）設 `aria-hidden`：內容與頁面 h1、主價重複，且沒有互動。
+- 精簡標頭（`trade-compact`）設 `aria-hidden`：內容與頁面 h1、主價重複；唯一的互動（切換商品）是 aria-hidden 之外的兄弟按鈕 `trade-compact-switch`。
 - 整股／盤中零股切換與「五檔｜明細」同列（收尾）。
   - 零股狀態由 trade-page 持有。DepthLadder 改為受控（`oddLot` prop，頁面與 ticket 變體共用），不再自帶切換鍵；交易頁在分頁列右側渲染匯出的 `DepthOddToggle`（testid `depth-odd-toggle` 不變）。是否可切換只看 `depthOddCapable(contract)`（股票才可以）。
   - 「明細」分頁時切換鍵不渲染，但保留同寬空位，避免分頁跳動；零股狀態也保留。原本切到明細會卸載五檔，回來時重設為整股，這是刻意的行為差異。
@@ -700,6 +700,13 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 - 選價列出現時（非全螢幕）以沒有 transform 的外層 `scrollIntoView({ block: 'nearest' })`，靠 main 的 `scroll-padding-bottom` 停在交易鍵列與分頁列之上（第二階段後修正：小螢幕或開副圖時原本會落在底部 chrome 後面）；減少動態時不平滑。
 - 持倉摘要卡的「未成交：N 筆 ›」連結外包一層 `workingLinkRow`（第二階段後修正）：GroupedSection 的列間髮絲線（`card > * + *::after`）與連結 pressableRow 的按壓層原本共用同一個 `::after`，兩者都失效；現在髮絲線落在外層，`::after` 只當按壓層。
 - 精簡標頭顯示期間，main 的 `scroll-padding-top` 設為 `SIZE.compactBarH`，隱藏或卸載時移除（第二階段後修正）。原因：遮擋檢查發現 scrollIntoView 或焦點移動會把週期列停在精簡標頭後面。
+- **快速切換商品**（使用者需求：「股票代號及名稱那邊可以增加快速搜尋（支持模糊查詢）讓使用者可以快速切換股票」）：
+  - 入口：標頭 h1 內的按鈕 `trade-switch`（aria-haspopup=dialog、aria-expanded、aria-label「切換商品，目前 <代碼> <名稱>」；名稱後 ChevronDown；點擊區以 expandHit 擴到 TOUCH_MIN）。精簡標頭顯示時另有 `trade-compact-switch`：它是 aria-hidden 精簡標頭的兄弟節點，只在顯示時渲染；點擊區固定只補到 44px，不隨 rem 放大。
+  - 面板 `trade-switch-sheet`：標題「切換商品」，large。搜尋欄與結果列同自選搜尋，共用 `hooks/use-product-search`（debounce 250ms、上限 10、AbortController；面板退場中暫停，只取消不清空）。模糊比對沿用上游 `searchProducts`：代碼前綴、名稱子字串、跳字模糊、別名、加「期」查期貨。結果列整列＝切換，列尾只保留「加入自選」，目前商品標「目前」、點了只關閉。
+  - 空白查詢：「最近查看」（`lib/recent-codes`，localStorage `sj-mobile-recent-codes`，最多 10 筆，只存代碼、名稱、種類）與「自選」（取殼層已載入的自選清單，不發新請求）。
+  - 切換：`navigate(..., { replace: true })`，返回鍵回到進交易頁之前的畫面；`ui.currentCode` 由既有路由 effect 更新；選了其他商品後，面板退場結束才把焦點移到新頁的切換鍵。
+  - 開啟即可打字：點擊 handler 內以 flushSync 提交面板，再於同一手勢聚焦 `lib/focus-proxy` 的暫時 input 叫出 iOS 鍵盤。面板進場完成後焦點移到搜尋框，並帶入已打的字；輸入法組字中則延到 compositionend，最多 800ms，逾時只移焦點、不帶標記文字。所有關閉與卸載路徑都會移除暫時 input。
+  - 交易安全：只查詢與導覽，openTicket／openOrderAction／lib 送出函式 0 次（trade-page.test）；下單或確認面板開啟時殼層 inert，標頭不可點。§17「標頭左右滑切換商品」仍不做，點擊開搜尋不在此列。
 
 ### 7.4 下單面板（`order-ticket-sheet.tsx`、`ticket/*`、`order-ticket.css.ts`）
 
@@ -937,6 +944,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
   1. `vite.fork.config.ts` 在合併後把 lucide-react 排除出上游 vendor 群組，各入口只載入自己用到的圖示，約 −8 KiB。找不到上游 vendor 群組時不改。
   2. 自選頁「排行」分段延遲載入（`lib/deferred-modules.ts`，retryableLazy＋ModuleErrorBoundary＋閒置預載），約 −3 KiB。
   - 桌面 `index.html` 771.6 → 772.3 KiB；`approval.html` 79.2 KiB 不變。
+  - 加入快速切換商品後：手機首屏 213.1 KiB（13 個 JS），mobile 入口 chunk 多 0.13 KiB（共用搜尋 hook），新面板只在延遲載入的交易頁 chunk（約 +2.6 KiB）。
   - 刻意留在首屏的狀態列面板：帳戶切換、連線詳情與 ResumeGate 確認、解除鎖單。帳戶切換試過延遲載入，只省約 0.3 KiB，但載入中點了沒有回饋、殼層不會 inert，晚到的面板會疊在其他面板上並搶走焦點，所以撤回。
   - 已知小問題：排除 lucide 後有一個 77 bytes 的 vendor 轉接 chunk，檔名帶 rolldown 去重尾碼（雜湊 9 碼），不符合 nginx 長快取規則，會以 no-cache 提供。只影響桌面，功能正確。
 
@@ -994,7 +1002,7 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
 9. 淺色綠對白 4.34（theme 層級，另案）。
 10. 通知雙錨點的使用者接受度（G1）。
 11. 面板退場期間 TicketForm 多存活約 0.3–0.5 秒仍訂閱行情：無副作用，但 `onBusyChange(false)` 須在真正卸載時呼叫（沿用 `order-ticket-sheet.tsx:116`）。
-12. 首屏 JS（gzip）：第二階段後 226.3 KiB，收尾後 214.7 KiB，已回到目標 ≤218 KiB 內（§13）。
+12. 首屏 JS（gzip）：第二階段後 226.3 KiB，收尾後 214.7 KiB；加入快速切換商品後 213.1 KiB（rolldown 重新切 chunk，13 個 JS），在目標 ≤218 KiB 內（§13）。
 13. 第二階段各畫面的實機項目（§7.2、§7.7、§7.8 的「待實機確認」，以及 §7.3 的長按震動與選價列捲動）尚未驗收；實機驗收清單見規格 §14.3。
 
 ---
