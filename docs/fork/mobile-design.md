@@ -25,7 +25,7 @@
 3. 移除 `src/mobile/styles/layout.css.ts:52-60` 的全域減少動態保底規則（P3）。
 4. 通知維持在狀態列下方疊在內容上（P2/P3）；通知長時間蓋住狀態列鎖單鈕（P1）；「結果未知」被後到的通知壓在後面，或不自動消失卻停在遮擋內容的位置。
 5. 承載連線、環境、鎖單的狀態列做成半透明（P1/P3）。
-6. 自選列預設逐列 `fetchKbars` 迷你走勢（P2，`src/components/sparkline.tsx:8-47`，抵觸規格 §9.1／§9.3）；在共用 `main` 上 `scroll-snap`；交易頁標頭左右滑切換商品。
+6. 自選列無限制地逐列 `fetchKbars` 迷你走勢（P2，`src/components/sparkline.tsx:8-47`，抵觸規格 §9.1／§9.3）。2026-11-06 依使用者參考圖改版，改為只讀可見列、有請求上限、可關閉的版本，見 §7.2；在共用 `main` 上 `scroll-snap`；交易頁標頭左右滑切換商品。
 7. 面板投射係數 0.998（P3）；面板拖曳接手時不排除 `[role=slider]`、輸入元件。
 8. 把 SlideToConfirm 指標處理改成只綁 ref 的原生監聽（`slide-to-confirm.test.tsx:22-29` 直接呼叫 `props.onPointerDown/Move/Up`）。
 9. 確認面板仍 `if (!current) return null`（`order-confirm-sheet.tsx:148`）卻期待退場動畫；移除 approve／cancel 的 entry id 檢查（同檔 154-173）；讓已核准面板等 lib 處理完才離開（`src/lib/order-confirm.ts:85-97` resolve 時立即清空 pending）。
@@ -642,7 +642,20 @@ Stepper({ value: string; onChange(text: string): void; onStep(delta: 1 | -1): vo
 - 排行：Segmented scroll 變體（tablist 語意不變）；caption「更新於 hh:mm:ss」＋更新 IconButton（冷卻秒數沿用）；列首名次（numSm mutedForeground）；不顯示走勢圖。
 - 列表載入：6 列 Skeleton；空清單 EmptyState（Star 圖示、沿用空狀態文字、［搜尋並加入］）；錯誤：InlineNote danger＋［重試］。
 - 長按 500ms（沿用）：`haptic('longPress')`，開啟操作面板（ListRow 樣式）：開啟交易頁、**買進…**、**賣出…**（新增，只呼叫 `openTicket({ code, action, source: 'other' })`，之後仍需預覽與滑動確認）、移到最上、上移、下移、從自選移除（danger、沿用兩段式確認與「與桌面共用」說明）。編輯模式列尾 ⋯ 沿用。
-- 自選列不顯示迷你走勢（不新增任何 K 線請求）；日內區間條列入第二輪。
+- **依使用者參考圖改版（2026-11-06）**。使用者提供另一家券商 App 的自選畫面作參考，只參考版面與資訊結構，不使用對方的品牌、標誌或圖示：
+  - 列（64px）：左側第一行名稱（單行省略），第二行代碼＋市場標記（上市→市、上櫃→櫃、興櫃→興、期貨→期、選擇權→權、指數→指）＋試撮／處置徽章。代碼與市場標記不縮，空間不足時由名稱省略吸收。右側第一行成交價（依漲跌著色，保留 PriceFlash），第二行「漲跌 漲跌幅」純文字（帶正負號、依漲跌著色，不再用實心膠囊）。
+  - 表頭「名稱｜指標切換（漲跌 漲跌幅 ↔ 總量，兩態；舊值 'chg' 讀成 'pct'）｜編輯」。編輯鍵從頁首移到表頭（testid `watch-edit` 不變；aria-label「編輯自選」／「完成編輯」，含可見文字）。
+  - 迷你走勢（使用者要求，有限制地做）：canvas 畫目前或最近一個交易時段的 1 分 K 收盤折線＋淡色面積，昨收虛線為基準並決定顏色。即時成交依分鐘寫入尾段。
+    - 只有可見列掛載（不可見列沒有 canvas、不排 rAF、不讀 K 線）。
+    - 每檔每時段最多 2 次成功讀取：盤中讀過的，收盤後再補一次。休市時段往前補找一次。失敗或盤中資料不足時，15 分鐘後重試。佇列同時 ≤2，未開始的請求在列離開畫面時取消。
+    - 模組延遲載入加閒置預載，載入前與失敗時都是同尺寸空白佔位。
+    - 可在帳戶頁「顯示」關閉（`sj-mobile-watch-spark`，預設開啟），關閉後不發 K 線請求。窄螢幕（≤400px）且字級大時不顯示也不請求。
+    - 指數與組合商品不畫。
+  - 處置徽章：`GET /api/v1/data/regulatory_punish`，模組層快取，自選頁可見時最多每 30 分鐘一次，失敗靜默。參考圖的「注」（注意股）與「N 天後除息」沒有資料來源，不做。
+  - 列尾快速下單鍵 `watch-row-ticket`（44px，只呼叫 `openTicket({ code, source: 'other' })`，不帶方向）。指數與組合商品放同寬的 aria-hidden 佔位，讓各列對齊；編輯模式維持「⋯」。
+  - 多個清單時以 Segmented scroll 分頁（`watch-list-tabs`／`watch-list-tab-<id>`，tablist）取代 PopUpButton，選中分頁自動捲入可見範圍。只有一個清單時不顯示分頁。
+  - 底部指數列 `ShellSlot bottom`：加權（IX0001）與櫃買（IX0043）。用 `retainContractQuotes` 帶型別訂閱，不經合約解析；收盤後或首次開啟沒有即時資料時，以快照（10 分鐘最多一次）作後備。文字一律 foreground，方向以有色 SVG 三角形表示；字級大時數值與漲跌幅上下排列。點擊開該指數的交易頁。
+  - 搜尋面板改為延遲載入（第一次開啟才掛載，失敗時面板顯示載入失敗與重試），讓首屏仍在目標內。
 - 搜尋面板：large；搜尋框為 body 內 `position: sticky; top: 0` 的 `islandBg` 欄（不模糊）；結果列與自選列同樣式，尾端「加入／已加入」Chip。選做：開啟鍵 handler 內以 `flushSync` 掛載面板後同步 `focus()` 輸入框（iOS 只允許手勢同一呼叫堆疊叫出鍵盤，需實機確認）。
 
 **第二階段實作差異**（以程式碼為準）：
@@ -936,7 +949,13 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 只動畫 transform／opacity；手勢與彈簧在同一 rAF 迴圈直接寫 style，拖曳中不 setState（滑塊只在跨 5% 與門檻時更新語意 state）；will-change 只在動畫期間。
 - 模糊層：底部 chrome 一片＋通知；面板開啟時 chrome 實心；canvas 上方與 sticky 列不模糊。
 - 即時資料節流沿用：行情 50ms 合併、自選列 100ms、圖表 100ms；PriceFlash 同格 ≥350ms、只閃可見格；量條 120ms scaleX。
-- 不新增任何網路請求（不做迷你走勢）。
+- 自選改版後，每次進入自選頁的請求上限如下（自選清單本身由 WatchlistProvider 常駐讀取，不另計）：
+  - 處置清單 GET ≤1（30 分鐘內 0）。
+  - 指數快照 POST ≤1（10 分鐘內 0）。
+  - 合約解析 0。
+  - Quote 訂閱：指數 2 筆，加上可見列。
+  - K 線 POST：每個可見的可交易列 ≤1；休市時段補找時 ≤2；同時 ≤2；關閉開關時 0。
+  - 送單、改單、刪單 0。
 - 低階 Android 預設降低透明度；Chrome DevTools 4× CPU 降速下面板拖曳、滑塊、自選 200 列捲動 p95 幀時間 ≤16.7ms、無 >50ms long task；實機 30 分鐘記憶體不持續成長。
 - 首屏 JS（gzip）增量估計：spring＋tween 0.9、gesture 0.9、prefs／haptics／ui-settings 0.5、sheet-stack＋sheet-context 0.5、BottomSheet v2 增量 2.0、SlideToConfirm v2 增量 0.6、ToastHost v2 增量 0.9、殼層（slots、捲動記憶、html 屬性、狀態列）0.9、Segmented＋IconButton＋PageHeader 0.7、新增 lucide 圖示約 9 個 1.5 → **合計約 9.4 KiB**（目標首屏 ≤218 KiB，上限增量 10 KiB）。Stepper、DirectionToggle、QuickChips、PopUpButton、Grouped、InlineNote 等落在既有 lazy chunk。CSS（gzip）增量 ≤12 KiB。
 - 量測：`pnpm exec vite build --config vite.fork.config.ts` 後依規格 §9.4 加總 `dist/mobile.html` 引用的 script 與 modulepreload gzip 大小，PR 附前後數字。
@@ -945,6 +964,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
   2. 自選頁「排行」分段延遲載入（`lib/deferred-modules.ts`，retryableLazy＋ModuleErrorBoundary＋閒置預載），約 −3 KiB。
   - 桌面 `index.html` 771.6 → 772.3 KiB；`approval.html` 79.2 KiB 不變。
   - 加入快速切換商品後：手機首屏 213.1 KiB（13 個 JS），mobile 入口 chunk 多 0.13 KiB（共用搜尋 hook），新面板只在延遲載入的交易頁 chunk（約 +2.6 KiB）。
+  - 自選改版後：手機首屏 211.3 KiB（13 個 JS）。迷你走勢（約 3.2 KiB gzip）與搜尋面板（約 4.0 KiB）改為延遲載入並閒置預載；只延遲走勢時是 215.1 KiB。
   - 刻意留在首屏的狀態列面板：帳戶切換、連線詳情與 ResumeGate 確認、解除鎖單。帳戶切換試過延遲載入，只省約 0.3 KiB，但載入中點了沒有回饋、殼層不會 inert，晚到的面板會疊在其他面板上並搶走焦點，所以撤回。
   - 已知小問題：排除 lucide 後有一個 77 bytes 的 vendor 轉接 chunk，檔名帶 rolldown 去重尾碼（雜湊 9 碼），不符合 nginx 長快取規則，會以 no-cache 提供。只影響桌面，功能正確。
 
@@ -965,6 +985,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 | **刻意更新 1** `toast-host.test.tsx:24` | 以 `button` 找通知 | 改為 `n.props['data-testid'] === 'toast-item'`；className、role、第一個 span 為標題、內文、DOM 順序斷言不變 |
 | **刻意更新 2** `positions-page.test.tsx:451` | `style.width === '50%'` | 改 `style.transform === 'scaleX(0.5)'` |
 | **刻意更新 3** `depth-ladder.test.tsx`（第二階段） | 「ticket 變體不顯示內外盤比」 | 與 §7.3「ticket 變體也顯示內外盤比」衝突，刪除該斷言；改由新增案例驗證 ticket 變體顯示內外盤比（aria-label 文字標示內盤／外盤）、沒有內外盤量或試撮時仍隱藏 |
+| **刻意更新 5** `routes/watchlist-page.test.tsx`（自選改版） | 列訂閱斷言、清單選擇器、排行分段、「不讀 K 線」、表頭指標三案 | 使用者要求依參考圖改版：列訂閱斷言排除底部指數列的 IX0001／IX0043（可見列判斷不放寬）；PopUpButton 改分頁（`watch-list-tabs`）；「不讀 K 線」改為「走勢關閉時不讀 K 線」，並如實計算處置清單、指數快照、Quote 訂閱；膠囊改第二行文字，三態改兩態。S1、兩段式移除、長按與操作面板「買進…／賣出…」的斷言不變 |
 | **刻意更新 4** `styles/primitives.test.ts`（B4） | `controls.routeBadge` 的鍵為 production／simulation／unknown | 舊 `routeBadge` 匯出已無引用並刪除（樣式在 `route-badge.css.ts`，§6.5），刪除該斷言；button、tradeButton、滑塊的斷言不變 |
 
 其他測試不得降低斷言；新增測試見 §10 與各區塊。
@@ -1002,8 +1023,9 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
 9. 淺色綠對白 4.34（theme 層級，另案）。
 10. 通知雙錨點的使用者接受度（G1）。
 11. 面板退場期間 TicketForm 多存活約 0.3–0.5 秒仍訂閱行情：無副作用，但 `onBusyChange(false)` 須在真正卸載時呼叫（沿用 `order-ticket-sheet.tsx:116`）。
-12. 首屏 JS（gzip）：第二階段後 226.3 KiB，收尾後 214.7 KiB；加入快速切換商品後 213.1 KiB（rolldown 重新切 chunk，13 個 JS），在目標 ≤218 KiB 內（§13）。
+12. 首屏 JS（gzip）：第二階段後 226.3 KiB，收尾後 214.7 KiB；加入快速切換商品後 213.1 KiB；自選改版後 211.3 KiB（迷你走勢與搜尋面板延遲載入），在目標 ≤218 KiB 內（§13）。
 13. 第二階段各畫面的實機項目（§7.2、§7.7、§7.8 的「待實機確認」，以及 §7.3 的長按震動與選價列捲動）尚未驗收；實機驗收清單見規格 §14.3。
+14. 自選改版的實機項目：canvas 在 DPR 2／3 的清晰度與進出畫面時是否閃爍、200 列快速捲動、底部指數列在真實 bar 材質上的對比、以 ContractBase 直接訂閱 IX0001／IX0043 是否收到推播、第一次開搜尋面板的延遲、快速下單鍵與列的誤觸。
 
 ---
 
@@ -1011,4 +1033,4 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
 
 **第二輪候選（需各自原型與實機驗證）**：面板內容捲到頂再下拉接手（非被動 touchmove，只在 10px 門檻內且 cancelable 時 preventDefault）；長按 ContextMenu（只開面板）；FLIP 版面動畫；交易頁 ☆ 加入自選；自選列日內區間條（`src/lib/day-range.ts`，不發請求）；委託與持倉下拉更新（僅 iOS 16＋與 Chrome，受 6 秒冷卻）；列水平滑動揭示按鈕（不做滑到底執行）。
 
-**不做**：一鍵／閃電下單、圖上拖曳改價、價格拖曳調整（scrub）、觸價／括號／條件單、批次市價平倉、背景執行、交易頁標頭左右滑切換商品、列滑到底直接執行、預設逐列迷你走勢、修改 `src/lib` 交易邏輯或確認佇列、修改 theme 色票、修改 mobile.html。
+**不做**：一鍵／閃電下單、圖上拖曳改價、價格拖曳調整（scrub）、觸價／括號／條件單、批次市價平倉、背景執行、交易頁標頭左右滑切換商品、列滑到底直接執行、無限制的逐列迷你走勢（有限制的版本已依使用者要求實作，§7.2）、修改 `src/lib` 交易邏輯或確認佇列、修改 theme 色票、修改 mobile.html。
