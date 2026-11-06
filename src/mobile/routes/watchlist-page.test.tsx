@@ -192,6 +192,20 @@ const priceText = (code: string) =>
     view!.root.find(n => n.type === 'li' && n.props['data-code'] === code).find(n => n.props['data-testid'] === 'watch-price').props.children as string;
 const tick = (close: string, chg: string, simtrade = false) => ({ tick: { close, price_chg: chg, simtrade }, index: undefined });
 
+/**
+ * 延遲載入的元件：等動態 import 結算到條件成立。以時間為上限，不以迴圈次數決定成敗——
+ * 2026-11 上游同步後搜尋面板會連帶載入較大的上游搜尋模組，CI 較慢時固定 50 次 setTimeout(0) 等不到。
+ */
+async function settleUntil(pred: () => boolean, timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!pred() && Date.now() < deadline) {
+        await act(async () => {
+            await vi.dynamicImportSettled();
+            await new Promise(resolve => setTimeout(resolve, 10));
+        });
+    }
+}
+
 /** 迷你走勢的 lazy 先載入完成（模組層快取）：之後可見列的走勢欄同步渲染，各測試不必等動態 import */
 beforeAll(async () => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
@@ -200,21 +214,17 @@ beforeAll(async () => {
     m.apiGet.mockResolvedValue({ code: [] });
     m.wl = { items: items.slice(0, 1), loading: false, structureBusy: false, loadError: false, serverLists: [], activeListId: 'a' };
     await act(async () => { view = create(createElement(WatchlistProvider, null, createElement(WatchlistPage)), { createNodeMock: nodeMock }); });
-    for (let i = 0; i < 50 && view!.root.findAll(n => n.type === WatchSparkline).length === 0; i++) {
-        await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
-    }
+    await settleUntil(() => view!.root.findAll(n => n.type === WatchSparkline).length > 0);
     expect(view!.root.findAll(n => n.type === WatchSparkline)).toHaveLength(1);
     // 搜尋面板同樣延遲載入：開一次讓 lazy 載入完成
     const searchSheet = () => view!.root.findAll(n => n.type === BottomSheet && n.props.testId === 'search-sheet');
     await act(async () => { view!.root.find(n => n.props['data-testid'] === 'watch-search' && n.type === 'button').props.onClick(); });
-    for (let i = 0; i < 50 && searchSheet().length === 0; i++) {
-        await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
-    }
+    await settleUntil(() => searchSheet().length > 0);
     expect(searchSheet()).toHaveLength(1);
     await act(async () => view!.unmount());
     view = undefined;
     vi.unstubAllGlobals();
-});
+}, 30_000);
 
 beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
