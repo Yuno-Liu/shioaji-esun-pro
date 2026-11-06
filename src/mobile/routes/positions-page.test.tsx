@@ -125,7 +125,8 @@ vi.mock('../../lib/shioaji', async (importOriginal) => ({
 
 import { resetTradingCostSettings, setTradingCostSettings } from '../../lib/trading-cost-settings';
 import { resetTradingLimitsForTest } from '../hooks/use-trading-limits';
-import { addOnBlockReason, addOnPlanFor, closePlanFor, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
+import { POSITIONS_VIEW_KEY, readPositionsView } from '../lib/positions-view';
+import { addOnBlockReason, addOnPlanFor, closePlanFor, COMPACT_TEXT, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
 
 const stockAcc = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '' };
 const stockAcc2 = { account_type: 'S', broker_id: 'ESUN1', account_id: '7777777', person_id: 'A', signed: true, username: '' };
@@ -1000,5 +1001,225 @@ describe('淨損益與損益兩平價', () => {
         await click(inRow('2330', 'position-close'));
         expect(all('position-close-sheet')).toHaveLength(1);
         expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+    });
+});
+
+describe('「詳細｜精簡」檢視', () => {
+    /** 以 Map 模擬 localStorage（測試環境沒有） */
+    function fakeStorage(initial: Record<string, string> = {}) {
+        const map = new Map(Object.entries(initial));
+        return {
+            map,
+            getItem: vi.fn((k: string) => (map.has(k) ? map.get(k)! : null)),
+            setItem: vi.fn((k: string, v: string) => { map.set(k, String(v)); }),
+            removeItem: (k: string) => { map.delete(k); },
+        };
+    }
+    /** 同代碼有多列（例如現股＋融資）時取第一列 */
+    const compactRowOf = (code: string) => {
+        const rows = view!.root.findAll(n => n.props['data-testid'] === 'position-compact-row' && n.props['data-code'] === code && typeof n.type === 'string');
+        expect(rows.length).toBeGreaterThan(0);
+        return rows[0]!;
+    };
+    const inCompact = (code: string, id: string) => compactRowOf(code).find(n => n.props['data-testid'] === id && typeof n.type === 'string');
+    const compactCodes = () => all('position-compact-row').map(n => n.props['data-code'] as string);
+    const sendFns = () => [m.placeStockExitByShares, m.placeQuickOrder];
+    async function pickView(v: 'detail' | 'compact') {
+        await click(one(`position-view-${v}`));
+    }
+
+    it('預設為詳細：沒有儲存值時顯示既有詳細卡片，切換鍵以 aria-pressed 標示目前檢視', async () => {
+        await render();
+        const group = one('position-view');
+        expect(group.props.role).toBe('group');
+        expect(group.props['aria-label']).toBe('持倉顯示方式');
+        expect(one('position-view-detail').props['aria-pressed']).toBe(true);
+        expect(one('position-view-compact').props['aria-pressed']).toBe(false);
+        expect(textOf(one('position-view-detail'))).toBe('詳細');
+        expect(textOf(one('position-view-compact'))).toBe('精簡');
+        expect(all('position-row')).toHaveLength(2);
+        expect(all('position-compact-row')).toHaveLength(0);
+        expect(readPositionsView()).toBe('detail');
+    });
+
+    it('切換並存 localStorage（sj-mobile-positions-view）；重新開啟頁面沿用；切回詳細也記住', async () => {
+        const storage = fakeStorage();
+        vi.stubGlobal('localStorage', storage);
+        await render();
+        await pickView('compact');
+        expect(one('position-view-compact').props['aria-pressed']).toBe(true);
+        expect(compactCodes()).toEqual(['2330', 'TXFL6']);
+        expect(all('position-row')).toHaveLength(0);
+        expect(storage.map.get(POSITIONS_VIEW_KEY)).toBe('compact');
+        // 帳戶分組、摘要卡照常
+        expect(all('position-group')).toHaveLength(2);
+        expect(textOf(one('position-total'))).toBe('+121,697');
+
+        await act(async () => view!.unmount());
+        await render();
+        expect(compactCodes()).toEqual(['2330', 'TXFL6']);
+        await pickView('detail');
+        expect(storage.map.get(POSITIONS_VIEW_KEY)).toBe('detail');
+        expect(all('position-row')).toHaveLength(2);
+        // 點目前已選的段不重寫
+        storage.setItem.mockClear();
+        await pickView('detail');
+        expect(storage.setItem).not.toHaveBeenCalled();
+    });
+
+    it('localStorage 壞值、讀取丟例外：一律回到詳細；寫入丟例外：本次仍可切換', async () => {
+        vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'COMPACT ' }));
+        await render();
+        expect(all('position-row')).toHaveLength(2);
+        expect(one('position-view-detail').props['aria-pressed']).toBe(true);
+        await act(async () => view!.unmount());
+
+        vi.stubGlobal('localStorage', { getItem: () => { throw new Error('SecurityError'); }, setItem: () => { throw new Error('QuotaExceededError'); } });
+        expect(readPositionsView()).toBe('detail');
+        await render();
+        expect(all('position-row')).toHaveLength(2);
+        await pickView('compact');
+        expect(compactCodes()).toEqual(['2330', 'TXFL6']);
+        expect(one('position-view-compact').props['aria-pressed']).toBe(true);
+    });
+
+    it('精簡列內容：股票（現股／融資／融券）、期貨、玉山與永豐；淨損益、報酬率與兩平狀態文字', async () => {
+        m.contracts = { ...m.contracts, '2317': { ...stk2330, code: '2317', name: '鴻海' } };
+        setPositions([
+            stockPos(),
+            stockPos({ id: 4, cond: 'MarginTrading', quantity: 2000, yd_quantity: 2000 }),
+            stockPos({ id: 5, code: '2317', account: stockAcc2, direction: 'Sell', cond: 'ShortSelling', quantity: 1000, price: 1100, last_price: 1085, pnl: 12_000, yd_quantity: 1000 }),
+            futPos({ direction: 'Sell', quantity: 1, last_price: 22572, pnl: -45_600 }),
+            stockPos({ id: 8, code: '9999', pnl: 5_000 }),
+        ]);
+        vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'compact' }));
+        await render();
+        const headers = all('position-group-header').map(textOf);
+        expect(headers.some(h => h.includes('永豐證券 ***4567'))).toBe(true);
+        expect(headers.some(h => h.includes('玉山證券 ***7777'))).toBe(true);
+        expect(headers.some(h => h.includes('永豐期貨 ***4321'))).toBe(true);
+
+        // 永豐現股多單：名稱／代碼・現股・多 3張+500股｜淨損益（與詳細卡片同值）／報酬率・已過兩平
+        const cash = textOf(compactRowOf('2330'));
+        expect(cash).toContain('台積電');
+        expect(cash).toContain('2330');
+        expect(cash).toContain('現股');
+        expect(cash).toContain('淨損益（含手續費、證交稅）');
+        expect(textOf(inCompact('2330', 'position-compact-qty'))).toBe('多 3張+500股');
+        expect(textOf(inCompact('2330', 'position-compact-pnl'))).toBe('+91,697');
+        expect(textOf(inCompact('2330', 'position-compact-return'))).toBe('+2.49%');
+        expect(textOf(inCompact('2330', 'position-compact-status'))).toBe(COMPACT_TEXT.aboveBreakEven);
+
+        // 融資：條件膠囊
+        const marginRow = all('position-compact-row').filter(n => n.props['data-code'] === '2330')[1]!;
+        expect(textOf(marginRow)).toContain('融資');
+        expect(textOf(marginRow)).toContain('多 2張');
+
+        // 玉山融券空單：現價低於兩平價＝已過兩平（文字，不只靠顏色）
+        expect(textOf(compactRowOf('2317'))).toContain('融券');
+        expect(textOf(inCompact('2317', 'position-compact-qty'))).toBe('空 1張');
+        expect(textOf(inCompact('2317', 'position-compact-status'))).toBe('已過兩平');
+
+        // 期貨空單：券商損益＋未扣費稅
+        expect(textOf(compactRowOf('TXFL6'))).toContain('期貨');
+        expect(textOf(compactRowOf('TXFL6'))).toContain('損益（券商，未扣費稅）');
+        expect(textOf(inCompact('TXFL6', 'position-compact-qty'))).toBe('空 1 口');
+        expect(textOf(inCompact('TXFL6', 'position-compact-pnl'))).toBe('-45,600');
+        expect(textOf(inCompact('TXFL6', 'position-compact-return'))).toBe('+1.00%');
+        expect(textOf(inCompact('TXFL6', 'position-compact-status'))).toBe(COMPACT_TEXT.derivNote);
+
+        // 商品資料未載入：名稱以代碼代替、淨損益不猜（—）、待確認、改顯示現價
+        expect(textOf(inCompact('9999', 'position-compact-pnl'))).toBe('—');
+        expect(textOf(inCompact('9999', 'position-compact-status'))).toBe(COMPACT_TEXT.pending);
+        expect(textOf(inCompact('9999', 'position-compact-price'))).toBe('現價 1,085');
+        expect(compactRowOf('9999').findAll(n => n.props['data-testid'] === 'position-compact-return')).toHaveLength(0);
+        expect(textOf(one('position-total-pending'))).toContain('合計待確認：1 筆');
+    });
+
+    it('遮蔽金額：精簡列的淨損益與數量都遮蔽（報酬率不含金額照常）', async () => {
+        m.privMoney = true;
+        vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'compact' }));
+        await render();
+        expect(textOf(inCompact('2330', 'position-compact-pnl'))).toBe('•••••');
+        expect(textOf(inCompact('2330', 'position-compact-qty'))).toBe('多 •••••');
+        expect(textOf(inCompact('TXFL6', 'position-compact-pnl'))).toBe('•••••');
+        expect(textOf(inCompact('TXFL6', 'position-compact-qty'))).toBe('多 •••••');
+        expect(textOf(inCompact('2330', 'position-compact-return'))).toBe('+2.49%');
+        expect(textOf(one('position-total'))).toBe('•••••');
+        const text = pageText();
+        for (const s of ['97,500', '91,697', '30,000', '3張', '2 口']) expect(text).not.toContain(s);
+    });
+
+    it('未展開不掛詳細卡片子樹；點列展開（aria-expanded／aria-controls）出現既有平倉、加碼、看圖鍵，再點收合', async () => {
+        setPositions([stockPos(), stockPos({ id: 7, code: '2317', account: stockAcc2 }), futPos()]);
+        vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'compact' }));
+        await render();
+        for (const id of ['position-row', 'position-close', 'position-add', 'position-chart', 'position-pnl-info', 'position-pnl-bar']) expect(all(id)).toHaveLength(0);
+        // 收合時列內只有一顆鍵（展開鍵），不新增任何送單入口
+        expect(compactRowOf('2330').findAll(n => n.type === 'button')).toHaveLength(1);
+
+        const toggle = inCompact('2330', 'position-compact-toggle');
+        expect(toggle.props['aria-expanded']).toBe(false);
+        expect(toggle.props['aria-controls']).toBeUndefined();
+        await click(toggle);
+        const opened = inCompact('2330', 'position-compact-toggle');
+        expect(opened.props['aria-expanded']).toBe(true);
+        expect(all('position-row')).toHaveLength(1);
+        expect(inCompact('2330', 'position-row').props.id).toBe(opened.props['aria-controls']);
+        // 既有詳細卡片內容（不重複第一行的損益）
+        expect(all('position-close')).toHaveLength(1);
+        expect(all('position-add')).toHaveLength(1);
+        expect(all('position-chart')).toHaveLength(1);
+        expect(textOf(inRow('2330', 'position-broker-pnl'))).toBe('券商 +97,500');
+        expect(textOf(inRow('2330', 'position-cost'))).toBe('3,683,750');
+        expect(textOf(inRow('2330', 'position-breakeven'))).toBe('1,060');
+        expect(rowOf('2330').findAll(n => n.props['data-testid'] === 'position-pnl')).toHaveLength(0);
+        // 其他列仍未展開
+        expect(inCompact('TXFL6', 'position-compact-toggle').props['aria-expanded']).toBe(false);
+
+        // 玉山列展開後仍可開庫存明細
+        await click(inCompact('2317', 'position-compact-toggle'));
+        await click(inRow('2317', 'position-detail-toggle'));
+        expect(textOf(one('stub-esun-detail'))).toBe('明細 2317');
+
+        await click(inCompact('2330', 'position-compact-toggle'));
+        expect(inCompact('2330', 'position-compact-toggle').props['aria-expanded']).toBe(false);
+        expect(compactRowOf('2330').findAll(n => n.props['data-testid'] === 'position-row')).toHaveLength(0);
+        expect(all('position-row')).toHaveLength(1); // 2317 仍展開
+    });
+
+    it('展開後的平倉與加碼走既有流程：加碼只呼叫 openTicket、平倉只開說明面板，按「繼續」才呼叫 lib', async () => {
+        vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'compact' }));
+        await render();
+        await click(inCompact('TXFL6', 'position-compact-toggle'));
+        await click(inRow('TXFL6', 'position-add'));
+        expect(m.openTicket).toHaveBeenCalledWith({ code: 'TXFL6', action: 'Buy', source: 'position' });
+        await click(inRow('TXFL6', 'position-close'));
+        expect(all('position-close-sheet')).toHaveLength(1);
+        for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        await click(one('position-close-continue'));
+        expect(m.placeQuickOrder).toHaveBeenCalledTimes(1);
+        expect(firstCall(m.placeQuickOrder)[0]).toBe(txf);
+        expect(firstCall(m.placeQuickOrder)[1]).toBe('Sell');
+        expect(firstCall(m.placeQuickOrder)[3]).toBe(2);
+        expect(firstCall(m.placeQuickOrder)[4]).toMatchObject({ account: futAcc, ocType: 'Cover', source: 'manual' });
+    });
+
+    it('S1：切換檢視、展開／收合、展開後開平倉說明面板，lib 送單／改單／刪單 0 次、不開下單面板', async () => {
+        vi.stubGlobal('localStorage', fakeStorage());
+        await render();
+        await pickView('compact');
+        await click(inCompact('2330', 'position-compact-toggle'));
+        await click(inCompact('TXFL6', 'position-compact-toggle'));
+        await click(inCompact('TXFL6', 'position-compact-toggle'));
+        await click(inRow('2330', 'position-close'));
+        expect(all('position-close-sheet')).toHaveLength(1);
+        await act(async () => { view!.root.find(n => n.props.testId === 'position-close-sheet').props.onClose(); });
+        await pickView('detail');
+        await pickView('compact');
+        for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.notify).not.toHaveBeenCalled();
+        expect(m.reconcileAfterUnknownOutcome).not.toHaveBeenCalled();
     });
 });

@@ -13,6 +13,7 @@
 // - 版面（設計規格 §7.7）：GroupedSection 卡片；caption「未實現淨損益合計（估）」＋numHero（漲跌色、正負號）；
 //   合計跳價閃爍（PriceFlash：遮蔽或未讀到時不閃、只動畫 opacity）；下方雙欄市值、權益數與風險指標
 //   （數值文字＋等級文字為 foreground，狀態色只給下方進度條 scaleX）。
+// - compact（持倉頁精簡檢視）：同樣內容，內距與合計字級縮小。
 
 import { useRef } from 'react';
 import { maskMoney } from '../../lib/privacy';
@@ -43,6 +44,8 @@ export interface PositionSummaryCardProps {
     derivGross?: boolean;
     /** 額度列要顯示的證券帳戶（持倉頁篩選單一證券帳戶時）；未提供時用目前選取的證券帳戶 */
     limitsAccount?: Pick<Account, 'broker_id' | 'account_id' | 'account_type'> | null;
+    /** 持倉頁精簡檢視：內距、間距與合計字級縮小（內容不變） */
+    compact?: boolean;
 }
 
 const tone = (v: number): 'up' | 'down' | 'flat' => (v > 0 ? 'up' : v < 0 ? 'down' : 'flat');
@@ -51,7 +54,7 @@ const tone = (v: number): 'up' | 'down' | 'flat' => (v > 0 ? 'up' : v < 0 ? 'dow
 export const RISK_BAR_FULL_PCT = 300;
 const RISK_TONE: Record<RiskLevel, BarTone> = { danger: 'danger', warn: 'amber', ok: 'success' };
 
-export function PositionSummaryCard({ summary, known, margin, futuresLabel, privMoney, pending = 0, allPending = false, derivGross = false, limitsAccount }: PositionSummaryCardProps) {
+export function PositionSummaryCard({ summary, known, margin, futuresLabel, privMoney, pending = 0, allPending = false, derivGross = false, limitsAccount, compact = false }: PositionSummaryCardProps) {
     const risk = margin ? futuresRiskOf(margin) : null;
     const value = summary.marketValue;
     const flashRef = useRef<HTMLSpanElement | null>(null);
@@ -59,11 +62,11 @@ export function PositionSummaryCard({ summary, known, margin, futuresLabel, priv
     usePriceFlash(flashRef, shown && Number.isFinite(summary.pnl) ? summary.pnl : null, { enabled: shown, masked: privMoney });
     return (
         <GroupedSection testId='position-summary'>
-            <div className={styles.summary}>
+            <div className={compact ? styles.summaryTight : styles.summary}>
                 <div>
                     <p className={styles.summaryCaption}>未實現淨損益合計（估）</p>
                     <div className={styles.summaryMain}>
-                        <span className={`${styles.summaryValue} ${flash.host}`}>
+                        <span className={`${compact ? styles.summaryValueTight : styles.summaryValue} ${flash.host}`}>
                             <span ref={flashRef} className={flash.overlay} aria-hidden='true' />
                             <span className={styles.tone[shown ? tone(summary.pnl) : 'flat']} data-testid='position-total'>
                                 {shown ? maskMoney(fmtSigned(summary.pnl, 0), privMoney) : '—'}

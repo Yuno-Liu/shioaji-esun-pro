@@ -32,9 +32,13 @@
 //   「損益兩平」列（文字標示現價高於／低於兩平價、手續費折數、當沖稅率、估算）點開 position-pnl-sheet 計算明細（只讀）。
 //   今日買進股數：玉山庫存明細（分批成交日）→ 今日成交回報（委託查詢成功時）；都沒有則一般稅率並標「未判斷當沖」。
 //   期權維持券商損益並標「未扣費稅」。摘要、分組小計、損益條、損益／報酬率排序都用同一個值；無法計算的列不猜，標「合計待確認」。
+// - 「詳細｜精簡」檢視（篩選列行尾 Segmented toggle；lib/positions-view 存 localStorage，預設詳細）：
+//   精簡＝每個部位一列（名稱／代碼・條件・多空數量｜淨損益／報酬率・已過或未達兩平），帳戶分組、摘要、篩選、排序照常、摘要卡較緊湊。
+//   點列（aria-expanded）就地展開既有詳細卡片（不重複第一行），再點收合；平倉、加碼、看圖入口與流程不變，不新增送單入口。
+//   未展開的列不掛詳細卡片子樹；切換時以切換鍵為錨點保留捲動位置；減少動態時不做展開動畫。
 
 import { ChevronRight, RotateCw, Wallet } from 'lucide-react';
-import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
 import { useTradingLive } from '../../hooks/use-stream';
 import { getAccountState, selectAccount, useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
@@ -80,8 +84,9 @@ import { RouteBadge } from '../components/route-badge';
 import { classifyTicketOutcome, OUTCOME_UNKNOWN_TITLE } from '../hooks/use-mobile-ticket';
 import { useResumeGate } from '../hooks/use-resume-gate';
 import { navigate } from '../lib/hash-router';
-import { computeStockPnl, stockPnlInputOf, todayStockFills, type StockPnl, type TodayFills } from '../lib/position-pnl';
+import { breakEvenRelation, computeStockPnl, stockPnlInputOf, todayStockFills, type StockPnl, type TodayFills } from '../lib/position-pnl';
 import { openTicket, type TicketCond, type TicketLot } from '../lib/mobile-store';
+import { readPositionsView, writePositionsView, type PositionsView } from '../lib/positions-view';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { assertResumeReady, getResumeGate, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import * as controls from '../styles/controls.css';
@@ -409,6 +414,8 @@ interface RowProps {
     onAddOn: (contract: ContractInfo | undefined) => void;
     onToggleDetail: () => void;
     onOpenPnl: () => void;
+    /** 精簡列展開時：嵌在精簡列的 li 內（div＋id，供 aria-controls），不重複第一行（代碼、條件、多空數量、損益已在精簡列） */
+    embeddedId?: string;
 }
 
 function Cell({ label, children, className, testId }: { label: string; children: ReactNode; className?: string; testId?: string }) {
@@ -427,7 +434,7 @@ function pnlSrLabel(rp: RowPnl): string {
     return d !== undefined && d < 1 ? `淨損益（含手續費 ${discountText(d)} 折、證交稅）` : '淨損益（含手續費、證交稅）';
 }
 
-function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsPnl, ydNotice, expanded, rp, onClose, onAddOn, onToggleDetail, onOpenPnl }: RowProps) {
+function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsPnl, ydNotice, expanded, rp, onClose, onAddOn, onToggleDetail, onOpenPnl, embeddedId }: RowProps) {
     const contract = useContract(p.code);
     const long = p.direction === 'Buy';
     const stock = isStockPosition(p);
@@ -445,9 +452,10 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
     const breakEven = sp && sp.breakEven !== null && rp.contract ? formatToTick(rp.contract, sp.breakEven) : '—';
     const relation = sp ? breakEvenRelationText(sp, p.last_price) : null;
     const money = (v: number | null) => maskMoney(v === null ? '—' : fmtInt(Math.round(v)), privMoney);
-    return (
-        <li className={styles.row} data-testid='position-row' data-code={p.code}>
-            <div className={styles.rowHead}>
+    const embedded = embeddedId !== undefined;
+    const body = (
+        <>
+            {!embedded && <div className={styles.rowHead}>
                 <span className={styles.rowCode}>{p.code}</span>
                 {contract?.name && <span className={styles.rowName}>{contract.name}</span>}
                 <span className={styles.tag}>{positionCondText(p, contract)}</span>
@@ -459,7 +467,7 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                     <span className={srOnly}>{pnlSrLabel(rp)}</span>
                     <span data-testid='position-pnl'>{shown === null ? '—' : maskMoney(fmtSigned(shown, 0), privMoney)}</span>
                 </span>
-            </div>
+            </div>}
             <div className={styles.rowMeta}>
                 <RouteBadge account={p.account} />
                 {p.account && <span>{mobileAccountLabel(p.account, priv)}</span>}
@@ -524,8 +532,96 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                 ? <p className={styles.rowNote} data-testid='position-add-note'>{addOnReason}</p>
                 : addOnNote && <p className={styles.rowNote} data-testid='position-add-note'>{addOnNote}</p>}
             {esun && expanded && <PositionEsunDetails position={p} />}
+        </>
+    );
+    return embedded
+        ? <div id={embeddedId} className={styles.compactDetail} data-testid='position-row' data-code={p.code}>{body}</div>
+        : <li className={styles.row} data-testid='position-row' data-code={p.code}>{body}</li>;
+}
+
+export const COMPACT_TEXT = {
+    derivNote: '券商・未扣費稅',
+    pending: '淨損益待確認',
+    aboveBreakEven: '已過兩平',
+    belowBreakEven: '未達兩平',
+    atBreakEven: '等於兩平',
+} as const;
+
+/**
+ * 精簡列右側第二行的狀態文字（不只靠顏色）：股票＝現價與兩平價的關係（已過兩平／未達兩平／等於兩平）；
+ * 期權＝券商損益未扣費稅；淨損益算不出＝待確認；缺兩平價或現價時回 null。
+ */
+export function compactStatusText(p: Pick<Position, 'last_price'>, rp: RowPnl): string | null {
+    if (rp.deriv) return COMPACT_TEXT.derivNote;
+    if (rp.value === null || !rp.stock) return COMPACT_TEXT.pending;
+    const rel = breakEvenRelation(rp.stock, p.last_price);
+    return rel === 'profit' ? COMPACT_TEXT.aboveBreakEven : rel === 'loss' ? COMPACT_TEXT.belowBreakEven : rel === 'even' ? COMPACT_TEXT.atBreakEven : null;
+}
+
+interface CompactRowProps {
+    p: AccountedPosition;
+    privMoney: boolean;
+    rp: RowPnl;
+    open: boolean;
+    onToggle: () => void;
+    /** 展開時才呼叫（未展開的列不掛詳細卡片子樹） */
+    renderDetail: (id: string) => ReactNode;
+}
+
+/** 精簡列：左＝名稱／代碼・條件・多空數量；右＝淨損益／報酬率（缺時現價）・兩平狀態；點一下就地展開既有詳細卡片 */
+function PositionCompactRow({ p, privMoney, rp, open, onToggle, renderDetail }: CompactRowProps) {
+    const contract = useContract(p.code);
+    const detailId = useId();
+    const shown = rp.value;
+    const ret = rowReturnPct(p, rp);
+    const status = compactStatusText(p, rp);
+    const name = contract?.name;
+    return (
+        <li className={styles.compactItem} data-testid='position-compact-row' data-code={p.code}>
+            <button
+                type='button'
+                className={styles.compactRow}
+                aria-expanded={open}
+                aria-controls={open ? detailId : undefined}
+                onClick={onToggle}
+                data-testid='position-compact-toggle'
+            >
+                <span className={styles.compactLeft}>
+                    <span className={styles.compactName}>{name || p.code}</span>
+                    <span className={styles.compactMeta}>
+                        {name && <span className={styles.compactCode}>{p.code}</span>}
+                        <span className={`${styles.tag} ${styles.compactTag}`}>{positionCondText(p, contract)}</span>
+                        <span className={styles.compactSide[p.direction === 'Buy' ? 'long' : 'short']} data-testid='position-compact-qty'>
+                            {sideText(p.direction)} {maskMoney(positionQtyText(p), privMoney)}
+                        </span>
+                    </span>
+                </span>
+                <span className={styles.compactRight}>
+                    <span className={`${styles.compactPnl} ${styles.tone[shown === null ? 'flat' : pnlTone(shown)]}`}>
+                        <span className={srOnly}>{pnlSrLabel(rp)}</span>
+                        <span data-testid='position-compact-pnl'>{shown === null ? '—' : maskMoney(fmtSigned(shown, 0), privMoney)}</span>
+                    </span>
+                    <span className={styles.compactSub}>
+                        {ret !== null
+                            ? <span className={styles.tone[pnlTone(ret)]} data-testid='position-compact-return'>{fmtPct(ret)}</span>
+                            : <span data-testid='position-compact-price'>現價 {fmtPrice(p.last_price)}</span>}
+                        {status && <span data-testid='position-compact-status'>{status}</span>}
+                    </span>
+                </span>
+                <ChevronRight className={styles.compactChevron} aria-hidden='true' focusable='false' />
+            </button>
+            {open && renderDetail(detailId)}
         </li>
     );
+}
+
+/** 最近的可捲動祖先（殼層 main）；找不到時用文件捲動 */
+function scrollParentOf(el: HTMLElement): HTMLElement | null {
+    for (let n = el.parentElement; n; n = n.parentElement) {
+        const oy = getComputedStyle(n).overflowY;
+        if (oy === 'auto' || oy === 'scroll') return n;
+    }
+    return document.scrollingElement instanceof HTMLElement ? document.scrollingElement : null;
 }
 
 interface CloseSheetProps {
@@ -741,6 +837,35 @@ export function PositionsPage() {
         return next;
     });
 
+    // ---- 「詳細｜精簡」檢視（預設詳細；localStorage 讀寫失敗時只在本次有效）----
+    const [view, setView] = useState<PositionsView>(readPositionsView);
+    const viewRef = useRef<HTMLDivElement | null>(null);
+    const viewAnchor = useRef<number | null>(null);
+    const changeView = (next: PositionsView) => {
+        if (next === view) return;
+        // 以切換鍵為錨點：記下它在視窗中的位置，提交後補回內容高度改變造成的位移（保留捲動位置）
+        viewAnchor.current = viewRef.current ? viewRef.current.getBoundingClientRect().top : null;
+        setView(next);
+        writePositionsView(next);
+    };
+    useLayoutEffect(() => {
+        const before = viewAnchor.current;
+        viewAnchor.current = null;
+        const el = viewRef.current;
+        if (before === null || !el) return;
+        const scroller = scrollParentOf(el);
+        const delta = el.getBoundingClientRect().top - before;
+        if (scroller && delta !== 0) scroller.scrollTop += delta;
+    }, [view]);
+    // 精簡列展開（可同時展開多列：展開或收合一列時其他列不位移）
+    const [compactOpen, setCompactOpen] = useState<ReadonlySet<string>>(() => new Set());
+    const toggleCompact = (key: string) => setCompactOpen(prev => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+    });
+
     // ---- 「⟳」6 秒冷卻 ----
     const [cooling, setCooling] = useState(false);
     const coolTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -888,6 +1013,20 @@ export function PositionsPage() {
                     options={SORT_MODES.map(s => ({ value: s.key, label: `排序：${s.label}` }))}
                     onChange={setSort}
                 />
+                <div className={styles.viewToggle} ref={viewRef}>
+                    <Segmented<PositionsView>
+                        semantics='toggle'
+                        size='compact'
+                        ariaLabel='持倉顯示方式'
+                        testId='position-view'
+                        items={[
+                            { value: 'detail', label: '詳細', testId: 'position-view-detail' },
+                            { value: 'compact', label: '精簡', testId: 'position-view-compact' },
+                        ]}
+                        value={view}
+                        onChange={changeView}
+                    />
+                </div>
             </div>
 
             {reconcile && (
@@ -915,6 +1054,7 @@ export function PositionsPage() {
                 futuresLabel={accounts.selectedFutures ? mobileAccountLabel(accounts.selectedFutures, priv) : ''}
                 privMoney={privMoney}
                 limitsAccount={limitsAccount}
+                compact={view === 'compact'}
             />
 
             {unclassified > 0 && (
@@ -958,7 +1098,7 @@ export function PositionsPage() {
                         <ul className={styles.list} aria-label={groupLabel(g.account, priv)}>
                             {g.rows.map(p => {
                                 const key = positionKey(p);
-                                return (
+                                const detail = (embeddedId?: string) => (
                                     <PositionRow
                                         key={key}
                                         p={p}
@@ -974,6 +1114,19 @@ export function PositionsPage() {
                                         onAddOn={(contract) => onAddOn(p, contract)}
                                         onToggleDetail={() => toggleDetail(key)}
                                         onOpenPnl={() => setPnlKey(key)}
+                                        embeddedId={embeddedId}
+                                    />
+                                );
+                                if (view !== 'compact') return detail();
+                                return (
+                                    <PositionCompactRow
+                                        key={key}
+                                        p={p}
+                                        privMoney={privMoney}
+                                        rp={pnlOf(p)}
+                                        open={compactOpen.has(key)}
+                                        onToggle={() => toggleCompact(key)}
+                                        renderDetail={detail}
                                     />
                                 );
                             })}
