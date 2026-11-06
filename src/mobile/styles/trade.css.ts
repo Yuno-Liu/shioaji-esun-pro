@@ -306,9 +306,11 @@ export const controlGrow = style({
 });
 
 /**
- * 「五檔｜明細」＋右側［整股｜盤中零股］同列（§7.3）。寬度全以 rem 計（隨字級等比放大）：
- * 分頁至少 6rem、切換鍵固定 10rem（「盤中零股」4 字 callout 3.5rem＋左右內距 1rem＝每段 4.5rem）、間距 .75rem，
- * 列寬不足 16.75rem（360 寬、字級大：(360 − 2×20.8) ÷ 20.8 ≈ 15.3rem）時切換鍵換到第二行靠右，不重疊、不溢出。
+ * 「五檔｜明細｜公司」＋右側［整股｜盤中零股］同列（§7.3）。寬度全以 rem 計（隨字級等比放大）：
+ * 分頁至少 8.5rem（3 段 ×（2 字 callout 1.75rem＋左右內距 1rem）＋軌道內距）、
+ * 切換鍵固定 9.5rem（「盤中零股」4 字 callout 3.5rem＋左右內距 1rem＝每段 4.5rem）、間距 .75rem，
+ * 列寬不足 18.75rem 時切換鍵換到第二行靠右，不重疊、不溢出
+ * （390 寬字級標準 (390 − 2×18.4) ÷ 18.4 ≈ 19.2rem 同列；375／360 寬字級標準、任何寬度字級大時換行）。
  * 行距 s2：compact 上下各擴 4px 的點擊區不與另一行重疊。
  */
 export const panelRow = style([controlRow, {
@@ -317,13 +319,13 @@ export const panelRow = style([controlRow, {
 }]);
 
 export const panelTabs = style({
-    flex: '1 1 6rem',
+    flex: '1 1 8.5rem',
     minWidth: 0,
 });
 
-/** 切換鍵位置（股票才渲染）：明細分頁時只留空位，分頁寬度不跳動 */
+/** 切換鍵位置（股票才渲染）：明細、公司分頁時只留空位，分頁寬度不跳動 */
 export const oddToggleSlot = style({
-    flex: '0 0 10rem',
+    flex: '0 0 9.5rem',
     marginLeft: 'auto',
     minWidth: 0,
 });

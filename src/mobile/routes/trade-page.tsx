@@ -4,8 +4,9 @@
 // │       統計格（股票）開 高 均 總／參 低 單 額（期權無「額」；顏色相對參考價）
 // │       漲跌停價・非「可當沖」的當沖狀態（股票）或到期月份・時段（期權）
 // ├ 週期 Segmented（toggle）［走勢］［1分］［5分］［15分］［60分］［日］＋交易圖表（委託線、成本線、漲跌停、參考價）
-// ├ 五檔／明細 Segmented（tabs）＋同列右側［整股｜盤中零股］（股票；明細分頁時隱藏但保留狀態、窄螢幕換行）
+// ├ 五檔／明細／公司 Segmented（tabs）＋同列右側［整股｜盤中零股］（股票；明細、公司分頁時隱藏但保留狀態、窄螢幕換行）
 // │   （五檔買賣同列：委買量｜買價｜賣價｜委賣量、量條、五檔總量、買賣比與內外盤比）
+// │   （公司：components/company/company-tab，切到該分頁才延遲載入並讀 shioaji-data；只導覽與開外部連結，不下單）
 // ├ 持倉摘要・未成交 N 筆 ›（#/orders；GroupedSection）
 // └［買 進］［賣 出］→ openTicket()（只開下單面板，送單一律經確認面板）；以 ShellSlot bottom 放進底部 chrome
 //
@@ -15,7 +16,7 @@
 // code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。合約解析出的正規代碼與路由不同（小寫、舊指數代碼）時改寫路由。
 
 import { ChevronDown } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type Ref } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type Ref } from 'react';
 import { flushSync } from 'react-dom';
 import { useQuote } from '../../hooks/use-stream';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
@@ -31,7 +32,9 @@ import { fmtCompactInt, fmtStockLots } from '../../lib/utils/format';
 import { nowWallClockUtc } from '../../lib/utils/kbars';
 import { formatToTick } from '../../lib/utils/ticksize';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
+import { loadCompanyTab } from '../components/company/load-company-tab';
 import { DepthLadder, depthOddCapable, DepthOddToggle } from '../components/depth-ladder';
+import { ModuleErrorBoundary, ModuleLoadError, retryableLazy } from '../components/route-error-boundary';
 import { TickList } from '../components/tick-list';
 import { TradeChart } from '../components/trade-chart';
 import { TradeSwitchSheet } from '../components/trade-switch-sheet';
@@ -53,6 +56,7 @@ import { usePriceFlash } from '../ui/price-flash';
 import * as flash from '../ui/price-flash.css';
 import { Segmented } from '../ui/segmented';
 import { ShellSlot } from '../ui/shell-slots';
+import { Skeleton } from '../ui/skeleton';
 
 // ---- 純函式（標頭文字） ----
 
@@ -159,10 +163,17 @@ function savePeriod(p: ChartPeriod) {
 // ---- 元件 ----
 
 const PERIOD_ITEMS = CHART_PERIODS.map(p => ({ value: p.key, label: p.label }));
+type PanelKey = 'depth' | 'ticks' | 'company';
 const PANEL_ITEMS = [
     { value: 'depth', label: '五檔' },
     { value: 'ticks', label: '明細' },
+    { value: 'company', label: '公司', testId: 'trade-panel-company' },
 ] as const;
+
+// 「公司」分頁（公司資料、產業鏈、營收、題材、上下游、來源）：只有切到這個分頁才 import 並開始讀 shioaji-data，
+// 不閒置預載、不增加首屏體積。載入失敗只在分頁內容區顯示「載入失敗」＋［重試］（retryableLazy 換新的 lazy 重新 import）。
+const CompanyTab = retryableLazy(() => loadCompanyTab().then(m => m.CompanyTab), 'CompanyTab');
+const resetCompanyTab = () => { CompanyTab.reset(); };
 
 type StatKey = 'open' | 'high' | 'low' | 'reference' | 'avg' | 'total' | 'last' | 'amount';
 
@@ -424,7 +435,14 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
     const privMoney = usePrivacyMoney();
     const [period, setPeriodState] = useState<ChartPeriod>(loadPeriod);
     const setPeriod = (p: ChartPeriod) => { setPeriodState(p); savePeriod(p); };
-    const [panel, setPanel] = useState<'depth' | 'ticks'>('depth');
+    const [panel, setPanelState] = useState<PanelKey>('depth');
+    // 公司分頁第一次切入後保持掛載（切走只隱藏）：子分頁、展開狀態不重設，也不重新讀取；換商品時整頁重建而重設
+    // 隱藏時傳 active=false：公司分頁不再跟著成交重繪（不和五檔、圖表搶主執行緒）
+    const [companyMounted, setCompanyMounted] = useState(false);
+    const setPanel = (p: PanelKey) => {
+        setPanelState(p);
+        if (p === 'company') setCompanyMounted(true);
+    };
     // 五檔整股／盤中零股：放在本頁（切到明細再回來不重設）；換商品時整頁重建而重設為整股
     const [oddLot, setOddLot] = useState(false);
 
@@ -471,7 +489,7 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
 
             <div className={styles.panelRow} data-testid='trade-panel-row'>
                 <div className={styles.panelTabs}>
-                    <Segmented<'depth' | 'ticks'> items={PANEL_ITEMS} value={panel} onChange={setPanel} semantics='tabs' ariaLabel='五檔與明細' size='compact' />
+                    <Segmented<PanelKey> items={PANEL_ITEMS} value={panel} onChange={setPanel} semantics='tabs' ariaLabel='五檔、明細與公司' size='compact' />
                 </div>
                 {depthOddCapable(contract) && (
                     <div className={styles.oddToggleSlot}>
@@ -479,9 +497,17 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
                     </div>
                 )}
             </div>
-            {panel === 'depth'
-                ? <DepthLadder code={sym} contract={contract} trades={trading.trades} oddLot={oddLot} />
-                : contract ? <TickList code={sym} contract={contract} /> : null}
+            {panel === 'depth' && <DepthLadder code={sym} contract={contract} trades={trading.trades} oddLot={oddLot} />}
+            {panel === 'ticks' && contract && <TickList code={sym} contract={contract} />}
+            {companyMounted && (
+                <div hidden={panel !== 'company'} data-testid='trade-company'>
+                    <ModuleErrorBoundary onRetry={resetCompanyTab} fallback={props => <ModuleLoadError {...props} testId='company-load-error' />}>
+                        <Suspense fallback={<Skeleton label='公司資料載入中…' rows={5} testId='company-module-loading' />}>
+                            <CompanyTab contract={contract} active={panel === 'company'} />
+                        </Suspense>
+                    </ModuleErrorBoundary>
+                </div>
+            )}
 
             <div className={styles.summaryWrap}>
                 <GroupedSection testId='trade-summary'>

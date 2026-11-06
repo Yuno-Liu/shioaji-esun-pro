@@ -44,6 +44,11 @@ vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, openOrderActio
 vi.mock('../../lib/product-search', () => ({ searchProducts: m.searchProducts }));
 vi.mock('../components/trade-chart', () => ({ TradeChart: (props: unknown) => { m.chartProps.push(props); return null; } }));
 vi.mock('../components/tick-list', () => ({ TickList: () => null }));
+// 「公司」分頁（延遲載入）：以替身取代，不讀 shioaji-data（內容與 S1 另見 components/company/company-tab.test.tsx）
+vi.mock('../components/company/load-company-tab', async () => {
+    const { createElement: h } = await import('react');
+    return { loadCompanyTab: async () => ({ CompanyTab: (props: { contract?: { code: string } }) => h('div', { 'data-testid': 'company-stub' }, props.contract?.code ?? '') }) };
+});
 vi.mock('../../lib/shioaji', () => ({
     fetchSnapshots: m.fetchSnapshots,
     placeStockOrder: m.send.placeStockOrder,
@@ -367,21 +372,24 @@ describe('TradePage B3b', () => {
     const buttons = () => view!.root.findAll(n => n.type === 'button');
     const btn = (label: string) => buttons().find(b => text(b) === label)!;
 
-    it('S1：交易頁每個按鈕（買賣鍵、週期、五檔／明細、整股／零股、五檔點價）只呼叫 openTicket，lib 送出函式 0 次', async () => {
+    it('S1：交易頁每個按鈕（買賣鍵、週期、五檔／明細／公司、整股／零股、五檔點價）只呼叫 openTicket，lib 送出函式 0 次', async () => {
         m.useQuote.mockReturnValue({
             tick: { code: '2330', close: '1085', price_chg: '15', total_volume: 23456 },
             bidask: { bid_price: ['1080', '1075'], bid_volume: [5, 3], ask_price: ['1085', '1090'], ask_volume: [4, 2] },
         });
         await render();
-        // 先點「五檔」相關按鈕，再切到明細（明細列表已 mock），最後點買賣鍵
+        // 先點「五檔」相關按鈕，再切到明細（明細列表已 mock）、再切到公司（公司分頁以替身取代），各自再點一輪（含買賣鍵）
         const clickAll = async () => {
             for (const b of buttons().filter(n => !n.props.disabled)) {
-                if (text(b) === '明細') continue;
+                if (text(b) === '明細' || text(b) === '公司') continue;
                 await act(async () => { b.props.onClick?.(); });
             }
         };
         await clickAll();
         await act(async () => { btn('明細').props.onClick(); });
+        await clickAll();
+        await act(async () => { btn('公司').props.onClick(); });
+        expect(view!.root.findAllByProps({ 'data-testid': 'company-stub' })).toHaveLength(1);
         await clickAll();
         expect(m.openTicket.mock.calls.length).toBeGreaterThanOrEqual(6);
         for (const [arg] of m.openTicket.mock.calls) {
@@ -405,11 +413,12 @@ describe('TradePage B3b', () => {
         expect((m.chartProps.at(-1) as { period: string }).period).toBe('5m');
     });
 
-    it('五檔／明細改為 Segmented tabs（role=tablist／tab＋aria-selected）', async () => {
+    it('五檔／明細／公司為 Segmented tabs（role=tablist／tab＋aria-selected）', async () => {
         await render();
         const list = view!.root.findAll(n => n.type === 'div' && n.props.role === 'tablist');
         expect(list).toHaveLength(1);
-        expect(list[0]!.props['aria-label']).toBe('五檔與明細');
+        expect(list[0]!.props['aria-label']).toBe('五檔、明細與公司');
+        expect(list[0]!.findAllByType('button').map(b => text(b))).toEqual(['五檔', '明細', '公司']);
         expect(btn('五檔').props.role).toBe('tab');
         expect(btn('五檔').props['aria-selected']).toBe(true);
         await act(async () => { btn('明細').props.onClick(); });
