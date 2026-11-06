@@ -3,15 +3,16 @@
 // - 自選列 64px（依使用者參考圖改版）：左第一行名稱 headline、第二行代碼＋市場標記＋徽章（試撮、處置）；
 //   右第一行成交價（比 numMd 大一級、漲跌色＋PriceFlash 覆蓋層）、第二行「漲跌 漲跌幅」或總量（純文字、漲跌色）；
 //   迷你走勢 canvas（可在帳戶頁關閉）；列尾快速下單鍵 IconButton 44（指數、組合商品不顯示）。
-// - 排行列沿用漲跌膠囊（pill：實心 up／down＋inkStrong 白字 numSm 600；平盤 elevatedBg＋foreground）。
+// - 排行列與自選列共用 components/quote-row.tsx（同一套兩行列）；名次是名稱前的小字，附加資訊在第二行。
+// - 編輯模式：列首移除鍵（rowLeading）、列尾「⋯」＋拖曳握把（grip，touch-action none）；拖曳中的列 rowDragging（transform 由 JS 寫入）。
 // - 底部指數列（indexStrip）放在殼層配件槽（bar 材質上：標籤、數值、漲跌幅文字一律 foreground，方向以有色 ▲▼ 圖形表示）。
 // - 髮絲線左內縮 16；捲動容器內的列用 pressableRow（延後 80ms 加深）。
 // - 顏色只用 vars／sj；漲跌只用 vars.color.up／down 並附 ▲▼ 或正負號；不用 color-mix()、:has()、linear()；
-//   只動畫 opacity（按壓、骨架、跳價閃爍皆由共用元件處理）。
+//   只動畫 opacity（按壓、骨架、跳價閃爍皆由共用元件處理）與拖曳排序的 transform（lib/watch-reorder.ts 寫入）。
 import { globalStyle, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
 import { sj } from './theme-vars.css';
-import { LOW_DPR, MORE_CONTRAST, RADIUS, SAFE_LEFT, SAFE_RIGHT, SIZE, SPACE, TOUCH_MIN } from './tokens';
+import { ELEVATION, LOW_DPR, MORE_CONTRAST, RADIUS, SAFE_LEFT, SAFE_RIGHT, SIZE, SPACE, TOUCH_MIN } from './tokens';
 import { NUM, NUMERIC, TEXT } from './typography.css';
 
 /** 頁面左右邊距（＋安全區；main 已讓出安全區時 env() 在直式為 0） */
@@ -36,9 +37,82 @@ export const controls = style({
     minWidth: 0,
 });
 
+/** 清單列：清單分頁（或只有一個清單時的名稱）＋最後的「＋」新增清單鍵 */
+export const listBar = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: SPACE.s1,
+    minWidth: 0,
+});
+
 /** 多個自選清單的分頁（Segmented scroll 變體）：不撐出頁寬，自己橫向捲動 */
 export const listTabs = style({
+    flex: '1 1 auto',
     minWidth: 0,
+});
+
+/** 只有一個清單時的清單名稱（清單列內） */
+export const listBarName = style({
+    flex: '1 1 auto',
+    minWidth: 0,
+    margin: 0,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+});
+
+/** 編輯模式的清單工具（重新命名、刪除清單）：點擊區 TOUCH_MIN */
+export const listTools = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: SPACE.s2,
+    minWidth: 0,
+});
+
+export const listTool = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: TOUCH_MIN,
+    padding: `0 ${SPACE.s3}`,
+    margin: 0,
+    borderRadius: RADIUS.md,
+    border: `0.5px solid ${vars.color.border}`,
+    background: sj.elevatedBg,
+    color: vars.color.foreground,
+    ...TEXT.callout,
+    whiteSpace: 'nowrap',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&:disabled': { opacity: 0.45, cursor: 'default' },
+    },
+    '@media': {
+        [MORE_CONTRAST]: { border: `1px solid ${vars.color.borderBright}` },
+    },
+});
+
+/** 刪除清單：danger 文字（狀態色，不隨漲跌配色翻轉） */
+export const listToolDanger = style({
+    color: vars.color.danger,
+});
+
+/** 清單名稱面板的表單 */
+export const listForm = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: SPACE.s3,
+    padding: `${SPACE.s1} 0 ${SPACE.s2}`,
+});
+
+export const listFormNote = style({
+    margin: 0,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
 });
 
 export const listName = style({
@@ -211,6 +285,90 @@ export const rowHasTrailing = style({
     paddingRight: SPACE.s1,
 });
 
+/** 列首有鍵（編輯模式的移除鍵）：左邊距交給列首鍵 */
+export const rowHasLeading = style({
+    paddingLeft: SPACE.s1,
+});
+
+/** 拖曳中的列：蓋在其他列之上（不透明底＋陰影；位移由 transform 跟手指，lib/watch-reorder.ts） */
+export const rowDragging = style({
+    zIndex: 2,
+    background: sj.contentBg,
+    boxShadow: ELEVATION.e2,
+});
+
+/** 編輯模式列首的移除鍵（IconButton 44）：圖示 danger */
+export const rowLeading = style({
+    alignSelf: 'center',
+    marginLeft: `calc(${SPACE.s1} + ${SAFE_LEFT})`,
+});
+
+globalStyle(`${rowLeading} svg`, { color: vars.color.danger });
+
+/** 拖曳握把：點擊區 TOUCH_MIN、高度隨列；touch-action none（只有握把能拖，列的其他區域照常捲動，§8） */
+export const grip = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flex: '0 0 auto',
+    alignSelf: 'stretch',
+    width: TOUCH_MIN,
+    minHeight: TOUCH_MIN,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    borderRadius: RADIUS.md,
+    background: 'transparent',
+    color: vars.color.mutedForeground,
+    cursor: 'grab',
+    touchAction: 'none',
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+    WebkitTouchCallout: 'none',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&:disabled': { opacity: 0.45, cursor: 'default' },
+        '[data-dragging="true"] &': { cursor: 'grabbing', color: vars.color.foreground },
+    },
+});
+
+/** 列尾兩個鍵（排行：加入自選＋快速下單；自選編輯模式：⋯＋握把） */
+export const trailingPair = style({
+    display: 'flex',
+    alignItems: 'center',
+    alignSelf: 'stretch',
+});
+
+/** 已在自選的星號：實心 accent，停用時不變淡（狀態，不是不可用） */
+export const starOn = style({});
+
+globalStyle(`${starOn} svg`, { color: vars.color.accent, fill: 'currentColor' });
+globalStyle(`${starOn}[disabled]:disabled`, { opacity: 1 });
+
+/** 編輯模式清單底部的「加入股票」 */
+export const addSymbolRow = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: SPACE.s2,
+    width: '100%',
+    minHeight: '56px',
+    margin: 0,
+    padding: `0 calc(${PAD_X} + ${SAFE_RIGHT}) 0 calc(${PAD_X} + ${SAFE_LEFT})`,
+    border: 'none',
+    borderTop: HAIRLINE,
+    background: 'transparent',
+    ...TEXT.headline,
+    color: vars.color.accent,
+    textAlign: 'left',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    '@media': {
+        [LOW_DPR]: { borderTopWidth: '1px' },
+        [MORE_CONTRAST]: { borderTop: `1px solid ${vars.color.borderBright}` },
+    },
+});
+
 /** 開啟迷你走勢：名稱｜數字｜走勢 */
 export const rowWithSpark = style({
     gridTemplateColumns: 'minmax(min-content, 1fr) auto auto',
@@ -245,6 +403,26 @@ export const rowTitle = style({
     color: vars.color.foreground,
     width: 0,
     minWidth: '100%',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+});
+
+/** 第一行有前置小字（排行名次）：名次＋名稱，名稱單行省略；同 rowTitle 不計入名稱欄的 min-content */
+export const rowTitleLead = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    gap: SPACE.s1_5,
+    width: 0,
+    minWidth: '100%',
+});
+
+export const rowTitleFlex = style({
+    ...TEXT.headline,
+    fontWeight: 500,
+    color: vars.color.foreground,
+    flex: '1 1 0',
+    minWidth: 0,
     overflow: 'hidden',
     textOverflow: 'ellipsis',
     whiteSpace: 'nowrap',
@@ -367,46 +545,13 @@ export const spark = style({
     },
 });
 
-/** 價格下的第二行（排行的漲跌、量）：numSm */
-export const priceSub = style({
-    ...NUM.numSm,
-    ...NUMERIC,
-    whiteSpace: 'nowrap',
-    textAlign: 'right',
-});
-
 export const tone = styleVariants({
     up: { color: vars.color.up },
     down: { color: vars.color.down },
     flat: { color: vars.color.flat },
 });
 
-const pillBase = style({
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-    boxSizing: 'border-box',
-    minWidth: '4.75rem',
-    height: '1.75rem',
-    padding: `0 ${SPACE.s2}`,
-    borderRadius: RADIUS.sm,
-    ...NUM.numSm,
-    ...NUMERIC,
-    fontWeight: 600,
-    whiteSpace: 'nowrap',
-});
-
-/**
- * 漲跌膠囊：up／down 為實心填色＋inkStrong 白字（搭配 primitives 的 fill.<tone>.strong 提供底色與疊黑）；
- * flat 與無方向指標（總量）為 elevatedBg＋foreground。
- */
-export const pill = styleVariants({
-    up: [pillBase],
-    down: [pillBase],
-    flat: [pillBase, { background: sj.elevatedBg, color: vars.color.foreground, boxShadow: `inset 0 0 0 0.5px ${vars.color.border}` }],
-});
-
-/** 列尾鍵（編輯模式「⋯」、排行「＋」）：IconButton 44×44，靠右對齊頁邊距 */
+/** 列尾鍵（快速下單、編輯模式「⋯」＋握把、排行星號＋下單）：IconButton 44×44，靠右對齊頁邊距 */
 export const rowTrailing = style({
     alignSelf: 'center',
     marginRight: `calc(${SPACE.s1} + ${SAFE_RIGHT})`,
@@ -606,17 +751,19 @@ export const rankRefresh = style({
     },
 });
 
-/** 排行列：名次｜名稱代碼（＋量）｜成交價＋漲跌｜漲跌%膠囊 */
-export const rankRow = style([row, {
-    gridTemplateColumns: '1.5rem minmax(0, 1fr) auto auto',
-    paddingRight: SPACE.s1,
-}]);
-
+/** 排行名次：名稱前的小字（numSm mutedForeground，設計規格 §7.2 列首名次） */
 export const rankNo = style({
+    flex: '0 0 auto',
     ...NUM.numSm,
     ...NUMERIC,
     color: vars.color.mutedForeground,
-    textAlign: 'center',
+});
+
+/** 排行第二行的附加資訊（量／值／價差）：不縮、不換行，放不下時整組換到下一行 */
+export const rankExtra = style({
+    flex: '0 0 auto',
+    ...NUMERIC,
+    whiteSpace: 'nowrap',
 });
 
 // ---- 搜尋面板（search-sheet.tsx） ----

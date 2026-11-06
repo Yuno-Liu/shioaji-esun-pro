@@ -21,6 +21,8 @@ vi.mock('../lib/deferred-modules', () => ({
         return new Promise<RankingModule>((resolve, reject) => { m.pending = { resolve, reject }; });
     },
     loadWatchSparkline: () => new Promise(() => undefined),
+    loadSearchSheet: () => new Promise(() => undefined),
+    loadWatchListSheet: () => new Promise(() => undefined),
 }));
 vi.mock('../../hooks/use-stream', () => ({ useQuote: () => undefined }));
 // 底部指數列：直接以 ContractBase 訂閱（不連線、不送訂閱）

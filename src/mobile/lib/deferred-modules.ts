@@ -16,3 +16,5 @@ export const loadRankingList = () => import('../components/ranking-list');
 export const loadWatchSparkline = () => import('../components/watch-sparkline');
 /** 自選頁商品搜尋面板（按「搜尋」或空清單的「搜尋並加入」才掛載；連同 lib/product-search 約 4 KiB gzip） */
 export const loadSearchSheet = () => import('../components/search-sheet');
+/** 自選清單名稱面板（新增清單、重新命名；按「＋」或編輯模式的「重新命名」才掛載） */
+export const loadWatchListSheet = () => import('../components/watch-list-sheet');

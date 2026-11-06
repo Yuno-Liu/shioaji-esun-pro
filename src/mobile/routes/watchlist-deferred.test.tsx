@@ -34,6 +34,7 @@ vi.mock('../lib/deferred-modules', () => ({
         m.searchLoads++;
         return new Promise<SearchModule>((resolve, reject) => { m.searchPending = { resolve, reject }; });
     },
+    loadWatchListSheet: () => new Promise(() => undefined),
 }));
 vi.mock('../../hooks/use-stream', () => ({ useQuote: () => undefined }));
 vi.mock('../../hooks/use-watchlist', () => ({ useWatchlist: () => m.wl }));

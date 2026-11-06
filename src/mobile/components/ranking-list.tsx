@@ -8,16 +8,29 @@
 // - 只在自選頁的「排行」分段掛載本元件時才讀取；頁面在背景（document.hidden）時不讀，回前景時若快取過期才讀。
 // - 每種排行有模組層快取 RANKING_CACHE_MS（30 秒）：切換種類、切換分頁再回來都先用快取；
 //   任何讀取（含自動、手動、錯誤後重試）距上次讀取未滿 RANKING_COOLDOWN_MS（15 秒）都不發出。
-// - 列：名次、名稱代碼（＋量）、成交價＋漲跌（▲▼＋顏色）、漲跌%膠囊；點一列 → 交易頁；「＋」加入自選。
-// - 排行是快照資料（不訂閱即時行情、不讀 K 線），以「更新於」標示時間；不顯示走勢圖。
+// - 列（與自選共用 components/quote-row.tsx，使用者要求「排行的顯示方式也要跟自選一樣」）：
+//   第一行名次（小字）＋名稱；第二行代碼（＋市場標記，合約快取有時）＋處置徽章＋附加資訊（成交值排行顯示值、
+//   高低價差排行顯示價差，其餘顯示量）；右側成交價與「漲跌 漲跌幅」（純文字、依漲跌著色）；迷你走勢；
+//   列尾星號「加入自選／已在自選」與快速下單鍵（只呼叫 openTicket，不帶方向，設計規格 §10 S1）。點一列 → 交易頁。
+// - 排行是快照資料（不訂閱即時行情），以「更新於」標示時間。
+// - 迷你走勢沿用自選的限制（lib/watch-sparkline-data.ts）：只有可見列、每檔每時段上限、佇列同時 ≤2、帳戶頁可關閉。
+//   排行資料沒有交易所：可見、走勢開關開啟（且放得下）的列，合約不在快取時經 lib/ranking-spark-contracts.ts
+//   以 ensureContract(code) 解析一次（同時 ≤2、列不可見或開關關閉時取消未開始的、失敗 5 分鐘內不重試）；
+//   解析成功後列顯示市場標記與走勢。每次進入排行最多多出「捲到可見且不在快取的不同代碼數」個合約 GET（≤30／種）。
+// - 處置徽章：與自選共用 lib/regulatory-punish.ts 的模組層快取（有排行資料時才讀，30 分鐘最多 1 次，失敗靜默）。
 // - 版面（設計規格 §7.2）：種類用 Segmented scroll 變體（tablist 語意不變）；載入 Skeleton、空 EmptyState、錯誤 InlineNote。
 
-import { Check, Plus, TrendingUp } from 'lucide-react';
-import { useCallback, useEffect, useReducer, useState, useSyncExternalStore } from 'react';
+import { Star, TrendingUp } from 'lucide-react';
+import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react';
+import { useContract } from '../../lib/contracts-cache';
 import { fetchScanner } from '../../lib/shioaji';
+import type { ContractInfo } from '../../lib/types/contract';
 import type { ScannerItem, ScannerType } from '../../lib/types/market';
-import { fmtCompactInt, fmtPct, fmtPrice } from '../../lib/utils/format';
-import { fill, focusRing, pressable, pressableRow } from '../styles/primitives.css';
+import { fmtCompactInt, fmtPrice } from '../../lib/utils/format';
+import { openTicket } from '../lib/mobile-store';
+import { requestSparkContract } from '../lib/ranking-spark-contracts';
+import { usePunishedCodes } from '../lib/regulatory-punish';
+import { focusRing, pressable } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
 import { expandHit } from '../ui/chip.css';
 import { EmptyState } from '../ui/empty-state';
@@ -25,6 +38,7 @@ import { IconButton } from '../ui/icon-button';
 import { InlineNote } from '../ui/inline-note';
 import { Segmented } from '../ui/segmented';
 import { Skeleton } from '../ui/skeleton';
+import { marketTag, QuoteRow, TicketButton, useSparkColumn, useVisibilityTracker, type RowQuoteView, type VisibilityTracker } from './quote-row';
 
 export type RankingKind = 'gainers' | 'losers' | 'volume' | 'amount' | 'range';
 
@@ -217,8 +231,6 @@ function useCooldownLeft(kind: RankingKind): number {
     return left;
 }
 
-const ARROW = { up: '▲', down: '▼', flat: '' } as const;
-const DIR_TEXT = { up: '漲', down: '跌', flat: '平盤' } as const;
 
 function fmtTime(ms: number): string {
     const d = new Date(ms);
@@ -247,7 +259,10 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
     const state = useRankingState(kind);
     const cooldown = useCooldownLeft(kind);
     const [adding, setAdding] = useState<string | null>(null);
+    const addingRef = useRef(false);
     const [addError, setAddError] = useState<string | null>(null);
+    const tracker = useVisibilityTracker();
+    const spark = useSparkColumn();
 
     const setKind = useCallback((k: RankingKind) => {
         lastKind = k;
@@ -263,23 +278,29 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
         return () => document.removeEventListener('visibilitychange', onVisible);
     }, [kind]);
 
-    const add = async (code: string) => {
-        if (adding) return;
+    const onAddRef = useRef(onAdd);
+    onAddRef.current = onAdd;
+    const add = useCallback(async (code: string) => {
+        if (addingRef.current) return;
+        addingRef.current = true;
         setAdding(code);
         setAddError(null);
         try {
-            await onAdd(code);
+            await onAddRef.current(code);
         } catch (e) {
             setAddError(`${code} 加入自選失敗：${e instanceof Error && e.message ? e.message : '請稍後再試'}`);
         } finally {
+            addingRef.current = false;
             setAdding(null);
         }
-    };
+    }, []);
 
     const def = defOf(kind);
     const cooling = cooldown > 0;
     const secs = Math.ceil(cooldown / 1_000);
     const items = state.items;
+    // 處置清單：有排行資料時才讀（與自選共用快取，30 分鐘最多 1 次）
+    const punished = usePunishedCodes(items !== null && items.length > 0);
 
     return (
         <div data-testid='ranking'>
@@ -349,6 +370,10 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
                             rank={index + 1}
                             kind={kind}
                             item={item}
+                            index={index}
+                            tracker={tracker}
+                            spark={spark}
+                            punished={punished.has(item.code)}
                             watched={watchedCodes.has(item.code)}
                             canAdd={canAdd && adding === null}
                             adding={adding === item.code}
@@ -369,62 +394,107 @@ function rangeText(item: ScannerItem): string {
     return `價差 ${range !== undefined ? fmtPrice(range) : '—'}${pct !== undefined ? `（振幅 ${pct.toFixed(2)}%）` : ''}`;
 }
 
-function RankingRow({ rank, kind, item, watched, canAdd, adding, onOpen, onAdd }: {
+/** 排行列第二行的附加資訊（依種類）：成交值排行顯示值、高低價差排行顯示價差，其餘顯示量 */
+export function rankingExtraText(kind: RankingKind, item: ScannerItem): string {
+    if (kind === 'amount') return `值 ${fmtAmount(Number(item.total_amount))}`;
+    if (kind === 'range') {
+        const range = rankingPriceRange(item);
+        return `價差 ${range !== undefined ? fmtPrice(range) : '—'}`;
+    }
+    const vol = Number(item.total_volume);
+    return `量 ${Number.isFinite(vol) && vol >= 0 ? fmtCompactInt(vol) : '—'}`;
+}
+
+/** 排行的快照行情（不訂閱即時）：漲跌與漲跌幅由伺服器的漲跌與成交價推算 */
+export function rankingView(item: ScannerItem): RowQuoteView {
+    const close = Number(item.close);
+    const chg = Number(item.change_price);
+    const vol = Number(item.total_volume);
+    return {
+        close: Number.isFinite(close) ? close : undefined,
+        chg: Number.isFinite(chg) ? chg : undefined,
+        pct: rankingChangePct(item),
+        dir: !Number.isFinite(chg) || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down',
+        simtrade: false,
+        vol: Number.isFinite(vol) && vol >= 0 ? vol : undefined,
+    };
+}
+
+/**
+ * 走勢用的合約：合約快取裡的股票合約（自選、看過的交易頁、或可見列經 requestSparkContract 解析後進快取）。
+ * 沒有、或不是股票時走勢欄是空白佔位。
+ */
+function sparkContractOf(c: ContractInfo | undefined): ContractInfo | null {
+    return c && c.security_type === 'STK' && !c.combo ? c : null;
+}
+
+/** 只開下單面板、不帶方向（S1：之後仍需預覽與滑動確認） */
+const quickTicket = (code: string) => { openTicket({ code, source: 'other' }); };
+
+const RankingRow = memo(function RankingRow({ rank, kind, item, index, tracker, spark, punished, watched, canAdd, adding, onOpen, onAdd }: {
     rank: number;
     kind: RankingKind;
     item: ScannerItem;
+    index: number;
+    tracker: VisibilityTracker | null;
+    spark: boolean;
+    punished: boolean;
     watched: boolean;
     canAdd: boolean;
     adding: boolean;
     onOpen: (code: string) => void;
     onAdd: (code: string) => void;
 }) {
-    const chg = Number(item.change_price);
-    const dir = !Number.isFinite(chg) || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down';
-    const pct = rankingChangePct(item);
-    const priceText = fmtPrice(item.close);
-    const chgText = Number.isFinite(chg) ? `${ARROW[dir]}${fmtPrice(Math.abs(chg))}` : '—';
-    const pctText = pct !== undefined ? fmtPct(pct) : '—';
-    const volText = fmtCompactInt(Number(item.total_volume));
-    const extra = kind === 'amount'
-        ? `值 ${fmtAmount(Number(item.total_amount))}`
-        : kind === 'range'
-            ? rangeText(item)
-            : null;
+    const code = item.code;
     const name = item.name ?? '';
-
-    const pillTone = pct === undefined ? 'flat' : dir;
-    const pillClass = pillTone === 'flat' ? styles.pill.flat : `${styles.pill[pillTone]} ${fill[pillTone].strong}`;
-
+    const view = useMemo(() => rankingView(item), [item]);
+    const cached = useContract(code);
+    const contract = sparkContractOf(cached);
+    // 可見、走勢欄開啟、合約不在快取：解析一次（佇列同時 ≤2）；不可見、開關關閉、卸載時取消未開始的解析
+    const [visible, setVisible] = useState(false);
+    const needContract = spark && visible && !cached;
+    useEffect(() => (needContract ? requestSparkContract(code) : undefined), [needContract, code]);
+    const extra = rankingExtraText(kind, item);
+    const reference = view.close !== undefined && view.chg !== undefined ? view.close - view.chg : undefined;
+    const ariaSuffix = kind === 'amount'
+        ? `，成交${extra}`
+        : kind === 'range'
+            ? `，${rangeText(item)}`
+            : '';
     return (
-        <li className={styles.rowItem} data-code={item.code} data-testid='ranking-row'>
-            <button
-                type='button'
-                className={`${styles.rankRow} ${pressableRow}`}
-                aria-label={`第 ${rank} 名 ${item.code} ${name}，${priceText}，${DIR_TEXT[dir]} ${chgText} ${pctText}，成交量 ${volText} 張${extra ? `，${extra}` : ''}`}
-                onClick={() => onOpen(item.code)}
-                data-testid='ranking-row-button'
-            >
-                <span className={styles.rankNo}>{rank}</span>
-                <span className={styles.rowName}>
-                    <span className={styles.rowCode}>{name || item.code}</span>
-                    <span className={styles.rowSub}>{item.code}・量 {volText}{extra ? ` ${extra}` : ''}</span>
+        <QuoteRow
+            testPrefix='ranking'
+            code={code}
+            name={name}
+            tag={contract ? marketTag(contract) : null}
+            tradable
+            index={index}
+            tracker={tracker}
+            metric='pct'
+            spark={spark}
+            sparkContract={contract}
+            sparkReference={contract?.reference || (reference !== undefined && reference > 0 ? reference : undefined)}
+            punished={punished}
+            staticView={view}
+            lead={<span className={styles.rankNo} aria-hidden='true' data-testid='ranking-rank'>{rank}</span>}
+            metaExtra={<span className={styles.rankExtra} data-testid='ranking-extra'>{extra}</span>}
+            ariaPrefix={`第 ${rank} 名 `}
+            ariaSuffix={ariaSuffix}
+            onVisibleChange={setVisible}
+            onOpen={onOpen}
+            trailing={(
+                <span className={`${styles.rowTrailing} ${styles.trailingPair}`}>
+                    <IconButton
+                        ariaLabel={watched ? `${code} 已在自選` : adding ? `${code} 加入自選中` : `${code} 加入自選`}
+                        icon={Star}
+                        className={watched ? styles.starOn : undefined}
+                        disabled={watched || !canAdd}
+                        onClick={() => onAdd(code)}
+                        testId='ranking-add'
+                    />
+                    <TicketButton code={code} name={name} onTicket={quickTicket} testId='ranking-row-ticket' />
                 </span>
-                <span className={styles.priceCell}>
-                    <span className={`${styles.rowPrice} ${styles.tone[dir]}`} data-testid='ranking-price'>{priceText}</span>
-                    <span className={`${styles.priceSub} ${styles.tone[dir]}`} data-testid='ranking-change'>{chgText}</span>
-                </span>
-                <span className={pillClass} data-testid='ranking-pct'>{pctText}</span>
-            </button>
-            <span className={styles.rowTrailing}>
-                <IconButton
-                    ariaLabel={watched ? `${item.code} 已在自選` : adding ? `${item.code} 加入自選中` : `${item.code} 加入自選`}
-                    icon={watched ? Check : Plus}
-                    disabled={watched || !canAdd}
-                    onClick={() => onAdd(item.code)}
-                    testId='ranking-add'
-                />
-            </span>
-        </li>
+            )}
+        />
     );
-}
+});
