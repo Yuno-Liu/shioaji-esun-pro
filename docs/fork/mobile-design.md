@@ -243,7 +243,7 @@ export const bar = style({
 
 - 中文不加負字距；負字距只套在 num 樣式。
 - 輸入欄位維持 `INPUT_FONT_SIZE = max(16px, 1rem)`，含疊在按鈕上的透明 select。
-- 字級「大」（`html[data-sj-font-scale="1.3"]`）：統計格 2 欄、快捷價 3×2、五檔表頭改縮寫（不用容器查詢）。
+- 字級「大」（`html[data-sj-font-scale="1.3"]`）：統計格 2 欄、快捷價 3×2、五檔表頭改縮寫（不用容器查詢；只縮量欄：委買量→買量、委賣量→賣量，價欄不變）。
 - `trade-chart.tsx:258` 圖表字型改為同一系統字族字串（只改字型選項，不動圖表邏輯）。
 
 ### 4.8 色彩規則與對比實算
@@ -691,8 +691,12 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 - 長按（圖表與自選列）呼叫 `haptic('longPress')`：只在 Android 且使用者開啟「介面觸覺回饋」時震動，iOS 不震（`motion/haptics.ts`）。
 - 選價列收回：另渲染一個 `chart-pick-closing` 殘影節點（`aria-hidden`＋`inert`）播放沿原路收回的動畫，`chart-pick` 本身在選完或取消時立即移除，測試與輔助技術不會看到兩份選價列。
 - 精簡標頭（`trade-compact`）設 `aria-hidden`：內容與頁面 h1、主價重複，且沒有互動。
-- 整股／盤中零股切換仍在五檔區塊內，沒有與「五檔｜明細」同列（與上方示意圖不同）。
-- 未做：字級「大」時五檔表頭改縮寫（§4.7）。
+- 整股／盤中零股切換與「五檔｜明細」同列（收尾）。
+  - 零股狀態由 trade-page 持有。DepthLadder 改為受控（`oddLot` prop，頁面與 ticket 變體共用），不再自帶切換鍵；交易頁在分頁列右側渲染匯出的 `DepthOddToggle`（testid `depth-odd-toggle` 不變）。是否可切換只看 `depthOddCapable(contract)`（股票才可以）。
+  - 「明細」分頁時切換鍵不渲染，但保留同寬空位，避免分頁跳動；零股狀態也保留。原本切到明細會卸載五檔，回來時重設為整股，這是刻意的行為差異。
+  - 列寬以 rem 計：分頁 ≥6rem、切換鍵 10rem。不足約 16.75rem 時（360 寬、字級大），切換鍵換到第二行靠右。
+  - 零股五檔點價仍開零股下單面板（帶 `lot: 'IntradayOdd'`）。
+- 字級「大」時五檔表頭縮寫（收尾）：量欄同時渲染完整與縮寫兩個 span。縮寫 aria-hidden；字級大時完整標籤以 clip 視覺隱藏（不用 display:none）。交易頁與下單面板內嵌五檔共用。靜態檢查在 `styles/trade-depth-layout.test.ts`。
 - 選價列出現時（非全螢幕）以沒有 transform 的外層 `scrollIntoView({ block: 'nearest' })`，靠 main 的 `scroll-padding-bottom` 停在交易鍵列與分頁列之上（第二階段後修正：小螢幕或開副圖時原本會落在底部 chrome 後面）；減少動態時不平滑。
 - 持倉摘要卡的「未成交：N 筆 ›」連結外包一層 `workingLinkRow`（第二階段後修正）：GroupedSection 的列間髮絲線（`card > * + *::after`）與連結 pressableRow 的按壓層原本共用同一個 `::after`，兩者都失效；現在髮絲線落在外層，`::after` 只當按壓層。
 - 精簡標頭顯示期間，main 的 `scroll-padding-top` 設為 `SIZE.compactBarH`，隱藏或卸載時移除（第二階段後修正）。原因：遮擋檢查發現 scrollIntoView 或焦點移動會把週期列停在精簡標頭後面。
@@ -929,7 +933,12 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 低階 Android 預設降低透明度；Chrome DevTools 4× CPU 降速下面板拖曳、滑塊、自選 200 列捲動 p95 幀時間 ≤16.7ms、無 >50ms long task；實機 30 分鐘記憶體不持續成長。
 - 首屏 JS（gzip）增量估計：spring＋tween 0.9、gesture 0.9、prefs／haptics／ui-settings 0.5、sheet-stack＋sheet-context 0.5、BottomSheet v2 增量 2.0、SlideToConfirm v2 增量 0.6、ToastHost v2 增量 0.9、殼層（slots、捲動記憶、html 屬性、狀態列）0.9、Segmented＋IconButton＋PageHeader 0.7、新增 lucide 圖示約 9 個 1.5 → **合計約 9.4 KiB**（目標首屏 ≤218 KiB，上限增量 10 KiB）。Stepper、DirectionToggle、QuickChips、PopUpButton、Grouped、InlineNote 等落在既有 lazy chunk。CSS（gzip）增量 ≤12 KiB。
 - 量測：`pnpm exec vite build --config vite.fork.config.ts` 後依規格 §9.4 加總 `dist/mobile.html` 引用的 script 與 modulepreload gzip 大小，PR 附前後數字。
-- **實測（第二階段後）**：手機首屏 JS（gzip）**226.3 KiB**，超出本節目標 ≤218 KiB 約 8 KiB；仍在硬性上限 400 KB 內（規格 §9.4）。**待辦**：找出超出目標的增量來源（逐 chunk 比對第一階段前後的建置），能延後載入的移到 lazy chunk；若確認無法壓回，需由使用者決定是否放寬目標。
+- **實測**：第二階段後手機首屏 JS（gzip）226.3 KiB，超出本節目標。收尾後降為 **214.7 KiB**（16 個 JS），已在目標 ≤218 KiB 內。作法：
+  1. `vite.fork.config.ts` 在合併後把 lucide-react 排除出上游 vendor 群組，各入口只載入自己用到的圖示，約 −8 KiB。找不到上游 vendor 群組時不改。
+  2. 自選頁「排行」分段延遲載入（`lib/deferred-modules.ts`，retryableLazy＋ModuleErrorBoundary＋閒置預載），約 −3 KiB。
+  - 桌面 `index.html` 771.6 → 772.3 KiB；`approval.html` 79.2 KiB 不變。
+  - 刻意留在首屏的狀態列面板：帳戶切換、連線詳情與 ResumeGate 確認、解除鎖單。帳戶切換試過延遲載入，只省約 0.3 KiB，但載入中點了沒有回饋、殼層不會 inert，晚到的面板會疊在其他面板上並搶走焦點，所以撤回。
+  - 已知小問題：排除 lucide 後有一個 77 bytes 的 vendor 轉接 chunk，檔名帶 rolldown 去重尾碼（雜湊 9 碼），不符合 nginx 長快取規則，會以 no-cache 提供。只影響桌面，功能正確。
 
 ---
 
@@ -985,7 +994,7 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
 9. 淺色綠對白 4.34（theme 層級，另案）。
 10. 通知雙錨點的使用者接受度（G1）。
 11. 面板退場期間 TicketForm 多存活約 0.3–0.5 秒仍訂閱行情：無副作用，但 `onBusyChange(false)` 須在真正卸載時呼叫（沿用 `order-ticket-sheet.tsx:116`）。
-12. 首屏 JS（gzip）第二階段後為 226.3 KiB，超出目標 ≤218 KiB 約 8 KiB（§13 待辦）。
+12. 首屏 JS（gzip）：第二階段後 226.3 KiB，收尾後 214.7 KiB，已回到目標 ≤218 KiB 內（§13）。
 13. 第二階段各畫面的實機項目（§7.2、§7.7、§7.8 的「待實機確認」，以及 §7.3 的長按震動與選價列捲動）尚未驗收；實機驗收清單見規格 §14.3。
 
 ---

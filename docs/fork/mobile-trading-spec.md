@@ -315,6 +315,7 @@ export default defineConfig(async (env: ConfigEnv) => {
 
 - **已以原型驗證（2026-11-05）**：以上述 `vite.fork.config.ts`＋最小 `mobile.html`＋引用 MVP 所需 `src/lib` 模組的探針入口執行 `pnpm exec vite build --config vite.fork.config.ts`，同時產出 `index.html`、`approval.html`、`mobile.html`，`vite.config.ts` 完全未修改。原型檔案未提交。
 - **開發模式**：`pnpm dev` 不需任何設定即可開啟 `http://127.0.0.1:5173/mobile.html`（Vite dev server 會直接提供根目錄的 HTML）。
+- **圖示切分**：`vite.fork.config.ts` 在合併後把 lucide-react 排除出上游 vendor 群組，讓各入口只載入自己用到的圖示；找不到上游 vendor 群組時不改（設計規格 §13）。
 - **型別檢查**：`src/mobile/**` 由 `tsconfig.app.json` 的 `include: ["src", …]` 涵蓋，`tsc -b` 會檢查。`vite.fork.config.ts` 不在 `tsconfig.node.json` 內，以 fork-ci 的實際建置驗證。
 
 ### 4.4 `mobile.html` 要點
@@ -1240,5 +1241,5 @@ MVP（Phase 0＋Phase 1）實作時發現的規格範例錯誤，以及經獨立
 - 第二階段（各頁）：交易頁、自選／排行／搜尋、委託與持倉、帳戶與 HTTPS 說明頁（§6 各節的「現況」）。之後修正切換分頁時舊頁 portal 殘留、圖表選價列被底部 chrome 擋住、自選指標切換鍵與「未成交」連結的點擊區問題。
 - 交易安全不變：新單、改價、減量、刪單、全部刪單、批次刪單、平倉、解除鎖單都仍需滑動確認；新入口（自選「買進…／賣出…」、五檔點價、選價列）只開下單面板；沒有新增網路請求或逐列查詢。
 - 測試：既有斷言只在設計規格 §14 列出的「刻意更新」處修改（其中第二階段刪除 `depth-ladder.test.tsx`「ticket 變體不顯示內外盤比」，B4 刪除 `primitives.test.ts` 對已刪除的舊 `routeBadge` 樣式的斷言）。
-- 體積：首次載入 JS（gzip，量測方式同 §9.4）第二階段後為 226.3 KiB，在 400 KB 上限內，但超出設計目標 ≤ 218 KiB 約 8 KiB，列為待辦（設計規格 §13）。上表 §9.4 列的 347.1 KiB 是 MVP 當時的數字，之後延遲載入分頁曾降到約 208 KiB。
+- 體積：首次載入 JS（gzip，量測方式同 §9.4）第二階段後為 226.3 KiB；收尾後降為 214.7 KiB，在設計目標 ≤ 218 KiB 內（設計規格 §13：lucide 圖示不進上游 vendor 群組、自選頁「排行」延遲載入）。上表 §9.4 列的 347.1 KiB 是 MVP 當時的數字，之後延遲載入分頁曾降到約 208 KiB。
 - 未完成：實機驗收（§14.3，含 E2 的面板與全螢幕圖表遮擋檢查）；gesture-guard 只在 WebKit 掛 touchmove 的調整，等實機確認 Android 遵守 `user-scalable=no` 後才改（設計規格 §16 第 8 項）。
