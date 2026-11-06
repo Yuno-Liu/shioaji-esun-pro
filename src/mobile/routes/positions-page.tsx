@@ -7,6 +7,7 @@
 // - 摘要卡（position-summary）：未實現損益合計（估）、股票總市值、期貨權益數與風險指標
 //   （margin 屬於目前選取的期貨帳戶，只在範圍包含該帳戶時顯示）；金額遮蔽用 usePrivacyMoney＋maskMoney。
 //   持倉尚未讀到（queries.positions.updatedAt 為 null 且沒有任何持倉列）時顯示「—」，不顯示 0。
+//   今日額度列：帳戶篩選為單一證券帳戶時顯示該帳戶的額度，全部或期貨帳戶時沿用目前選取的證券帳戶。
 // - 持倉列：均價、現價、損益（估）、報酬率；股票另有昨餘、成本（均價×股數）、市值；損益條（up／down 色＋文字）。
 //   玉山股票列可展開庫存明細（position-esun-details）。
 // - 平倉：先開說明面板寫明行為，使用者按「繼續」才呼叫 src/lib；lib 內部會再出現一次確認面板
@@ -27,14 +28,25 @@
 //   「多／空 N 張」實心膠囊、損益 numMd；均價、現價、報酬率／昨餘、成本、市值 numSm；損益條 scaleX（中線為 0）；
 //   動作列［庫存明細］…［平倉］（中性外框，避免與新單買賣鍵混淆）［加碼］［看圖 ›］。
 //   平倉說明與切換帳戶面板改 GroupedSection／InlineNote＋footer 版型（行為不變：繼續後才呼叫 lib，lib 再開確認面板）。
+// - 淨損益與損益兩平價（lib/position-pnl，純函式）：股票列以「淨損益（含手續費 X 折、證交稅）」為主、券商原始損益小字並列；
+//   「損益兩平」列（文字標示現價高於／低於兩平價、手續費折數、當沖稅率、估算）點開 position-pnl-sheet 計算明細（只讀）。
+//   今日買進股數：玉山庫存明細（分批成交日）→ 今日成交回報（委託查詢成功時）；都沒有則一般稅率並標「未判斷當沖」。
+//   期權維持券商損益並標「未扣費稅」。摘要、分組小計、損益條、損益／報酬率排序都用同一個值；無法計算的列不猜，標「合計待確認」。
+// - 「詳細｜精簡」檢視（篩選列行尾 Segmented toggle；lib/positions-view 存 localStorage，預設詳細）：
+//   精簡＝每個部位一列（名稱／代碼・條件・多空數量｜淨損益／報酬率・已過或未達兩平），帳戶分組、摘要、篩選、排序照常、摘要卡較緊湊。
+//   點列（aria-expanded）就地展開既有詳細卡片（不重複第一行），再點收合；平倉、加碼、看圖入口與流程不變，不新增送單入口。
+//   未展開的列不掛詳細卡片子樹；切換時以切換鍵為錨點保留捲動位置；減少動態時不做展開動畫。
+// - 重繪範圍（稽核 P2）：詳細列與精簡列以 memo 包起來，只比該列用到的值（持倉物件參考、淨損益數值、遮蔽、平倉停用…）；
+//   交易狀態重估市價時只有跳價的那列重繪（本頁最大損益改變時全部重繪以更新損益條比例）。列的按鈕經 rowActions 轉給最新的處理函式。
 
 import { ChevronRight, RotateCw, Wallet } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
 import { useTradingLive } from '../../hooks/use-stream';
 import { getAccountState, selectAccount, useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
 import { ensureContract, getCachedContract, useContract } from '../../lib/contracts-cache';
 import { isEsunAccount } from '../../lib/esun';
+import { findEsunInventoryDetail, getEsunInventoryDetailsSnapshot, subscribeEsunInventoryDetails } from '../../lib/esun/account-details';
 import { accountMatches } from '../../lib/flash-account';
 import { SHARES_PER_LOT } from '../../lib/odd-lot';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
@@ -42,14 +54,17 @@ import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../../l
 import { useServerInfo, yesterdayQuantityNotice } from '../../lib/server-info-store';
 import { creditExitLabel, stockExitFor, type CreditExitCond } from '../../lib/stock-exit-cond';
 import { notify, placeQuickOrder, placeStockExitByShares } from '../../lib/trade';
+import { discountText, useTradingCostSettings, type TradingCostSettings } from '../../lib/trading-cost-settings';
 import { RECONCILE_REASON_LABELS, refreshTradingState, useTradingState, type TradingQueryStatus } from '../../lib/trading-state';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Action } from '../../lib/types/order';
 import type { Account, AccountedPosition, Position, StockPosition } from '../../lib/types/portfolio';
-import { fmtInt, fmtPct, fmtPrice, fmtSigned, fmtStockLots } from '../../lib/utils/format';
+import { fmtPct, fmtPrice, fmtSigned } from '../../lib/utils/format';
+import { fmtInt, fmtStockLots, formatToTick } from '../lib/num-format';
 import { mobileAccountLabel, useAccountSwitchLocked } from '../components/account-switch-sheet';
 import { BottomSheet, SheetFooter } from '../components/bottom-sheet';
 import { PositionEsunDetails } from '../components/position-esun-details';
+import { breakEvenRelationText, PNL_TEXT, pnlTags, PositionPnlSheet } from '../components/position-pnl-sheet';
 import {
     accountKeyOf,
     filterByMarket,
@@ -71,7 +86,9 @@ import { RouteBadge } from '../components/route-badge';
 import { classifyTicketOutcome, OUTCOME_UNKNOWN_TITLE } from '../hooks/use-mobile-ticket';
 import { useResumeGate } from '../hooks/use-resume-gate';
 import { navigate } from '../lib/hash-router';
+import { breakEvenRelation, computeStockPnl, stockPnlInputOf, todayStockFills, type StockPnl, type TodayFills } from '../lib/position-pnl';
 import { openTicket, type TicketCond, type TicketLot } from '../lib/mobile-store';
+import { readPositionsView, writePositionsView, type PositionsView } from '../lib/positions-view';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { assertResumeReady, getResumeGate, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import * as controls from '../styles/controls.css';
@@ -118,6 +135,9 @@ export const POSITIONS_TEXT = {
     switchFailed: '帳戶切換未成功，請到「帳戶」頁確認後再試',
     closeSent: '平倉委託已送出',
     cancelled: '已取消',
+    pnlNoContract: '商品資料尚未載入，淨損益待確認',
+    pnlUnsupported: '此信用條件不估算費稅，淨損益待確認',
+    pnlNoPrice: '缺現價，淨損益待確認',
 } as const;
 
 // ---- 純函式（測試用匯出）----
@@ -275,6 +295,87 @@ export function addOnBlockReason(p: AccountedPosition, contract?: Pick<ContractI
     return typeof plan === 'string' ? plan : null;
 }
 
+// ---- 淨損益（含手續費折數、證交稅）----
+
+export interface RowPnl {
+    /** 主要顯示的損益：股票＝淨損益、期權＝券商損益；無法計算為 null（不猜） */
+    value: number | null;
+    /** 股票的計算結果（兩平價與明細）；期權或無法計算為 null */
+    stock: StockPnl | null;
+    /** 計算時用的商品資料（兩平價依跳動價位格式化） */
+    contract: ContractInfo | null;
+    /** 期權：券商損益、未扣費稅 */
+    deriv: boolean;
+    /** 股票淨損益無法計算的原因 */
+    reason: string | null;
+}
+
+export interface RowPnlContext {
+    settings: TradingCostSettings;
+    now: number;
+    /** 今日成交（委託查詢尚未成功時為 null） */
+    fills: ReadonlyMap<string, TodayFills> | null;
+}
+
+const finiteNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/** 玉山股票持倉對應的庫存明細（快照；對不上回 null） */
+function esunDetailOf(p: AccountedPosition) {
+    if (!isStockPosition(p) || !isEsunAccount(p.account)) return null;
+    return findEsunInventoryDetail(getEsunInventoryDetailsSnapshot(p.account)?.details, p);
+}
+
+/** 一筆持倉的淨損益；股票需要商品資料（稅別、跳動價位） */
+export function rowPnlOf(p: AccountedPosition, contract: ContractInfo | undefined, ctx: RowPnlContext): RowPnl {
+    if (!isStockPosition(p)) return { value: finiteNum(p.pnl) ? p.pnl : null, stock: null, contract: contract ?? null, deriv: true, reason: null };
+    if (!contract) return { value: null, stock: null, contract: null, deriv: false, reason: POSITIONS_TEXT.pnlNoContract };
+    const input = stockPnlInputOf(p, contract, { ...ctx, esun: esunDetailOf(p) });
+    const stock = input ? computeStockPnl(input) : null;
+    if (!stock) return { value: null, stock: null, contract, deriv: false, reason: POSITIONS_TEXT.pnlUnsupported };
+    return { value: stock.net, stock, contract, deriv: false, reason: stock.net === null ? POSITIONS_TEXT.pnlNoPrice : null };
+}
+
+export interface NetTotals {
+    /** 可計算列的合計 */
+    sum: number;
+    /** 可計算的列數 */
+    counted: number;
+    /** 無法計算（合計待確認）的列數 */
+    pending: number;
+    /** 合計含期權的券商損益（未扣費稅） */
+    deriv: boolean;
+}
+
+export function netTotals(rows: readonly AccountedPosition[], pnlOf: (p: AccountedPosition) => RowPnl): NetTotals {
+    let sum = 0;
+    let counted = 0;
+    let pending = 0;
+    let deriv = false;
+    for (const p of rows) {
+        const r = pnlOf(p);
+        if (r.value === null) { pending += 1; continue; }
+        sum += r.value;
+        counted += 1;
+        if (r.deriv) deriv = true;
+    }
+    return { sum, counted, pending, deriv };
+}
+
+/** 列的報酬率（%）：股票＝淨損益 ÷（均價 × 股數）；期權沿用 positionReturnPct */
+export function rowReturnPct(p: AccountedPosition, r: RowPnl): number | null {
+    if (!isStockPosition(p)) return positionReturnPct(p);
+    const cost = positionCost(p);
+    return r.value === null || cost === null || cost <= 0 ? null : (r.value / cost) * 100;
+}
+
+/** 依值排序（大到小、null 排最後、穩定） */
+function sortByValue<T>(rows: readonly T[], valueOf: (p: T) => number | null): T[] {
+    return rows
+        .map((p, i) => ({ p, i, v: valueOf(p) }))
+        .sort((a, b) => (a.v === null ? (b.v === null ? a.i - b.i : 1) : b.v === null ? -1 : b.v - a.v || a.i - b.i))
+        .map(x => x.p);
+}
+
 /** 帳戶標籤（券商＋市場＋遮蔽帳號）；帳戶不明時回「帳戶不明」 */
 function groupLabel(a: Account | undefined, priv: boolean): string {
     if (!a) return '帳戶不明';
@@ -309,9 +410,14 @@ interface RowProps {
     maxAbsPnl: number;
     ydNotice: string | undefined;
     expanded: boolean;
+    /** 淨損益（rowPnlOf） */
+    rp: RowPnl;
     onClose: () => void;
     onAddOn: (contract: ContractInfo | undefined) => void;
     onToggleDetail: () => void;
+    onOpenPnl: () => void;
+    /** 精簡列展開時：嵌在精簡列的 li 內（div＋id，供 aria-controls），不重複第一行（代碼、條件、多空數量、損益已在精簡列） */
+    embeddedId?: string;
 }
 
 function Cell({ label, children, className, testId }: { label: string; children: ReactNode; className?: string; testId?: string }) {
@@ -323,7 +429,14 @@ function Cell({ label, children, className, testId }: { label: string; children:
     );
 }
 
-function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsPnl, ydNotice, expanded, onClose, onAddOn, onToggleDetail }: RowProps) {
+/** 螢幕報讀用的損益名稱 */
+function pnlSrLabel(rp: RowPnl): string {
+    if (rp.deriv) return '損益（券商，未扣費稅）';
+    const d = rp.stock?.feeDiscount;
+    return d !== undefined && d < 1 ? `淨損益（含手續費 ${discountText(d)} 折、證交稅）` : '淨損益（含手續費、證交稅）';
+}
+
+function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsPnl, ydNotice, expanded, rp, onClose, onAddOn, onToggleDetail, onOpenPnl, embeddedId }: RowProps) {
     const contract = useContract(p.code);
     const long = p.direction === 'Buy';
     const stock = isStockPosition(p);
@@ -331,15 +444,20 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
     const plan = addOnPlanFor(p, contract);
     const addOnReason = typeof plan === 'string' ? plan : accountReason;
     const addOnNote = typeof plan === 'string' ? null : plan.note;
-    const ret = positionReturnPct(p);
+    const ret = rowReturnPct(p, rp);
     const cost = positionCost(p);
     const value = positionMarketValue(p);
     const yd = yesterdayText(p, ydNotice, privMoney);
-    const bar = privMoney ? 0 : pnlBarWidth(p.pnl, maxAbsPnl);
+    const shown = rp.value;
+    const bar = privMoney || shown === null ? 0 : pnlBarWidth(shown, maxAbsPnl);
+    const sp = rp.stock;
+    const breakEven = sp && sp.breakEven !== null && rp.contract ? formatToTick(rp.contract, sp.breakEven) : '—';
+    const relation = sp ? breakEvenRelationText(sp, p.last_price) : null;
     const money = (v: number | null) => maskMoney(v === null ? '—' : fmtInt(Math.round(v)), privMoney);
-    return (
-        <li className={styles.row} data-testid='position-row' data-code={p.code}>
-            <div className={styles.rowHead}>
+    const embedded = embeddedId !== undefined;
+    const body = (
+        <>
+            {!embedded && <div className={styles.rowHead}>
                 <span className={styles.rowCode}>{p.code}</span>
                 {contract?.name && <span className={styles.rowName}>{contract.name}</span>}
                 <span className={styles.tag}>{positionCondText(p, contract)}</span>
@@ -347,14 +465,17 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                     <span>{sideText(p.direction)}</span>
                     <span>{maskMoney(positionQtyText(p), privMoney)}</span>
                 </span>
-                <span className={`${styles.rowPnl} ${styles.tone[pnlTone(p.pnl)]}`}>
-                    <span className={srOnly}>損益（估）</span>
-                    <span data-testid='position-pnl'>{maskMoney(fmtSigned(p.pnl, 0), privMoney)}</span>
+                <span className={`${styles.rowPnl} ${styles.tone[shown === null ? 'flat' : pnlTone(shown)]}`}>
+                    <span className={srOnly}>{pnlSrLabel(rp)}</span>
+                    <span data-testid='position-pnl'>{shown === null ? '—' : maskMoney(fmtSigned(shown, 0), privMoney)}</span>
                 </span>
-            </div>
+            </div>}
             <div className={styles.rowMeta}>
                 <RouteBadge account={p.account} />
                 {p.account && <span>{mobileAccountLabel(p.account, priv)}</span>}
+                {stock
+                    ? <span className={styles.brokerPnl} data-testid='position-broker-pnl'>{PNL_TEXT.brokerLabel} {maskMoney(fmtSigned(p.pnl, 0), privMoney)}</span>
+                    : <span className={styles.brokerPnl} data-testid='position-pnl-note'>{PNL_TEXT.derivNote}</span>}
             </div>
             <dl className={styles.rowGrid}>
                 <Cell label='均價'>{fmtPrice(p.price)}</Cell>
@@ -366,11 +487,27 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                 {stock && <Cell label='成本' testId='position-cost'>{money(cost)}</Cell>}
                 {stock && <Cell label='市值' testId='position-value'>{money(value)}</Cell>}
             </dl>
+            {sp && (
+                <button type='button' className={styles.pnlInfo} onClick={onOpenPnl} aria-haspopup='dialog' data-testid='position-pnl-info'>
+                    <span className={styles.pnlInfoBody}>
+                        <span className={styles.pnlInfoMain}>
+                            <span className={styles.pnlInfoLabel}>{PNL_TEXT.breakEven}</span>
+                            <span className={styles.pnlInfoValue} data-testid='position-breakeven'>{breakEven}</span>
+                            {relation && <span className={styles.pnlInfoRel} data-testid='position-breakeven-relation'>{relation}</span>}
+                        </span>
+                        <span className={styles.pnlTagList} data-testid='position-pnl-tags'>
+                            {pnlTags(sp).map(t => <span key={t} className={styles.tag}>{t}</span>)}
+                        </span>
+                    </span>
+                    <ChevronRight className={styles.actionIcon} aria-hidden='true' focusable='false' />
+                </button>
+            )}
+            {stock && rp.reason && <p className={styles.pnlNote} data-testid='position-pnl-reason'>{rp.reason}</p>}
             {bar > 0 && (
                 <div className={styles.pnlBar} aria-hidden='true' data-testid='position-pnl-bar'>
                     <span className={styles.pnlBarMid} />
                     {/* 寬度百分比（0–50，以中線為 0）→ scaleX(寬度 ÷ 100)；只動畫 transform */}
-                    <span className={styles.pnlBarFill[p.pnl > 0 ? 'up' : 'down']} style={{ transform: scaleXOf(bar / 100) }} />
+                    <span className={styles.pnlBarFill[(shown ?? 0) > 0 ? 'up' : 'down']} style={{ transform: scaleXOf(bar / 100) }} />
                 </div>
             )}
             <div className={styles.rowActions}>
@@ -397,8 +534,148 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                 ? <p className={styles.rowNote} data-testid='position-add-note'>{addOnReason}</p>
                 : addOnNote && <p className={styles.rowNote} data-testid='position-add-note'>{addOnNote}</p>}
             {esun && expanded && <PositionEsunDetails position={p} />}
+        </>
+    );
+    return embedded
+        ? <div id={embeddedId} className={styles.compactDetail} data-testid='position-row' data-code={p.code}>{body}</div>
+        : <li className={styles.row} data-testid='position-row' data-code={p.code}>{body}</li>;
+}
+
+// ---- 列的重繪範圍（稽核 P2）----
+// 交易狀態每次發布都重繪本頁；持倉列以 memo 包起來，只在「該列實際用到的值」改變時重繪。
+// - p 以參考比較：交易狀態重估市價時只替換有成交的那個代碼的持倉物件，其餘列沿用同一個物件。
+// - rp（淨損益）每次重算都是新物件：比較數值、原因、商品參考，stock 明細（小型純資料）做結構比較。
+// - 回呼不比較：頁面傳入的回呼只捕捉 p、由 p 算出的 key 與穩定的 rowActions／setter（見 PositionsPage），
+//   p 相同時舊回呼與新回呼行為相同；rowActions 每次呼叫都轉給最新一次提交的處理函式（帳戶、閘門等狀態不會過期）。
+
+/** 小型純資料（數字、字串、陣列、物件）的結構相等 */
+export function plainEqual(a: unknown, b: unknown): boolean {
+    if (Object.is(a, b)) return true;
+    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    const ka = Object.keys(a);
+    if (ka.length !== Object.keys(b).length) return false;
+    for (const k of ka) {
+        if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+        if (!plainEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
+    }
+    return true;
+}
+
+export function rowPnlEqual(a: RowPnl, b: RowPnl): boolean {
+    return a === b || (a.value === b.value && a.deriv === b.deriv && a.reason === b.reason && a.contract === b.contract && plainEqual(a.stock, b.stock));
+}
+
+/** 詳細列的 memo 比較：只比該列實際用到的欄位（回呼除外，見上方說明） */
+export function rowPropsEqual(a: RowProps, b: RowProps): boolean {
+    return a.p === b.p
+        && a.priv === b.priv
+        && a.privMoney === b.privMoney
+        && a.closeDisabled === b.closeDisabled
+        && a.accountReason === b.accountReason
+        && a.maxAbsPnl === b.maxAbsPnl
+        && a.ydNotice === b.ydNotice
+        && a.expanded === b.expanded
+        && a.embeddedId === b.embeddedId
+        && rowPnlEqual(a.rp, b.rp);
+}
+
+const MemoPositionRow = memo(PositionRow, rowPropsEqual);
+
+export const COMPACT_TEXT = {
+    derivNote: '券商・未扣費稅',
+    pending: '淨損益待確認',
+    aboveBreakEven: '已過兩平',
+    belowBreakEven: '未達兩平',
+    atBreakEven: '等於兩平',
+    /** 精簡列報酬率的報讀標籤（視覺上只有數字） */
+    returnSrLabel: '報酬率（估）',
+} as const;
+
+/**
+ * 精簡列右側第二行的狀態文字（不只靠顏色）：股票＝現價與兩平價的關係（已過兩平／未達兩平／等於兩平）；
+ * 期權＝券商損益未扣費稅；淨損益算不出＝待確認；缺兩平價或現價時回 null。
+ */
+export function compactStatusText(p: Pick<Position, 'last_price'>, rp: RowPnl): string | null {
+    if (rp.deriv) return COMPACT_TEXT.derivNote;
+    if (rp.value === null || !rp.stock) return COMPACT_TEXT.pending;
+    const rel = breakEvenRelation(rp.stock, p.last_price);
+    return rel === 'profit' ? COMPACT_TEXT.aboveBreakEven : rel === 'loss' ? COMPACT_TEXT.belowBreakEven : rel === 'even' ? COMPACT_TEXT.atBreakEven : null;
+}
+
+interface CompactRowProps {
+    p: AccountedPosition;
+    privMoney: boolean;
+    rp: RowPnl;
+    open: boolean;
+    onToggle: () => void;
+    /** 展開時嵌入的詳細卡片 props（未展開的列不掛詳細卡片子樹） */
+    detail: Omit<RowProps, 'embeddedId'>;
+}
+
+/** 精簡列的 memo 比較：收合時只比精簡列用到的欄位；展開時再比嵌入的詳細卡片 */
+export function compactRowPropsEqual(a: CompactRowProps, b: CompactRowProps): boolean {
+    if (a.p !== b.p || a.privMoney !== b.privMoney || a.open !== b.open || !rowPnlEqual(a.rp, b.rp)) return false;
+    return !a.open || rowPropsEqual(a.detail, b.detail);
+}
+
+/** 精簡列：左＝名稱／代碼・條件・多空數量；右＝淨損益／報酬率（缺時現價）・兩平狀態；點一下就地展開既有詳細卡片 */
+function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail }: CompactRowProps) {
+    const contract = useContract(p.code);
+    const detailId = useId();
+    const shown = rp.value;
+    const ret = rowReturnPct(p, rp);
+    const status = compactStatusText(p, rp);
+    const name = contract?.name;
+    return (
+        <li className={styles.compactItem} data-testid='position-compact-row' data-code={p.code}>
+            <button
+                type='button'
+                className={styles.compactRow}
+                aria-expanded={open}
+                aria-controls={open ? detailId : undefined}
+                onClick={onToggle}
+                data-testid='position-compact-toggle'
+            >
+                <span className={styles.compactLeft}>
+                    <span className={styles.compactName}>{name || p.code}</span>
+                    <span className={styles.compactMeta}>
+                        {name && <span className={styles.compactCode}>{p.code}</span>}
+                        <span className={`${styles.tag} ${styles.compactTag}`}>{positionCondText(p, contract)}</span>
+                        <span className={styles.compactSide[p.direction === 'Buy' ? 'long' : 'short']} data-testid='position-compact-qty'>
+                            {sideText(p.direction)} {maskMoney(positionQtyText(p), privMoney)}
+                        </span>
+                    </span>
+                </span>
+                <span className={styles.compactRight}>
+                    <span className={`${styles.compactPnl} ${styles.tone[shown === null ? 'flat' : pnlTone(shown)]}`}>
+                        <span className={srOnly}>{pnlSrLabel(rp)}</span>
+                        <span data-testid='position-compact-pnl'>{shown === null ? '—' : maskMoney(fmtSigned(shown, 0), privMoney)}</span>
+                    </span>
+                    <span className={styles.compactSub}>
+                        {/* 報讀標籤：視覺上只有數字，按鈕的無障礙名稱補上欄位名稱（同詳細卡片的「報酬率（估）」） */}
+                        {ret !== null
+                            ? <span className={styles.tone[pnlTone(ret)]}><span className={srOnly}>{COMPACT_TEXT.returnSrLabel}</span><span data-testid='position-compact-return'>{fmtPct(ret)}</span></span>
+                            : <span data-testid='position-compact-price'>現價 {fmtPrice(p.last_price)}</span>}
+                        {status && <span data-testid='position-compact-status'>{status}</span>}
+                    </span>
+                </span>
+                <ChevronRight className={styles.compactChevron} aria-hidden='true' focusable='false' />
+            </button>
+            {open && <MemoPositionRow {...detail} embeddedId={detailId} />}
         </li>
     );
+}
+
+const MemoPositionCompactRow = memo(PositionCompactRow, compactRowPropsEqual);
+
+/** 最近的可捲動祖先（殼層 main）；找不到時用文件捲動 */
+function scrollParentOf(el: HTMLElement): HTMLElement | null {
+    for (let n = el.parentElement; n; n = n.parentElement) {
+        const oy = getComputedStyle(n).overflowY;
+        if (oy === 'auto' || oy === 'scroll') return n;
+    }
+    return document.scrollingElement instanceof HTMLElement ? document.scrollingElement : null;
 }
 
 interface CloseSheetProps {
@@ -522,6 +799,10 @@ export function PositionsPage() {
     const priv = usePrivacyMode();
     const privMoney = usePrivacyMoney();
     const switchLocked = useAccountSwitchLocked();
+    const costSettings = useTradingCostSettings();
+    // 玉山庫存明細（實際手續費、分批成交日）更新時重算淨損益
+    const [, bumpEsun] = useReducer((x: number) => x + 1, 0);
+    useEffect(() => subscribeEsunInventoryDetails(bumpEsun), []);
 
     const ydNotice = yesterdayQuantityNotice(useServerInfo());
 
@@ -557,19 +838,82 @@ export function PositionsPage() {
     const [market, setMarket] = useState<PositionMarketFilter>('all');
     const [sort, setSort] = useState<PositionSortMode>('default');
     const { rows, unclassified } = filterByMarket(accountRows, market, getCachedContract);
-    const sortedRows = sortPositions(rows, sort);
+
+    // ---- 淨損益 ----
+    // 今日成交只在委託查詢成功後採用（否則無法確定今天沒有買進 → 未判斷當沖）
+    const ordersQuery = trading.queries.orders as TradingQueryStatus | undefined;
+    const ordersKnown = !!ordersQuery && ordersQuery.updatedAt !== null && !ordersQuery.error;
+    const trades = trading.trades;
+    const fills = useMemo(() => (ordersKnown ? todayStockFills(trades ?? [], Date.now()) : null), [ordersKnown, trades]);
+    const pnlCtx: RowPnlContext = { settings: costSettings, now: Date.now(), fills };
+    const pnlCache = new Map<string, RowPnl>();
+    const pnlOf = (p: AccountedPosition): RowPnl => {
+        const key = positionKey(p);
+        let r = pnlCache.get(key);
+        if (!r) { r = rowPnlOf(p, getCachedContract(p.code), pnlCtx); pnlCache.set(key, r); }
+        return r;
+    };
+    // 損益與報酬率排序用淨損益（無法計算時以券商數字排序，只影響順序）
+    const sortedRows = sort === 'pnl'
+        ? sortByValue(rows, p => pnlOf(p).value ?? (finiteNum(p.pnl) ? p.pnl : null))
+        : sort === 'return'
+            ? sortByValue(rows, p => rowReturnPct(p, pnlOf(p)) ?? positionReturnPct(p))
+            : sortPositions(rows, sort);
     const groups = groupPositionsByAccount(sortedRows);
     const summary = summarizePositions(rows);
-    const maxAbsPnl = rows.reduce((mx, p) => (Number.isFinite(p.pnl) ? Math.max(mx, Math.abs(p.pnl)) : mx), 0);
+    const totals = netTotals(rows, pnlOf);
+    const netSummary = {
+        ...summary,
+        pnl: totals.sum,
+        pnlPct: summary.pnlPct !== null && totals.pending === 0 && summary.stockCost ? (totals.sum / summary.stockCost) * 100 : null,
+    };
+    const maxAbsPnl = rows.reduce((mx, p) => { const v = pnlOf(p).value; return v === null ? mx : Math.max(mx, Math.abs(v)); }, 0);
     // 持倉還沒讀到時合計未知：顯示「—」而不是 0
     const totalKnown = query.updatedAt !== null || positions.length > 0;
     // 保證金屬於「目前選取的期貨帳戶」：範圍包含該帳戶（全部帳戶或就是它）且不是只看股票時才顯示
     const futuresKey = accountKeyOf(accounts.selectedFutures);
     const showMargin = !!trading.margin && market !== 'stock' && futuresKey !== '' && (activeFilter === '' || activeFilter === futuresKey);
+    // 今日額度列：篩選單一證券帳戶時顯示該帳戶；全部或期貨帳戶時沿用目前選取的證券帳戶（只看期貨列時摘要卡不顯示）
+    const filterAccount = activeFilter ? accountOptions.find(([k]) => k === activeFilter)?.[1] ?? null : null;
+    const limitsAccount = filterAccount?.account_type === 'S' ? filterAccount : null;
+
+    // ---- 損益計算明細面板 ----
+    const [pnlKey, setPnlKey] = useState<string | null>(null);
+    const pnlTarget = pnlKey ? positions.find(p => positionKey(p) === pnlKey) : undefined;
+    const pnlTargetRow = pnlTarget ? pnlOf(pnlTarget) : null;
 
     // ---- 玉山庫存明細展開 ----
     const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
     const toggleDetail = (key: string) => setExpanded(prev => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+    });
+
+    // ---- 「詳細｜精簡」檢視（預設詳細；localStorage 讀寫失敗時只在本次有效）----
+    const [view, setView] = useState<PositionsView>(readPositionsView);
+    const viewRef = useRef<HTMLDivElement | null>(null);
+    const viewAnchor = useRef<number | null>(null);
+    const changeView = (next: PositionsView) => {
+        if (next === view) return;
+        // 以切換鍵為錨點：記下它在視窗中的位置，提交後補回內容高度改變造成的位移（保留捲動位置）
+        viewAnchor.current = viewRef.current ? viewRef.current.getBoundingClientRect().top : null;
+        setView(next);
+        writePositionsView(next);
+    };
+    useLayoutEffect(() => {
+        const before = viewAnchor.current;
+        viewAnchor.current = null;
+        const el = viewRef.current;
+        if (before === null || !el) return;
+        const scroller = scrollParentOf(el);
+        const delta = el.getBoundingClientRect().top - before;
+        if (scroller && delta !== 0) scroller.scrollTop += delta;
+    }, [view]);
+    // 精簡列展開（可同時展開多列：展開或收合一列時其他列不位移）
+    const [compactOpen, setCompactOpen] = useState<ReadonlySet<string>>(() => new Set());
+    const toggleCompact = (key: string) => setCompactOpen(prev => {
         const next = new Set(prev);
         if (next.has(key)) next.delete(key);
         else next.add(key);
@@ -675,6 +1019,18 @@ export function PositionsPage() {
         openTicket(plan.request);
     };
 
+    // ---- 列的動作（memo 列用）：穩定的轉接函式，每次呼叫都轉給最新一次提交的處理函式 ----
+    const latestRowHandlers = useRef({ openClose, onAddOn, toggleDetail, toggleCompact });
+    useLayoutEffect(() => {
+        latestRowHandlers.current = { openClose, onAddOn, toggleDetail, toggleCompact };
+    });
+    const rowActions = useMemo(() => ({
+        close: (p: AccountedPosition) => latestRowHandlers.current.openClose(p),
+        addOn: (p: AccountedPosition, contract: ContractInfo | undefined) => latestRowHandlers.current.onAddOn(p, contract),
+        toggleDetail: (key: string) => latestRowHandlers.current.toggleDetail(key),
+        toggleCompact: (key: string) => latestRowHandlers.current.toggleCompact(key),
+    }), []);
+
     const reconcile = reconcileText(query);
     const loading = query.updatedAt === null && !query.error;
     // 第一次讀取就失敗（從未讀到）：不能說「目前沒有持倉」（比照委託頁 readFailed、桌面 holdingsPhase 'failed'）
@@ -723,6 +1079,20 @@ export function PositionsPage() {
                     options={SORT_MODES.map(s => ({ value: s.key, label: `排序：${s.label}` }))}
                     onChange={setSort}
                 />
+                <div className={styles.viewToggle} ref={viewRef}>
+                    <Segmented<PositionsView>
+                        semantics='toggle'
+                        size='compact'
+                        ariaLabel='持倉顯示方式'
+                        testId='position-view'
+                        items={[
+                            { value: 'detail', label: '詳細', testId: 'position-view-detail' },
+                            { value: 'compact', label: '精簡', testId: 'position-view-compact' },
+                        ]}
+                        value={view}
+                        onChange={changeView}
+                    />
+                </div>
             </div>
 
             {reconcile && (
@@ -741,11 +1111,16 @@ export function PositionsPage() {
             </div>
 
             <PositionSummaryCard
-                summary={summary}
+                summary={netSummary}
                 known={totalKnown}
+                pending={totals.pending}
+                allPending={totals.counted === 0 && totals.pending > 0}
+                derivGross={totals.deriv}
                 margin={showMargin ? trading.margin ?? null : null}
                 futuresLabel={accounts.selectedFutures ? mobileAccountLabel(accounts.selectedFutures, priv) : ''}
                 privMoney={privMoney}
+                limitsAccount={limitsAccount}
+                compact={view === 'compact'}
             />
 
             {unclassified > 0 && (
@@ -763,7 +1138,9 @@ export function PositionsPage() {
             ) : rows.length === 0 ? (
                 <div className={styles.emptyWrap}><EmptyState title={POSITIONS_TEXT.filteredEmpty} /></div>
             ) : (
-                groups.map(g => (
+                groups.map(g => {
+                    const gt = netTotals(g.rows, pnlOf);
+                    return (
                     <GroupedSection
                         key={g.key || 'unknown'}
                         testId='position-group'
@@ -777,33 +1154,60 @@ export function PositionsPage() {
                                     </span>
                                 )}
                                 {/* 頁面底色上：損益小計用 foreground＋正負號（§4.8 規則 9，不放漲跌色小字） */}
-                                <span className={styles.groupPnl}>損益 {maskMoney(fmtSigned(g.pnl, 0), privMoney)}</span>
+                                <span className={styles.groupPnl} data-testid='position-group-pnl'>
+                                    損益 {gt.counted === 0 && gt.pending > 0 ? '—' : maskMoney(fmtSigned(gt.sum, 0), privMoney)}
+                                    {gt.pending > 0 ? '（待確認）' : ''}
+                                </span>
                             </span>
                         )}
                     >
                         <ul className={styles.list} aria-label={groupLabel(g.account, priv)}>
                             {g.rows.map(p => {
                                 const key = positionKey(p);
+                                // 回呼只捕捉 p、key 與穩定的 rowActions／setPnlKey（memo 比較不看回呼，見 rowPropsEqual）
+                                const detail: Omit<RowProps, 'embeddedId'> = {
+                                    p,
+                                    priv,
+                                    privMoney,
+                                    closeDisabled: closing || gateProblem !== null,
+                                    accountReason: accountReasonOf(p),
+                                    maxAbsPnl,
+                                    ydNotice,
+                                    expanded: expanded.has(key),
+                                    rp: pnlOf(p),
+                                    onClose: () => rowActions.close(p),
+                                    onAddOn: (contract) => rowActions.addOn(p, contract),
+                                    onToggleDetail: () => rowActions.toggleDetail(key),
+                                    onOpenPnl: () => setPnlKey(key),
+                                };
+                                if (view !== 'compact') return <MemoPositionRow key={key} {...detail} />;
                                 return (
-                                    <PositionRow
+                                    <MemoPositionCompactRow
                                         key={key}
                                         p={p}
-                                        priv={priv}
                                         privMoney={privMoney}
-                                        closeDisabled={closing || gateProblem !== null}
-                                        accountReason={accountReasonOf(p)}
-                                        maxAbsPnl={maxAbsPnl}
-                                        ydNotice={ydNotice}
-                                        expanded={expanded.has(key)}
-                                        onClose={() => openClose(p)}
-                                        onAddOn={(contract) => onAddOn(p, contract)}
-                                        onToggleDetail={() => toggleDetail(key)}
+                                        rp={detail.rp}
+                                        open={compactOpen.has(key)}
+                                        onToggle={() => rowActions.toggleCompact(key)}
+                                        detail={detail}
                                     />
                                 );
                             })}
                         </ul>
                     </GroupedSection>
-                ))
+                    );
+                })
+            )}
+
+            {pnlTarget && pnlTargetRow?.stock && pnlTargetRow.contract && (
+                <PositionPnlSheet
+                    summary={`${pnlTarget.code}${pnlTargetRow.contract.name ? ` ${pnlTargetRow.contract.name}` : ''} ${positionCondText(pnlTarget, pnlTargetRow.contract)} ${sideText(pnlTarget.direction)} ${maskMoney(positionQtyText(pnlTarget), privMoney)}`}
+                    pnl={pnlTargetRow.stock}
+                    contract={pnlTargetRow.contract}
+                    brokerPnl={pnlTarget.pnl}
+                    privMoney={privMoney}
+                    onClose={() => setPnlKey(null)}
+                />
             )}
 
             {closeKey !== null && (

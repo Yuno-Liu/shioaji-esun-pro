@@ -12,9 +12,8 @@ import { onAnyTick } from '../../lib/stream';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { SseTick } from '../../lib/types/market';
 import type { HistoryTicks } from '../../lib/types/tick';
-import { fmtInt } from '../../lib/utils/format';
+import { fmtInt, formatToTick } from '../lib/num-format';
 import { dateStrOffset } from '../../lib/utils/kbars';
-import { formatToTick } from '../../lib/utils/ticksize';
 import * as styles from '../styles/trade.css';
 
 export const TICK_HISTORY_COUNT = 50;

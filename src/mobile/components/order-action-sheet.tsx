@@ -13,7 +13,8 @@
 // - 結果：成功 notify；失敗一律 notify({ kind: 'err', ...mutationErrorNotice(err, verb) })。
 //   「未送出」（mutationNotStarted）面板保留可修改後重試；其餘＝結果未知，關閉面板，不自動重送、不提供重送鍵。
 // - 面板開啟期間該委託已不在未成交（成交或已刪）時，顯示「此委託已不在未成交」並停用所有動作。
-// - OrderLines（委託頁列、本面板摘要共用）：類別徽章、成交均價、成交進度條、已取消／原始委託量、券商訊息（遮蔽身分證號）。
+// - OrderLines（委託頁列、本面板摘要共用）：商品（TradeInstrument：名稱為主、代碼為次；名稱來源見 lib/contract-names.ts）、
+//   類別徽章、成交均價、成交進度條、已取消／原始委託量、券商訊息（遮蔽身分證號）。
 // - 版面（設計規格 §7.5，流程不變）：頂部 GroupedSection 摘要 → 選單 ListRow（改價／減量／刪單，按鈕文字恰為動作名，
 //   不可用原因在按鈕外）或子畫面（Stepper）→ 固定 footer：未送出回饋＋SlideToConfirm（改價、減量 neutral；刪單 danger）＋「返回」。
 //   kind 為 price／qty／cancel 時直接進入對應子畫面。樣式在 styles/order-action.css.ts（OrderLines 仍用 orders.css.ts）。
@@ -40,6 +41,7 @@ import { fmtInt, fmtPrice } from '../../lib/utils/format';
 import { roundToTick, stepPrice } from '../../lib/utils/ticksize';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
 import { useResumeGate } from '../hooks/use-resume-gate';
+import { instrumentText, useContractName } from '../lib/contract-names';
 import { isNotStarted, notStarted } from '../lib/errors';
 import { avgFillPrice, avgPriceDigits, fillProgress, orderBadges } from '../lib/order-fills';
 import { closeOrderAction, useMobileUi, type OrderActionKind } from '../lib/mobile-store';
@@ -252,6 +254,26 @@ export function FillBar({ trade }: { trade: Trade }) {
     );
 }
 
+/** 委託的商品名稱（trade.contract.name 優先，其次合約快取；沒有回 null） */
+export function useTradeName(trade: Pick<Trade, 'contract'> | null): string | null {
+    return useContractName(trade?.contract.code ?? null, trade?.contract.name, trade?.contract.security_type ?? undefined);
+}
+
+/**
+ * 商品（名稱為主、代碼為次，同自選列；委託列、成交列、明細標頭共用）。
+ * 名稱載入前只顯示代碼；單行省略號，名稱到達時列高不變。
+ */
+export function TradeInstrument({ trade, testId = 'order-instrument' }: { trade: Pick<Trade, 'contract'>; testId?: string }) {
+    const name = useTradeName(trade);
+    const code = trade.contract.code;
+    return (
+        <span className={styles.instrument} data-testid={testId} data-name={name ?? undefined}>
+            <span className={styles.instrumentName}>{name ?? code}</span>
+            {name && <span className={styles.instrumentCode}>{code}</span>}
+        </span>
+    );
+}
+
 /** 委託內容（委託頁列與操作面板摘要共用；全部用 span，可放在按鈕內） */
 export function OrderLines({ trade, meta }: { trade: Trade; meta: EsunOrderMeta | null }) {
     const priv = usePrivacyMode();
@@ -269,8 +291,7 @@ export function OrderLines({ trade, meta }: { trade: Trade; meta: EsunOrderMeta 
     return (
         <>
             <span className={styles.line}>
-                <span className={styles.code}>{trade.contract.code}</span>
-                {trade.contract.name && <span>{trade.contract.name}</span>}
+                <TradeInstrument trade={trade} />
                 <span className={styles.side[trade.order.action === 'Buy' ? 'Buy' : 'Sell']} data-testid='order-side'>{sideText}</span>
                 <OrderBadges trade={trade} />
             </span>
@@ -323,7 +344,9 @@ export function OrderActionSheet() {
 
     useEffect(() => { if (!orderAction) setBusy(false); }, [orderAction]);
 
-    const title = trade ? `委託操作 ${trade.contract.code}` : '委託操作';
+    // 標題（對話框名稱）含名稱與代碼，與委託明細面板一致；只影響顯示
+    const name = useTradeName(trade);
+    const title = trade ? `委託操作 ${instrumentText(trade.contract.code, name)}` : '委託操作';
     return (
         <BottomSheet open={orderAction !== null} onClose={closeOrderAction} dismissible={!busy} title={title} testId='order-action-sheet'>
             {orderAction && (trade

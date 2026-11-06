@@ -583,6 +583,84 @@ export const settleAmount = style({
     ...NUMERIC,
 });
 
+// ---- 今日剩餘交易額度（帳戶頁頂部卡的主值；持倉頁摘要的一行） ----
+
+/** 主值區：caption 標籤＋numHero 金額＋已用／總額度；與下方鍵值列以髮絲線分隔 */
+export const limitsHero = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.125rem',
+    padding: `${SPACE.s3} 0`,
+    minWidth: 0,
+    borderBottom: HAIRLINE,
+    '@media': {
+        [LOW_DPR]: { borderBottomWidth: '1px' },
+        [MORE_CONTRAST]: { borderBottom: HAIRLINE_CONTRAST },
+    },
+});
+
+export const limitsHeroLabel = style({
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
+export const limitsHeroValue = style({
+    ...NUM.numHero,
+    ...NUMERIC,
+    color: vars.color.foreground,
+    overflowWrap: 'anywhere',
+});
+
+export const limitsHeroSub = style({
+    ...TEXT.subhead,
+    ...NUMERIC,
+    color: vars.color.mutedForeground,
+    overflowWrap: 'anywhere',
+});
+
+/** 持倉頁摘要的額度列：整列可點（≥44px），標籤靠左、金額靠右，點擊跳到帳戶頁額度卡 */
+export const limitsLine = style([pressable, focusRing, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    gap: `0 ${SPACE.s2}`,
+    width: '100%',
+    minHeight: TOUCH_MIN,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    borderTop: HAIRLINE,
+    background: 'transparent',
+    color: vars.color.foreground,
+    textAlign: 'left',
+    font: 'inherit',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    '@media': {
+        [LOW_DPR]: { borderTopWidth: '1px' },
+        [MORE_CONTRAST]: { borderTop: HAIRLINE_CONTRAST },
+    },
+}]);
+
+export const limitsLineLabel = style({
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
+export const limitsLineValue = style({
+    ...NUM.numMd,
+    ...NUMERIC,
+    color: vars.color.foreground,
+    overflowWrap: 'anywhere',
+});
+
+export const limitsLineNote = style({
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
 // ---- 已實現損益 ----
 
 export const totalLine = style({
@@ -619,6 +697,13 @@ export const pnlCode = style({
     minWidth: 0,
     overflow: 'hidden',
     ...TEXT.headline,
+});
+
+/** 商品名稱（名稱為主；載入前為代碼）：單行省略號，名稱到達時列高不變 */
+export const pnlName = style({
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
 });
 
 export const pnlMeta = style({

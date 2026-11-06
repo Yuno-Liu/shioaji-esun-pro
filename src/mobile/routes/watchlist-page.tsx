@@ -7,33 +7,77 @@
 //   也就不呼叫 useQuote；離開畫面時 probe 卸載，由 src/lib/quote-ownership 在 RELEASE_GRACE_MS（1.5 秒）
 //   後才真正退訂，快速捲動來回不會反覆訂閱／退訂。永豐行情訂閱 50 次／5 秒（§9.1）。
 // - 重繪：行情 store 已以 50 ms 合併通知；每列再以 WATCH_REPAINT_MS（100 ms）節流重繪（§9.4）。
+// - 列（components/quote-row.tsx，與排行共用）：兩行列、迷你走勢、處置徽章、快速下單鍵、指數／組合商品佔位。
 // - 點一列 → #/trade/:code；長按（或編輯模式的「⋯」鍵）→ 操作面板：開啟交易頁、買進…、賣出…、移到最上、上移、下移、移除。
 //   「買進…／賣出…」**只呼叫 openTicket()**（只開下單面板；之後仍需預覽與滑動確認才會送出，設計規格 §10 S1）。
-// - 搜尋：search-sheet.tsx（searchProducts(query, 10)）。
+// - 搜尋：search-sheet.tsx（searchProducts(query, 10)）。延遲載入（lib/deferred-modules.ts loadSearchSheet，閒置預載），
+//   第一次要求開啟時才掛載；載入失敗以底部面板「載入失敗」＋［重試］顯示。
 // - 試撮（tick.simtrade）：比照桌面，代碼旁加「試撮」徽章，不當成真實成交顯示。
 // - 分段「自選｜排行」（§13 Phase 3）：排行見 components/ranking-list.tsx（延遲載入），只在「排行」分段掛載時讀取；
 //   「排行」分段不掛載自選列，自選列的行情訂閱隨之釋放。分段選擇在模組層保留（切換分頁再回來不變）。
-// - 版面（設計規格 §7.2）：PageHeader＋IconButton；Segmented tabs；表頭「商品｜指標切換鍵」（watch-metric-toggle，
-//   在表頭不在列按鈕內，避免巢狀互動）；列 56px、價格 PriceFlash、漲跌膠囊（實心 up／down＋inkStrong）；
-//   載入 Skeleton、空清單 EmptyState、錯誤 InlineNote。不顯示迷你走勢（不新增任何 K 線請求）。
+// - 版面（設計規格 §7.2，依使用者參考圖改版）：PageHeader（搜尋）；Segmented tabs（自選｜排行）；
+//   清單列：多個清單時清單分頁（Segmented scroll 變體，選中的自動捲進可見範圍），只有一個清單時顯示名稱；最後是「＋」新增清單；
+//   表頭「名稱｜指標切換鍵（watch-metric-toggle）｜編輯（watch-edit）」，都在表頭、不在列按鈕內（避免巢狀互動）；
+//   列 64px：名稱／代碼＋市場標記＋徽章（試撮、處置）｜成交價／「漲跌 漲跌幅」或總量（純文字、漲跌色）｜迷你走勢｜快速下單鍵。
+//   載入 Skeleton、空清單 EmptyState、錯誤 InlineNote。
+// - 清單增減（使用者要求「自選要增加可增加或減少的功能」）：
+//   - 新增清單：清單列最後的「＋」→ 名稱面板（components/watch-list-sheet.tsx；空白與重複名稱檢查）→ createList。
+//   - 編輯模式：目前清單「重新命名」（renameCurrentList；改名會換清單 id；失敗時面板與編輯模式保持）、
+//     「刪除清單」（兩段式確認；只剩一個清單時停用）→ deleteCurrentList（失敗顯示原因、保持編輯模式）。
+//   - 編輯模式每列列首「−」→ 移除確認面板（沿用操作面板的移除流程與文字）；清單底部「加入股票」開既有搜尋面板。
+//     非編輯模式沿用長按操作面板。
+// - 手指拖曳排序（使用者要求；lib/watch-reorder.ts）：編輯模式每列列尾有握把（touch-action none，只有握把能拖，
+//   列的其他區域照常捲動，§8）；列以 transform 跟手指、其他列以 transform 讓位（減少動態時不做讓位動畫）、靠近
+//   main 上下緣自動捲動；放手時位置有變才呼叫一次 reorderSymbol（hook 每次是 GET＋PUT＋GET）；pointercancel 還原；
+//   拖曳中與放手後短時間內不觸發列點擊與長按；清單載入中、載入失敗（loadError）、結構更新中或清單不可寫入
+//   （canReplaceList false）時停用握把。鍵盤 ↑／↓ 一次移一格（忽略自動重複與寫入中），移動後焦點留在該列握把。
+//   操作面板的上移、下移、移到最上保留。
+//   編輯模式不顯示迷你走勢（列首、列尾各多一個鍵，讓出寬度給名稱）。
+// - 迷你走勢（使用者明確要求，有限制地做）：只為可見列讀取目前（或最近一段）交易時段的 1 分 K，模組層快取每檔每段一次
+//   （盤中讀過的收盤後補讀一次）、佇列同時 2 個，即時成交以分鐘為桶接在尾段（lib/watch-sparkline-data.ts）；
+//   帳戶頁「顯示」可關閉，關閉時不掛載走勢欄、不發 K 線請求。指數、組合商品顯示空白佔位。
+//   窄螢幕（視窗寬 ≤400px，matchMedia）且字級「大」（1.3）時也不顯示，與關閉相同：不掛載、不請求、不排 rAF、
+//   不留空白佔位（各列一致改為「名稱｜數字」），讓出寬度給名稱欄，第二行代碼與市場標記不截斷（sparkFitsRow）。
+//   延遲載入（lib/deferred-modules.ts loadWatchSparkline，閒置預載）；只有可見列掛載 canvas（不可見列沒有點陣、不排 rAF），
+//   不可見、載入中、載入失敗都是同尺寸空白佔位；載入失敗後列下次變為可見時重新 import。
+// - 處置徽章：lib/regulatory-punish.ts（自選頁顯示清單且含股票時才讀，最多每 30 分鐘一次，失敗靜默）。
+// - 快速下單鍵（watch-row-ticket）：列尾的兄弟節點（不在列按鈕內，不觸發開交易頁或長按），只呼叫
+//   openTicket({ code, source: 'other' })（不帶方向；之後仍需預覽與滑動確認，設計規格 §10 S1）。指數、組合商品不顯示，
+//   改放同寬的 aria-hidden 空白佔位（watch-row-ticket-spacer），各列的價格欄與走勢欄對齊；編輯模式改顯示「⋯」與握把。
+// - 表頭編輯鍵的無障礙名稱包含可見文字（WCAG 2.5.3）：「編輯」→「編輯自選」、「完成」→「完成編輯」。
+// - 底部指數列（components/watch-index-strip.tsx）：ShellSlot bottom，加權／櫃買，點按只 navigate；
+//   沒有即時指數時以快照（自選頁掛載時讀，最多每 INDEX_SNAPSHOT_TTL_MS 一次）顯示收盤值。
+//   以 ContractBase 直接訂閱 Quote（retainContractQuotes），不經 useQuote → ensureContract，沒有合約解析 GET。
+// - 進入本頁的請求（清單本身由 WatchlistProvider 常駐讀取，不在此列）：
+//   處置清單 GET ≤1（含股票時，30 分鐘最多 1 次）；指數快照 POST ≤1（10 分鐘最多 1 次）；合約解析 0
+//   （列的合約由 useWatchlist 預先放進快取，指數不經解析）；Quote 訂閱＝指數 2 筆＋每個可見列 Tick、BidAsk 各 1 筆；
+//   K 線 POST 每個可見可交易列 ≤1（假日補找時 2，同時 2 個，每檔每段讀過即快取）；走勢 chunk 1 個（通常已閒置預載）。
+//   清單管理只在使用者操作時發出（新增、改名、刪除、移除、排序各自是 use-watchlist 的既有請求）。
 
-import { ChevronsUpDown, MoreHorizontal, Pencil, Search, Star } from 'lucide-react';
-import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { ChevronsUpDown, CircleMinus, GripVertical, MoreHorizontal, Pencil, Plus, Search, Star } from 'lucide-react';
+import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuote, type PriceQuoteState } from '../../hooks/use-stream';
 import type { WatchItem } from '../../hooks/use-watchlist';
 import { neighborCode } from '../../lib/list-move';
 import type { ProductSuggestion } from '../../lib/product-search';
-import type { ContractInfo } from '../../lib/types/contract';
-import type { Snapshot } from '../../lib/types/market';
-import { fmtCompactInt, fmtPct, fmtPrice } from '../../lib/utils/format';
 import { BottomSheet } from '../components/bottom-sheet';
-import { ModuleErrorBoundary, ModuleLoadError, retryableLazy } from '../components/route-error-boundary';
-import { SearchSheet } from '../components/search-sheet';
-import { loadRankingList } from '../lib/deferred-modules';
+import {
+    marketTag,
+    QuoteRow,
+    tradableContract,
+    useSparkColumn,
+    useVisibilityTracker,
+    type VisibilityTracker,
+    type WatchMetric,
+} from '../components/quote-row';
+import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from '../components/route-error-boundary';
+import { WatchIndexStrip } from '../components/watch-index-strip';
+import { loadRankingList, loadSearchSheet, loadWatchListSheet } from '../lib/deferred-modules';
 import { navigate } from '../lib/hash-router';
 import { openTicket } from '../lib/mobile-store';
+import { usePunishedCodes } from '../lib/regulatory-punish';
+import { useListReorder, type ListReorder } from '../lib/watch-reorder';
 import { useMobileWatchlist } from '../lib/watchlist-context';
-import { haptic } from '../motion/haptics';
 import { fill, focusRing, pressable, pressableRow } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
 import { EmptyState } from '../ui/empty-state';
@@ -41,155 +85,34 @@ import { GroupedSection, ListRow } from '../ui/grouped';
 import { IconButton } from '../ui/icon-button';
 import { InlineNote } from '../ui/inline-note';
 import { PageHeader } from '../ui/page-header';
-import { PopUpButton } from '../ui/pop-up-button';
-import { usePriceFlash } from '../ui/price-flash';
-import * as flashStyles from '../ui/price-flash.css';
 import { Segmented } from '../ui/segmented';
+import { ShellSlot } from '../ui/shell-slots';
 import { Skeleton } from '../ui/skeleton';
 
-/** 每列重繪節流（ms）：≤ 10 fps */
-export const WATCH_REPAINT_MS = 100;
-/** 長按門檻（ms） */
-export const LONG_PRESS_MS = 500;
-/** 長按期間手指移動超過這個距離（px）視為捲動，取消長按 */
-export const LONG_PRESS_MOVE_PX = 10;
-/** 可見範圍上下各預先多算的距離：捲動時提早訂閱，避免空白價格 */
-export const VISIBILITY_ROOT_MARGIN = '160px 0px';
-/** 瀏覽器沒有 IntersectionObserver 時，只讓前幾列訂閱（避免整份清單全部訂閱） */
-export const FALLBACK_VISIBLE_ROWS = 20;
+// 列、行情推算、可見列追蹤等搬到 components/quote-row.tsx（自選與排行共用）；保留從這裡匯出
+export {
+    createVisibilityTracker,
+    FALLBACK_VISIBLE_ROWS,
+    LARGE_FONT_SCALE,
+    LONG_PRESS_MOVE_PX,
+    LONG_PRESS_MS,
+    marketTag,
+    NARROW_WATCH_QUERY,
+    PUNISH_LABEL,
+    rowQuoteView,
+    SIM_LABEL,
+    sparkFitsRow,
+    tradableContract,
+    VISIBILITY_ROOT_MARGIN,
+    WATCH_REPAINT_MS,
+} from '../components/quote-row';
+export type { MarketTag, RowQuoteView, SparkSlotState, VisibilityTracker, WatchMetric } from '../components/quote-row';
 
-// ---------------------------------------------------------------------------
-// 價格與漲跌（與桌面 src/components/watchlist.tsx 相同規則）
-
-export interface RowQuoteView {
-    close?: number;
-    chg?: number;
-    pct?: number;
-    dir: 'up' | 'down' | 'flat';
-    /** 試撮揭示價（不是真實成交）：列上顯示「試撮」徽章 */
-    simtrade: boolean;
-    /** 總量（股票、期權為張／口；指數不顯示） */
-    vol?: number;
-}
-
-/**
- * 即時 tick／指數優先，沒有時退回快照收盤。
- * 不使用 tick.pct_chg（股票與期權串流的單位不同），一律由漲跌與參考價推算。
- */
-export function rowQuoteView(contract: Pick<ContractInfo, 'reference'> & Partial<Pick<ContractInfo, 'security_type'>>, snapshot: Snapshot | undefined, quote: PriceQuoteState | undefined): RowQuoteView {
-    const tick = quote?.tick;
-    const index = quote?.index;
-    const close = tick ? Number(tick.close) : index ? Number(index.close) : snapshot?.close;
-    const ref = index ? Number(index.reference) : contract.reference;
-    const chg = tick?.price_chg
-        ? Number(tick.price_chg)
-        : index
-            ? Number(index.close) - Number(index.reference)
-            : close !== undefined && ref
-                ? close - ref
-                : undefined;
-    const pct = chg !== undefined && ref ? (chg / ref) * 100 : snapshot?.change_rate;
-    const dir = chg === undefined || !Number.isFinite(chg) || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down';
-    const vol = index || contract.security_type === 'IND' ? undefined : tick ? Number(tick.total_volume) : snapshot?.total_volume;
-    return {
-        close: close !== undefined && Number.isFinite(close) ? close : undefined,
-        chg: chg !== undefined && Number.isFinite(chg) ? chg : undefined,
-        pct: pct !== undefined && Number.isFinite(pct) ? pct : undefined,
-        dir,
-        simtrade: tick?.simtrade === true,
-        vol: vol !== undefined && Number.isFinite(vol) && vol >= 0 ? vol : undefined,
-    };
-}
-
-const ARROW: Record<RowQuoteView['dir'], string> = { up: '▲', down: '▼', flat: '' };
-const DIR_TEXT: Record<RowQuoteView['dir'], string> = { up: '漲', down: '跌', flat: '平盤' };
-/** 試撮徽章文字 */
-export const SIM_LABEL = '試撮';
-
-// ---------------------------------------------------------------------------
-// 可見列追蹤（整頁共用一個 IntersectionObserver）
-
-export interface VisibilityTracker {
-    /** false：瀏覽器沒有 IntersectionObserver */
-    readonly supported: boolean;
-    /** 開始追蹤一個元素；回傳停止追蹤 */
-    observe(el: Element, onChange: (visible: boolean) => void): () => void;
-    disconnect(): void;
-}
-
-type IoCtor = new (cb: (entries: { target: Element; isIntersecting: boolean }[]) => void, opts?: { root?: Element | null; rootMargin?: string }) => {
-    observe(el: Element): void;
-    unobserve(el: Element): void;
-    disconnect(): void;
-};
-
-export function createVisibilityTracker(): VisibilityTracker {
-    const IO = (globalThis as { IntersectionObserver?: IoCtor }).IntersectionObserver;
-    if (typeof IO !== 'function') {
-        return { supported: false, observe: () => () => undefined, disconnect: () => undefined };
-    }
-    const callbacks = new Map<Element, (visible: boolean) => void>();
-    const io = new IO(entries => {
-        for (const entry of entries) callbacks.get(entry.target)?.(entry.isIntersecting);
-    }, { root: null, rootMargin: VISIBILITY_ROOT_MARGIN });
-    return {
-        supported: true,
-        observe(el, onChange) {
-            callbacks.set(el, onChange);
-            io.observe(el);
-            return () => {
-                callbacks.delete(el);
-                io.unobserve(el);
-            };
-        },
-        disconnect() {
-            callbacks.clear();
-            io.disconnect();
-        },
-    };
-}
-
-function useRowVisible(ref: { current: Element | null }, tracker: VisibilityTracker | null, fallbackVisible: boolean): boolean {
-    const [visible, setVisible] = useState(false);
-    useEffect(() => {
-        if (!tracker) return;
-        if (!tracker.supported) {
-            setVisible(fallbackVisible);
-            return;
-        }
-        const el = ref.current;
-        if (!el) return;
-        return tracker.observe(el, setVisible);
-    }, [ref, tracker, fallbackVisible]);
-    return visible;
-}
-
-// ---------------------------------------------------------------------------
-// 節流
-
-/** 值可以隨時 push；畫面最多每 ms 毫秒更新一次（取最後一個值） */
-function useThrottledValue<T>(initial: T, ms: number): [T, (next: T) => void] {
-    const [value, setValue] = useState(initial);
-    const pending = useRef<{ value: T } | null>(null);
-    const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const last = useRef(0);
-    useEffect(() => () => {
-        if (timer.current) clearTimeout(timer.current);
-        timer.current = null;
-    }, []);
-    const push = useCallback((next: T) => {
-        pending.current = { value: next };
-        if (timer.current) return;
-        const wait = Math.max(0, last.current + ms - Date.now());
-        timer.current = setTimeout(() => {
-            timer.current = null;
-            last.current = Date.now();
-            const p = pending.current;
-            pending.current = null;
-            if (p) setValue(() => p.value);
-        }, wait);
-    }, [ms]);
-    return [value, push];
+/** 讓 item 完整露出時捲動容器 scrollLeft 需要的位移（px；已完整可見時 0）。純函式，供清單分頁自動捲動與測試 */
+export function revealDelta(container: { left: number; right: number }, item: { left: number; right: number }, pad = 8): number {
+    if (item.left < container.left) return item.left - container.left - pad;
+    if (item.right > container.right) return item.right - container.right + pad;
+    return 0;
 }
 
 /**
@@ -205,17 +128,16 @@ export function WatchQuoteProbe({ code, onQuote }: { code: string; onQuote: (q: 
 // ---------------------------------------------------------------------------
 // 列右側指標（表頭切換鍵循環；存 localStorage）
 
-export type WatchMetric = 'pct' | 'chg' | 'vol';
-
-export const WATCH_METRICS: readonly WatchMetric[] = ['pct', 'chg', 'vol'];
-export const WATCH_METRIC_LABEL: Readonly<Record<WatchMetric, string>> = { pct: '漲跌幅', chg: '漲跌', vol: '總量' };
+export const WATCH_METRICS: readonly WatchMetric[] = ['pct', 'vol'];
+export const WATCH_METRIC_LABEL: Readonly<Record<WatchMetric, string>> = { pct: '漲跌幅', vol: '總量' };
 /** localStorage 鍵（per-device 偏好；讀寫失敗只在本次有效） */
 export const WATCH_METRIC_KEY = 'sj-mobile-watch-metric';
 
 function readMetric(): WatchMetric {
     try {
         const v = typeof localStorage === 'undefined' ? null : localStorage.getItem(WATCH_METRIC_KEY);
-        return v === 'pct' || v === 'chg' || v === 'vol' ? v : 'pct';
+        // 舊版的 'chg'（只顯示漲跌）併入 'pct'：第二行已同時顯示漲跌與漲跌幅
+        return v === 'vol' ? 'vol' : 'pct';
     } catch {
         return 'pct';
     }
@@ -229,7 +151,7 @@ function writeMetric(m: WatchMetric): void {
     }
 }
 
-/** 下一個指標（漲跌幅 → 漲跌 → 總量 → 漲跌幅） */
+/** 下一個指標（漲跌幅 → 總量 → 漲跌幅） */
 export function nextWatchMetric(m: WatchMetric): WatchMetric {
     return WATCH_METRICS[(WATCH_METRICS.indexOf(m) + 1) % WATCH_METRICS.length]!;
 }
@@ -243,126 +165,84 @@ interface WatchRowProps {
     tracker: VisibilityTracker | null;
     editing: boolean;
     metric: WatchMetric;
+    /** 顯示迷你走勢：設定開啟且放得下（否則不掛載走勢欄、不請求、不留佔位） */
+    spark: boolean;
+    punished: boolean;
+    /** 拖曳中的列 */
+    dragging: boolean;
+    /** 握把停用（清單載入或結構更新中） */
+    gripDisabled: boolean;
+    grip: ListReorder['grip'];
     onOpen: (code: string) => void;
     onActions: (code: string) => void;
+    onRemove: (code: string) => void;
+    onTicket: (code: string) => void;
 }
 
-const WatchRow = memo(function WatchRow({ item, index, tracker, editing, metric, onOpen, onActions }: WatchRowProps) {
+const WatchRow = memo(function WatchRow({ item, index, tracker, editing, metric, spark, punished, dragging, gripDisabled, grip, onOpen, onActions, onRemove, onTicket }: WatchRowProps) {
     const code = item.contract.code;
     const name = item.contract.name ?? '';
-    const ref = useRef<HTMLLIElement | null>(null);
-    const flashRef = useRef<HTMLSpanElement | null>(null);
-    const visible = useRowVisible(ref, tracker, index < FALLBACK_VISIBLE_ROWS);
-    const [quote, pushQuote] = useThrottledValue<PriceQuoteState | undefined>(undefined, WATCH_REPAINT_MS);
-    const view = rowQuoteView(item.contract, item.snapshot, quote);
-    // 跳價閃爍：快照 → 即時的那一筆不閃（來源切換）；只閃可見格（price-flash 內共用 IntersectionObserver）
-    usePriceFlash(flashRef, view.close, { source: quote ? 'live' : 'snapshot', enabled: visible });
-
-    // 長按：LONG_PRESS_MS 不放開且未移動 → 操作面板；長按後的 click 不開交易頁
-    const press = useRef<{ id: number; x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
-    const longPressed = useRef(false);
-    const clearPress = () => {
-        if (press.current) clearTimeout(press.current.timer);
-        press.current = null;
-    };
-    useEffect(() => clearPress, []);
-    const onPointerDown = (e: ReactPointerEvent<HTMLButtonElement>) => {
-        clearPress();
-        longPressed.current = false;
-        if (e.pointerType === 'mouse' && e.button !== 0) return;
-        press.current = {
-            id: e.pointerId,
-            x: e.clientX,
-            y: e.clientY,
-            timer: setTimeout(() => {
-                press.current = null;
-                longPressed.current = true;
-                haptic('longPress');
-                onActions(code);
-            }, LONG_PRESS_MS),
-        };
-    };
-    const onPointerMove = (e: ReactPointerEvent<HTMLButtonElement>) => {
-        const p = press.current;
-        if (!p || p.id !== e.pointerId) return;
-        if (Math.hypot(e.clientX - p.x, e.clientY - p.y) > LONG_PRESS_MOVE_PX) clearPress();
-    };
-
-    const priceText = view.close !== undefined ? fmtPrice(view.close) : '—';
-    const chgText = view.chg !== undefined ? `${ARROW[view.dir]}${fmtPrice(Math.abs(view.chg))}` : '—';
-    const pctText = view.pct !== undefined ? fmtPct(view.pct) : '';
-    const volText = view.vol !== undefined ? fmtCompactInt(view.vol) : '';
-    const pillText = metric === 'pct' ? (pctText || '—') : metric === 'chg' ? chgText : (volText || '—');
-    // 總量沒有方向；數值缺少時也不著色
-    const pillTone: RowQuoteView['dir'] = metric === 'vol' || pillText === '—' ? 'flat' : view.dir;
-    const pillClass = pillTone === 'flat' ? styles.pill.flat : `${styles.pill[pillTone]} ${fill[pillTone].strong}`;
-    const ariaLabel = `${code} ${name}，${view.simtrade ? `${SIM_LABEL} ` : ''}${priceText}，${DIR_TEXT[view.dir]} ${chgText} ${pctText}`.trim()
-        + (volText ? `，總量 ${volText}` : '');
-
+    const tradable = tradableContract(item.contract);
+    const label = `${code} ${name}`.trim();
     return (
-        <li ref={ref} className={styles.rowItem} data-code={code} data-testid='watch-row' data-visible={visible ? 'true' : 'false'}>
-            <button
-                type='button'
-                className={`${styles.row} ${pressableRow}${editing ? ` ${styles.rowEditing}` : ''}`}
-                aria-label={ariaLabel}
-                onPointerDown={onPointerDown}
-                onPointerMove={onPointerMove}
-                onPointerUp={clearPress}
-                onPointerCancel={clearPress}
-                onPointerLeave={clearPress}
-                onContextMenu={e => {
-                    // Android 長按與滑鼠右鍵都會觸發 contextmenu：不開系統選單，改開操作面板（只開一次）
-                    e.preventDefault();
-                    const already = longPressed.current;
-                    clearPress();
-                    longPressed.current = true;
-                    if (!already) {
-                        haptic('longPress');
-                        onActions(code);
-                    }
-                }}
-                onClick={() => {
-                    if (longPressed.current) {
-                        longPressed.current = false;
-                        return;
-                    }
-                    onOpen(code);
-                }}
-                data-testid='watch-row-button'
-            >
-                <span className={styles.rowName}>
-                    <span className={styles.rowTitleLine}>
-                        <span className={styles.rowCode}>{code}</span>
-                        {view.simtrade && <span className={styles.simBadge} data-testid='watch-simtrade'>{SIM_LABEL}</span>}
-                    </span>
-                    <span className={styles.rowSub}>{name}</span>
+        <QuoteRow
+            testPrefix='watch'
+            code={code}
+            name={name}
+            tag={marketTag(item.contract)}
+            tradable={tradable}
+            index={index}
+            tracker={tracker}
+            metric={metric}
+            spark={spark && !editing}
+            sparkContract={tradable ? item.contract : null}
+            sparkReference={item.contract.reference || undefined}
+            punished={punished}
+            quoteContract={item.contract}
+            snapshot={item.snapshot}
+            probe={WatchQuoteProbe}
+            onOpen={onOpen}
+            onLongPress={onActions}
+            onTicket={onTicket}
+            dragging={dragging}
+            leading={editing ? (
+                <span className={styles.rowLeading}>
+                    <IconButton ariaLabel={`從自選移除 ${label}`} icon={CircleMinus} onClick={() => onRemove(code)} testId='watch-row-remove' />
                 </span>
-                <span className={`${styles.rowPrice} ${flashStyles.host} ${styles.tone[view.dir]}`}>
-                    <span ref={flashRef} className={flashStyles.overlay} aria-hidden='true' />
-                    <span data-testid='watch-price'>{priceText}</span>
-                </span>
-                <span className={pillClass} data-testid='watch-pill' data-metric={metric}>{pillText}</span>
-            </button>
-            {visible && <WatchQuoteProbe code={code} onQuote={pushQuote} />}
-            {editing && (
-                <span className={styles.rowTrailing}>
+            ) : undefined}
+            trailing={editing ? (
+                <span className={`${styles.rowTrailing} ${styles.trailingPair}`}>
                     <IconButton ariaLabel={`${code} 更多操作`} icon={MoreHorizontal} onClick={() => onActions(code)} testId='watch-more' />
+                    <button
+                        type='button'
+                        className={`${styles.grip} ${focusRing}`}
+                        aria-label={`拖曳以調整 ${label} 的位置`}
+                        aria-keyshortcuts='ArrowUp ArrowDown'
+                        disabled={gripDisabled}
+                        onPointerDown={e => grip.onPointerDown(code, e)}
+                        onPointerMove={grip.onPointerMove}
+                        onPointerUp={grip.onPointerUp}
+                        onPointerCancel={grip.onPointerCancel}
+                        onLostPointerCapture={grip.onPointerCancel}
+                        onKeyDown={e => grip.onKeyDown(code, e)}
+                        onClick={grip.onClick}
+                        onContextMenu={e => e.preventDefault()}
+                        data-testid='watch-row-grip'
+                    >
+                        <GripVertical size={20} aria-hidden='true' focusable='false' />
+                    </button>
                 </span>
-            )}
-        </li>
+            ) : undefined}
+        />
     );
 });
 
 // ---------------------------------------------------------------------------
-// 長按操作面板
+// 長按操作面板（mode 'remove'：編輯模式列首「−」，只顯示移除並直接進入確認）
 
-/** 指數與組合商品不能下單：操作面板不提供「買進…／賣出…」 */
-function tradableContract(c: Pick<ContractInfo, 'security_type' | 'combo'>): boolean {
-    return c.security_type !== 'IND' && !c.combo;
-}
-
-function RowActionsSheet({ code, items, onClose, onOpen, onRemove, onMove }: {
+function RowActionsSheet({ code, mode, items, onClose, onOpen, onRemove, onMove }: {
     code: string | null;
+    mode: 'actions' | 'remove';
     items: WatchItem[];
     onClose: () => void;
     onOpen: (code: string) => void;
@@ -373,10 +253,10 @@ function RowActionsSheet({ code, items, onClose, onOpen, onRemove, onMove }: {
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
     useEffect(() => {
-        setConfirmRemove(false);
+        setConfirmRemove(mode === 'remove');
         setError(null);
         setBusy(false);
-    }, [code]);
+    }, [code, mode]);
     const item = code ? items.find(i => i.contract.code === code) : undefined;
     const codes = items.map(i => i.contract.code);
     const up = code ? neighborCode(codes, code, -1) : null;
@@ -412,32 +292,36 @@ function RowActionsSheet({ code, items, onClose, onOpen, onRemove, onMove }: {
         <BottomSheet open={code !== null && item !== undefined} onClose={onClose} title={item ? `${item.contract.code} ${item.contract.name ?? ''}` : ''} testId='watch-actions'>
             {code && (
                 <div className={styles.actionSheet}>
-                    <GroupedSection>
-                        <ListRow title='開啟交易頁' chevron onClick={() => { onOpen(code); onClose(); }} testId='watch-action-open' />
-                        {tradable && (
-                            <ListRow
-                                title='買進…'
-                                leading={<span className={`${styles.sideBadge} ${fill.up.strong}`}>買</span>}
-                                disabled={busy}
-                                onClick={() => ticket('Buy')}
-                                testId='watch-action-buy'
-                            />
-                        )}
-                        {tradable && (
-                            <ListRow
-                                title='賣出…'
-                                leading={<span className={`${styles.sideBadge} ${fill.down.strong}`}>賣</span>}
-                                disabled={busy}
-                                onClick={() => ticket('Sell')}
-                                testId='watch-action-sell'
-                            />
-                        )}
-                    </GroupedSection>
-                    <GroupedSection>
-                        <ListRow title='移到最上' disabled={!top || busy} onClick={() => top && onMove(code, top)} />
-                        <ListRow title='上移' disabled={!up || busy} onClick={() => up && onMove(code, up)} />
-                        <ListRow title='下移' disabled={!down || busy} onClick={() => down && onMove(code, down)} />
-                    </GroupedSection>
+                    {mode === 'actions' && (
+                        <>
+                            <GroupedSection>
+                                <ListRow title='開啟交易頁' chevron onClick={() => { onOpen(code); onClose(); }} testId='watch-action-open' />
+                                {tradable && (
+                                    <ListRow
+                                        title='買進…'
+                                        leading={<span className={`${styles.sideBadge} ${fill.up.strong}`}>買</span>}
+                                        disabled={busy}
+                                        onClick={() => ticket('Buy')}
+                                        testId='watch-action-buy'
+                                    />
+                                )}
+                                {tradable && (
+                                    <ListRow
+                                        title='賣出…'
+                                        leading={<span className={`${styles.sideBadge} ${fill.down.strong}`}>賣</span>}
+                                        disabled={busy}
+                                        onClick={() => ticket('Sell')}
+                                        testId='watch-action-sell'
+                                    />
+                                )}
+                            </GroupedSection>
+                            <GroupedSection>
+                                <ListRow title='移到最上' disabled={!top || busy} onClick={() => top && onMove(code, top)} />
+                                <ListRow title='上移' disabled={!up || busy} onClick={() => up && onMove(code, up)} />
+                                <ListRow title='下移' disabled={!down || busy} onClick={() => down && onMove(code, down)} />
+                            </GroupedSection>
+                        </>
+                    )}
                     <GroupedSection footer={confirmRemove && !busy ? '自選清單與桌面共用，移除後桌面也會看不到。' : undefined}>
                         <button
                             type='button'
@@ -466,6 +350,17 @@ export type WatchSegment = 'watchlist' | 'ranking';
 const RankingList = retryableLazy(() => loadRankingList().then(m => m.RankingList), 'RankingList');
 const resetRankingList = () => { RankingList.reset(); };
 
+// 搜尋面板只在按「搜尋」（或空清單的「搜尋並加入」、編輯模式的「加入股票」）後才用到：延遲載入（連同 lib/product-search
+// 約 4 KiB gzip），閒置時由 app.tsx 預載。第一次要求開啟時才掛載、之後保持掛載（面板開關動畫正常；同 app.tsx 的下單面板）。
+// 載入失敗以底部面板顯示「載入失敗」＋［重試］（SheetLoadError），可關閉，不影響頁面。
+const SearchSheet = retryableLazy(() => loadSearchSheet().then(m => m.SearchSheet), 'SearchSheet');
+const resetSearchSheet = () => { SearchSheet.reset(); };
+
+// 清單名稱面板（新增、重新命名）只在按「＋」或「重新命名」後才用到：延遲載入，第一次要求開啟時才掛載、之後保持掛載。
+// 載入失敗以底部面板顯示「載入失敗」＋［重試］（SheetLoadError），可關閉，不影響頁面。
+const WatchListSheet = retryableLazy(() => loadWatchListSheet().then(m => m.WatchListSheet), 'WatchListSheet');
+const resetWatchListSheet = () => { WatchListSheet.reset(); };
+
 const SEGMENTS = [
     { value: 'watchlist', label: '自選', testId: 'watch-segment-watchlist' },
     { value: 'ranking', label: '排行', testId: 'watch-segment-ranking' },
@@ -474,6 +369,21 @@ const SEGMENTS = [
 /** 上次選的分段（切換分頁再回來保留） */
 let lastSegment: WatchSegment = 'watchlist';
 
+/**
+ * 握把（拖曳、鍵盤排序）是否可用：清單已載入、沒有載入失敗、沒有結構更新，且清單可整份寫入。
+ * use-watchlist 的 canReplaceList 是 hook 內部的 ref（未回傳；不可修改 src/hooks）：依該 hook 的寫法，它為 false 時
+ * loading、loadError 或 structureBusy 必有其一為 true，因此以這三者判斷；若日後 hook 回傳 canReplaceList 也一併採用。
+ */
+export function canReorderList(wl: { loading: boolean; structureBusy: boolean; loadError: boolean; canReplaceList?: boolean }): boolean {
+    return !wl.loading && !wl.structureBusy && !wl.loadError && wl.canReplaceList !== false;
+}
+
+/** 刪除清單鍵的無障礙名稱：以可見文字開頭（WCAG 2.5.3），再補上清單名稱 */
+export function deleteListLabel(name: string, confirming: boolean, busy: boolean): string {
+    if (busy) return `刪除中…（清單「${name}」）`;
+    return confirming ? `確定刪除「${name}」清單` : `刪除清單「${name}」`;
+}
+
 /** 測試用：分段回到「自選」 */
 export function resetWatchlistSegmentForTest(): void {
     lastSegment = 'watchlist';
@@ -481,12 +391,27 @@ export function resetWatchlistSegmentForTest(): void {
 
 export function WatchlistPage() {
     const wl = useMobileWatchlist();
-    const [tracker, setTracker] = useState<VisibilityTracker | null>(null);
+    const tracker = useVisibilityTracker();
     const [searchOpen, setSearchOpen] = useState(false);
+    /** 搜尋面板第一次要求開啟後保持掛載 */
+    const [searchMounted, setSearchMounted] = useState(false);
     const [editing, setEditing] = useState(false);
     const [actionCode, setActionCode] = useState<string | null>(null);
+    const [actionMode, setActionMode] = useState<'actions' | 'remove'>('actions');
     const [segment, setSegmentState] = useState<WatchSegment>(lastSegment);
     const [metric, setMetricState] = useState<WatchMetric>(readMetric);
+    /** 清單名稱面板（新增／重新命名） */
+    const [listSheet, setListSheetState] = useState<'create' | 'rename' | null>(null);
+    /** 清單名稱面板第一次要求開啟後保持掛載 */
+    const [listSheetMounted, setListSheetMounted] = useState(false);
+    const setListSheet = useCallback((mode: 'create' | 'rename' | null) => {
+        if (mode) setListSheetMounted(true);
+        setListSheetState(mode);
+    }, []);
+    /** 刪除清單的兩段式確認 */
+    const [confirmDelete, setConfirmDelete] = useState(false);
+    const [listBusy, setListBusy] = useState(false);
+    const [listError, setListError] = useState<string | null>(null);
     const setSegment = useCallback((next: WatchSegment) => {
         lastSegment = next;
         setSegmentState(next);
@@ -500,20 +425,19 @@ export function WatchlistPage() {
         });
     }, []);
 
-    useEffect(() => {
-        const t = createVisibilityTracker();
-        setTracker(t);
-        return () => t.disconnect();
-    }, []);
-
     const openTrade = useCallback((code: string) => {
         navigate({ name: 'trade', code });
     }, []);
-    const openActions = useCallback((code: string) => setActionCode(code), []);
-    const openSearch = useCallback(() => setSearchOpen(true), []);
+    const openSearch = useCallback(() => {
+        setSearchMounted(true);
+        setSearchOpen(true);
+    }, []);
+    const closeSearch = useCallback(() => setSearchOpen(false), []);
+    /** 列尾快速下單鍵：只開下單面板、不帶方向（S1：之後仍需預覽與滑動確認） */
+    const quickTicket = useCallback((code: string) => { openTicket({ code, source: 'other' }); }, []);
 
     const watchedCodes = useMemo(() => new Set(wl.items.map(i => i.contract.code)), [wl.items]);
-    const { addSymbol, removeSymbol, reorderSymbol } = wl;
+    const { addSymbol, removeSymbol, reorderSymbol, createList, renameCurrentList, deleteCurrentList } = wl;
     const onAdd = useCallback(async (s: ProductSuggestion) => {
         await addSymbol(s.code, s.security_type, s.contract);
     }, [addSymbol]);
@@ -522,10 +446,84 @@ export function WatchlistPage() {
     const onAddRanked = useCallback(async (code: string) => { await addSymbol(code, 'STK'); }, [addSymbol]);
     const canAdd = !wl.loading && !wl.structureBusy && !wl.loadError;
 
+    // 拖曳排序（編輯模式的握把）：放手時位置有變才呼叫一次 reorderSymbol
+    const listRef = useRef<HTMLUListElement | null>(null);
+    const codes = useMemo(() => wl.items.map(i => i.contract.code), [wl.items]);
+    const gripDisabled = !canReorderList(wl);
+    const reorder = useListReorder({ listRef, codes, disabled: gripDisabled || !editing, onMove: reorderSymbol });
+    const { blocked } = reorder;
+    // 拖曳中與剛放手時不開交易頁、不開操作面板
+    const openRow = useCallback((code: string) => { if (!blocked()) openTrade(code); }, [blocked, openTrade]);
+    const openActions = useCallback((code: string) => {
+        if (blocked()) return;
+        setActionMode('actions');
+        setActionCode(code);
+    }, [blocked]);
+    const askRemove = useCallback((code: string) => {
+        if (blocked()) return;
+        setActionMode('remove');
+        setActionCode(code);
+    }, [blocked]);
+
     const activeList = wl.serverLists.find(l => l.id === wl.activeListId);
     const ranking = segment === 'ranking';
     const showList = !ranking && wl.items.length > 0;
     const metricLabel = WATCH_METRIC_LABEL[metric];
+    // 走勢欄：設定開啟且放得下才掛載（窄螢幕＋字級「大」時與設定關閉相同：不掛載、不請求、不留佔位）
+    const spark = useSparkColumn();
+    // 處置清單：只在顯示自選列且清單含股票時讀取（受 30 分鐘間隔限制）
+    const hasStocks = useMemo(() => wl.items.some(i => i.contract.security_type === 'STK'), [wl.items]);
+    const punished = usePunishedCodes(showList && hasStocks);
+    const showListTabs = !ranking && wl.serverLists.length > 1;
+    // 清單本身載入中（hook 的 loading 在清單結構更新時也為 true；結構更新中不算，避免編輯模式中途被收起）
+    const listLoading = wl.loading && !wl.structureBusy;
+    // 空清單（已載入）也顯示表頭的編輯鍵：才能重新命名或刪除空的清單
+    const emptyList = !ranking && !wl.items.length && !listLoading && !wl.loadError;
+    const showHeader = showList || (emptyList && activeList !== undefined);
+    const listNames = useMemo(() => wl.serverLists.map(l => l.name), [wl.serverLists]);
+    const canDeleteList = wl.serverLists.length > 1;
+
+    // 換清單或離開編輯模式時，取消刪除確認與錯誤訊息
+    useEffect(() => {
+        setConfirmDelete(false);
+        setListError(null);
+    }, [wl.activeListId, editing]);
+    // 清單變空且不再顯示表頭時（例如載入中）結束編輯模式
+    useEffect(() => {
+        if (!showHeader) setEditing(false);
+    }, [showHeader]);
+
+    const deleteList = async () => {
+        if (!canDeleteList || listBusy) return;
+        if (!confirmDelete) {
+            setConfirmDelete(true);
+            return;
+        }
+        setListBusy(true);
+        setListError(null);
+        try {
+            await deleteCurrentList();
+            setConfirmDelete(false);
+        } catch (e) {
+            setListError(`刪除清單失敗：${e instanceof Error && e.message ? e.message : '請稍後再試'}`);
+        } finally {
+            setListBusy(false);
+        }
+    };
+
+    // 清單分頁：選中的那個自動捲進可見範圍（只動水平 scrollLeft，不捲動頁面）
+    const listTabsRef = useRef<HTMLDivElement | null>(null);
+    useEffect(() => {
+        const root = listTabsRef.current;
+        if (!showListTabs || !root || typeof root.querySelector !== 'function') return;
+        const scroller = root.querySelector<HTMLElement>('[role="tablist"]');
+        const selected = root.querySelector<HTMLElement>('[aria-selected="true"]');
+        if (!scroller || !selected) return;
+        const delta = revealDelta(scroller.getBoundingClientRect(), selected.getBoundingClientRect());
+        if (delta !== 0) scroller.scrollLeft += delta;
+    }, [showListTabs, wl.activeListId, wl.serverLists.length]);
+
+    const structureBusy = wl.structureBusy || listBusy;
 
     return (
         <section className={styles.page} data-testid='page-watchlist'>
@@ -534,9 +532,6 @@ export function WatchlistPage() {
                 actions={(
                     <>
                         <IconButton ariaLabel='搜尋商品' icon={Search} iconSize={22} onClick={openSearch} testId='watch-search' />
-                        {!ranking && (
-                            <IconButton ariaLabel='編輯自選' icon={Pencil} pressed={editing} onClick={() => setEditing(v => !v)} testId='watch-edit' />
-                        )}
                     </>
                 )}
             />
@@ -549,20 +544,60 @@ export function WatchlistPage() {
                     semantics='tabs'
                     ariaLabel='自選或排行'
                 />
-                {ranking ? null : wl.serverLists.length > 1 ? (
-                    <PopUpButton
-                        className={styles.listPicker}
-                        ariaLabel='切換自選清單'
-                        value={wl.activeListId}
-                        options={wl.serverLists.map(l => ({ value: l.id, label: l.name }))}
-                        disabled={wl.structureBusy}
-                        onChange={id => wl.setActiveList(id)}
-                        testId='watch-list-picker'
-                    />
-                ) : activeList ? (
-                    <p className={styles.listName}>{activeList.name}</p>
-                ) : null}
-                {!ranking && editing && <p className={styles.listName}>按「⋯」或長按一列可調整順序或移除。</p>}
+                {!ranking && wl.serverLists.length > 0 && (
+                    <div className={styles.listBar}>
+                        {showListTabs ? (
+                            <div ref={listTabsRef} className={styles.listTabs}>
+                                <Segmented<string>
+                                    items={wl.serverLists.map(l => ({ value: l.id, label: l.name, testId: `watch-list-tab-${l.id}` }))}
+                                    value={wl.activeListId}
+                                    onChange={id => { if (id !== wl.activeListId) wl.setActiveList(id); }}
+                                    semantics='tabs'
+                                    variant='scroll'
+                                    ariaLabel='自選清單'
+                                    disabled={wl.structureBusy}
+                                    testId='watch-list-tabs'
+                                />
+                            </div>
+                        ) : (
+                            <p className={styles.listBarName}>{activeList?.name ?? ''}</p>
+                        )}
+                        <IconButton ariaLabel='新增自選清單' icon={Plus} onClick={() => setListSheet('create')} disabled={structureBusy} testId='watch-list-add' />
+                    </div>
+                )}
+                {!ranking && editing && activeList && (
+                    <div className={styles.listTools} data-testid='watch-list-tools'>
+                        <button
+                            type='button'
+                            className={`${styles.listTool} ${pressable} ${focusRing}`}
+                            disabled={structureBusy}
+                            onClick={() => setListSheet('rename')}
+                            data-testid='watch-list-rename'
+                        >
+                            重新命名
+                        </button>
+                        <button
+                            type='button'
+                            className={`${styles.listTool} ${styles.listToolDanger} ${pressable} ${focusRing}`}
+                            disabled={!canDeleteList || structureBusy}
+                            aria-label={deleteListLabel(activeList.name, confirmDelete, listBusy)}
+                            onClick={() => void deleteList()}
+                            data-testid='watch-list-delete'
+                        >
+                            {listBusy ? '刪除中…' : confirmDelete ? `確定刪除「${activeList.name}」` : '刪除清單'}
+                        </button>
+                    </div>
+                )}
+                {!ranking && editing && (
+                    <p className={styles.listName} data-testid='watch-edit-hint'>
+                        {!canDeleteList
+                            ? '只剩一個清單時不能刪除。按住右側握把拖曳可調整順序，按「−」移除。'
+                            : confirmDelete
+                                ? '自選清單與桌面共用，刪除後桌面也會看不到。'
+                                : '按住右側握把拖曳可調整順序，按「−」移除；也可按「⋯」或長按一列。'}
+                    </p>
+                )}
+                {!ranking && listError && <InlineNote tone='danger' role='alert' testId='watch-list-error'>{listError}</InlineNote>}
             </div>
 
             {ranking && (
@@ -580,8 +615,39 @@ export function WatchlistPage() {
                     </InlineNote>
                 </div>
             )}
-            {!ranking && !showList && wl.loading && !wl.loadError && <Skeleton label='自選清單載入中…' rows={6} testId='watch-loading' />}
-            {!ranking && !showList && !wl.loading && !wl.loadError && (
+            {!ranking && !showList && listLoading && !wl.loadError && <Skeleton label='自選清單載入中…' rows={6} testId='watch-loading' />}
+
+            {showHeader && (
+                <div className={styles.listHeader} data-testid='watch-list-header'>
+                    <span className={styles.headerName} aria-hidden='true'>名稱</span>
+                    {showList && (
+                        <button
+                            type='button'
+                            className={`${styles.metricToggle} ${pressable} ${focusRing}`}
+                            aria-label={`第二行顯示${metric === 'pct' ? '漲跌與漲跌幅' : metricLabel}，點按切換（漲跌與漲跌幅、總量）`}
+                            onClick={cycleMetric}
+                            data-testid='watch-metric-toggle'
+                            data-metric={metric}
+                        >
+                            {metricLabel}
+                            <ChevronsUpDown className={styles.metricIcon} aria-hidden='true' focusable='false' />
+                        </button>
+                    )}
+                    <button
+                        type='button'
+                        className={`${styles.editButton} ${pressable} ${focusRing}`}
+                        aria-label={editing ? '完成編輯' : '編輯自選'}
+                        aria-pressed={editing}
+                        onClick={() => setEditing(v => !v)}
+                        data-testid='watch-edit'
+                    >
+                        <Pencil className={styles.metricIcon} aria-hidden='true' focusable='false' />
+                        {editing ? '完成' : '編輯'}
+                    </button>
+                </div>
+            )}
+
+            {emptyList && !editing && (
                 <EmptyState
                     icon={Star}
                     title='這份清單還沒有商品。'
@@ -592,57 +658,92 @@ export function WatchlistPage() {
             )}
 
             {showList && (
-                <>
-                    <div className={styles.listHeader} data-testid='watch-list-header'>
-                        <span aria-hidden='true'>商品</span>
-                        <button
-                            type='button'
-                            className={`${styles.metricToggle} ${pressable} ${focusRing}`}
-                            aria-label={`右側欄顯示${metricLabel}，點按切換（漲跌幅、漲跌、總量）`}
-                            onClick={cycleMetric}
-                            data-testid='watch-metric-toggle'
-                            data-metric={metric}
-                        >
-                            {metricLabel}
-                            <ChevronsUpDown className={styles.metricIcon} aria-hidden='true' focusable='false' />
-                        </button>
-                    </div>
-                    <ul className={styles.list} aria-label='自選商品' data-testid='watch-list'>
-                        {wl.items.map((item, index) => (
-                            <WatchRow
-                                key={item.contract.code}
-                                item={item}
-                                index={index}
-                                tracker={tracker}
-                                editing={editing}
-                                metric={metric}
-                                onOpen={openTrade}
-                                onActions={openActions}
-                            />
-                        ))}
-                    </ul>
-                </>
+                <ul ref={listRef} className={styles.list} aria-label='自選商品' data-testid='watch-list'>
+                    {wl.items.map((item, index) => (
+                        <WatchRow
+                            key={item.contract.code}
+                            item={item}
+                            index={index}
+                            tracker={tracker}
+                            editing={editing}
+                            metric={metric}
+                            spark={spark}
+                            punished={punished.has(item.contract.code)}
+                            dragging={reorder.dragging === item.contract.code}
+                            gripDisabled={gripDisabled}
+                            grip={reorder.grip}
+                            onOpen={openRow}
+                            onActions={openActions}
+                            onRemove={askRemove}
+                            onTicket={quickTicket}
+                        />
+                    ))}
+                </ul>
+            )}
+            {!ranking && editing && (
+                <button
+                    type='button'
+                    className={`${styles.addSymbolRow} ${pressableRow} ${focusRing}`}
+                    disabled={!canAdd}
+                    onClick={openSearch}
+                    data-testid='watch-add-symbol'
+                >
+                    <Plus size={20} aria-hidden='true' focusable='false' />
+                    加入股票
+                </button>
             )}
 
-            <SearchSheet
-                open={searchOpen}
-                onClose={() => setSearchOpen(false)}
-                watchedCodes={watchedCodes}
-                canAdd={canAdd}
-                onAdd={onAdd}
-                onOpenTrade={code => {
-                    setSearchOpen(false);
-                    openTrade(code);
-                }}
-            />
+            <ModuleErrorBoundary
+                onRetry={resetSearchSheet}
+                fallback={props => <SheetLoadError {...props} open={searchOpen} onClose={closeSearch} testId='search-load-error' />}
+            >
+                <Suspense fallback={null}>
+                    {searchMounted && (
+                        <SearchSheet
+                            open={searchOpen}
+                            onClose={closeSearch}
+                            watchedCodes={watchedCodes}
+                            canAdd={canAdd}
+                            onAdd={onAdd}
+                            onOpenTrade={code => {
+                                setSearchOpen(false);
+                                openTrade(code);
+                            }}
+                        />
+                    )}
+                </Suspense>
+            </ModuleErrorBoundary>
             <RowActionsSheet
                 code={actionCode}
+                mode={actionMode}
                 items={wl.items}
                 onClose={() => setActionCode(null)}
                 onOpen={openTrade}
                 onRemove={onRemove}
                 onMove={reorderSymbol}
             />
+            <ModuleErrorBoundary
+                onRetry={resetWatchListSheet}
+                fallback={props => <SheetLoadError {...props} open={!ranking && listSheet !== null} onClose={() => setListSheet(null)} testId='watch-list-sheet-load-error' />}
+            >
+                <Suspense fallback={null}>
+                    {listSheetMounted && (
+                        <WatchListSheet
+                            mode={ranking ? null : listSheet}
+                            currentName={activeList?.name ?? ''}
+                            names={listNames}
+                            busy={wl.structureBusy}
+                            onCreate={createList}
+                            onRename={renameCurrentList}
+                            onClose={() => setListSheet(null)}
+                        />
+                    )}
+                </Suspense>
+            </ModuleErrorBoundary>
+            {/* 底部指數列：殼層配件槽（分頁列之上）；只在自選頁掛載時訂閱加權／櫃買 */}
+            <ShellSlot slot='bottom'>
+                <WatchIndexStrip />
+            </ShellSlot>
         </section>
     );
 }

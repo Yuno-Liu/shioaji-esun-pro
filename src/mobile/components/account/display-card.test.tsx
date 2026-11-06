@@ -36,6 +36,7 @@ vi.mock('../../../lib/sounds', () => ({ soundEnabled: () => false, setSoundEnabl
 vi.mock('../../lib/fill-audio', () => ({ unlockFillAudio: vi.fn(() => true), playFillSound: vi.fn(() => true) }));
 
 import { getMobileUiSettings, resetMobileUiSettingsForTest } from '../../lib/ui-settings';
+import { getWatchSparklineEnabled, resetWatchPrefsForTest, WATCH_SPARK_KEY } from '../../lib/watch-prefs';
 import { resetMobileDeviceSettingsForTest } from '../../lib/mobile-device-settings';
 import { resetWakeLockStatusForTest } from '../../lib/wake-lock';
 import { DeviceSettingsSection } from './device-settings-section';
@@ -52,6 +53,7 @@ beforeEach(() => {
     // 高階裝置：首次載入不套用「低階 Android 預設降低透明度」
     vi.stubGlobal('navigator', { hardwareConcurrency: 8, deviceMemory: 8, vibrate: () => true });
     resetMobileUiSettingsForTest();
+    resetWatchPrefsForTest();
     resetMobileDeviceSettingsForTest();
     resetWakeLockStatusForTest();
     m.setThemeSettings.mockClear();
@@ -94,6 +96,29 @@ describe('DisplayCard transparency', () => {
         }
         await act(async () => segButtons('display-font')[2]!.props.onClick());
         expect(m.setThemeSettings).toHaveBeenCalledWith({ fontScale: 1.3 });
+    });
+});
+
+describe('DisplayCard 自選迷你走勢', () => {
+    it('預設開啟；切換寫入 localStorage（失敗時只在本次有效）', async () => {
+        const data = new Map<string, string>();
+        vi.stubGlobal('localStorage', { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v); } });
+        await act(async () => { view = create(createElement(DisplayCard)); });
+        const sw = () => byTestId('display-watch-spark');
+        expect(sw().props.role).toBe('switch');
+        expect(sw().props['aria-label']).toBe('自選迷你走勢');
+        expect(sw().props['aria-checked']).toBe(true);
+        await act(async () => sw().props.onClick());
+        expect(sw().props['aria-checked']).toBe(false);
+        expect(data.get(WATCH_SPARK_KEY)).toBe('0');
+        expect(getWatchSparklineEnabled()).toBe(false);
+        await act(async () => view!.unmount());
+        vi.stubGlobal('localStorage', { getItem: () => { throw new Error('denied'); }, setItem: () => { throw new Error('denied'); } });
+        resetWatchPrefsForTest();
+        await act(async () => { view = create(createElement(DisplayCard)); });
+        expect(sw().props['aria-checked']).toBe(true);
+        await act(async () => sw().props.onClick());
+        expect(sw().props['aria-checked']).toBe(false);
     });
 });
 

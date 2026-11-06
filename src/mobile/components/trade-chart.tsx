@@ -52,7 +52,8 @@ import { getChartColors, themeKey, useThemeSettings, type ChartColors } from '..
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Candle } from '../../lib/types/market';
 import { aggregate, kbarsToCandles, nowWallClockUtc, wallClockToUtc } from '../../lib/utils/kbars';
-import { formatToTick, roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
+import { roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
+import { formatToTick } from '../lib/num-format';
 import { currentOrientationEnv, shouldAutoFullscreen } from '../lib/chart-fullscreen';
 import { fetchMobileChartHistory } from '../lib/chart-history-cache';
 import { getHistoryEntry, planHistory, setHistoryEntry } from '../lib/chart-history-freshness';
@@ -904,6 +905,10 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         }
         layoutRef.current();
         return () => {
+            // 主 series 已換掉（圖表在主 effect 的清理中移除：卸載、換週期／配色重建）：價格線隨舊圖表一起銷毀，
+            // 不可再呼叫 removePriceLine。對已移除的圖表呼叫它不會丟錯（try/catch 接不到），卻會排一次重繪，
+            // 下一個影格畫到已銷毀的畫布而在 rAF 中丟出「Object is disposed」（未捕捉的例外）。
+            if (mainRef.current !== series) return;
             for (const pl of created) {
                 try { series.removePriceLine(pl); } catch { /* 圖表已移除 */ }
             }

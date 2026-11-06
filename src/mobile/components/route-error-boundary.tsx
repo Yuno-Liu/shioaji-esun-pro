@@ -9,8 +9,12 @@
 //   不在失敗當下自動換新：React 在錯誤後會同步重試渲染一次，自動換新會變成連續重抓的迴圈；只在使用者按［重試］時換。
 // - 部分瀏覽器會把失敗的 module fetch 留在 module map，同一網址再 import 仍會失敗：重試失敗後多顯示［重新整理頁面］。
 //   這個按鈕只在使用者按下時整頁重新載入，不送出任何委託。
+// - preload()（稽核 P3）：閒置預載呼叫它，模組 resolve 後把元件存起來；之後「新掛載」的實例若已 resolve 就直接渲染該元件、
+//   不經 React.lazy，不會 suspend，也就沒有 fallback 與 React 約 300ms 的 Suspense 揭示節流。
+//   每個實例在掛載時決定走哪條路（useState 記住），之後不換元件型別：已用 lazy 掛上的實例不會因預載晚到而被重掛。
+//   預載失敗只吞掉、不標記 failed：不影響之後的 lazy（仍會自己 import）與［重試］語意；下次 preload() 會再試。
 
-import { Component, lazy, type ComponentType, type ReactNode } from 'react';
+import { Component, lazy, useState, type ComponentType, type ReactNode } from 'react';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
 import { BottomSheet } from './bottom-sheet';
@@ -23,12 +27,23 @@ export interface RetryableLazy<P extends object> {
     displayName?: string;
     /** 上一次載入失敗時換新的 lazy 並回傳 true；未失敗（載入中或已成功）時不動、回傳 false */
     reset: () => boolean;
+    /**
+     * 預先載入：resolve 後記住元件，之後新掛載的實例直接渲染、不 suspend。
+     * 回傳的 promise 一律 resolve（失敗只吞掉，不影響 lazy 與 reset／重試）；已載入或載入中不重複呼叫 load()。
+     */
+    preload: () => Promise<void>;
 }
 
 export function retryableLazy<P extends object>(load: () => Promise<ComponentType<P>>, name = 'RetryableLazy'): RetryableLazy<P> {
     let failed = false;
+    /** 已 resolve 的元件（預載或 lazy 任一條路成功後設定；之後不清除） */
+    let resolved: ComponentType<P> | null = null;
+    let preloading: Promise<void> | null = null;
     const make = () => lazy(() => load().then(
-        component => ({ default: component }),
+        component => {
+            resolved ??= component;
+            return { default: component };
+        },
         (error: unknown) => {
             failed = true;
             throw error;
@@ -36,10 +51,20 @@ export function retryableLazy<P extends object>(load: () => Promise<ComponentTyp
     ));
     let current = make();
     const Retryable = ((props: P) => {
-        const Current = current as unknown as ComponentType<P>;
+        // 掛載當下已 resolve → 固定渲染該元件；否則每次渲染讀目前的 lazy（reset 後換新的）
+        const [ready] = useState(() => resolved);
+        const Current = (ready ?? current) as unknown as ComponentType<P>;
         return <Current {...props} />;
     }) as RetryableLazy<P>;
     Retryable.displayName = name;
+    Retryable.preload = () => {
+        if (resolved) return Promise.resolve();
+        preloading ??= load().then(
+            component => { resolved ??= component; },
+            () => { preloading = null; },
+        );
+        return preloading;
+    };
     Retryable.reset = () => {
         if (!failed) return false;
         failed = false;

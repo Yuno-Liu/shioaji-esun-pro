@@ -269,6 +269,28 @@ describe('TradeChart', () => {
         expect(m.openTicket).not.toHaveBeenCalled();
     });
 
+    it('卸載時不在 chart.remove() 之後呼叫 removePriceLine（否則會排一次重繪，畫到已銷毀的畫布而丟出 Object is disposed）', async () => {
+        await render();
+        const main = m.allSeries[0] as unknown as { removePriceLine: ReturnType<typeof vi.fn> };
+        const order: string[] = [];
+        m.chart.remove.mockImplementation(() => { order.push('remove'); });
+        main.removePriceLine.mockImplementation(() => { order.push('removePriceLine'); });
+        await unmount();
+        expect(order).toEqual(['remove']);
+    });
+
+    it('委託線改變（圖表仍在）時照常移除舊的價格線', async () => {
+        await render();
+        const main = m.allSeries[0] as unknown as { removePriceLine: ReturnType<typeof vi.fn> };
+        main.removePriceLine.mockClear();
+        await act(async () => {
+            view!.update(createElement(TradeChart, { code: '2330', contract, period: '5m', lines: [{ ...ORDER_LINE, key: 'order:o2', price: 1075, tradeId: 'o2' }] }));
+        });
+        await tick(50);
+        expect(main.removePriceLine).toHaveBeenCalledTimes(1);
+        expect(m.chart.remove).not.toHaveBeenCalled();
+    });
+
     it('歷史載入失敗顯示重新載入；重新載入以新 revision 重抓且不重建圖表', async () => {
         m.fetchChartHistory.mockReset().mockRejectedValueOnce(new Error('timeout')).mockResolvedValue(KBARS);
         await render();

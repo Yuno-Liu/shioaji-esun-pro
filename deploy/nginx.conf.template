@@ -18,6 +18,24 @@ map $http_sec_fetch_site $shioaji_pro_cross_site {
     none 0;
 }
 
+# /api/ 的寫入請求只接受 JSON（縱深防禦：sidecar 自己的跨來源檢查會因 Host 改寫而失效）。
+# GET／HEAD 不檢查；DELETE 沒有 body 時沒有 Content-Type，放行。前端（src/lib/api.ts）的 POST／PUT 一律帶
+# application/json，DELETE 有 body 時也是。其他（表單、text/plain、沒有 Content-Type 的 POST）回 415。
+map "$request_method:$content_type" $shioaji_pro_api_bad_type {
+    default 1;
+    "~^(GET|HEAD):" 0;
+    "~*^(POST|PUT|DELETE):application/json\s*(;.*)?$" 0;
+    "DELETE:" 0;
+}
+
+# HSTS 只送給 Tailscale 的 *.ts.net 主機名（一定經 HTTPS 前端開啟）；$host 已是小寫且不含 port。
+# 不加 includeSubDomains／preload；localhost、區網 http://trade.lan:8080 等主機為空字串，
+# 空值的 add_header 不會送出，避免把只走 HTTP 的主機名強制升級成 HTTPS 而連不上。
+map $host $shioaji_pro_hsts {
+    default "";
+    "~*\.ts\.net$" "max-age=31536000";
+}
+
 # 預設 server：Host 不在允許清單（例如 DNS rebinding、以 IP 從區網直連）一律斷線
 server {
     listen ${PORT} default_server;
@@ -68,12 +86,21 @@ server {
         try_files /approval.html =404;
     }
 
-    # 手機版短網址（選配）：/m → /mobile.html；mobile.html 本身由下方 location / 以 no-cache 提供。
+    # 手機版短網址（選配）：/m → /mobile.html。
     # absolute_redirect off：Location 只送相對路徑，前面接 TLS 前端時不會被改寫成 http:// 或帶上 :8080。
     # 此 location 不自訂 add_header，安全標頭沿用 server 層級設定。
     location = /m {
         absolute_redirect off;
         return 302 /mobile.html;
+    }
+
+    # 手機交易頁：不快取（同 location /），另加 COOP same-origin，
+    # 由其他網站 window.open 開啟時切斷 opener 參照（防 tabnabbing）。有 add_header，安全標頭需再 include。
+    location = /mobile.html {
+        add_header Cache-Control "no-cache" always;
+        add_header Cross-Origin-Opener-Policy "same-origin" always;
+        include /etc/nginx/snippets/security-headers.conf;
+        try_files /mobile.html =404;
     }
 
     # 手機版 PWA manifest（由 vite.fork.config.ts 產生，無雜湊）：明確以 application/manifest+json 提供，
@@ -90,8 +117,11 @@ server {
 
     # 只有 Vite 產出的帶雜湊資產（vite.config.ts 設 assetsDir: ''，檔名形如 main-D_2YXx_3.js）
     # 才可長期快取；public/ 內無雜湊的檔案走下方 location / 的 no-cache。
+    # rolldown 遇到同名同雜湊會在 8 碼雜湊後補一位數字（例如 vendor-CjBHE94L2.js），所以允許第 9 碼為數字；
+    # 不可放寬成 {8,}，否則 apple-touch-icon.png、shioaji-mark-small.svg 會被誤判為長快取
+    # （deploy/test_nginx_template.py 以實際建置輸出驗證）。
     # /api/、/esun/ 使用 ^~，不會被這個 regex 搶先比對。
-    location ~* "-[A-Za-z0-9_-]{8}\.(?:js|mjs|css|woff2?|ttf|png|jpe?g|gif|svg|webp|avif|ico|wasm)$" {
+    location ~* "-[A-Za-z0-9_-]{8}[0-9]?\.(?:js|mjs|css|woff2?|ttf|png|jpe?g|gif|svg|webp|avif|ico|wasm)$" {
         add_header Cache-Control "public, max-age=31536000, immutable" always;
         include /etc/nginx/snippets/security-headers.conf;
         try_files $uri =404;
@@ -110,6 +140,12 @@ server {
         if ($shioaji_pro_cross_site) {
             return 403;
         }
+        # 玉山 driver（src/lib/esun/http-driver.ts）只送 GET、POST；其他方法在 nginx 就回 403。
+        # body 上限與 bridge 相同（64 KiB），超過時 nginx 直接回 413、不轉送。
+        limit_except GET POST {
+            deny all;
+        }
+        client_max_body_size 64k;
 
         # proxy_pass 帶變數時不可再附 URI：原始的 /esun/... 路徑會原樣轉送
         set $esun_bridge_upstream ${ESUN_BRIDGE_UPSTREAM};
@@ -126,6 +162,9 @@ server {
         # 值為空時 nginx 不送出此標頭，也會移除客戶端自帶的同名標頭
         proxy_set_header Host $http_host;
         proxy_set_header X-Esun-Bridge-Token "${ESUN_BRIDGE_TOKEN}";
+        # 不把 Basic Auth 帳密（Authorization）與瀏覽器 cookie 轉給上游（空值時 nginx 不送出此標頭）
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -144,6 +183,15 @@ server {
         if ($shioaji_pro_cross_site) {
             return 403;
         }
+        if ($shioaji_pro_api_bad_type) {
+            return 415;
+        }
+        # 前端只用 GET、POST、PUT、DELETE（src/lib/api.ts）；其他方法（PATCH、OPTIONS、TRACE…）回 403。
+        # body 上限 256 KiB：最大的請求是自選清單同步（每檔約 60 bytes，可容納數千檔），委託 JSON 都在 1 KiB 內。
+        limit_except GET POST PUT DELETE {
+            deny all;
+        }
+        client_max_body_size 256k;
 
         proxy_pass ${SHIOAJI_API_UPSTREAM}/api/;
         proxy_http_version 1.1;
@@ -161,9 +209,17 @@ server {
         # （空值時 nginx 不送出此標頭）。本機開啟時 $host 本來就是 127.0.0.1，行為不變。
         proxy_set_header Host 127.0.0.1;
         proxy_set_header Origin "";
+        # 不把 Basic Auth 帳密（Authorization）與瀏覽器 cookie 轉給第三方 sidecar
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 帳務、持倉 JSON 不留在瀏覽器 HTTP 快取（sidecar 自己帶什麼快取標頭不可靠）。
+        # 有 add_header 就不繼承 server 層，安全標頭需再 include。
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/security-headers.conf;
     }
 
     # SPA routing fallback（index.html 與 public/ 內無雜湊的檔案一律重新驗證）

@@ -9,3 +9,12 @@
 // 為了這點體積不值得。
 /** 漲跌幅排行（自選頁「排行」分段） */
 export const loadRankingList = () => import('../components/ranking-list');
+/**
+ * 自選列迷你走勢（canvas＋1 分 K 資料、時段計算）：只有可見列才載入與掛載；
+ * 載入前與載入失敗時走勢欄是同尺寸空白佔位，不影響列與頁面。
+ */
+export const loadWatchSparkline = () => import('../components/watch-sparkline');
+/** 自選頁商品搜尋面板（按「搜尋」或空清單的「搜尋並加入」才掛載；連同 lib/product-search 約 4 KiB gzip） */
+export const loadSearchSheet = () => import('../components/search-sheet');
+/** 自選清單名稱面板（新增清單、重新命名；按「＋」或編輯模式的「重新命名」才掛載） */
+export const loadWatchListSheet = () => import('../components/watch-list-sheet');

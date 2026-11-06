@@ -1,7 +1,7 @@
 // 帳戶頁（規格 §6.7、§10）：風控一鍵鎖單（鎖定立即生效、解除需滑動確認）、
 // 「手動下單確認」一律顯示鎖定開啟且不可關閉（不寫入桌面設定）、明示只對本裝置有效、遮蔽金額；
 // 資金／交割行事曆／交易額度／已實現損益／玉山帳務概覽／永豐預收（按需讀取＋冷卻）、三個樁的掛載位置。
-import { createElement, useSyncExternalStore } from 'react';
+import { createElement, StrictMode, useSyncExternalStore } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -32,6 +32,8 @@ const m = vi.hoisted(() => {
         usage: null as unknown,
         setThemeSettings: vi.fn(),
         setPrivacyMoney: vi.fn(),
+        contracts: {} as Record<string, { code: string; name: string }>,
+        ensureContract: vi.fn(),
     };
 });
 
@@ -94,7 +96,12 @@ vi.mock('../../lib/shioaji', () => ({
     fetchEarmarkingDetail: m.fetchEarmarkingDetail,
 }));
 vi.mock('../../lib/settle-date', () => ({ settleDateLabel: (raw: string) => raw, bizDateLabel: (t: number) => `biz+${t}` }));
-vi.mock('../../lib/realized-name', () => ({ canonicalBrokerCode: (c: string) => c.trim() }));
+vi.mock('../../lib/realized-name', () => ({ canonicalBrokerCode: (c: string) => c.trim(), realizedCodeCandidates: (c: string) => [c.trim()] }));
+// 已實現損益列的名稱：合約快取（每個代碼一次 ensureContract；未知代碼查詢失敗）
+vi.mock('../../lib/contracts-cache', () => ({
+    useContract: (code: string | null) => (code ? m.contracts[code] : undefined),
+    ensureContract: m.ensureContract,
+}));
 vi.mock('../../lib/theme-store', () => ({ useThemeSettings: () => ({ mode: 'dark', convention: 'tw', fontScale: 1.15 }), setThemeSettings: m.setThemeSettings }));
 vi.mock('../components/account-switch-sheet', () => ({
     AccountSwitchSheet: () => null,
@@ -107,6 +114,9 @@ vi.mock('../components/account/device-settings-section', () => ({ DeviceSettings
 vi.mock('../components/account/esun-reconnect-section', () => ({ EsunReconnectSection: () => createElement('div', { 'data-testid': 'stub-esun-reconnect' }) }));
 
 import { loadTradingLimits, resetTradingLimitsForTest, TRADING_LIMITS_MIN_REFRESH_MS } from '../hooks/use-trading-limits';
+import { resetContractNamesForTest } from '../lib/contract-names';
+import { createScrollMemory, ScrollRestorer } from '../lib/scroll-memory';
+import { openTodayLimits, resetTodayLimitsFocusForTest, TODAY_LIMITS_ID } from '../components/account/today-limits';
 import { AccountPage, resetAccountPageCacheForTest, SETTLEMENT_REUSE_MS } from './account-page';
 
 const stock = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A1' };
@@ -151,6 +161,10 @@ beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     resetAccountPageCacheForTest();
     resetTradingLimitsForTest();
+    resetContractNamesForTest();
+    resetTodayLimitsFocusForTest();
+    m.contracts = {};
+    m.ensureContract.mockReset().mockRejectedValue(new Error('not found'));
     m.risk = { enabled: false, maxQty: 0, maxDailyLoss: 0, locked: false, escCancelAll: false, confirmManualOrders: false, orderLineLock: false };
     m.riskListeners.clear();
     m.setRiskSettings.mockClear();
@@ -640,5 +654,172 @@ describe('AccountPage status', () => {
         expect(esun).toContain('模擬');
         expect(esun).toContain('已失效');
         expect(esun).toContain('未連線');
+    });
+});
+
+describe('AccountPage realized P&L names', () => {
+    it('shows name first and code second: own name field, contract cache, lookup, or the code alone on failure', async () => {
+        m.contracts = { '2330': { code: '2330', name: '台積電' } };
+        m.ensureContract.mockImplementation(async (code: string) => {
+            if (code === 'TXFL6') {
+                m.contracts = { ...m.contracts, TXFL6: { code: 'TXFL6', name: '臺股期貨12' } };
+                return m.contracts.TXFL6;
+            }
+            throw new Error('not found');
+        });
+        m.fetchProfitLoss.mockImplementation(async (market: string) => (market === 'S'
+            ? [stockPnl(1, '2330', 300), stockPnl(2, '2317', -900), stockPnl(3, '2317', -100), { ...stockPnl(4, '1101', 50), name: '台泥' }]
+            : [{ id: 1, code: 'TXFL6', quantity: 1, pnl: 2000, date: twDate(0), direction: 'Buy', entry_price: 1, cover_price: 2, fee: 0, tax: 0 }]));
+        await render();
+        await click('account-pnl-toggle');
+        await rerender(); // 合約查詢完成後重繪（測試的 useContract 不訂閱）
+        const rows = allByTestId('pnl-row');
+        const byCode = (code: string) => rows.filter(r => textOf(r).includes(code));
+        const nameOf = (node: ReactTestInstance) => textOf(node.find(n => n.props['data-testid'] === 'pnl-name'));
+        // 依 |損益|：TXFL6 → 2317 → 2330 → 2317 → 1101
+        expect(nameOf(rows[0]!)).toBe('臺股期貨12');
+        expect(textOf(rows[0]!)).toContain('TXFL6 · 期貨');
+        expect(nameOf(byCode('2330')[0]!)).toBe('台積電');
+        expect(byCode('2330')[0]!.props['aria-label']).toBe('台積電 2330 已實現損益');
+        expect(nameOf(byCode('1101')[0]!)).toBe('台泥');
+        // 查詢失敗：只顯示代碼
+        expect(nameOf(byCode('2317')[0]!)).toBe('2317');
+        expect(byCode('2317')[0]!.props['aria-label']).toBe('2317 已實現損益');
+        // 已有名稱（快取 2330、列帶 1101）不查；其餘每個不重複代碼一次（2317 兩列只查一次）
+        expect(m.ensureContract.mock.calls.map(c => c[0]).sort()).toEqual(['2317', 'TXFL6']);
+    });
+
+    it('uses the E.SUN transaction detail name for E.SUN rows without querying', async () => {
+        m.accounts = { accounts: [esunStock], selectedStock: esunStock, selectedFutures: null, loaded: true, loadError: false };
+        m.fetchProfitLoss.mockResolvedValue([stockPnl(1, '2884', 120)]);
+        m.fetchProfitLossSummary.mockResolvedValue(pnlSum(120, 1));
+        m.esunTx = { details: [{ rowId: 1, code: '2884', name: '玉山金', fills: [] }] };
+        await render();
+        await click('account-pnl-toggle');
+        expect(textOf(byTestId('pnl-name'))).toBe('玉山金');
+        expect(m.ensureContract).not.toHaveBeenCalled();
+    });
+});
+
+describe('AccountPage today trading limit card', () => {
+    const sinopacLimits = {
+        trading_limit: 1000000, trading_used: 200000, trading_available: 800000, margin_limit: 0, margin_used: 0, margin_available: 0, short_limit: 0, short_used: 0, short_available: 0,
+    };
+
+    it('sits at the top of the page', async () => {
+        await render();
+        const order = testIdOrder();
+        expect(order.indexOf('account-limits')).toBeGreaterThanOrEqual(0);
+        expect(order.indexOf('account-limits')).toBeLessThan(order.indexOf('account-accounts'));
+    });
+
+    it('永豐: available is the main value with used and total', async () => {
+        m.fetchTradingLimits.mockResolvedValue(sinopacLimits);
+        await render();
+        expect(byTestId('account-limits').props['aria-label']).toBe('今日剩餘交易額度（永豐）');
+        expect(textOf(byTestId('limits-today'))).toContain('現股今日剩餘（可用）');
+        expect(textOf(byTestId('limits-today-value'))).toBe('$800,000');
+        expect(textOf(byTestId('limits-today-sub'))).toBe('已用 $200,000 · 總額度 $1,000,000');
+        expect(text()).toContain('資料時間');
+        expect(m.fetchTradingLimits).toHaveBeenCalledTimes(1);
+    });
+
+    it('玉山: shows only the cap labelled 上限 and explains that used / remaining are not provided', async () => {
+        m.accounts = { accounts: [esunStock, fut], selectedStock: esunStock, selectedFutures: fut, loaded: true, loadError: false };
+        m.fetchTradingLimits.mockResolvedValue({
+            trading_limit: 2000000, trading_used: 0, trading_available: 2000000, margin_limit: 0, margin_used: 0, margin_available: 0, short_limit: 0, short_used: 0, short_available: 0,
+        });
+        await render();
+        expect(byTestId('account-limits').props['aria-label']).toBe('今日交易額度上限（玉山）');
+        const hero = textOf(byTestId('limits-today'));
+        expect(hero).toContain('上限');
+        expect(hero).toContain('$2,000,000');
+        expect(hero).not.toContain('可用');
+        expect(hero).not.toContain('剩餘');
+        expect(hero).not.toContain('已用');
+        expect(allByTestId('limits-today-sub')).toHaveLength(0);
+        expect(textOf(byTestId('limits-caps-only'))).toContain('不提供已用額度');
+    });
+
+    it('no data (simulation / outside hours): no main value, explains instead of $0', async () => {
+        await render();
+        expect(allByTestId('limits-today')).toHaveLength(0);
+        expect(textOf(byTestId('limits-empty'))).toContain('08:30–15:00');
+    });
+
+    it('loading and error states', async () => {
+        let reject!: (e: Error) => void;
+        m.fetchTradingLimits.mockImplementation(() => new Promise((_, r) => { reject = r; }));
+        await render();
+        expect(text()).toContain('交易額度查詢中…');
+        expect(allByTestId('limits-today')).toHaveLength(0);
+        await act(async () => { reject(new Error('limits down')); });
+        expect(text()).toContain('交易額度查詢失敗');
+        expect(text()).toContain('limits down');
+        expect(allByTestId('limits-today')).toHaveLength(0);
+    });
+
+    it('masks amounts when 遮蔽金額 is on', async () => {
+        m.privMoney = true;
+        m.fetchTradingLimits.mockResolvedValue(sinopacLimits);
+        await render();
+        expect(textOf(byTestId('limits-today-value'))).toBe('•••••');
+        expect(textOf(byTestId('limits-today-sub'))).toBe('已用 ••••• · 總額度 •••••');
+    });
+
+    it('futures-only selection explains that futures have no daily trading limit and sends no query', async () => {
+        m.accounts = { accounts: [fut], selectedStock: null, selectedFutures: fut, loaded: true, loadError: false };
+        await render();
+        expect(textOf(byTestId('limits-no-stock'))).toContain('期貨／選擇權帳戶沒有每日交易額度');
+        expect(m.fetchTradingLimits).not.toHaveBeenCalled();
+    });
+
+    it('arriving from the positions summary scrolls to and focuses the card once', async () => {
+        const el = { scrollIntoView: vi.fn(), focus: vi.fn() };
+        vi.stubGlobal('document', {
+            getElementById: (id: string) => (id === TODAY_LIMITS_ID ? el : null),
+            addEventListener: () => undefined,
+            removeEventListener: () => undefined,
+            visibilityState: 'visible',
+        });
+        openTodayLimits();
+        await render();
+        expect(el.scrollIntoView).toHaveBeenCalledWith({ block: 'start' });
+        expect(el.focus).toHaveBeenCalledTimes(1);
+        await act(async () => view!.unmount());
+        await render();
+        expect(el.focus).toHaveBeenCalledTimes(1);
+    });
+
+    it('with the shell ScrollRestorer after the page and a remembered account scroll, the card wins (scroll lands on the card)', async () => {
+        // 殼層：main 是唯一捲動容器；帳戶頁先前捲到 1,500px，之後切到持倉頁
+        const main = { scrollTop: 0 };
+        const memory = createScrollMemory();
+        memory.restore('account', main);
+        expect(memory.record('account', 1500)).toBe(true);
+        memory.restore('positions', main);
+        const CARD_TOP = 120;
+        const el = { scrollIntoView: vi.fn(() => { main.scrollTop = CARD_TOP; }), focus: vi.fn(() => { order.push('focus'); }) };
+        const order: string[] = [];
+        const restore = memory.restore.bind(memory);
+        memory.restore = (key, target) => { order.push(`restore:${key}`); restore(key, target); };
+        vi.stubGlobal('document', {
+            getElementById: (id: string) => (id === TODAY_LIMITS_ID ? el : null),
+            addEventListener: () => undefined,
+            removeEventListener: () => undefined,
+            visibilityState: 'visible',
+        });
+        openTodayLimits();
+        // 同殼層順序：RoutePage 之後才是 ScrollRestorer（layout effect 依序執行）；StrictMode 會重跑 effect
+        await act(async () => {
+            view = create(createElement(StrictMode, null,
+                createElement(AccountPage),
+                createElement(ScrollRestorer, { routeKey: 'account', memory, getTarget: () => main })));
+        });
+        expect(order[0]).toBe('restore:account');
+        expect(main.scrollTop).toBe(CARD_TOP);
+        expect(el.scrollIntoView).toHaveBeenCalledTimes(1);
+        expect(el.focus).toHaveBeenCalledTimes(1);
+        expect(el.focus).toHaveBeenCalledWith({ preventScroll: true });
     });
 });

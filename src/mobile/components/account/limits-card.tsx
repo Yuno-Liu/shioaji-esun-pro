@@ -1,4 +1,10 @@
-// src/mobile/components/account/limits-card.tsx — 帳戶頁「交易額度」（規格 Phase 2；比照桌面 LimitsSection）
+// src/mobile/components/account/limits-card.tsx — 帳戶頁頂部「今日剩餘交易額度」（規格 Phase 2；比照桌面 LimitsSection）
+//
+// 主值：永豐＝現股今日剩餘（可用），已用與總額度有資料時一併顯示；玉山＝現股額度上限（標示「上限」，
+// 說明玉山不提供已用／剩餘額度）。下方仍列現股／融資／融券 可用／上限（玉山只列上限）。規則見 today-limits.tsx。
+// 依目前帳戶的市場：只有證券帳戶有交易額度；沒有證券帳戶而選了期貨帳戶時說明期貨沒有每日交易額度。
+// 持倉頁摘要的額度列以 openTodayLimits() 跳來時，掛載後捲到本卡並聚焦（不發請求）；
+// 在殼層 ScrollRestorer 還原捲動位置之後才捲動（見 useFocusOnArrival）。
 //
 // 資料：共用 useTradingLimits（模組層快取 60 秒、手動重新整理最短間隔 TRADING_LIMITS_MIN_REFRESH_MS）。
 // 交易日 08:30–15:00 才有值；模擬環境回全 0 → limitsLookEmpty 時顯示「—」並說明，不顯示「可用 $0」。
@@ -7,7 +13,7 @@
 //   看到 loading 由 false 變 true 就記為發出時間；按下後 hook 沒有發出（仍在最短間隔內）就不進入倒數，改顯示說明。
 //   冷卻期間才每秒重繪。
 
-import { useEffect, useReducer, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { useAccounts } from '../../../lib/account-store';
 import { maskMoney, usePrivacyMoney } from '../../../lib/privacy';
 import {
@@ -21,10 +27,11 @@ import { formatClock, formatTwd } from '../../lib/account-format';
 import { useOrderRoute } from '../route-badge';
 import * as styles from '../../styles/account.css';
 import { brokerName, Card, Item, RefreshButton } from './account-ui';
+import { consumeTodayLimitsFocus, TODAY_LIMITS_ID, TODAY_LIMITS_TEXT, todayLimitView } from './today-limits';
 
 export const LIMITS_TEXT = {
     throttled: `剛查詢過，查詢間隔至少 ${TRADING_LIMITS_MIN_REFRESH_MS / 1000} 秒，請稍候再按。`,
-    capsOnly: '玉山只提供額度上限，未提供可用／剩餘額度；額度及信用權限另見「玉山帳務概覽」。',
+    capsOnly: '玉山只提供額度上限，未提供可用／剩餘額度，也不提供已用額度；額度及信用權限另見「玉山帳務概覽」。',
 } as const;
 
 /** 最後一次觀察到「實際發出」查詢的時間（loading false→true）；帳戶切換時重設 */
@@ -38,8 +45,28 @@ function useObservedAttempt(key: string, loading: boolean): number | null {
     return at && at.key === key ? at.at : null;
 }
 
+/**
+ * 持倉頁跳來時捲到本卡並聚焦（jsdom 等沒有 scrollIntoView 時只聚焦）。
+ * 延到微任務（同一次提交的 layout effect 全部跑完後、繪製前）：殼層的 ScrollRestorer 排在路由頁面之後，
+ * 同一次提交會把 main 還原成帳戶頁記住的位置，直接在這裡捲動會被它蓋掉。
+ * 請求在微任務內才消化：StrictMode 的掛載→卸載→再掛載只有最後一次會執行。
+ */
+function useFocusOnArrival() {
+    useLayoutEffect(() => {
+        let cancelled = false;
+        queueMicrotask(() => {
+            if (cancelled || !consumeTodayLimitsFocus() || typeof document === 'undefined') return;
+            const el = document.getElementById(TODAY_LIMITS_ID);
+            if (!el) return;
+            if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'start' });
+            el.focus({ preventScroll: true });
+        });
+        return () => { cancelled = true; };
+    }, []);
+}
+
 export function LimitsCard() {
-    const { selectedStock: stock } = useAccounts();
+    const { selectedStock: stock, selectedFutures: futures } = useAccounts();
     const limits = useTradingLimits(stock);
     const route = useOrderRoute(stock);
     const privMoney = usePrivacyMoney();
@@ -64,6 +91,8 @@ export function LimitsCard() {
     const data = limits.data;
     const capsOnly = limitsAreCapsOnly(stock);
     const term = (name: string) => (capsOnly ? `${name} 上限` : `${name} 可用／上限`);
+    const today = todayLimitView(limits, capsOnly);
+    useFocusOnArrival();
     const onRefresh = () => {
         if (!stock) return;
         limits.refresh();
@@ -72,11 +101,29 @@ export function LimitsCard() {
     };
 
     return (
-        <Card title={stock ? `交易額度（${brokerName(stock)}）` : '交易額度'} testId='account-limits'>
+        <Card
+            title={stock ? `${capsOnly ? TODAY_LIMITS_TEXT.capsTitle : TODAY_LIMITS_TEXT.title}（${brokerName(stock)}）` : TODAY_LIMITS_TEXT.title}
+            testId='account-limits'
+            id={TODAY_LIMITS_ID}
+        >
             {!stock ? (
-                <p className={styles.note}>尚未選擇證券帳戶。</p>
+                <p className={styles.note} data-testid='limits-no-stock'>{futures ? TODAY_LIMITS_TEXT.futures : '尚未選擇證券帳戶。'}</p>
             ) : (
                 <>
+                    {today.status === 'ok' && (
+                        <div className={styles.limitsHero} data-testid='limits-today'>
+                            <span className={styles.limitsHeroLabel}>
+                                {capsOnly ? '現股' : '現股今日剩餘（可用）'}
+                                {capsOnly && <span className={styles.badge}>上限</span>}
+                            </span>
+                            <span className={styles.limitsHeroValue} data-testid='limits-today-value'>{today.primary === null ? '—' : money(today.primary)}</span>
+                            {!capsOnly && (today.used !== null || today.total !== null) && (
+                                <span className={styles.limitsHeroSub} data-testid='limits-today-sub'>
+                                    {[today.used !== null ? `已用 ${money(today.used)}` : '', today.total !== null ? `總額度 ${money(today.total)}` : ''].filter(Boolean).join(' · ')}
+                                </span>
+                            )}
+                        </div>
+                    )}
                     {limits.loading && !data ? (
                         <p className={styles.note}>交易額度查詢中…</p>
                     ) : empty || !data ? (

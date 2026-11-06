@@ -2,8 +2,8 @@
 //
 // 只編排 src/lib 既有函式，不自行組 HTTP 請求；順序比照桌面 src/components/order-ticket.tsx 的 execute()，另加手機閘門：
 //   1) ResumeGate＋串流 LIVE → 2) 記下伺服器模式代次 → 3) 風控 → 4) 商品與券商規則（期權＋玉山帳戶在此拒絕）
-//   → 5) 固定送單帳戶與顯示路由 → 6) 強制確認（不看 confirmManualOrders）→ 7) 確認後重驗
-//   → 8) beforeDispatch（HTTP 送出前最後一刻同步重驗；現股當沖先賣再以最新合約確認仍可當沖）
+//   → 5) 固定送單帳戶與顯示路由 → 6) 強制確認（不看 confirmManualOrders）→ 7) 確認後重驗（含風控）
+//   → 8) beforeDispatch（HTTP 送出前最後一刻同步重驗，含風控；現股當沖先賣再以最新合約確認仍可當沖）
 //   → 9) placeStockOrder／placeFuturesOrder。
 // 結果分類（規格 R6、§7.2）：送出前任何閘門擋下都丟出 mutationNotStarted（確定沒有送出）；
 // 送單函式的錯誤原樣丟出（UI 依 mutationNotStarted 判斷，其餘一律「結果未知」）。絕不重送。
@@ -93,9 +93,13 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
     ) {
         throw notStarted(ORDER_INPUT_MISMATCH_MESSAGE);
     }
-    // 3) 風控：鎖單、單筆上限、當日虧損上限
-    const blocked = checkOrderAllowed(order.quantity, orderLot);
-    if (blocked) throw notStarted(blocked);
+    // 3) 風控：鎖單、單筆上限、當日虧損上限。確認可能停留很久（期間可能鎖單、虧損越過上限，
+    //    或其他同源分頁經 storage 事件同步鎖單），所以確認後與 beforeDispatch 再各檢查一次（比照 lib placeQuickOrder）
+    const assertRiskAllowed = () => {
+        const blocked = checkOrderAllowed(order.quantity, orderLot);
+        if (blocked) throw notStarted(blocked);
+    };
+    assertRiskAllowed();
     // 4) 商品與券商規則：期權先拒絕玉山帳戶、再查期權條件；股票先玉山規則再上游規則
     if (input.isFutures && isEsunAccount(input.displayedAccount)) throw notStarted(ESUN_FUTURES_MESSAGE);
     const problem = input.isFutures
@@ -143,11 +147,13 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
     // 7) 確認後重驗（確認可能停留很久）
     if (!sameServerMode()) throw notStarted(SERVER_MODE_CHANGED_MESSAGE);
     if (!isSelectedAccountUnchanged(orderAccount)) throw notStarted(ACCOUNT_CHANGED_MESSAGE);
+    assertRiskAllowed();
     // 8) beforeDispatch：HTTP 送出前最後一刻同步重驗，丟出就不送（每一項都是 mutationNotStarted）
     const dispatch = {
         beforeDispatch: () => {
             guards.assertResumeReady();
             assertTradingLive();
+            assertRiskAllowed();
             if (!guards.isContextCurrent()) throw notStarted(ORDER_CONTEXT_CHANGED_MESSAGE);
             if (!sameServerMode()) throw notStarted(SERVER_MODE_CHANGED_MESSAGE);
             if (daytradeShort) assertDayTradeStillAllowed(input.contract);

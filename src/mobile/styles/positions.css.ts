@@ -4,13 +4,16 @@
 // amber 不作小字顏色（規則 4）。只動畫 transform（損益條 scaleX）與 opacity（庫存明細淡入）；不用 color-mix()、:has()。
 import { globalStyle, keyframes, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
-import { fill, focusRing, pressable } from './primitives.css';
+import { fill, focusRing, pressable, pressableRow } from './primitives.css';
 import { elevation, sj } from './theme-vars.css';
 import { DUR, EASE, LOW_DPR, MORE_CONTRAST, RADIUS, REDUCED_MOTION, SAFE_LEFT, SAFE_RIGHT, SPACE, TOUCH_MIN } from './tokens';
 import { NUM, NUMERIC, TEXT } from './typography.css';
 
 const INSET_X = `calc(${SPACE.s4} + ${SAFE_LEFT})`;
 const INSET_R = `calc(${SPACE.s4} + ${SAFE_RIGHT})`;
+
+/** 展開區淡入（玉山庫存明細、精簡列展開）；減少動態時不動畫 */
+const fadeIn = keyframes({ from: { opacity: 0 }, to: { opacity: 1 } });
 
 // ---- 頁面 ----
 
@@ -443,6 +446,276 @@ export const rowNote = style({
     textAlign: 'right',
 });
 
+// ---- 淨損益與損益兩平價 ----
+
+/** 券商原始損益（rowMeta 行尾小字，方便與淨損益對照；不用漲跌色） */
+export const brokerPnl = style({
+    marginLeft: 'auto',
+    ...NUMERIC,
+    whiteSpace: 'nowrap',
+});
+
+/** 「損益兩平」列：整列可點開計算明細（中性島底、44pt 觸控高度） */
+export const pnlInfo = style([pressable, focusRing, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: SPACE.s2,
+    width: '100%',
+    minHeight: TOUCH_MIN,
+    margin: 0,
+    padding: `${SPACE.s1} ${SPACE.s2} ${SPACE.s1} ${SPACE.s3}`,
+    border: 'none',
+    borderRadius: RADIUS.md,
+    background: sj.islandBg,
+    color: vars.color.foreground,
+    font: 'inherit',
+    textAlign: 'left',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    minWidth: 0,
+}]);
+
+export const pnlInfoBody = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.125rem',
+    flex: '1 1 auto',
+    minWidth: 0,
+});
+
+export const pnlInfoMain = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    flexWrap: 'wrap',
+    columnGap: SPACE.s1_5,
+    ...TEXT.footnote,
+});
+
+export const pnlInfoLabel = style({
+    color: vars.color.mutedForeground,
+});
+
+export const pnlInfoValue = style({
+    ...NUM.numSm,
+    ...NUMERIC,
+    fontWeight: 600,
+    color: vars.color.foreground,
+});
+
+/** 現價與兩平價的關係（文字，不只靠顏色） */
+export const pnlInfoRel = style({
+    color: vars.color.foreground,
+});
+
+export const pnlTagList = style({
+    listStyle: 'none',
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: SPACE.s1,
+    margin: 0,
+    padding: 0,
+});
+
+/** 期權列「券商損益・未扣費稅」、股票列無法計算的原因 */
+export const pnlNote = style({
+    margin: 0,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
+// ---- 精簡檢視（「詳細｜精簡」切換；預設詳細）----
+
+/** 篩選列行尾的「詳細｜精簡」分段（compact 尺寸；點擊區仍為 TOUCH_MIN） */
+export const viewToggle = style({
+    flex: '0 0 auto',
+    width: '7.5rem',
+    marginLeft: 'auto',
+});
+
+/** 精簡模式的摘要卡：內距、間距與合計字級縮小 */
+export const summaryTight = style([summary, {
+    gap: SPACE.s2,
+    padding: `${SPACE.s2} ${SPACE.s4}`,
+}]);
+
+export const summaryValueTight = style([summaryValue, {
+    ...NUM.numLg,
+}]);
+
+globalStyle(`${summaryTight} ${summaryGrid}`, { rowGap: SPACE.s2 });
+
+/** 一個部位一列（約 60px，比照自選列）；展開時同一個 li 內接既有詳細卡片 */
+export const compactItem = style({
+    position: 'relative',
+    minWidth: 0,
+});
+
+// 列間髮絲線：同詳細列，從文字起點（16px）開始
+globalStyle(`${compactItem} + ${compactItem}::before`, {
+    content: '""',
+    position: 'absolute',
+    top: 0,
+    left: SPACE.s4,
+    right: 0,
+    height: 0,
+    borderTop: `0.5px solid ${vars.color.border}`,
+    pointerEvents: 'none',
+    '@media': {
+        [LOW_DPR]: { borderTopWidth: '1px' },
+        [MORE_CONTRAST]: { borderTop: `1px solid ${vars.color.borderBright}` },
+    },
+});
+
+/**
+ * 精簡列本體（整列一顆按鈕，aria-expanded）：名稱與代碼｜損益與報酬率｜chevron
+ * 左欄最窄＝其 min-content（第二行最寬的一項：代碼／條件／多空數量；名稱不計入），不會被右欄擠到截斷數量。
+ */
+export const compactRow = style([pressableRow, {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(min-content, 1fr) auto auto',
+    alignItems: 'center',
+    columnGap: SPACE.s3,
+    boxSizing: 'border-box',
+    width: '100%',
+    minHeight: '60px',
+    margin: 0,
+    padding: `${SPACE.s2} ${SPACE.s3} ${SPACE.s2} ${SPACE.s4}`,
+    border: 'none',
+    borderRadius: 0,
+    background: 'transparent',
+    color: vars.color.foreground,
+    font: 'inherit',
+    textAlign: 'left',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    outline: 'none',
+    selectors: {
+        '&:focus-visible': { boxShadow: `inset 0 0 0 2px ${vars.color.accent}` },
+    },
+    '@media': {
+        [MORE_CONTRAST]: { selectors: { '&:focus-visible': { boxShadow: `inset 0 0 0 3px ${vars.color.accent}` } } },
+    },
+}]);
+
+export const compactLeft = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.0625rem',
+    minWidth: 0,
+});
+
+/**
+ * 第一行：名稱（headline 500、單行省略）。空間不足時由這裡省略吸收。
+ * width 0＋minWidth 100%：不計入左欄的 min-content（長名稱不撐寬欄位），版面上仍佔滿整欄。
+ */
+export const compactName = style({
+    ...TEXT.headline,
+    fontWeight: 500,
+    width: 0,
+    minWidth: '100%',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+});
+
+/** 第二行：代碼、條件小膠囊、方向與數量（文字＋顏色）。各項不縮不省略；放不下時整項換行，不裁切 */
+export const compactMeta = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    columnGap: SPACE.s1_5,
+    rowGap: '0.125rem',
+    minWidth: 0,
+    ...TEXT.subhead,
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+});
+
+export const compactCode = style({
+    ...NUMERIC,
+    flex: '0 0 auto',
+    whiteSpace: 'nowrap',
+});
+
+/** 條件小膠囊（與 tag 併用）：不縮 */
+export const compactTag = style({
+    flex: '0 0 auto',
+});
+
+/** 方向與數量（「多 3張+500股」「空 12 口」）：不縮、不換行、不省略（數量被截斷會誤讀） */
+const compactSideBase = style({
+    fontWeight: 700,
+    ...NUMERIC,
+    flex: '0 0 auto',
+    whiteSpace: 'nowrap',
+});
+
+export const compactSide = styleVariants({
+    long: [compactSideBase, { color: vars.color.up }],
+    short: [compactSideBase, { color: vars.color.down }],
+});
+
+export const compactRight = style({
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'flex-end',
+    gap: '0.0625rem',
+    minWidth: 0,
+    textAlign: 'right',
+});
+
+export const compactPnl = style({
+    ...NUM.numMd,
+    ...NUMERIC,
+    whiteSpace: 'nowrap',
+});
+
+/**
+ * 右側第二行：報酬率（或現價）＋兩平狀態文字（已過兩平／未達兩平，不只靠顏色）。
+ * 放不下時狀態文字換到下一行（不裁切）；字級「大」固定上下排列，讓左欄保有空間。
+ */
+export const compactSub = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end',
+    alignItems: 'baseline',
+    columnGap: SPACE.s1,
+    ...TEXT.footnote,
+    ...NUMERIC,
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+    selectors: {
+        'html[data-sj-font-scale="1.3"] &': { flexDirection: 'column', alignItems: 'flex-end' },
+    },
+});
+
+/** 展開提示：收合時朝右、展開時朝下（transform；減少動態時瞬間） */
+export const compactChevron = style([actionIcon, {
+    color: vars.color.mutedForeground,
+    transition: `transform ${DUR.tone}ms ${EASE.out}`,
+    selectors: {
+        '[aria-expanded="true"] > &': { transform: 'rotate(90deg)' },
+    },
+    '@media': {
+        [REDUCED_MOTION]: { transition: 'none' },
+    },
+}]);
+
+/** 展開後的既有詳細卡片內容（不重複第一行；淡入，減少動態時不動畫） */
+export const compactDetail = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: SPACE.s1_5,
+    padding: `0 ${SPACE.s4} 0.6875rem`,
+    minWidth: 0,
+    animation: `${fadeIn} ${DUR.fade}ms ${EASE.out} both`,
+    '@media': {
+        [REDUCED_MOTION]: { animation: 'none' },
+    },
+});
+
 // ---- 空狀態 ----
 
 export const emptyWrap = inset;
@@ -494,8 +767,6 @@ export const sheetActions = style({
 });
 
 // ---- 玉山庫存明細（展開區：立即展開＋150ms 淡入）----
-
-const fadeIn = keyframes({ from: { opacity: 0 }, to: { opacity: 1 } });
 
 export const detail = style({
     display: 'flex',

@@ -9,7 +9,7 @@
 //   不當成「最後成交」或時間軸的成交時間。
 // - 改價／減量／刪單：只關閉本面板並以 openOrderAction(id, kind) 開啟既有的委託操作面板，
 //   顯示規則（orderActionAvailability）、閘門與滑動確認全部沿用 order-action-sheet.tsx，這裡不呼叫任何 lib 交易函式。
-// - 版面（設計規格 §7.6）：large 面板；標頭（方向膠囊、代碼名稱、狀態）＋GroupedSection 欄位＋成交時間軸（圓點＋細線，純 CSS）；
+// - 版面（設計規格 §7.6）：large 面板；標頭（方向膠囊、商品＝名稱為主代碼為次、狀態；標題「委託明細 名稱 代碼」）＋GroupedSection 欄位＋成交時間軸（圓點＋細線，純 CSS）；
 //   改價／減量／刪單在固定 footer。欄位文字與 testid 不變。
 
 import { useRef, type ReactNode } from 'react';
@@ -20,6 +20,7 @@ import { useTradingState } from '../../lib/trading-state';
 import type { Trade } from '../../lib/types/order';
 import { fmtInt, fmtPrice } from '../../lib/utils/format';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
+import { instrumentText } from '../lib/contract-names';
 import { openOrderAction, type OrderActionKind } from '../lib/mobile-store';
 import { dealFillTs, dealTimeline, esunCancellableText, fillProgress, isAggregateDeal, lastDealFillTs, missingDealQuantity } from '../lib/order-fills';
 import * as styles from '../styles/orders.css';
@@ -39,6 +40,8 @@ import {
     orderTimeText,
     orderUnitOf,
     tradeAccountOf,
+    TradeInstrument,
+    useTradeName,
 } from './order-action-sheet';
 import { routeBadgeText, useOrderRoute } from './route-badge';
 
@@ -65,7 +68,8 @@ export function OrderDetailSheet({ tradeId, onClose }: OrderDetailSheetProps) {
     const lastSeen = useRef<Trade | null>(null);
     if (found) lastSeen.current = found;
     const trade = found ?? (tradeId && lastSeen.current?.order.id === tradeId ? lastSeen.current : null);
-    const title = trade ? `委託明細 ${trade.contract.code}` : '委託明細';
+    const name = useTradeName(trade);
+    const title = trade ? `委託明細 ${instrumentText(trade.contract.code, name)}` : '委託明細';
     return (
         <BottomSheet open={tradeId !== null} onClose={onClose} title={title} detent='large' testId='order-detail-sheet'>
             {tradeId !== null && (trade
@@ -112,8 +116,7 @@ function DetailBody({ trade, working, onClose }: { trade: Trade; working: boolea
         <div className={styles.sheetBody} data-testid='order-detail-body'>
             <div className={styles.detailHead}>
                 <span className={styles.side[trade.order.action === 'Buy' ? 'Buy' : 'Sell']}>{trade.order.action === 'Buy' ? '買進' : '賣出'}</span>
-                <span className={styles.code}>{trade.contract.code}</span>
-                {trade.contract.name && <span>{trade.contract.name}</span>}
+                <TradeInstrument trade={trade} testId='detail-instrument' />
                 <span className={styles.status}>{orderStatusLabel(trade.status.status)}</span>
             </div>
 

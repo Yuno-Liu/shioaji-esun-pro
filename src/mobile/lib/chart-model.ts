@@ -7,6 +7,7 @@ import type { Candle } from '../../lib/types/market';
 import { ACTIVE_ORDER_STATUSES, type AccountedTrade } from '../../lib/types/order';
 import type { AccountedPosition } from '../../lib/types/portfolio';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
+import { formatNumber } from './num-format';
 
 export type PriceLineKind = 'order-buy' | 'order-sell' | 'cost' | 'limit-up' | 'limit-down' | 'reference';
 
@@ -23,7 +24,7 @@ export interface PriceLineSpec {
 
 /** 線上標籤的價格格式：千分位、最多兩位小數（1080 → 1,080；1052.5 → 1,052.5） */
 export function formatLinePrice(price: number): string {
-    return Number(price.toFixed(2)).toLocaleString('en-US', { maximumFractionDigits: 2 });
+    return formatNumber(Number(price.toFixed(2)), 'en-US', { maximumFractionDigits: 2 });
 }
 
 /** 委託單位是「股」（盤中零股、盤後零股） */
@@ -243,7 +244,7 @@ export function dayHighLow(candles: readonly Pick<Candle, 'high' | 'low'>[]): { 
 export function formatIndicatorValue(value: number | undefined | null, decimals: number): string {
     if (value === undefined || value === null || !Number.isFinite(value)) return '—';
     const d = Math.max(0, Math.min(6, Math.floor(decimals)));
-    return value.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+    return formatNumber(value, 'en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
 // ---- K 棒資料整形 ----

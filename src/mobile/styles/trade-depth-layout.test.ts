@@ -1,7 +1,8 @@
 // 交易頁五檔版面的靜態檢查（jsdom 沒有版面與 html 屬性選擇器的計算樣式）：
 // - 字級「大」表頭縮寫（設計規格 §4.7）：以 html[data-sj-font-scale="1.3"] 切換，不用容器查詢、:has()；
 //   完整標籤改為視覺隱藏（不是 display:none，輔助技術仍讀得到），縮寫預設 display:none。
-// - 「五檔｜明細」與［整股｜盤中零股］同列（§7.3）：rem 寬度預算，360 寬字級大時換行、其他字級同列。
+// - 「五檔｜明細｜公司」與［整股｜盤中零股］同列（§7.3）：rem 寬度預算；加入「公司」分頁後，
+//   390 寬字級標準與 360 寬字級小同列，360 寬字級標準與字級大換行（換行後各自一行放得下）。
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
@@ -46,7 +47,7 @@ describe('五檔表頭縮寫（字級「大」）', () => {
     });
 });
 
-describe('「五檔｜明細」＋整股／盤中零股同列', () => {
+describe('「五檔｜明細｜公司」＋整股／盤中零股同列', () => {
     const tabsBasis = rem(/flex:\s*'1 1 ([\d.]+)rem'/, styleBlock('panelTabs'));
     const toggleBasis = rem(/flex:\s*'0 0 ([\d.]+)rem'/, styleBlock('oddToggleSlot'));
     const gap = 0.75; // controlRow gap SPACE.s3
@@ -63,21 +64,23 @@ describe('「五檔｜明細」＋整股／盤中零股同列', () => {
         expect(styleBlock('oddToggleSlot')).toMatch(/marginLeft:\s*'auto'/);
     });
 
-    it('寬度預算：切換鍵容得下「盤中零股」、分頁容得下「五檔／明細」（rem 隨字級等比）', () => {
+    it('寬度預算：切換鍵容得下「盤中零股」、分頁容得下「五檔／明細／公司」（rem 隨字級等比）', () => {
         // Segmented 每段等寬：文字 callout × 字數＋左右內距；軌道內距 2px×2（以字級小 16px 換算 0.25rem，偏保守）
         const track = 0.25;
         expect(toggleBasis).toBeGreaterThanOrEqual(2 * (4 * callout + 2 * segPadX) + track);
-        expect(tabsBasis).toBeGreaterThanOrEqual(2 * (2 * callout + 2 * segPadX) + track);
+        expect(tabsBasis).toBeGreaterThanOrEqual(3 * (2 * callout + 2 * segPadX) + track);
     });
 
-    it('360 寬：字級大（1.3）換行、字級標準（1.15）與小（1）同列', () => {
+    it('同列或換行：390 寬字級標準（1.15）與 360 寬字級小（1）同列；360 寬字級標準與字級大（1.3）換行', () => {
         const need = tabsBasis + gap + toggleBasis;
-        const available = (scale: number) => (360 - 2 * padX * 16 * scale) / (16 * scale);
-        expect(available(1.3)).toBeLessThan(need);
-        expect(available(1.15)).toBeGreaterThanOrEqual(need);
-        expect(available(1)).toBeGreaterThanOrEqual(need);
-        // 換行後各自一行也放得下（不溢出）
-        expect(available(1.3)).toBeGreaterThanOrEqual(toggleBasis);
+        const available = (width: number, scale: number) => (width - 2 * padX * 16 * scale) / (16 * scale);
+        expect(available(390, 1.15)).toBeGreaterThanOrEqual(need);
+        expect(available(360, 1)).toBeGreaterThanOrEqual(need);
+        expect(available(360, 1.15)).toBeLessThan(need);
+        expect(available(360, 1.3)).toBeLessThan(need);
+        // 換行後各自一行也放得下（不溢出）：最窄 360 寬字級大
+        expect(available(360, 1.3)).toBeGreaterThanOrEqual(toggleBasis);
+        expect(available(360, 1.3)).toBeGreaterThanOrEqual(tabsBasis);
     });
 
     it('舊的五檔區塊內工具列樣式已移除', () => {

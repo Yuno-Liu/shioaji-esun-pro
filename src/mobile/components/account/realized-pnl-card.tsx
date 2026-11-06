@@ -5,6 +5,7 @@
 // - 資料經由 src/lib 的 fetchProfitLoss／fetchProfitLossSummary（玉山帳戶由 lib 轉往 bridge）；玉山區間先以
 //   clampEsunDateRange180Days 限制在 180 天內，並以同一組日期字串讀取玉山成交明細 store（useEsunTransactionDetails）。
 // - 合計規則見 src/mobile/lib/account-pnl.ts（sum 優先、列表加總後備、逐帳戶判斷）。
+// - 明細列顯示商品名稱為主、代碼為次（見 PnlRow；名稱查詢沿用合約快取，每個不重複代碼最多一次）。
 
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useState } from 'react';
@@ -36,6 +37,7 @@ import {
     type RealizedPnlResult,
     type RealizedPnlRow,
 } from '../../lib/account-pnl';
+import { instrumentText, realizedLookupCode, useContractName } from '../../lib/contract-names';
 import * as styles from '../../styles/account.css';
 import { brokerName, CollapsibleCard, Item, RefreshButton, Segmented, useNow } from './account-ui';
 
@@ -153,14 +155,18 @@ function EsunDetailView({ detail }: { detail: EsunTransactionDetail }) {
     );
 }
 
-/** 玉山證券列的「交易成本明細」展開；非玉山證券列不渲染 */
-function EsunRowDetail({ row, plans }: { row: RealizedPnlRow; plans: readonly PnlPlan[] }) {
-    const [open, setOpen] = useState(false);
+/** 玉山證券列對應的成交明細（只讀 store，不發請求）；非玉山證券列 applies＝false */
+function useEsunRowDetail(row: RealizedPnlRow, plans: readonly PnlPlan[]): { applies: boolean; detail: EsunTransactionDetail | undefined } {
     const ref = esunRefOfPnlRow(row);
     const plan = ref ? plans.find(p => p.market === 'S' && p.account.broker_id === ref.broker_id && p.account.account_id === ref.account_id) : undefined;
     const snapshot = useEsunTransactionDetails(plan ? ref : null, plan?.begin ?? '', plan?.end ?? '');
-    if (!ref || !plan) return null;
-    const detail = findEsunTransactionDetail(snapshot?.details, row);
+    if (!ref || !plan) return { applies: false, detail: undefined };
+    return { applies: true, detail: findEsunTransactionDetail(snapshot?.details, row) };
+}
+
+/** 玉山證券列的「交易成本明細」展開 */
+function EsunRowDetail({ detail }: { detail: EsunTransactionDetail | undefined }) {
+    const [open, setOpen] = useState(false);
     return (
         <>
             <button type='button' className={styles.toggleRow} aria-expanded={open} onClick={() => setOpen(v => !v)} data-testid='pnl-esun-detail-toggle'>
@@ -172,28 +178,41 @@ function EsunRowDetail({ row, plans }: { row: RealizedPnlRow; plans: readonly Pn
     );
 }
 
-function PnlRows({ result, plans, showDate }: { result: RealizedPnlResult; plans: readonly PnlPlan[]; showDate: boolean }) {
+/**
+ * 一列已實現損益：商品名稱為主、代碼為次（同自選列）。名稱依序取列本身的 name、玉山成交明細的 stk_na，
+ * 都沒有才查合約快取（lib/contract-names：每個不重複代碼最多一次合約查詢，失敗只顯示代碼）。
+ * 名稱載入前第一行是代碼、第二行是市場與日期；名稱到達後第一行換成名稱、代碼移到第二行開頭，列高不變。
+ */
+function PnlRow({ row, plans, showDate }: { row: RealizedPnlRow; plans: readonly PnlPlan[]; showDate: boolean }) {
     const privMoney = usePrivacyMoney();
+    const esun = useEsunRowDetail(row, plans);
+    const code = canonicalBrokerCode(String(row.code ?? '')) || String(row.code ?? '');
+    const own = (row as { name?: unknown }).name;
+    const known = (typeof own === 'string' && own.trim()) || esun.detail?.name || null;
+    const lookup = realizedLookupCode(code, row.market);
+    const name = useContractName(known ? code : lookup, known);
+    const meta = [name ? code : '', MARKET_TEXT[row.market], showDate && row.date ? row.date : ''].filter(Boolean).join(' · ');
+    return (
+        <div className={styles.pnlItem} data-testid='pnl-row' role='group' aria-label={`${instrumentText(code, name)} 已實現損益`}>
+            <div className={styles.pnlRow}>
+                <span className={styles.pnlCode}>
+                    <span className={styles.pnlName} data-testid='pnl-name'>{name ?? code}</span>
+                    <span className={styles.pnlMeta}>{meta}</span>
+                </span>
+                <span className={styles.pnlQty}>
+                    {maskMoney(`${Math.abs(row.quantity).toLocaleString('en-US')}${row.market === 'S' ? '張' : '口'}`, privMoney)}
+                </span>
+                <span className={`${styles.pnlValue} ${styles.dir[signDir(row.pnl)]}`}>{maskMoney(formatTwd(row.pnl, true), privMoney)}</span>
+            </div>
+            {esun.applies && <EsunRowDetail detail={esun.detail} />}
+        </div>
+    );
+}
+
+function PnlRows({ result, plans, showDate }: { result: RealizedPnlResult; plans: readonly PnlPlan[]; showDate: boolean }) {
     return (
         <div data-testid='pnl-rows'>
-            {result.rows.map((r, i) => {
-                const meta = [MARKET_TEXT[r.market], showDate && r.date ? r.date : ''].filter(Boolean).join(' · ');
-                return (
-                    <div key={realizedRowKey(r, i)} className={styles.pnlItem} data-testid='pnl-row'>
-                        <div className={styles.pnlRow}>
-                            <span className={styles.pnlCode}>
-                                <span>{canonicalBrokerCode(String(r.code ?? '')) || r.code}</span>
-                                <span className={styles.pnlMeta}>{meta}</span>
-                            </span>
-                            <span className={styles.pnlQty}>
-                                {maskMoney(`${Math.abs(r.quantity).toLocaleString('en-US')}${r.market === 'S' ? '張' : '口'}`, privMoney)}
-                            </span>
-                            <span className={`${styles.pnlValue} ${styles.dir[signDir(r.pnl)]}`}>{maskMoney(formatTwd(r.pnl, true), privMoney)}</span>
-                        </div>
-                        <EsunRowDetail row={r} plans={plans} />
-                    </div>
-                );
-            })}
+            {result.rows.map((r, i) => <PnlRow key={realizedRowKey(r, i)} row={r} plans={plans} showDate={showDate} />)}
         </div>
     );
 }
