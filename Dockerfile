@@ -22,6 +22,8 @@ COPY tsconfig*.json vite.config.ts vite.fork.config.ts index.html approval.html 
 COPY public ./public
 COPY schemas ./schemas
 COPY src ./src
+# vite.config.ts（上游）匯入的開發用 ETF 名稱代理；tsconfig.node.json 也會型別檢查它（deploy/test_dockerfile.py）
+COPY scripts/dev-etf-proxy.ts ./scripts/dev-etf-proxy.ts
 
 # Build production assets into /app/dist
 # 以 fork 的 vite.fork.config.ts 建置：合併上游設定並加入手機入口 mobile.html
