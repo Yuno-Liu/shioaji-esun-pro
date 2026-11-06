@@ -1,6 +1,7 @@
 // 五檔（買賣同列；規格 §6.2）：第 i 列＝買 i＋賣 i、五檔總量、買賣比例條、內外盤比、
-// 買價／賣價各自點擊（onPick 帶 side；缺省只帶價開下單面板）、「我 買2」標記、盤中零股切換、ticket 變體
-import { createElement } from 'react';
+// 買價／賣價各自點擊（onPick 帶 side；缺省只帶價開下單面板）、「我 買2」標記、盤中零股（受控 oddLot＋DepthOddToggle）、ticket 變體、
+// 字級「大」表頭縮寫的 DOM 結構
+import { createElement, Fragment, useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractInfo } from '../../lib/types/contract';
@@ -12,7 +13,8 @@ vi.mock('../../hooks/use-stream', () => quoteMock);
 const storeMock = vi.hoisted(() => ({ openTicket: vi.fn() }));
 vi.mock('../lib/mobile-store', () => storeMock);
 
-import { DepthLadder, depthBook, depthMaxVolume, type DepthLadderProps } from './depth-ladder';
+import * as tradeStyles from '../styles/trade.css';
+import { DepthLadder, depthBook, depthMaxVolume, depthOddCapable, DepthOddToggle, type DepthLadderProps } from './depth-ladder';
 
 const BIDASK = {
     code: '2330',
@@ -45,6 +47,15 @@ const text = (n: { children?: unknown }): string => {
     const kids = (n.children ?? []) as unknown[];
     return kids.map(k => (typeof k === 'string' ? k : text(k as { children?: unknown }))).join('');
 };
+/** 輔助技術讀得到的文字（略過 aria-hidden 子樹；表頭縮寫 span 為 aria-hidden） */
+const fullText = (n: { children?: unknown }): string => {
+    const kids = (n.children ?? []) as unknown[];
+    return kids.map(k => {
+        if (typeof k === 'string') return k;
+        const node = k as { props?: Record<string, unknown>; children?: unknown };
+        return node.props?.['aria-hidden'] === 'true' ? '' : fullText(node);
+    }).join('');
+};
 const byId = (id: string) => view!.root.findByProps({ 'data-testid': id });
 const allById = (id: string) => view!.root.findAllByProps({ 'data-testid': id });
 const classOf = (id: string) => String(byId(id).findAll(n => typeof n.props.className === 'string' && n.props.className.includes('dirText'))[0]?.props.className ?? '');
@@ -64,6 +75,20 @@ afterEach(async () => {
 async function render(trades: AccountedTrade[] = [], extra: Partial<DepthLadderProps> = {}) {
     await act(async () => {
         view = create(createElement(DepthLadder, { code: '2330', contract, trades, ...extra }));
+    });
+}
+
+/** 交易頁的用法：狀態在外層、DepthOddToggle（股票才顯示）＋受控 DepthLadder（oddLot） */
+function Controlled(props: Omit<DepthLadderProps, 'oddLot'>) {
+    const [odd, setOdd] = useState(false);
+    return createElement(Fragment, null,
+        depthOddCapable(props.contract) ? createElement(DepthOddToggle, { oddLot: odd, onChange: setOdd }) : null,
+        createElement(DepthLadder, { ...props, oddLot: odd }));
+}
+
+async function renderControlled(trades: AccountedTrade[] = [], extra: Partial<Omit<DepthLadderProps, 'oddLot'>> = {}) {
+    await act(async () => {
+        view = create(createElement(Controlled, { code: '2330', contract, trades, ...extra }));
     });
 }
 
@@ -89,7 +114,7 @@ describe('DepthLadder（page）', () => {
     it('表頭「委買量｜買價｜賣價｜委賣量」；5 列各含買與賣', async () => {
         await render();
         const head = view!.root.findAll(n => n.props['aria-hidden'] === 'true' && typeof n.type === 'string' && n.type === 'div')[0]!;
-        expect(head.children.map(c => text(c as never))).toEqual(['委買量', '買價', '賣價', '委賣量']);
+        expect(head.children.map(c => fullText(c as never))).toEqual(['委買量', '買價', '賣價', '委賣量']);
         for (let i = 1; i <= 5; i++) {
             const row = byId(`depth-row-${i}`);
             expect(row.findAllByProps({ 'data-testid': `depth-bid-${i}` })).toHaveLength(1);
@@ -153,7 +178,7 @@ describe('DepthLadder（page）', () => {
     });
 
     it('盤中零股模式點價：以盤中零股開下單面板（lot: IntradayOdd）；切回整股不帶 lot', async () => {
-        await render();
+        await renderControlled();
         await act(async () => { byId('depth-odd-toggle').props.onClick(); });
         await act(async () => { byId('depth-ask-1').props.onClick(); });
         const whole = view!.root.findAll(n => n.type === 'button' && n.children.includes('整股'))[0]!;
@@ -183,7 +208,7 @@ describe('DepthLadder（page）', () => {
     });
 
     it('股票可切換盤中零股：改用 useQuote(code, { oddLot: true })，只標零股委託、量以股計', async () => {
-        await render([trade('a', 984, 2), trade('odd', 983, 300, 'IntradayOdd')]);
+        await renderControlled([trade('a', 984, 2), trade('odd', 983, 300, 'IntradayOdd')]);
         expect(quoteMock.useQuote).toHaveBeenLastCalledWith('2330', { oddLot: false });
         await act(async () => { byId('depth-odd-toggle').props.onClick(); });
         expect(quoteMock.useQuote).toHaveBeenLastCalledWith('2330', { oddLot: true });
@@ -193,7 +218,7 @@ describe('DepthLadder（page）', () => {
 
     it('期貨不提供零股切換，量以口計', async () => {
         await act(async () => {
-            view = create(createElement(DepthLadder, { code: 'TXFF6', contract: { ...contract, code: 'TXFF6', security_type: 'FUT' }, trades: [] }));
+            view = create(createElement(Controlled, { code: 'TXFF6', contract: { ...contract, code: 'TXFF6', security_type: 'FUT' }, trades: [] }));
         });
         expect(allById('depth-odd-toggle')).toHaveLength(0);
         expect(text(byId('depth-total'))).toContain('五檔總量（口）');
@@ -280,7 +305,7 @@ describe('DepthLadder B3b 視覺（設計規格 §7.3）', () => {
     });
 
     it('整股／盤中零股改為 Segmented toggle（role=group、aria-pressed）', async () => {
-        await render();
+        await renderControlled();
         const toggle = byId('depth-odd-toggle');
         const group = view!.root.findAll(n => n.type === 'div' && n.props.role === 'group')[0]!;
         expect(group.props['aria-label']).toContain('盤中零股');
@@ -299,5 +324,94 @@ describe('DepthLadder B3b 視覺（設計規格 §7.3）', () => {
             expect(arg).not.toHaveProperty('action');
             expect(arg).toMatchObject({ code: '2330', source: 'depth' });
         }
+    });
+});
+
+describe('DepthLadder 受控整股／盤中零股（設計規格 §7.3：切換鍵移到交易頁「五檔｜明細」同列）', () => {
+    it('page 變體本身不渲染切換鍵（ticket 亦同），整股／零股只看 oddLot prop', async () => {
+        await render();
+        expect(allById('depth-odd-toggle')).toHaveLength(0);
+        expect(quoteMock.useQuote).toHaveBeenLastCalledWith('2330', { oddLot: false });
+        await act(async () => { view!.update(createElement(DepthLadder, { code: '2330', contract, trades: [], oddLot: true })); });
+        expect(allById('depth-odd-toggle')).toHaveLength(0);
+        expect(quoteMock.useQuote).toHaveBeenLastCalledWith('2330', { oddLot: true });
+        expect(text(byId('depth-total'))).toContain('五檔總量（股）');
+        expect(byId('depth-ladder').props['data-variant']).toBe('page');
+    });
+
+    it('page 變體 oddLot=true：點零股五檔價格以盤中零股開下單面板（不帶方向）', async () => {
+        await render([], { oddLot: true });
+        await act(async () => { byId('depth-bid-2').props.onClick(); });
+        expect(storeMock.openTicket.mock.calls).toEqual([[{ code: '2330', price: 983, source: 'depth', lot: 'IntradayOdd' }]]);
+    });
+
+    it('page 變體：期貨即使 oddLot=true 也是整股五檔（不帶 lot）', async () => {
+        const fut = { ...contract, code: 'TXFF6', security_type: 'FUT' } as ContractInfo;
+        await act(async () => { view = create(createElement(DepthLadder, { code: 'TXFF6', contract: fut, trades: [], oddLot: true })); });
+        expect(quoteMock.useQuote).toHaveBeenLastCalledWith('TXFF6', { oddLot: false });
+        await act(async () => { byId('depth-bid-1').props.onClick(); });
+        expect(storeMock.openTicket.mock.calls[0]![0]).not.toHaveProperty('lot');
+    });
+
+    it('depthOddCapable：只有股票可切換（合約未載入為 false）', () => {
+        expect(depthOddCapable(contract)).toBe(true);
+        expect(depthOddCapable({ ...contract, security_type: 'FUT' } as ContractInfo)).toBe(false);
+        expect(depthOddCapable({ ...contract, security_type: 'IND' } as ContractInfo)).toBe(false);
+        expect(depthOddCapable(undefined)).toBe(false);
+    });
+
+    it('DepthOddToggle：Segmented toggle，testid 在「盤中零股」段，onChange 回報布林', async () => {
+        const onChange = vi.fn();
+        await act(async () => { view = create(createElement(DepthOddToggle, { oddLot: true, onChange })); });
+        const group = view!.root.findAll(n => n.type === 'div' && n.props.role === 'group')[0]!;
+        expect(group.props['aria-label']).toBe('五檔：整股或盤中零股');
+        expect(text(byId('depth-odd-toggle'))).toBe('盤中零股');
+        expect(byId('depth-odd-toggle').props['aria-pressed']).toBe(true);
+        const whole = view!.root.findAll(n => n.type === 'button' && n.children.includes('整股'))[0]!;
+        expect(whole.props['aria-pressed']).toBe(false);
+        await act(async () => { whole.props.onClick(); });
+        await act(async () => { byId('depth-odd-toggle').props.onClick(); });
+        expect(onChange.mock.calls).toEqual([[false], [true]]);
+    });
+});
+
+describe('DepthLadder 表頭縮寫（設計規格 §4.7：字級「大」以 html[data-sj-font-scale] 切換）', () => {
+    const head = () => view!.root.findAll(n => n.props['aria-hidden'] === 'true' && typeof n.type === 'string' && n.type === 'div')[0]!;
+    type Node = { type: unknown; props: Record<string, unknown>; children: (Node | string)[] };
+
+    it('量欄同時渲染完整（depthHeadFull）與縮寫（depthHeadShort，aria-hidden）兩個 span；價欄不變', async () => {
+        await render();
+        const cells = head().children as unknown as Node[];
+        expect(cells).toHaveLength(4);
+        for (const [i, full, short] of [[0, '委買量', '買量'], [3, '委賣量', '賣量']] as const) {
+            const cell = cells[i]! as unknown as { findAll(p: (n: Node) => boolean): Node[] };
+            const [f, s] = cell.findAll(n => n.type === 'span' && n !== (cell as unknown));
+            expect(f!.type).toBe('span');
+            expect(f!.props.className).toBe(tradeStyles.depthHeadFull);
+            expect(f!.props['aria-hidden']).toBeUndefined();
+            expect(text(f!)).toBe(full);
+            expect(s!.type).toBe('span');
+            expect(s!.props.className).toBe(tradeStyles.depthHeadShort);
+            expect(s!.props['aria-hidden']).toBe('true');
+            expect(text(s!)).toBe(short);
+            // 量欄 span 自己＋完整＋縮寫，沒有其他節點
+            expect(cell.findAll(n => n.type === 'span')).toHaveLength(3);
+        }
+        expect(cells[1]!.children).toEqual(['買價']);
+        expect(cells[2]!.children).toEqual(['賣價']);
+    });
+
+    it('輔助技術：表頭維持 aria-hidden，縮寫不進無障礙樹；每格 aria-label 仍是完整「委買／委賣…量」', async () => {
+        await render();
+        expect(head().props.className).toBe(tradeStyles.depthHead);
+        expect(fullText(head())).toBe('委買量買價賣價委賣量');
+        expect(byId('depth-bid-1').props['aria-label']).toMatch(/^委買第1檔 984，量 120 張/);
+        expect(byId('depth-ask-1').props['aria-label']).toMatch(/^委賣第1檔 985，量 88 張/);
+    });
+
+    it('ticket 變體表頭結構相同（同一組 CSS 切換）', async () => {
+        await render([], { variant: 'ticket', oddLot: false });
+        expect(fullText(head())).toBe('委買量買價賣價委賣量');
+        expect(view!.root.findAll(n => n.props.className === tradeStyles.depthHeadShort).map(n => text(n))).toEqual(['買量', '賣量']);
     });
 });

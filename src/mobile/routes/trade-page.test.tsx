@@ -528,3 +528,99 @@ describe('TradePage B3b', () => {
     });
 });
 
+// ---- 五檔整股／盤中零股切換與「五檔｜明細」同列（設計規格 §7.3 版面圖） ----
+
+describe('TradePage 五檔整股／盤中零股切換', () => {
+    const BIDASK = { bid_price: ['1080', '1075'], bid_volume: [5, 3], ask_price: ['1085', '1090'], ask_volume: [4, 2] };
+    const buttons = () => view!.root.findAll(n => n.type === 'button');
+    const btn = (label: string) => buttons().find(b => text(b) === label)!;
+    const all = (id: string) => view!.root.findAllByProps({ 'data-testid': id });
+    /** 五檔訂閱（Header 的 useQuote 帶 narrow，五檔帶 oddLot） */
+    const depthQuoteCalls = () => m.useQuote.mock.calls.filter(c => c[1] && 'oddLot' in (c[1] as object)).map(c => (c[1] as { oddLot: boolean }).oddLot);
+
+    beforeEach(() => {
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '1085', price_chg: '15', total_volume: 23456 }, bidask: BIDASK });
+    });
+
+    it('切換鍵在「五檔｜明細」同一列右側（分頁在前），不在五檔區塊內；testid 不變', async () => {
+        await render();
+        const row = byId('trade-panel-row');
+        expect(row.props.className).toBe(tradeStyles.panelRow);
+        const [tabsSlot, toggleSlot] = row.children as unknown as { props: { className: string }; findAll: typeof row.findAll }[];
+        expect(row.children).toHaveLength(2);
+        expect(tabsSlot!.props.className).toBe(tradeStyles.panelTabs);
+        expect(tabsSlot!.findAll(n => n.props.role === 'tablist')).toHaveLength(1);
+        expect(toggleSlot!.props.className).toBe(tradeStyles.oddToggleSlot);
+        expect(toggleSlot!.findAll(n => n.props['data-testid'] === 'depth-odd-toggle')).toHaveLength(1);
+        expect(text(byId('depth-odd-toggle'))).toBe('盤中零股');
+        expect(byId('depth-ladder').findAll(n => n.props['data-testid'] === 'depth-odd-toggle')).toHaveLength(0);
+        // Segmented toggle：role=group、aria-pressed、compact
+        const group = view!.root.findAll(n => n.type === 'div' && n.props.role === 'group' && n.props['aria-label'] === '五檔：整股或盤中零股');
+        expect(group).toHaveLength(1);
+        expect(byId('depth-odd-toggle').props['aria-pressed']).toBe(false);
+    });
+
+    it('受控：切換鍵改變五檔訂閱（整股 → 盤中零股 → 整股）', async () => {
+        await render();
+        expect(depthQuoteCalls().at(-1)).toBe(false);
+        await act(async () => { byId('depth-odd-toggle').props.onClick(); });
+        expect(byId('depth-odd-toggle').props['aria-pressed']).toBe(true);
+        expect(depthQuoteCalls().at(-1)).toBe(true);
+        expect(text(byId('depth-total'))).toContain('五檔總量（股）');
+        await act(async () => { btn('整股').props.onClick(); });
+        expect(depthQuoteCalls().at(-1)).toBe(false);
+        expect(text(byId('depth-total'))).toContain('五檔總量（張）');
+    });
+
+    it('零股五檔點價開零股下單面板（lot: IntradayOdd、不帶方向）；整股不帶 lot；lib 送出函式 0 次', async () => {
+        await render();
+        await act(async () => { byId('depth-bid-1').props.onClick(); });
+        await act(async () => { byId('depth-odd-toggle').props.onClick(); });
+        await act(async () => { byId('depth-ask-2').props.onClick(); });
+        expect(m.openTicket.mock.calls).toEqual([
+            [{ code: '2330', price: 1080, source: 'depth' }],
+            [{ code: '2330', price: 1090, source: 'depth', lot: 'IntradayOdd' }],
+        ]);
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
+    });
+
+    it('明細分頁時隱藏切換鍵但保留位置與狀態；切回五檔仍是盤中零股', async () => {
+        await render();
+        await act(async () => { byId('depth-odd-toggle').props.onClick(); });
+        await act(async () => { btn('明細').props.onClick(); });
+        expect(all('depth-odd-toggle')).toHaveLength(0);
+        expect(all('depth-ladder')).toHaveLength(0);
+        // 空位仍在（分頁寬度不跳動），且不含任何按鈕
+        const slot = byId('trade-panel-row').findAll(n => n.props.className === tradeStyles.oddToggleSlot);
+        expect(slot).toHaveLength(1);
+        expect(slot[0]!.findAll(n => n.type === 'button')).toHaveLength(0);
+        await act(async () => { btn('五檔').props.onClick(); });
+        expect(byId('depth-odd-toggle').props['aria-pressed']).toBe(true);
+        expect(depthQuoteCalls().at(-1)).toBe(true);
+        await act(async () => { byId('depth-bid-1').props.onClick(); });
+        expect(m.openTicket.mock.calls.at(-1)).toEqual([{ code: '2330', price: 1080, source: 'depth', lot: 'IntradayOdd' }]);
+    });
+
+    it('非股票（期貨、指數）與合約未載入時不顯示切換鍵、不留空位，分頁佔滿整列', async () => {
+        for (const c of [{ ...stock, code: 'TXFF6', security_type: 'FUT' }, { ...stock, code: 'TSE001', security_type: 'IND' }, undefined]) {
+            m.useContract.mockReturnValue(c);
+            await render(c?.code ?? '2330');
+            expect(all('depth-odd-toggle')).toHaveLength(0);
+            expect(byId('trade-panel-row').children).toHaveLength(1);
+            expect(depthQuoteCalls().at(-1)).toBe(false);
+            await act(async () => { view!.unmount(); });
+            view = undefined;
+        }
+    });
+
+    it('換商品時整頁重建：回到整股', async () => {
+        await render('2330');
+        await act(async () => { byId('depth-odd-toggle').props.onClick(); });
+        expect(byId('depth-odd-toggle').props['aria-pressed']).toBe(true);
+        m.useContract.mockReturnValue({ ...stock, code: '2317', name: '鴻海' });
+        await act(async () => { view!.update(createElement(TradePage, { code: '2317' })); });
+        expect(byId('depth-odd-toggle').props['aria-pressed']).toBe(false);
+        expect(depthQuoteCalls().at(-1)).toBe(false);
+    });
+});
+

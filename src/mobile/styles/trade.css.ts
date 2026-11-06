@@ -12,7 +12,7 @@ import { elevation, sj } from './theme-vars.css';
 import { DUR, EASE, RADIUS, REDUCED_MOTION, SAFE_LEFT, SAFE_RIGHT, SIZE, SPACE, TOUCH_MIN, TRADE_BUTTON_GAP } from './tokens';
 import { NUM, NUMERIC, TEXT } from './typography.css';
 
-/** 字級「大」（§4.7）：統計格 2 欄等版面切換 */
+/** 字級「大」（§4.7）：統計格 2 欄、五檔表頭縮寫等版面切換 */
 const FONT_LARGE = 'html[data-sj-font-scale="1.3"] &';
 
 const ellipsis = {
@@ -219,6 +219,29 @@ export const controlGrow = style({
     minWidth: 0,
 });
 
+/**
+ * 「五檔｜明細」＋右側［整股｜盤中零股］同列（§7.3）。寬度全以 rem 計（隨字級等比放大）：
+ * 分頁至少 6rem、切換鍵固定 10rem（「盤中零股」4 字 callout 3.5rem＋左右內距 1rem＝每段 4.5rem）、間距 .75rem，
+ * 列寬不足 16.75rem（360 寬、字級大：(360 − 2×20.8) ÷ 20.8 ≈ 15.3rem）時切換鍵換到第二行靠右，不重疊、不溢出。
+ * 行距 s2：compact 上下各擴 4px 的點擊區不與另一行重疊。
+ */
+export const panelRow = style([controlRow, {
+    flexWrap: 'wrap',
+    rowGap: SPACE.s2,
+}]);
+
+export const panelTabs = style({
+    flex: '1 1 6rem',
+    minWidth: 0,
+});
+
+/** 切換鍵位置（股票才渲染）：明細分頁時只留空位，分頁寬度不跳動 */
+export const oddToggleSlot = style({
+    flex: '0 0 10rem',
+    marginLeft: 'auto',
+    minWidth: 0,
+});
+
 // ---- 圖表 ----
 
 export const chartWrap = style({
@@ -419,6 +442,33 @@ export const depthHeadVol = style({ paddingLeft: DEPTH_CELL_PAD, textAlign: 'lef
 export const depthHeadPrice = style({ padding: `0 ${DEPTH_CELL_PAD}`, textAlign: 'center' });
 export const depthHeadVolRight = style({ paddingRight: DEPTH_CELL_PAD, textAlign: 'right' });
 
+/**
+ * 表頭量欄完整與縮寫兩個 span 同時渲染（§4.7：字級「大」改縮寫，不用容器查詢）：
+ * 預設顯示完整、隱藏縮寫；字級「大」時完整標籤改為視覺隱藏（與 primitives srOnly 相同手法，仍留給輔助技術）、顯示縮寫（aria-hidden）。
+ */
+export const depthHeadFull = style({
+    selectors: {
+        [FONT_LARGE]: {
+            position: 'absolute',
+            width: '1px',
+            height: '1px',
+            padding: 0,
+            margin: '-1px',
+            overflow: 'hidden',
+            clip: 'rect(0, 0, 0, 0)',
+            whiteSpace: 'nowrap',
+            border: 0,
+        },
+    },
+});
+
+export const depthHeadShort = style({
+    display: 'none',
+    selectors: {
+        [FONT_LARGE]: { display: 'inline' },
+    },
+});
+
 export const depthRow = style([hairlineBottom, {
     display: 'grid',
     gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
@@ -544,18 +594,6 @@ export const ladderMine = style({
     border: `1px solid ${vars.color.accent}`,
     color: vars.color.accent,
     ...TEXT.caption,
-});
-
-/** 整股／盤中零股切換（Segmented compact）所在列 */
-export const ladderToolbar = style({
-    display: 'flex',
-    justifyContent: 'flex-end',
-    padding: `${SPACE.s1} 0`,
-});
-
-export const ladderToolbarControl = style({
-    flex: '0 1 13rem',
-    minWidth: 0,
 });
 
 /** 次要動作鍵（重試、重新載入）：elevatedBg＋髮絲框 */

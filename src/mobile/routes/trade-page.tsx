@@ -4,7 +4,8 @@
 // │       統計格（股票）開 高 均 總／參 低 單 額（期權無「額」；顏色相對參考價）
 // │       漲跌停價・非「可當沖」的當沖狀態（股票）或到期月份・時段（期權）
 // ├ 週期 Segmented（toggle）［走勢］［1分］［5分］［15分］［60分］［日］＋交易圖表（委託線、成本線、漲跌停、參考價）
-// ├ 五檔／明細 Segmented（tabs）（五檔買賣同列：委買量｜買價｜賣價｜委賣量、量條、五檔總量、買賣比與內外盤比）
+// ├ 五檔／明細 Segmented（tabs）＋同列右側［整股｜盤中零股］（股票；明細分頁時隱藏但保留狀態、窄螢幕換行）
+// │   （五檔買賣同列：委買量｜買價｜賣價｜委賣量、量條、五檔總量、買賣比與內外盤比）
 // ├ 持倉摘要・未成交 N 筆 ›（#/orders；GroupedSection）
 // └［買 進］［賣 出］→ openTicket()（只開下單面板，送單一律經確認面板）；以 ShellSlot bottom 放進底部 chrome
 //
@@ -26,7 +27,7 @@ import { fmtCompactInt, fmtStockLots } from '../../lib/utils/format';
 import { nowWallClockUtc } from '../../lib/utils/kbars';
 import { formatToTick } from '../../lib/utils/ticksize';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
-import { DepthLadder } from '../components/depth-ladder';
+import { DepthLadder, depthOddCapable, DepthOddToggle } from '../components/depth-ladder';
 import { TickList } from '../components/tick-list';
 import { TradeChart } from '../components/trade-chart';
 import { chartPriceLines, formatLinePrice } from '../lib/chart-model';
@@ -368,6 +369,8 @@ function TradeView({ code }: { code: string }) {
     const [period, setPeriodState] = useState<ChartPeriod>(loadPeriod);
     const setPeriod = (p: ChartPeriod) => { setPeriodState(p); savePeriod(p); };
     const [panel, setPanel] = useState<'depth' | 'ticks'>('depth');
+    // 五檔整股／盤中零股：放在本頁（切到明細再回來不重設）；換商品時整頁重建而重設為整股
+    const [oddLot, setOddLot] = useState(false);
 
     const orderable = contract ? contract.target_code || contract.code : sym;
     const isStock = contract?.security_type === 'STK';
@@ -410,13 +413,18 @@ function TradeView({ code }: { code: string }) {
                     </div>
                 )}
 
-            <div className={styles.controlRow}>
-                <div className={styles.controlGrow}>
+            <div className={styles.panelRow} data-testid='trade-panel-row'>
+                <div className={styles.panelTabs}>
                     <Segmented<'depth' | 'ticks'> items={PANEL_ITEMS} value={panel} onChange={setPanel} semantics='tabs' ariaLabel='五檔與明細' size='compact' />
                 </div>
+                {depthOddCapable(contract) && (
+                    <div className={styles.oddToggleSlot}>
+                        {panel === 'depth' && <DepthOddToggle oddLot={oddLot} onChange={setOddLot} />}
+                    </div>
+                )}
             </div>
             {panel === 'depth'
-                ? <DepthLadder code={sym} contract={contract} trades={trading.trades} />
+                ? <DepthLadder code={sym} contract={contract} trades={trading.trades} oddLot={oddLot} />
                 : contract ? <TickList code={sym} contract={contract} /> : null}
 
             <div className={styles.summaryWrap}>
