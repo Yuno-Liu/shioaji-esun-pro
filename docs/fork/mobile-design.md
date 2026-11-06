@@ -1077,6 +1077,12 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 - **閒置預載逐一排程**（P10，`lib/idle-prefetch.ts`）：原本同一個 idle callback 一次發出 11 個 `import()`（約 305 KiB gzip，並在約 2.2 秒處有 55–75ms 長任務）。現在每個模組各自一個 `requestIdleCallback`（timeout 2 秒），前一個載入結束才排下一個；沒有 `requestIdleCallback`（iOS Safari）時第一個在原本 1.5 秒的計時器中執行，之後間隔 100ms。`navigator.connection.saveData` 為真，或 `effectiveType` 為 slow-2g／2g／3g 時，只預載迷你走勢、下單面板與交易頁，其他等點擊再載。卸載殼層時取消尚未執行的排程。
 - **數字格式化快取**（P1，`lib/num-format.ts`）：`toLocaleString(locale, options)` 每次都重建 Intl 格式器（headless Chrome 約 10–17µs／次），是交易頁與持倉頁重繪的最大 JS 熱點。手機版高頻路徑（五檔、明細、交易頁統計格與持倉摘要、圖表游標與線標籤、持倉頁、損益明細、玉山庫存明細、自選列、排行、委託頁、帳戶格式）改用以 locale＋選項為 key 快取的 `Intl.NumberFormat`（Node 微基準：帶選項 32.5µs → 0.57µs）。`src/lib` 不改，所以 `formatToTick`、`fmtInt`、`fmtCompactInt`、`fmtStockLots` 在手機版另有等價實作，以 4 萬筆以上的向量逐字比對 lib 版本（`num-format.test.ts`）；`fmtStockLots` 的張數照 lib 用執行環境預設語系，其他固定 en-US。**新程式請勿在渲染路徑直接呼叫帶選項的 `toLocaleString`**。
 - **交易狀態只由葉節點訂閱**（P2）：持倉商品每筆成交，lib 都會重估市價並發布整份交易狀態。交易頁改由三個葉節點各自 `useTradingState()`：圖上的線（線的內容 key 沒變時沿用同一陣列，搭配 `memo(TradeChart)`）、五檔的委託標記（只傳 trades 給 `memo(DepthLadder)`）、持倉摘要與未成交筆數。持倉市價重估時標頭、五檔、圖表都不重繪（`trade-page.test.tsx` 以渲染次數驗證）。持倉頁的詳細列與精簡列用 `memo`＋只比該列實際用到欄位的比較函式（`rowPropsEqual`、`compactRowPropsEqual`；持倉物件比參考，淨損益比數值與結構），沒有跳價的列不重繪；本頁最大損益改變時全部列重繪以更新損益條比例。列的平倉、加碼經穩定的 `rowActions` 轉給最新一次提交的處理函式，略過重繪的列不會拿到過期的帳戶或閘門狀態（有專門測試）。
+- **前後量測**（同一台機器、同一套 mock，headless Chrome 4× CPU 降速，自選 20 檔，每項量 10 秒；ae21ebc0 對 1e470f3）：
+  - 交易頁每秒 10 筆：JS 237 → 111 ms/s，主執行緒 570 → 455 ms/s。
+  - 交易頁每秒 50 筆加其他 7 檔：JS 261 → 112 ms/s，主執行緒 628 → 450 ms/s。
+  - 持倉頁每秒 50 筆：JS 149 → 102 ms/s，主執行緒 360 → 314 ms/s。
+  - 自選頁大致持平（每秒 300 筆 181 → 186 ms/s，在誤差內）。
+  - 兩次都只有零星 1 筆 64–88ms 長任務。主執行緒其餘時間主要是樣式、版面與繪製（P12，需實機 trace 再處理）。
 - **首屏**：本輪後手機首屏 **217.7 KiB**（16 個 JS），仍在 ≤218 KiB 內但只剩 0.3 KiB。增加的 1.2 KiB 是殼層必須常駐的閒置預載排程、`preload()` 與快取格式化（`lib/utils/ticksize` 原本就在首屏，沒有重複帶入）。桌面 `index.html` 771.6 KiB、`approval.html` 79.2 KiB 不變。**之後再加首屏程式碼前必須先拆分**，候選：自選編輯模式才用到的 `watch-reorder.ts` 改延遲載入。
 - 未處理（需要修改 `src/lib`，R2 不允許，列入 §16）：trading-state 每筆 tick 重算全部持倉並發布、每秒以 BroadcastChannel 傳出整份 state（P2 根因、P14）；SSE 第一次連線就發 RECONNECT 合約刷新，冷啟動同一份合約抓 3 次（P4）；自選快照等全部合約 info 才讀，LCP 被最慢的一筆卡住（P5）；首屏帶入 Tauri 橋接、閃電下單模組、MockEsunDriver 與玉山整合（P6、P7、P8、P15，稽核估計合計約 50 KiB gzip）。
 
