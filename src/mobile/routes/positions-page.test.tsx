@@ -37,6 +37,8 @@ const m = vi.hoisted(() => {
         assertResumeReady: vi.fn(),
         acknowledgeStaleData: vi.fn(),
         retryResume: vi.fn(),
+        /** 今日額度查詢（摘要卡的額度列經 hooks/use-trading-limits 呼叫）；一律 mock，不靠錯誤邊界吞錯 */
+        fetchTradingLimits: vi.fn(),
     };
 });
 
@@ -116,7 +118,13 @@ vi.mock('../lib/resume-gate-runtime', () => ({
 }));
 vi.mock('../lib/hash-router', () => ({ navigate: m.navigate }));
 vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket }));
+vi.mock('../../lib/shioaji', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../lib/shioaji')>()),
+    fetchTradingLimits: m.fetchTradingLimits,
+}));
 
+import { resetTradingCostSettings, setTradingCostSettings } from '../../lib/trading-cost-settings';
+import { resetTradingLimitsForTest } from '../hooks/use-trading-limits';
 import { addOnBlockReason, addOnPlanFor, closePlanFor, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
 
 const stockAcc = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '' };
@@ -134,6 +142,11 @@ const stockPos = (over: Record<string, unknown> = {}) =>
     ({ id: 1, code: '2330', direction: 'Buy', quantity: 3500, price: 1052.5, last_price: 1085, pnl: 97500, yd_quantity: 3500, cond: 'Cash', account: stockAcc, ...over }) as AccountedPosition;
 const futPos = (over: Record<string, unknown> = {}) =>
     ({ id: 2, code: 'TXFL6', direction: 'Buy', quantity: 2, price: 22800, last_price: 22950, pnl: 30000, account: futAcc, ...over }) as AccountedPosition;
+
+const tradingLimits = (over: Record<string, number> = {}) => ({
+    trading_limit: 1_000_000, trading_used: 200_000, trading_available: 800_000,
+    margin_limit: 0, margin_used: 0, margin_available: 0, short_limit: 0, short_used: 0, short_available: 0, ...over,
+});
 
 function setPositions(positions: AccountedPosition[], query: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) {
     m.trading = { positions, queries: { positions: { updatedAt: 1, needsReconcile: false, error: null, reasons: [], ...query } }, ...extra };
@@ -173,6 +186,8 @@ beforeEach(() => {
     m.placeQuickOrder.mockResolvedValue({});
     m.refreshTradingState.mockClear();
     m.ensureContract.mockClear();
+    resetTradingLimitsForTest();
+    m.fetchTradingLimits.mockReset().mockResolvedValue(tradingLimits());
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
@@ -252,7 +267,8 @@ describe('PositionsPage 顯示', () => {
         expect(stockRow).toContain('+97,500');
         expect(textOf(rowOf('TXFL6'))).toContain('2 口');
         expect(textOf(rowOf('TXFL6'))).toContain('期貨');
-        expect(textOf(one('position-total'))).toBe('+127,500');
+        // 合計改為淨損益：2330 淨損益 91,697（見「淨損益與損益兩平價」）＋期貨券商損益 30,000
+        expect(textOf(one('position-total'))).toBe('+121,697');
         expect(pageText()).toContain('（估）');
     });
 
@@ -269,7 +285,9 @@ describe('PositionsPage 顯示', () => {
         await render();
         await act(async () => { one('position-account-filter').props.onChange({ target: { value: 'S:ESUN1:7777777' } }); });
         expect(all('position-row')).toHaveLength(1);
-        expect(textOf(one('position-total'))).toBe('-1,000');
+        // 2317 商品資料未載入 → 淨損益無法計算：合計顯示「—」並標「合計待確認」，不以券商 −1,000 代替
+        expect(textOf(one('position-total'))).toBe('—');
+        expect(textOf(one('position-total-pending'))).toContain('合計待確認：1 筆');
     });
 
     it('對帳 banner 與載入中', async () => {
@@ -333,7 +351,7 @@ describe('摘要、篩選、排序與分組', () => {
     it('摘要卡：未實現損益合計、股票總市值、期貨權益數與風險指標（附文字）', async () => {
         setPositions([stockPos(), futPos()], {}, { margin: margin() });
         await render();
-        expect(textOf(one('position-total'))).toBe('+127,500');
+        expect(textOf(one('position-total'))).toBe('+121,697'); // 淨損益 91,697 ＋ 期貨券商損益 30,000
         expect(all('position-total-pct')).toHaveLength(0); // 混合股票與期貨：不給報酬率合計
         expect(textOf(one('position-market-value'))).toBe('3,797,500'); // 3,500 × 1,085
         expect(textOf(one('position-equity'))).toBe('1,234,567');
@@ -348,7 +366,7 @@ describe('摘要、篩選、排序與分組', () => {
         expect(all('position-risk-note')).toHaveLength(1);
         await pickMarket('stock');
         expect(all('position-equity')).toHaveLength(0);
-        expect(textOf(one('position-total-pct'))).toBe('（+2.65%）'); // 97,500 ÷ (1,052.5 × 3,500)
+        expect(textOf(one('position-total-pct'))).toBe('（+2.49%）'); // 淨損益 91,697 ÷ (1,052.5 × 3,500)
     });
 
     it('摘要卡：風險指標低於 100% 標示「危險」；篩選到非目前期貨帳戶時不顯示保證金', async () => {
@@ -415,6 +433,7 @@ describe('摘要、篩選、排序與分組', () => {
     });
 
     it('依帳戶分組：表頭顯示帳戶、筆數、市值、損益小計', async () => {
+        m.contracts = { ...m.contracts, '2317': { ...stk2330, code: '2317', name: '鴻海' }, '2454': { ...stk2330, code: '2454', name: '聯發科' } };
         setPositions([
             stockPos(),
             stockPos({ id: 5, code: '2317', account: stockAcc2, quantity: 2000, price: 100, last_price: 110, pnl: 20_000 }),
@@ -427,10 +446,12 @@ describe('摘要、篩選、排序與分組', () => {
         expect(headers[0]).toContain('永豐證券 ***4567');
         expect(headers[0]).toContain('2 筆');
         expect(headers[0]).toContain('市值 4,787,500'); // 3,797,500 ＋ 990,000
-        expect(headers[0]).toContain('損益 +87,500');
+        // 淨損益：2330 +91,697、2454 −15,806（990,000 − 1,411 − 2,970 − 1,001,425）
+        expect(headers[0]).toContain('損益 +75,891');
         expect(headers[1]).toContain('玉山證券 ***7777');
         expect(headers[1]).toContain('1 筆');
         expect(headers[1]).toContain('市值 220,000');
+        expect(headers[1]).toContain('損益 +18,741'); // 220,000 − 314 − 660 − 200,285
         expect(headers[2]).toContain('永豐期貨 ***4321');
         expect(headers[2]).not.toContain('市值');
         expect(headers[2]).toContain('損益 +30,000');
@@ -442,7 +463,7 @@ describe('摘要、篩選、排序與分組', () => {
         expect(textOf(inRow('2330', 'position-yd'))).toBe('2張');
         expect(textOf(inRow('2330', 'position-cost'))).toBe('3,683,750');
         expect(textOf(inRow('2330', 'position-value'))).toBe('3,797,500');
-        expect(textOf(inRow('2330', 'position-return'))).toBe('+2.65%');
+        expect(textOf(inRow('2330', 'position-return'))).toBe('+2.49%'); // 淨損益 91,697 ÷ 3,683,750
         expect(rowOf('TXFL6').findAll(n => n.props['data-testid'] === 'position-cost')).toHaveLength(0);
         expect(textOf(inRow('TXFL6', 'position-return'))).toBe('+1.00%'); // 空單：(22,572 − 22,800) ÷ 22,800 × −1
         const bar = inRow('2330', 'position-pnl-bar');
@@ -770,5 +791,214 @@ describe('加碼', () => {
         await render();
         expect(inRow('2330', 'position-add').props.disabled).toBe(true);
         expect(textOf(inRow('2330', 'position-add-note'))).toMatch(/不可交易/);
+    });
+});
+
+describe('摘要卡的今日額度列（fetchTradingLimits 已 mock）', () => {
+    const errorSpy = () => vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    /** console.error 的呼叫（排除 react-test-renderer 的棄用提示） */
+    const reported = (spy: ReturnType<typeof errorSpy>) =>
+        spy.mock.calls.filter(args => !String(args[0]).includes('react-test-renderer is deprecated'));
+    /** 呼叫參數中是否含指定訊息的 Error */
+    const mentions = (args: unknown[], message: string) =>
+        args.some(a => (a instanceof Error && a.message === message) || (typeof a === 'string' && a.includes(message)));
+
+    it('全部帳戶：顯示目前選取證券帳戶的額度，標籤帶券商名稱；查詢正常完成、未觸發錯誤邊界', async () => {
+        const spy = errorSpy();
+        try {
+            await render();
+            const line = one('position-limits-line');
+            expect(line.props['data-status']).toBe('ok');
+            expect(textOf(line)).toContain('永豐 今日剩餘額度');
+            expect(textOf(one('position-limits-value'))).toBe('$800,000');
+            expect(m.fetchTradingLimits).toHaveBeenCalledTimes(1);
+            expect(m.fetchTradingLimits).toHaveBeenCalledWith({ broker_id: '9A95', account_id: '1234567' });
+            expect(reported(spy)).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+        expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+        expect(m.placeQuickOrder).not.toHaveBeenCalled();
+    });
+
+    it('篩選單一證券帳戶：顯示該帳戶的額度（不是目前選取的帳戶）；篩選期貨帳戶只剩期貨列時不顯示', async () => {
+        m.fetchTradingLimits.mockImplementation(async (a: { broker_id: string }) =>
+            (a.broker_id === 'ESUN1' ? tradingLimits({ trading_limit: 500_000, trading_used: 0, trading_available: 450_000 }) : tradingLimits()));
+        setPositions([stockPos(), stockPos({ id: 9, account: stockAcc2 }), futPos()]);
+        await render();
+        expect(textOf(one('position-limits-value'))).toBe('$800,000');
+        await act(async () => { one('position-account-filter').props.onChange({ target: { value: 'S:ESUN1:7777777' } }); });
+        expect(m.fetchTradingLimits).toHaveBeenLastCalledWith({ broker_id: 'ESUN1', account_id: '7777777' });
+        expect(textOf(one('position-limits-value'))).toBe('$450,000');
+        // 切回全部：回到目前選取的證券帳戶（快取，不重查）
+        await act(async () => { one('position-account-filter').props.onChange({ target: { value: '' } }); });
+        expect(textOf(one('position-limits-value'))).toBe('$800,000');
+        expect(m.fetchTradingLimits).toHaveBeenCalledTimes(2);
+        // 期貨帳戶：只剩期貨列 → 依現有規則不顯示證券額度
+        await act(async () => { one('position-account-filter').props.onChange({ target: { value: 'F:F002000:7654321' } }); });
+        expect(all('position-limits-line')).toHaveLength(0);
+        expect(m.fetchTradingLimits).toHaveBeenCalledTimes(2);
+    });
+
+    it('錯誤邊界：額度查詢同步丟出時只隱藏額度列，持倉列、合計與平倉入口照常', async () => {
+        const spy = errorSpy();
+        try {
+            m.fetchTradingLimits.mockImplementation(() => { throw new Error('boom'); });
+            await render();
+            expect(m.fetchTradingLimits).toHaveBeenCalledTimes(1);
+            expect(all('position-limits-line')).toHaveLength(0);
+            expect(textOf(one('position-total'))).toBe('+121,697');
+            expect(all('position-row')).toHaveLength(2);
+            expect(inRow('2330', 'position-close').props.disabled).toBe(false);
+            // React 有回報被邊界攔下的錯誤（不是被吞掉而無聲）
+            expect(reported(spy).some(args => mentions(args, 'boom'))).toBe(true);
+        } finally {
+            spy.mockRestore();
+        }
+        expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+        expect(m.placeQuickOrder).not.toHaveBeenCalled();
+    });
+
+    it('查詢非同步失敗不經錯誤邊界：額度列顯示「暫時無法取得」', async () => {
+        m.fetchTradingLimits.mockRejectedValue(new Error('timeout'));
+        await render();
+        expect(one('position-limits-line').props['data-status']).toBe('error');
+        expect(textOf(one('position-limits-value'))).toBe('暫時無法取得');
+    });
+});
+
+describe('淨損益與損益兩平價', () => {
+    // 當沖稅率只在台北 13:30 前適用：固定在盤中（只假造 Date，不影響 act 的計時器）
+    beforeEach(() => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(Date.parse('2026-11-06T10:00:00+08:00'));
+    });
+    afterEach(() => { resetTradingCostSettings(); });
+
+    const okQuery = { updatedAt: 1, needsReconcile: false, error: null, reasons: [] };
+    /** 委託查詢成功＋今日成交 */
+    const withTrades = (positions: AccountedPosition[], trades: unknown[]) =>
+        setPositions(positions, {}, { trades, queries: { positions: okQuery, orders: okQuery } });
+    const buyTrade = (lots: number) => ({
+        contract: { code: '2330', security_type: 'STK', exchange: 'TSE', target_code: null },
+        order: { id: 't1', seqno: '', ordno: '', action: 'Buy', price: 1080, quantity: lots, order_lot: 'Common', order_cond: 'Cash' },
+        status: { id: 't1', status: 'Filled', status_code: '', order_quantity: lots, deal_quantity: lots, cancel_quantity: 0, modified_price: 0, msg: '', deals: [{ seq: '1', price: 1080, quantity: lots, ts: 0 }] },
+        account: stockAcc,
+    });
+    const sheetNode = () => view!.root.find(n => n.props['data-testid'] === 'position-pnl-sheet' && typeof n.type === 'string');
+
+    it('股票列：淨損益為主、券商損益小字並列；兩平價依跳動價位格式化並以文字標示高於／低於', async () => {
+        await render();
+        // 3,500 股 × 均價 1,052.5：買進手續費 4,499＋750（整張、零股兩筆）；現價 1,085 賣出手續費 4,638＋773、證交稅 11,393
+        expect(textOf(inRow('2330', 'position-pnl'))).toBe('+91,697');
+        expect(textOf(inRow('2330', 'position-broker-pnl'))).toBe('券商 +97,500');
+        expect(textOf(rowOf('2330'))).toContain('淨損益（含手續費、證交稅）');
+        // 代數解 1,058.7 → 往上取到 5 元檔 1,060；1,055 為虧損
+        expect(textOf(inRow('2330', 'position-breakeven'))).toBe('1,060');
+        expect(textOf(inRow('2330', 'position-breakeven-relation'))).toBe('現價高於兩平價・已過兩平');
+        const tags = textOf(inRow('2330', 'position-pnl-tags'));
+        expect(tags).toContain('手續費以牌告計（無折扣）');
+        expect(tags).toContain('未判斷當沖'); // 委託查詢未成功：取不到今日成交
+        expect(tags).toContain('估算');
+        // 期權：維持券商損益並標示未扣費稅
+        expect(textOf(inRow('TXFL6', 'position-pnl'))).toBe('+30,000');
+        expect(textOf(inRow('TXFL6', 'position-pnl-note'))).toBe('券商損益・未扣費稅');
+        expect(rowOf('TXFL6').findAll(n => n.props['data-testid'] === 'position-pnl-info')).toHaveLength(0);
+        expect(textOf(one('position-total-deriv'))).toContain('未扣費稅');
+        expect(all('position-total-pending')).toHaveLength(0);
+    });
+
+    it('手續費折數與今日成交：2.8 折、今日買進 1 張以當沖稅率 0.15% 計；明細面板列出各項', async () => {
+        setTradingCostSettings({ feeDiscount: 0.28 });
+        withTrades([stockPos({ yd_quantity: 2500 })], [buyTrade(1)]);
+        await render();
+        const tags = textOf(inRow('2330', 'position-pnl-tags'));
+        expect(tags).toContain('手續費以 2.8 折計');
+        expect(tags).toContain('當沖稅率 0.15%');
+        expect(tags).not.toContain('未判斷當沖');
+        expect(textOf(rowOf('2330'))).toContain('淨損益（含手續費 2.8 折、證交稅）');
+        // 2.8 折：買進 1,260＋210；賣出 1,299＋216；稅 1,085,000 × 0.15% ＋ 2,712,500 × 0.3% = 1,628 ＋ 8,138
+        expect(textOf(inRow('2330', 'position-pnl'))).toBe('+100,999');
+        await click(inRow('2330', 'position-pnl-info'));
+        const sheet = textOf(sheetNode());
+        expect(sheet).toContain('損益計算明細');
+        expect(textOf(one('pnl-open-fee'))).toBe('1,470');
+        expect(textOf(one('pnl-close-fee'))).toBe('1,515');
+        expect(textOf(one('pnl-tax-rate'))).toBe('當沖 0.15% × 1,000 股＋0.3% × 2,500 股');
+        expect(textOf(one('pnl-close-tax'))).toBe('9,766');
+        expect(textOf(one('pnl-net'))).toBe('+100,999');
+        expect(sheet).toContain('買進手續費（估算）');
+        expect(sheet).toContain('證券交易稅條例第 2 條之 1');
+    });
+
+    it('收盤後（台北 13:31）今日買進不再以當沖稅率計：標示「今日已收盤」，稅率回到 0.3%', async () => {
+        vi.setSystemTime(Date.parse('2026-11-06T13:31:00+08:00'));
+        setTradingCostSettings({ feeDiscount: 0.28 });
+        withTrades([stockPos({ yd_quantity: 2500 })], [buyTrade(1)]);
+        await render();
+        const tags = textOf(inRow('2330', 'position-pnl-tags'));
+        expect(tags).toContain('今日已收盤・一般稅率');
+        expect(tags).not.toContain('當沖稅率 0.15%');
+        // 稅 3,797,500 × 0.3% = 11,393（盤中為 9,766）→ 淨損益少 1,627
+        expect(textOf(inRow('2330', 'position-pnl'))).toBe('+99,372');
+        await click(inRow('2330', 'position-pnl-info'));
+        expect(textOf(one('pnl-tax-rate'))).toBe('0.3%');
+        expect(textOf(one('pnl-close-tax'))).toBe('11,393');
+        expect(textOf(sheetNode())).toContain('最早下一個交易日才能賣出');
+    });
+
+    it('融券：借券費與兩平價（回補價 ≤ 兩平才不虧），現價低於兩平以文字標示', async () => {
+        setPositions([stockPos({ direction: 'Sell', cond: 'ShortSelling', quantity: 1000, price: 1100, last_price: 1085, pnl: 12_000, yd_quantity: 1000 })]);
+        await render();
+        // 賣出 1,100,000：手續費 1,568、稅 3,300、借券費 880；回補 1,085,000＋1,546
+        expect(textOf(inRow('2330', 'position-pnl'))).toBe('+7,706');
+        expect(textOf(inRow('2330', 'position-breakeven'))).toBe('1,090');
+        expect(textOf(inRow('2330', 'position-breakeven-relation'))).toBe('現價低於兩平價・已過兩平');
+        await click(inRow('2330', 'position-pnl-info'));
+        expect(textOf(one('pnl-borrow-fee'))).toBe('880');
+        expect(textOf(one('pnl-basis'))).toBe('1,095,132');
+    });
+
+    it('合計待確認：有列算不出淨損益（商品資料未載入）時只加總可計算的列並標示，列內說明原因', async () => {
+        setPositions([stockPos(), stockPos({ id: 8, code: '9999', pnl: 5_000 })]);
+        await render();
+        expect(textOf(one('position-total'))).toBe('+91,697');
+        expect(textOf(one('position-total-pending'))).toBe('合計待確認：1 筆無法計算淨損益，未計入');
+        expect(textOf(inRow('9999', 'position-pnl'))).toBe('—');
+        expect(textOf(inRow('9999', 'position-broker-pnl'))).toBe('券商 +5,000');
+        expect(textOf(inRow('9999', 'position-pnl-reason'))).toBe(POSITIONS_TEXT.pnlNoContract);
+        expect(all('position-total-pct')).toHaveLength(0);
+        expect(textOf(one('position-group-pnl'))).toContain('（待確認）');
+    });
+
+    it('遮蔽金額：淨損益、券商損益、明細金額與股數都遮蔽（兩平價為價格，同均價不遮蔽）', async () => {
+        m.privMoney = true;
+        setTradingCostSettings({ feeDiscount: 0.28 });
+        withTrades([stockPos()], [buyTrade(1)]);
+        await render();
+        expect(textOf(inRow('2330', 'position-pnl'))).toBe('•••••');
+        expect(textOf(inRow('2330', 'position-broker-pnl'))).toBe('券商 •••••');
+        expect(textOf(inRow('2330', 'position-breakeven'))).not.toBe('—');
+        await click(inRow('2330', 'position-pnl-info'));
+        for (const id of ['pnl-open-fee', 'pnl-close-fee', 'pnl-close-tax', 'pnl-net', 'pnl-basis']) expect(textOf(one(id))).toBe('•••••');
+        expect(textOf(one('pnl-tax-rate'))).toBe('當沖 0.15% × •••••＋0.3% × •••••');
+        expect(textOf(sheetNode())).not.toContain('3張');
+    });
+
+    it('S1：開啟／關閉計算明細不呼叫任何送單函式、不開下單面板；面板內沒有平倉／加碼鍵；平倉流程不變', async () => {
+        await render();
+        await click(inRow('2330', 'position-pnl-info'));
+        expect(all('position-pnl-sheet')).toHaveLength(1);
+        const buttons = sheetNode().findAll(n => n.type === 'button').map(n => String(n.props['data-testid'] ?? ''));
+        expect(buttons.filter(id => /close|add|continue|confirm/.test(id))).toEqual([]);
+        await act(async () => { view!.root.find(n => n.props.testId === 'position-pnl-sheet').props.onClose(); });
+        expect(all('position-pnl-sheet')).toHaveLength(0);
+        expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+        expect(m.placeQuickOrder).not.toHaveBeenCalled();
+        expect(m.openTicket).not.toHaveBeenCalled();
+        // 平倉鍵仍只開說明面板
+        await click(inRow('2330', 'position-close'));
+        expect(all('position-close-sheet')).toHaveLength(1);
+        expect(m.placeStockExitByShares).not.toHaveBeenCalled();
     });
 });

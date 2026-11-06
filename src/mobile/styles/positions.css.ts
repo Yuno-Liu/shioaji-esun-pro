@@ -443,6 +443,84 @@ export const rowNote = style({
     textAlign: 'right',
 });
 
+// ---- 淨損益與損益兩平價 ----
+
+/** 券商原始損益（rowMeta 行尾小字，方便與淨損益對照；不用漲跌色） */
+export const brokerPnl = style({
+    marginLeft: 'auto',
+    ...NUMERIC,
+    whiteSpace: 'nowrap',
+});
+
+/** 「損益兩平」列：整列可點開計算明細（中性島底、44pt 觸控高度） */
+export const pnlInfo = style([pressable, focusRing, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: SPACE.s2,
+    width: '100%',
+    minHeight: TOUCH_MIN,
+    margin: 0,
+    padding: `${SPACE.s1} ${SPACE.s2} ${SPACE.s1} ${SPACE.s3}`,
+    border: 'none',
+    borderRadius: RADIUS.md,
+    background: sj.islandBg,
+    color: vars.color.foreground,
+    font: 'inherit',
+    textAlign: 'left',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    minWidth: 0,
+}]);
+
+export const pnlInfoBody = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.125rem',
+    flex: '1 1 auto',
+    minWidth: 0,
+});
+
+export const pnlInfoMain = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    flexWrap: 'wrap',
+    columnGap: SPACE.s1_5,
+    ...TEXT.footnote,
+});
+
+export const pnlInfoLabel = style({
+    color: vars.color.mutedForeground,
+});
+
+export const pnlInfoValue = style({
+    ...NUM.numSm,
+    ...NUMERIC,
+    fontWeight: 600,
+    color: vars.color.foreground,
+});
+
+/** 現價與兩平價的關係（文字，不只靠顏色） */
+export const pnlInfoRel = style({
+    color: vars.color.foreground,
+});
+
+export const pnlTagList = style({
+    listStyle: 'none',
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: SPACE.s1,
+    margin: 0,
+    padding: 0,
+});
+
+/** 期權列「券商損益・未扣費稅」、股票列無法計算的原因 */
+export const pnlNote = style({
+    margin: 0,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
 // ---- 空狀態 ----
 
 export const emptyWrap = inset;
