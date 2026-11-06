@@ -75,7 +75,7 @@ import { SIZE } from '../styles/tokens';
 import * as tradeStyles from '../styles/trade.css';
 import { card as groupedCard } from '../ui/grouped.css';
 import { ShellSlotsContext } from '../ui/shell-slots';
-import { dayTradeText, deliveryMonthText, positionSummaries, scrolledPast, sessionText, TradePage, workingOrderCount } from './trade-page';
+import { dayTradeText, deliveryMonthText, positionSummaries, scrolledPast, sessionText, statKeys, summaryUsesStockUnits, TradePage, workingOrderCount } from './trade-page';
 
 const stock = {
     exchange: 'TSE', code: '2330', security_type: 'STK', target_code: null, name: '台積電', currency: 'TWD',
@@ -141,6 +141,24 @@ describe('header helpers', () => {
         expect(sessionText('STK', 10 * 3600)).toBe('日盤 09:00–13:30');
     });
 
+});
+
+describe('權證（2026-11 上游同步後與股票同一條下單路徑）', () => {
+    it('持倉摘要以股票單位顯示（證券市場商品：股票、權證）', () => {
+        expect(summaryUsesStockUnits('STK')).toBe(true);
+        expect(summaryUsesStockUnits('WRT')).toBe(true);
+        expect(summaryUsesStockUnits('FUT')).toBe(false);
+        expect(summaryUsesStockUnits('OPT')).toBe(false);
+        expect(summaryUsesStockUnits('IND')).toBe(false);
+        expect(summaryUsesStockUnits(undefined)).toBe(false);
+        const rows = positionSummaries('030392', '030392', [pos('030392', 2000, 1.5, 100, { cond: 'Cash' })], summaryUsesStockUnits('WRT'));
+        expect(rows[0]!.quantity).toBe('2張');
+        expect(rows[0]!.quantity).not.toContain('口');
+    });
+
+    it('統計格與股票相同（有均價、總量、單量、金額）', () => {
+        expect(statKeys('WRT')).toEqual(statKeys('STK'));
+    });
 });
 
 describe('positionSummaries／workingOrderCount', () => {

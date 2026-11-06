@@ -4,7 +4,9 @@
 
 import { Check, Plus, Search, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useProductNamesVersion } from '../hooks/use-product-names-version';
 import type { WatchItem } from '../hooks/use-watchlist';
+import { useProductCatalogVersion } from '../lib/product-catalog-version';
 import { primeContract } from '../lib/contracts-cache';
 import {
     searchProducts,
@@ -72,6 +74,10 @@ export function HeaderSymbolSearch({
     const wrapRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
     const resolvedQueryRef = useRef('');
+    // 搜尋失敗（例如上游搜尋在目錄改版時要求重查）：不當成「找不到」，Enter 會重新搜尋
+    const [searchFailed, setSearchFailed] = useState(false);
+    const catalogVersion = useProductCatalogVersion();
+    const namesVersion = useProductNamesVersion();
 
     const watchlistCodes = useMemo(
         () => new Set(watchlistItems.map((i) => i.contract.code)),
@@ -128,13 +134,15 @@ export function HeaderSymbolSearch({
                 .then((items) => {
                     if (!active) return;
                     resolvedQueryRef.current = trimmedQuery;
+                    setSearchFailed(false);
                     setSuggestions(items);
                     setActiveIndex(0);
                     setSearching(false);
                 })
                 .catch(() => {
                     if (!active) return;
-                    resolvedQueryRef.current = trimmedQuery;
+                    resolvedQueryRef.current = '';
+                    setSearchFailed(true);
                     setSuggestions([]);
                     setSearching(false);
                 });
@@ -144,7 +152,7 @@ export function HeaderSymbolSearch({
             clearTimeout(timer);
             controller?.abort();
         };
-    }, [open, trimmedQuery, composing]);
+    }, [open, trimmedQuery, composing, catalogVersion, namesVersion]);
 
     const closeSearch = () => {
         setOpen(false);
@@ -375,14 +383,15 @@ export function HeaderSymbolSearch({
                             trimmedQuery &&
                             visibleItems.length === 0 && (
                                 <div className={styles.statusRow}>
-                                    找不到相符商品，按 Enter 直接解析代碼「
-                                    {trimmedQuery.toUpperCase()}」
+                                    {searchFailed
+                                        ? `搜尋失敗，按 Enter 重試（或直接解析代碼「${trimmedQuery.toUpperCase()}」）`
+                                        : `找不到相符商品，按 Enter 直接解析代碼「${trimmedQuery.toUpperCase()}」`}
                                 </div>
                             )}
 
                         {!trimmedQuery && visibleItems.length === 0 && (
                             <div className={styles.statusRow}>
-                                輸入代號或中文名稱（如：2330、台積、元大50、小台）
+                                輸入代號或中文名稱（如：2330、台積、元大50、台指）
                             </div>
                         )}
                     </div>

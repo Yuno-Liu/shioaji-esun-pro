@@ -98,8 +98,11 @@ it('a cash long and a 融券 short of the same stock are shown apart, even thoug
     expect(text(bar)).toContain('現股多 2');
     // the cash panel still warns: the cash buy does not cover the short
     expect(byTestId(r, 'flash-cover-warning')).toHaveLength(1);
-    // 平倉 stays with the positions panel while credit rows exist (net 0: no button)
-    expect(button(r, '平倉')).toBeUndefined();
+    // 平倉 stays with the positions panel while credit rows exist (net 0). Since upstream #376 the slot is always
+    // rendered, so it must be present but disabled and point to the positions panel — never a flatten action
+    const flat = button(r, '平倉')!;
+    expect(flat.props.disabled).toBe(true);
+    expect(flat.props.title).toContain('持倉面板');
 });
 
 it('the 融券 panel buys back as 融券買進（回補）, even when 可否融券 is 0', async () => {
@@ -157,5 +160,7 @@ it('cash panel holding a 融資 long: the sell side warns that a 現股 sell doe
     // only a cash long: no margin warning
     const r2 = await mount([cashRow]);
     expect(byTestId(r2, 'flash-margin-warning')).toHaveLength(0);
-    expect(button(r2, '市價賣')!.props.title).toBeUndefined();
+    // 上游讓按鈕提示顯示完整動作名稱；沒有融資多單時只是一般的「市價賣」，不是警告
+    expect(button(r2, '市價賣')!.props.title).toBe('市價賣');
+    expect(button(r2, '市價賣')!.props.title).not.toBe(CASH_SELL_NO_CLOSE_TEXT);
 });

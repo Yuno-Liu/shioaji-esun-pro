@@ -89,6 +89,43 @@ git diff $(git merge-base HEAD upstream/main) -- <檔案> | grep -c '^[+-][^+-]'
 同一批修正也改了持倉面板平倉、全平、`placeStockExitByShares` 與成交投影（`src/components/bottom-dock-positions.tsx`、`src/lib/conditional/flatten.ts`、`src/lib/trade.ts`、`src/lib/portfolio-projection.ts`），讓信用部位能用正確的條件平倉並套用成交。合併時同樣要保留。
 相關測試：`src/lib/odd-lot.test.ts`、`src/lib/trade-credit.test.ts`、`src/lib/credit-eligibility.test.ts`、`src/lib/chart-order-settings.test.ts`、`src/lib/flash-trigger.test.ts`、`src/components/order-ticket-credit.test.tsx`、`src/components/flash-order-credit.test.tsx`、`src/components/flash-order-short-cover.test.tsx`、`src/components/flash-order-cost.test.tsx`。上游若改寫這些規則，這些測試應該會失敗；不要直接改回上游的預期。
 
+## 同步紀錄
+
+### 2026-11-06（上游 65 個提交，Shioaji 1.7.10 → 1.7.11）
+
+11 個衝突檔，解法已由 rerere 記錄；細節見合併提交 568df3af 的訊息。
+
+- **交易**：
+  - `src/lib/trade.ts`：fork 的信用了結檢查與上游的「權證沒有零股」並存。
+  - `bottom-dock-positions.tsx`：沿用 fork 的 `refused()`（確定未送出、不對帳），市場判斷改用上游的 `contractMarket()`，權證歸股票。
+  - `flash-order.tsx`：採上游 #376 的「平倉鈕常駐」版面，數量與可否平倉仍看 fork 的 `exitNet`。買賣鈕提示遇到信用部位時，優先顯示 fork 的警告。
+- **搜尋**：上游重寫了搜尋。
+  - `product-search.ts`、`command-palette.tsx`、`App.tsx` 改採上游版本。
+  - `stock-index.ts` 的 `searchStocks` 以上游排序為主。fork 的模糊比對（去除前導 0 的代碼、代碼片段、多關鍵字、名稱子序列）只在上游比不到時補上，排在上游命中之後。「50 → 0050」這類去零後完全相符的代碼視同代碼相符。
+  - 頂欄與手機快速切換的模糊搜尋因此保留，「台電」「元大50」仍找得到。
+  - 「小台」這類期貨根簡稱的比對隨上游改寫移除，請用「台指」或 `MXF`。桌面頂欄的範例文字已改用「台指」。
+  - 審查修正：真正的代碼完全相符永遠排在去零相符之前（`6208` 日揚在 `006208` 富邦台50 之前，去零相符為 rank 0.5）。
+  - 上游每次搜尋讀股票目錄有 1.2 秒期限。手機搜尋面板與交易頁快速切換開啟時，先以不帶 signal 的 `loadStockCatalog()` 預熱，比照頂欄 focus 時的做法。
+  - 商品目錄或名稱目錄改版時，上游會讓進行中的查詢失敗並要求重查。手機 hook 與頂欄改為版本一變就自動重查；頂欄搜尋失敗時提示「按 Enter 重試」，不再顯示「找不到」。
+  - 手機版搜尋已在 QA mock 上端對端實測：自選搜尋面板與交易頁快速切換都正常。
+- **上游新的建置與執行期依賴**：
+  - `vite.config.ts` 匯入 `scripts/dev-etf-proxy.ts`，web 映像的 builder 階段原本沒有複製，`tsc -b` 失敗。已補上，並新增 `deploy/test_dockerfile.py`，檢查 tsconfig 與 vite 設定用到的檔案都有被複製。
+  - 上游新增同源路徑 `/metadata/etf/*`、`/metadata/equity/*`，用來向證交所、櫃買中心取得官方名稱；開發時由上面的代理提供。nginx 部署沒有代理這些路徑，請求會落到 `location /` 拿到 `index.html`，執行期解析失敗後，名稱退回券商的權證標的名稱，和同步前相同。
+  - 要讓網頁版也拿到官方名稱，需要在 nginx 加固定路徑的對外代理。這是新的對外連線，目前未做。
+- **手機版跟上的調整**：
+  - 權證持倉可以平倉（`closePlanFor` 改用 `contractMarket()`；權證有零股時先說明原因）。
+    lib 的 `resolveContract` 對權證不給漲跌停價（0），所以只有零股腳才要求漲跌停價；整張是市價 IOC，和 lib 相同。
+    玉山帳戶在說明面板就以 `esunStockLegProblem` 逐腳檢查。
+  - 交易頁持倉摘要、統計格與量單位把權證當股票整股（張）。
+  - 逐筆明細與下單面板的權證單位改為「張」。
+  - 產業頁測試補上 `GroupFlow.volumeRatio`。
+- **玉山**：`validateEsunStockOrder` 只接受 STK，玉山帳戶的權證委託仍在送出前拒絕（確定未送出），訊息改為明說「尚未支援權證委託」。
+  玉山 API 是否支援權證，需要在模擬環境實測後再決定。
+  桌面持倉面板平倉玉山的權證時，仍是確認之後才被 lib 擋下（也是確定未送出）。若要提前擋，需在上游熱點檔 `trade.ts` 加掛鉤，目前不加。
+- **搜尋的延遲載入體積**：上游搜尋本體含 390 筆 ETF 目錄，成為獨立的 `product-search` chunk，約 18.7 KiB gzip。
+  閒置預載或第一次開啟搜尋時才下載，手機首屏不受影響。
+- **熱點更新**：搜尋相關的 `product-search.ts`、`command-palette.tsx` 與上游已無差異；fork 差異集中在 `stock-index.ts` 的 `searchStocks`（模糊比對後補）。
+
 ## 同步後必跑
 
 ```bash
@@ -109,5 +146,10 @@ docker build --target runner      -t shioaji-pro-web:sync .
 - [ ] 上游 CI 的 pnpm 主版本（`pnpm/action-setup` 的 `version`）若改變，同步更新 `Dockerfile` 的 `PNPM_VERSION`。
 - [ ] `vite.config.ts` 與 `README.md` 仍只有最小的 fork 差異（見上表）。
 - [ ] 上游若新增 `/api` 路徑、SSE 或 `index.html` 之外的 HTML 入口，確認 `deploy/nginx.conf.template` 的代理與快取規則仍適用。
+  其他同源路徑（例如 2026-11 的 `/metadata/*`）在 nginx 會落到 `location /`、回 `index.html`，要確認執行期有後備。
+- [ ] 上游若在 `vite.config.ts` 或 tsconfig 加入新的建置期檔案（例如 `scripts/*.ts`），`Dockerfile` 的 builder 階段要一併 COPY。
+  `deploy/test_dockerfile.py` 會檢查；web 映像一定要實際建置一次。
+- [ ] 手機版（`src/mobile/**`）只呼叫 `src/lib` 既有函式；上游改了 lib 的型別或語意時，手機版的型別檢查、測試與 QA 都要重跑，
+  並量測手機首屏（設計規格 §13 的目標）。
 - [ ] fork CI（`.github/workflows/fork-ci.yml`）與上游 CI 都通過後，才合併回 `main`。
 - [ ] 合併後重新部署：`pnpm run docker:deploy`（或 `./scripts/deploy-docker.sh up`），確認 `docker compose ps` 三個服務都 healthy。

@@ -120,7 +120,7 @@ export function TickList({ code, contract }: { code: string; contract: ContractI
         };
     }, [code, contract.code, contract.security_type, retry]);
 
-    const unit = contract.security_type === 'STK' ? '張' : '口';
+    const unit = contract.security_type === 'STK' || contract.security_type === 'WRT' ? '張' : '口';
     return (
         <div data-testid='tick-list'>
             {status === 'error' && rows.length === 0 && (

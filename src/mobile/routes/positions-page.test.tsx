@@ -75,7 +75,11 @@ vi.mock('../../lib/server-info-store', () => ({
 vi.mock('../components/position-esun-details', () => ({
     PositionEsunDetails: ({ position }: { position: { code: string } }) => createElement('div', { 'data-testid': 'stub-esun-detail' }, `明細 ${position.code}`),
 }));
-vi.mock('../../lib/esun', () => ({ isEsunAccount: (a?: { broker_id?: string } | null) => !!a?.broker_id?.startsWith('ESUN') }));
+// 玉山規則用真正的 validateEsunStockOrder（closePlanFor 在說明面板就以玉山規則逐腳檢查）
+vi.mock('../../lib/esun', async () => {
+    const mapping = await vi.importActual<typeof import('../../lib/esun/order-mapping')>('../../lib/esun/order-mapping');
+    return { isEsunAccount: (a?: { broker_id?: string } | null) => !!a?.broker_id?.startsWith('ESUN'), validateEsunStockOrder: mapping.validateEsunStockOrder };
+});
 vi.mock('../../lib/flash-account', () => ({ accountMatches: (a?: Acc | null, b?: Acc | null) => same(a, b) }));
 vi.mock('../../lib/order-outcome', () => ({ reconcileAfterUnknownOutcome: m.reconcileAfterUnknownOutcome }));
 vi.mock('../../lib/privacy', () => ({
@@ -210,6 +214,29 @@ describe('純函式', () => {
         expect(closePlanFor(stockPos(), undefined)).toMatch(/商品資料/);
         expect(closePlanFor(stockPos({ account: undefined }), stk2330)).toMatch(/帳戶歸屬不明/);
         expect(closePlanFor(futPos({ direction: 'Sell' }), txf)).toEqual({ kind: 'futures', account: futAcc, contract: txf, action: 'Buy', lots: 2 });
+    });
+
+    it('closePlanFor：權證走股票平倉（同 lib contractMarket）；權證沒有零股；其他非證券商品仍是市場不符', () => {
+        // lib resolveContract 對權證不給漲跌停價（0）與名稱（代碼）：整張平倉是市價 IOC，不用漲跌停價，仍要能平倉
+        const wrt = { ...stk2330, code: '030392', security_type: 'WRT', name: '030392', reference: 0, limit_up: 0, limit_down: 0, day_trade: '' } as ContractInfo;
+        expect(closePlanFor(stockPos({ code: '030392', quantity: 2000 }), wrt)).toEqual({ kind: 'stock', account: stockAcc, contract: wrt, action: 'Sell', shares: 2000 });
+        expect(closePlanFor(stockPos({ code: '030392', quantity: 1500 }), wrt)).toBe(POSITIONS_TEXT.warrantOddLot);
+        expect(closePlanFor(stockPos(), { ...stk2330, security_type: 'IND' } as ContractInfo)).toBe(POSITIONS_TEXT.contractMismatch);
+        expect(closePlanFor(stockPos(), txf)).toBe(POSITIONS_TEXT.contractMismatch);
+    });
+
+    it('closePlanFor：只有零股腳需要漲跌停價（同 lib）；玉山帳戶在說明面板就以玉山規則逐腳檢查', () => {
+        const noLimits = { ...stk2330, limit_up: 0, limit_down: 0 } as ContractInfo;
+        expect(closePlanFor(stockPos({ quantity: 2000 }), noLimits)).toMatchObject({ kind: 'stock', action: 'Sell', shares: 2000 });
+        expect(closePlanFor(stockPos({ quantity: 2500 }), noLimits)).toBe(POSITIONS_TEXT.noLimits);
+        // 玉山（stockAcc2）：權證、超過 499 張的整張腳在確認前就拒絕，不等 lib 在確認後才擋
+        const wrt = { ...stk2330, code: '030392', security_type: 'WRT', name: '030392', reference: 0, limit_up: 0, limit_down: 0, day_trade: '' } as ContractInfo;
+        expect(closePlanFor(stockPos({ code: '030392', quantity: 2000, account: stockAcc2 }), wrt)).toMatch(/^玉山：.*權證/);
+        expect(closePlanFor(stockPos({ quantity: 500_000, yd_quantity: 500_000, account: stockAcc2 }), stk2330)).toMatch(/^玉山：整股委託數量必須在 1 至 499 張之間/);
+        // 玉山一般的整張＋零股平倉兩腳都合法，照常
+        expect(closePlanFor(stockPos({ account: stockAcc2 }), stk2330)).toMatchObject({ kind: 'stock', account: stockAcc2, shares: 3500 });
+        // 永豐不套玉山規則
+        expect(closePlanFor(stockPos({ quantity: 500_000, yd_quantity: 500_000 }), stk2330)).toMatchObject({ kind: 'stock', shares: 500_000 });
     });
 
     it('addOnPlanFor：各種部位帶入的方向、單位、信用條件與當沖先賣', () => {

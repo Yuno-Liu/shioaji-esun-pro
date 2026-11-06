@@ -59,6 +59,7 @@ import type {
     StockPosition,
 } from './types/portfolio';
 import type { HistoryTicks } from './types/tick';
+import { contractMarket } from './contract-market';
 import { todayStr } from './utils/date';
 
 export interface ServerInfo {
@@ -222,23 +223,25 @@ function contractQuery(params: Record<string, string | number | undefined>) {
     return qs.size ? `?${qs.toString()}` : '';
 }
 
-export function fetchContractBase(code: string, securityType?: SecurityType) {
+export function fetchContractBase(code: string, securityType?: SecurityType, opts?: { signal?: AbortSignal }) {
     const normalized = normalizeContractCode(code, securityType);
     return apiGet<ContractBase>(
         `/api/v1/data/contracts/${encodeURIComponent(normalized)}${contractQuery({
             security_type: securityType ?? undefined,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
-export function fetchContractInfo(code: string, securityType?: SecurityType) {
+export function fetchContractInfo(code: string, securityType?: SecurityType, opts?: { signal?: AbortSignal }) {
     const normalized = normalizeContractCode(code, securityType);
     return apiGet<ContractInfo>(
         `/api/v1/data/contracts/${encodeURIComponent(normalized)}/info${contractQuery({
             security_type: securityType ?? undefined,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
@@ -261,8 +264,11 @@ export function fetchContract(
 export async function resolveContract(
     code: string,
     securityType?: SecurityType,
+    opts?: { signal?: AbortSignal },
 ): Promise<ContractInfo> {
-    const base = await fetchContractBase(code, securityType);
+    const base = await fetchContractBase(code, securityType, opts);
+    // Cancellation must also stop the next GET when a transport finishes late.
+    if (opts?.signal?.aborted) throw opts.signal.reason ?? new DOMException('aborted', 'AbortError');
     if (base.security_type === 'WRT') {
         // Warrant info is sharded by underlying and cannot be fetched from
         // /{code}/info. A later warrant search can prime the full record.
@@ -280,13 +286,14 @@ export async function resolveContract(
             short_selling_balance: 0,
         };
     }
-    return fetchContractInfo(base.code, base.security_type);
+    return fetchContractInfo(base.code, base.security_type, opts);
 }
 
 export function fetchContracts(
     securityType: Exclude<SecurityType, null>,
     page?: number,
     pageSize?: number,
+    opts?: { signal?: AbortSignal },
 ) {
     return apiGet<ContractsQueryResponse>(
         `/api/v1/data/contracts${contractQuery({
@@ -295,6 +302,7 @@ export function fetchContracts(
             page,
             page_size: pageSize,
         })}`,
+        opts,
     );
 }
 
@@ -302,7 +310,7 @@ export function fetchFutures(filters: {
     root?: string;
     underlyingCode?: string;
     deliveryMonth?: string;
-} = {}) {
+} = {}, opts?: { signal?: AbortSignal }) {
     return apiGet<ContractInfo[]>(
         `/api/v1/data/contracts/futures${contractQuery({
             root: filters.root,
@@ -310,12 +318,14 @@ export function fetchFutures(filters: {
             delivery_month: filters.deliveryMonth,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
-export function fetchFuturesRoots() {
+export function fetchFuturesRoots(opts?: { signal?: AbortSignal }) {
     return apiGet<ContractRoot[]>(
         '/api/v1/data/contracts/futures/roots?region=TW',
+        opts,
     );
 }
 
@@ -361,6 +371,7 @@ export function fetchWarrants(
         expiryFrom?: string;
         expiryTo?: string;
     } = {},
+    opts?: { signal?: AbortSignal },
 ) {
     return apiGet<ContractInfo[]>(
         `/api/v1/data/contracts/warrants${contractQuery({
@@ -373,12 +384,14 @@ export function fetchWarrants(
             expiry_to: filters.expiryTo,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
-export function fetchWarrantUnderlyings() {
+export function fetchWarrantUnderlyings(opts?: { signal?: AbortSignal }) {
     return apiGet<WarrantUnderlying[]>(
         '/api/v1/data/contracts/warrants/underlyings?region=TW&include_name=true',
+        opts,
     );
 }
 
@@ -602,6 +615,13 @@ async function updateCapabilitySubscription(
         }
         if (action === 'unsubscribe' && refs === 0) {
             return { success: true, message: 'Already unsubscribed' };
+        }
+        // the last consumer releases nothing the server should drop (every
+        // stock is still fed under another key): forget the key locally
+        if (action === 'unsubscribe' && Array.isArray(body.stocks) && body.stocks.length === 0) {
+            capabilityRefs.delete(key);
+            unregisterCapabilitySubscription(key);
+            return { success: true, message: 'Nothing to release' };
         }
         let response: CapabilityResponse;
         for (let attempt = 0; ; attempt++) {
@@ -931,7 +951,7 @@ async function prepareOrderMutation(tradeId: string, trace: OrderTraceRecord | n
     const account = getAccountState().accounts.find(a => canTrade(a) && reference
         && a.account_type === reference.account_type && a.broker_id === reference.broker_id && a.account_id === reference.account_id);
     if (!account) refuse('缺少已驗證的委託帳戶，未送出改刪單');
-    const futures = ['FUT', 'OPT'].includes(trade.contract.security_type ?? '');
+    const futures = contractMarket(trade.contract.security_type) === 'F';
     if (account!.account_type !== (futures ? 'F' : 'S')) refuse('商品與委託帳戶不符，未送出改刪單');
     traceTrade(trace, trade, trade.account ?? trade.order.account ?? account);
     traceSet(trace, { reconcile: { ran: false } });

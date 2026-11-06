@@ -85,6 +85,14 @@ export type PulseSection = 'stocks' | 'flow';
 export type PulseSectionWeights = Record<PulseSection, number>;
 export type PulseIndexCode = 'IX0001' | 'IX0043';
 
+// 產業全景可同時開多個面板，各面板自己選市場（加權／櫃買）
+export const PANORAMA_INDEX_CODES = ['IX0001', 'IX0043'] as const;
+export type PanoramaIndexCode = (typeof PANORAMA_INDEX_CODES)[number];
+export const PANORAMA_INDEX_LABELS: Record<PanoramaIndexCode, string> = {
+    IX0001: '加權',
+    IX0043: '櫃買',
+};
+
 export interface Block {
     id: string;
     // Panel-local indicator state travels with saved workspace profiles.
@@ -111,6 +119,10 @@ export interface Block {
     pulseSections?: PulseSection[];
     pulseWeights?: Partial<PulseSectionWeights>;
     pulseIndex?: PulseIndexCode;
+    // 產業全景各面板自己的市場（可同時開加權與櫃買）；缺省 = 沿用上次選擇。
+    // 不列入 workspace spec 的 settings（與 pulseIndex 同）：套用 spec 時由
+    // 既有面板保留自己的市場，新面板才回到預設。
+    panoramaIndex?: PanoramaIndexCode;
     // 當日走勢牆的面板設定（清單/排列）— 跟版面一起持久化
     wallList?: string;
     wallCols?: number;
@@ -139,7 +151,7 @@ export interface Block {
 
 export const CHAIN_VIEWS = ['rank', 'rotation', 'heat'] as const;
 export type ChainView = (typeof CHAIN_VIEWS)[number];
-export const CHAIN_KINDS = ['all', 'chain', 'theme'] as const;
+export const CHAIN_KINDS = ['all', 'chain', 'theme', 'industry'] as const;
 export type ChainKind = (typeof CHAIN_KINDS)[number];
 export const HOLDING_FORMS = ['bubble', 'lanes'] as const;
 export type HoldingForm = (typeof HOLDING_FORMS)[number];
@@ -167,6 +179,14 @@ export interface Workspace {
     layout: LayoutItem[];
     // 連動群組各自的代碼（跟版面一起存）
     linkGroups?: Partial<Record<LinkGroupId, string>>;
+    // 此版本不認得的面板（較新版本存的版面降版讀到）：只在記憶體帶著、
+    // 不渲染；存檔時原樣併回，升版後面板自動回來。見 sanitizeWorkspace。
+    unsupported?: UnsupportedPanels;
+}
+
+export interface UnsupportedPanels {
+    blocks: Record<string, unknown>[];
+    layout: LayoutItem[];
 }
 
 // ---- 連動群組 ----
@@ -534,12 +554,13 @@ export const BLOCK_META: Record<
         description: '產業資金與強弱地圖，點產業下鑽主力貢獻',
         category: 'market',
         pinnable: false,
-        singleton: true,
+        // 可同時開多個：各面板存自己的 panoramaIndex（加權／櫃買並排免切換）
+        singleton: false,
         defaultSize: { w: 8, h: 11, minW: 5, minH: 6 },
     },
     chainmap: {
         label: '產業鏈資金流向',
-        description: '產業鏈與題材的即時資金流向：族群淨流入排行、輪動與熱力，上中下游流向與領頭股',
+        description: '產業鏈、題材與細產業的即時資金流向：族群金流排行、輪動與漲跌熱力／清單，上中下游流向與領頭股',
         category: 'market',
         pinnable: false,
         singleton: false,
@@ -1122,7 +1143,7 @@ const RAW_LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace }[]
     },
     {
         name: '族群輪動',
-        desc: '輪動象限看資金轉進、熱力看成分股，訊號與 K 線找點、閃電進場',
+        desc: '輪動象限看資金轉進、漲跌看成分股，訊號與 K 線找點、閃電進場',
         workspace: {
             blocks: [
                 { id: 'rotation-rt', type: 'chainmap', pin: null, chainView: 'rotation', chainKind: 'all' },
@@ -1142,7 +1163,7 @@ const RAW_LAYOUT_PRESETS: { name: string; desc: string; workspace: Workspace }[]
     },
     {
         name: '個股研究',
-        desc: '日 K 與報價、公司基本面與供應鏈位置，對照所屬族群的資金熱力',
+        desc: '日 K 與報價、公司基本面與供應鏈位置，對照所屬族群的漲跌熱力',
         workspace: {
             blocks: [
                 { id: 'watch-sr', type: 'watchlist', pin: null },
@@ -1178,8 +1199,100 @@ function validWorkspace(w: unknown): w is Workspace {
     const ws = w as Workspace;
     if (!Array.isArray(ws.blocks) || !Array.isArray(ws.layout)) return false;
     if (ws.blocks.length === 0) return false;
+    if (!ws.blocks.every((b) => !!b && typeof b === 'object')) return false;
+    if (!ws.layout.every((l) => !!l && typeof l === 'object')) return false;
     const ids = new Set(ws.blocks.map((b) => b.id));
     return ws.layout.every((l) => ids.has(l.i));
+}
+
+export function isKnownBlockType(value: unknown): value is BlockType {
+    return (
+        typeof value === 'string' &&
+        Object.prototype.hasOwnProperty.call(BLOCK_META, value)
+    );
+}
+
+/**
+ * 讀入邊界的唯一關卡：較新版本存的版面可能含這版不認得的面板類型
+ * （BLOCK_META 查不到 → 渲染時整個 App 崩潰）。未知類型的面板連同
+ * 對應的 layout 格子移到 `unsupported`，不渲染但跟著存檔原樣保留；
+ * 剩下的面板若一個都不剩就用預設版面（仍帶著 unsupported）。
+ * 已知類型完全不動；沒有未知面板時回傳原物件。
+ */
+export function sanitizeWorkspace(w: Workspace): Workspace {
+    const carried = w.unsupported;
+    const unknownIds = new Set(
+        w.blocks.filter((b) => !isKnownBlockType(b.type)).map((b) => b.id),
+    );
+    if (unknownIds.size === 0) return w;
+    const unsupported: UnsupportedPanels = {
+        blocks: [
+            ...(carried?.blocks ?? []),
+            ...(w.blocks.filter((b) => unknownIds.has(b.id)) as unknown as Record<string, unknown>[]),
+        ],
+        layout: [
+            ...(carried?.layout ?? []),
+            ...w.layout.filter((l) => unknownIds.has(l.i)),
+        ],
+    };
+    const blocks = w.blocks.filter((b) => !unknownIds.has(b.id));
+    if (blocks.length === 0) {
+        // 連動群組代碼是版面層級的資料，跟著留下（未知面板升版回來時還用得到）
+        return {
+            ...structuredClone(DEFAULT_WORKSPACE),
+            ...(w.linkGroups ? { linkGroups: w.linkGroups } : {}),
+            unsupported,
+        };
+    }
+    return {
+        ...w,
+        blocks,
+        layout: w.layout.filter((l) => !unknownIds.has(l.i)),
+        unsupported,
+    };
+}
+
+/** 此版本略過的面板數（給提示用） */
+export function unsupportedPanelCount(w: Workspace): number {
+    return w.unsupported?.blocks.length ?? 0;
+}
+
+/** 啟動提示文字；兩者皆 0 回傳 null */
+export function unsupportedPanelsNotice(current: number, library: number): string | null {
+    if (current <= 0 && library <= 0) return null;
+    const where = [
+        current > 0 ? `目前版面 ${current} 個` : null,
+        library > 0 ? `版面庫 ${library} 個` : null,
+    ]
+        .filter(Boolean)
+        .join('、');
+    return `${where}面板此版本不支援，已暫時略過（版面資料仍保留），請更新到最新版。`;
+}
+
+/**
+ * 寫入儲存的形狀：把 unsupported 併回 blocks/layout（不留 unsupported
+ * 欄位），較新版本讀到時面板原樣回來。id 若已被目前面板用掉（例如全部
+ * 未知時換成的預設版面、Agent 用了同一個 id），略過的面板換一個不衝突
+ * 的 id 連同 layout 一起存，不丟資料；換過的 id 存下後之後讀寫都穩定。
+ */
+export function toStoredWorkspace(w: Workspace): Workspace {
+    const { unsupported, ...rest } = w;
+    if (!unsupported || unsupported.blocks.length === 0) return rest;
+    const used = new Set<string>(rest.blocks.map((b) => b.id));
+    for (const l of rest.layout) used.add(l.i);
+    const blocks: Block[] = [...rest.blocks];
+    const layout: LayoutItem[] = [...rest.layout];
+    for (const hidden of unsupported.blocks) {
+        if (typeof hidden.id !== 'string') continue;
+        const original = hidden.id;
+        let id = original;
+        for (let n = 1; used.has(id); n++) id = `${original}~${n}`;
+        used.add(id);
+        blocks.push({ ...hidden, id } as unknown as Block);
+        const item = unsupported.layout.find((l) => l.i === original);
+        if (item) layout.push({ ...item, i: id });
+    }
+    return { ...rest, blocks, layout };
 }
 
 export function loadWorkspace(): Workspace {
@@ -1188,7 +1301,7 @@ export function loadWorkspace(): Workspace {
         const raw = localStorage.getItem(WS_KEY);
         if (raw) {
             const w = JSON.parse(raw);
-            if (validWorkspace(w)) return w;
+            if (validWorkspace(w)) return sanitizeWorkspace(stripCarry(w));
         }
     } catch {
         // fall through to legacy
@@ -1198,7 +1311,7 @@ export function loadWorkspace(): Workspace {
         const legacy = localStorage.getItem(WS_KEY_LEGACY);
         if (legacy) {
             const w = JSON.parse(legacy);
-            if (validWorkspace(w)) return upscaleLegacyWorkspace(w);
+            if (validWorkspace(w)) return sanitizeWorkspace(upscaleLegacyWorkspace(stripCarry(w)));
         }
     } catch {
         // fall through
@@ -1206,8 +1319,25 @@ export function loadWorkspace(): Workspace {
     return structuredClone(DEFAULT_WORKSPACE);
 }
 
+// 儲存的 JSON 不該有 unsupported 欄位（toStoredWorkspace 已併回）；
+// 萬一有就丟掉，避免外部資料塞進非預期形狀
+function stripCarry(w: Workspace): Workspace {
+    if (!('unsupported' in w)) return w;
+    const { unsupported: _u, ...rest } = w;
+    return rest;
+}
+
+/**
+ * 錯誤畫面的「重設版面」：目前版面（v3）寫成預設版面，版面庫（profiles）
+ * 不動。寫預設而不是刪 key：刪掉會讓讀取退回 v2 舊存檔，若壞的是那份
+ * 就會重載後再崩一次；v2 原樣保留給更舊的版本降版用。
+ */
+export function resetSavedWorkspace() {
+    localStorage.setItem(WS_KEY, JSON.stringify(DEFAULT_WORKSPACE));
+}
+
 export function saveWorkspace(w: Workspace) {
-    localStorage.setItem(WS_KEY, JSON.stringify(w));
+    localStorage.setItem(WS_KEY, JSON.stringify(toStoredWorkspace(w)));
 }
 
 export function loadProfiles(): Profile[] {
@@ -1217,12 +1347,16 @@ export function loadProfiles(): Profile[] {
         return (arr as Profile[])
             .filter(
                 (p) =>
-                    typeof p.name === 'string' && validWorkspace(p.workspace),
+                    !!p &&
+                    typeof p === 'object' &&
+                    typeof p.name === 'string' &&
+                    validWorkspace(p.workspace),
             )
             .map((p) => {
-                const ws = legacy
-                    ? upscaleLegacyWorkspace(p.workspace)
-                    : p.workspace;
+                const base = stripCarry(p.workspace);
+                const ws = sanitizeWorkspace(
+                    legacy ? upscaleLegacyWorkspace(base) : base,
+                );
                 return typeof p.icon === 'string' && p.icon
                     ? { ...p, workspace: ws }
                     : { name: p.name, workspace: ws };
@@ -1250,7 +1384,12 @@ export function loadProfiles(): Profile[] {
 }
 
 export function saveProfiles(profiles: Profile[]) {
-    localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+    localStorage.setItem(
+        PROFILES_KEY,
+        JSON.stringify(
+            profiles.map((p) => ({ ...p, workspace: toStoredWorkspace(p.workspace) })),
+        ),
+    );
 }
 
 let blockCounter = Date.now() % 100000;

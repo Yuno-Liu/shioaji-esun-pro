@@ -71,6 +71,17 @@ describe('searchStocks (fuzzy search)', () => {
         expect(searchStocks(sample, '330')[0]?.code).toBe('2330');
     });
 
+    it('a true exact code beats a leading-zero-stripped match (6208 日揚 before 006208 富邦台50)', () => {
+        const catalog = [
+            { code: '006208', name: '富邦台50', category: '00', exchange: 'TSE', kind: 'ETF' },
+            { code: '6208', name: '日揚', category: '28', exchange: 'OTC' },
+        ] as Parameters<typeof searchStocks>[0];
+        expect(searchStocks(catalog, '6208').map(s => s.code)).toEqual(['6208', '006208']);
+        // 沒有真正相符時，去零相符仍排第一
+        expect(searchStocks(sample, '50')[0]?.code).toBe('0050');
+        expect(searchStocks(sample, '878')[0]?.code).toBe('00878');
+    });
+
     it('normalizes 臺 and 台 in stock names and queries', () => {
         expect(searchStocks(sample, '臺積電')[0]?.code).toBe('2330');
         expect(searchStocks(sample, '台灣企銀')[0]?.code).toBe('2834');

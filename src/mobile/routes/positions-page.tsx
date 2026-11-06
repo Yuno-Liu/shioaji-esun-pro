@@ -52,6 +52,8 @@ import { SHARES_PER_LOT } from '../../lib/odd-lot';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
 import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../../lib/privacy';
 import { useServerInfo, yesterdayQuantityNotice } from '../../lib/server-info-store';
+import { contractMarket, isWarrant } from '../../lib/contract-market';
+import { esunStockLegProblem } from '../../lib/order-route';
 import { creditExitLabel, stockExitFor, type CreditExitCond } from '../../lib/stock-exit-cond';
 import { notify, placeQuickOrder, placeStockExitByShares } from '../../lib/trade';
 import { discountText, useTradingCostSettings, type TradingCostSettings } from '../../lib/trading-cost-settings';
@@ -129,6 +131,7 @@ export const POSITIONS_TEXT = {
     badQuantity: '持倉數量或方向不明，未送出委託',
     noContract: '商品資料（含漲跌停價）尚未載入，暫時無法平倉',
     contractMismatch: '商品與持倉帳戶市場不符，未送出委託',
+    warrantOddLot: '權證沒有零股，未滿一張的部分無法平倉，未送出委託',
     noLimits: '漲跌停價未知，暫時無法平倉',
     gone: '這筆持倉已不在清單中（可能已平倉或已更新）',
     switchLocked: '下單面板開啟或確認進行中，暫時不能切換帳戶。',
@@ -214,13 +217,44 @@ export function closePlanFor(p: AccountedPosition, contract: ContractInfo | unde
         const exit = stockExitFor(p.direction, p.cond, p.quantity);
         if (typeof exit === 'string') return exit;
         if (!contract) return POSITIONS_TEXT.noContract;
-        if (contract.security_type !== 'STK') return POSITIONS_TEXT.contractMismatch;
-        if (!(contract.limit_up > 0) || !(contract.limit_down > 0)) return POSITIONS_TEXT.noLimits;
+        // 權證與股票同一條下單路徑（lib contractMarket：STK、WRT 都是證券市場）；權證沒有零股，lib 送出前也會再擋
+        if (contractMarket(contract.security_type) !== 'S') return POSITIONS_TEXT.contractMismatch;
+        const odd = p.quantity % 1000;
+        if (isWarrant(contract.security_type) && odd !== 0) return POSITIONS_TEXT.warrantOddLot;
+        // 整張以市價 IOC 送出、不用漲跌停價；只有零股腳以漲跌停價限價（同 lib placeStockExitByShares）。
+        // 權證的合約資料沒有漲跌停價（lib resolveContract 回 0），整張平倉仍可送出。
+        if (odd !== 0 && (!(contract.limit_up > 0) || !(contract.limit_down > 0))) return POSITIONS_TEXT.noLimits;
+        // 玉山帳戶：照 lib 實際送出的兩腳先用玉山規則檢查（例如權證、超過 499 張），在說明面板就說明原因，不等確認後才被拒
+        const esunProblem = esunExitLegsProblem(account, contract, exit, p.quantity);
+        if (esunProblem) return esunProblem;
         return { kind: 'stock', account, contract, action: exit.exit, shares: p.quantity, ...(exit.orderCond ? { orderCond: exit.orderCond } : {}) };
     }
     if (!contract) return POSITIONS_TEXT.noContract;
     if (contract.security_type !== 'FUT' && contract.security_type !== 'OPT') return POSITIONS_TEXT.contractMismatch;
     return { kind: 'futures', account, contract, action: p.direction === 'Buy' ? 'Sell' : 'Buy', lots: p.quantity };
+}
+
+/**
+ * 平倉兩腳（同 lib placeStockExitByShares：整張市價 IOC＋信用條件、零股以漲跌停價限價 ROD 現股）逐腳以玉山規則檢查。
+ * 永豐帳戶回 null（交給 lib 與券商）。
+ */
+export function esunExitLegsProblem(
+    account: Account,
+    contract: ContractInfo,
+    exit: { exit: Action; orderCond?: CreditExitCond },
+    shares: number,
+): string | null {
+    type Leg = Parameters<typeof esunStockLegProblem>[2];
+    const lots = Math.floor(shares / 1000);
+    const odd = shares % 1000;
+    const legs: Leg[] = [];
+    if (lots > 0) legs.push({ action: exit.exit, price: 0, quantity: lots, price_type: 'MKT', order_type: 'IOC', order_lot: 'Common', order_cond: exit.orderCond ?? 'Cash' });
+    if (odd > 0) legs.push({ action: exit.exit, price: exit.exit === 'Sell' ? contract.limit_down : contract.limit_up, quantity: odd, price_type: 'LMT', order_type: 'ROD', order_lot: 'IntradayOdd', order_cond: 'Cash' });
+    for (const leg of legs) {
+        const problem = esunStockLegProblem(account, contract, leg);
+        if (problem) return problem;
+    }
+    return null;
 }
 
 /** 送出前（lib 的 beforeSend）同步檢查 ResumeGate；不允許時丟出 mutationNotStarted 錯誤 */

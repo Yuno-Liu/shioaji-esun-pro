@@ -1,4 +1,9 @@
 // src/lib/product-search-ranking.test.ts — 個股期根不得排在股票前面、過時搜尋可取消
+//
+// 2026-11 同步上游：searchProducts 改用上游的重寫版本（相關商品依股票、連續月期貨、權證分組；
+// 期貨以 underlying_code 關聯標的，不看 target_code；所有讀取都帶搜尋的 AbortSignal）。本檔保留 fork 的保護目的：
+// 股票不被個股期擠到後面、明確要期貨時列出個股期、取消的搜尋不再發出請求或留下未取消的請求。
+// 「小台」這類期貨根簡稱的子序列比對已隨上游重寫移除（請用「台指」或 MXF），不再測試。
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractInfo } from './types/contract';
@@ -9,6 +14,7 @@ const cdfContract: ContractInfo = {
     exchange: 'TAIFEX',
     security_type: 'FUT',
     target_code: '2330',
+    underlying_code: '2330',
     currency: 'TWD',
     reference: 1000,
     limit_up: 1100,
@@ -71,10 +77,11 @@ describe('searchProducts — 個股期根排序', () => {
         mocks.resolveContract.mockRejectedValue(new Error('not found'));
     });
 
-    it('部分股票名稱「台積」：股票排第一，不把個股期插到前面', async () => {
+    it('部分股票名稱「台積」：股票排第一，相關個股期只排在股票之後', async () => {
         const results = await searchProducts('台積');
         expect(results[0]).toMatchObject({ code: '2330', security_type: 'STK' });
-        expect(results.some((r) => r.security_type === 'FUT')).toBe(false);
+        const firstFuture = results.findIndex((r) => r.security_type === 'FUT');
+        expect(firstFuture === -1 || firstFuture > results.findIndex((r) => r.code === '2330')).toBe(true);
     });
 
     it('完整股票名稱「台積電」：仍以股票為第一筆', async () => {
@@ -87,14 +94,6 @@ describe('searchProducts — 個股期根排序', () => {
         expect(results.some((r) => r.code === 'CDFR1' && r.security_type === 'FUT')).toBe(true);
     });
 
-    it('期貨別名完全相符（小台）仍會列出期貨', async () => {
-        mocks.fetchFutures.mockImplementation(async (params?: { root?: string }) =>
-            params?.root === 'MXF' ? [{ ...cdfContract, code: 'MXFR1', root: 'MXF', name: '小型臺指期貨近月' }] : [],
-        );
-        const results = await searchProducts('小台');
-        expect(results[0]).toMatchObject({ code: 'MXFR1', security_type: 'FUT' });
-    });
-
     it('已取消（AbortSignal）的搜尋不再送出合約解析請求', async () => {
         const controller = new AbortController();
         controller.abort();
@@ -103,18 +102,26 @@ describe('searchProducts — 個股期根排序', () => {
         expect(mocks.fetchFutures).not.toHaveBeenCalled();
     });
 
-    it('目錄載入期間被取消時也不送出後續請求', async () => {
+    it('目錄載入期間被取消時不再送出後續請求', async () => {
         const controller = new AbortController();
         let release!: () => void;
+        let started!: () => void;
+        const catalogStarted = new Promise<void>((resolve) => { started = resolve; });
         mocks.loadStockCatalog.mockImplementation(
             () => new Promise((resolve) => {
+                started();
                 release = () => resolve([{ code: '2330', name: '台積電', exchange: 'TSE', category: '24' }]);
             }),
         );
         const pending = searchProducts('2330', 10, { signal: controller.signal });
+        await catalogStarted;
+        // 上游先查直接代碼、再載入目錄：取消前已完成的請求不算；取消之後不得再發出任何請求
+        const resolvedBeforeAbort = mocks.resolveContract.mock.calls.length;
         controller.abort();
         release();
         await expect(pending).rejects.toBeDefined();
-        expect(mocks.resolveContract).not.toHaveBeenCalled();
+        expect(mocks.resolveContract).toHaveBeenCalledTimes(resolvedBeforeAbort);
+        expect(mocks.fetchFutures).not.toHaveBeenCalled();
+        expect(mocks.fetchWarrants).not.toHaveBeenCalled();
     });
 });

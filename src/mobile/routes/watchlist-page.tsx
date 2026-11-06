@@ -351,7 +351,7 @@ const RankingList = retryableLazy(() => loadRankingList().then(m => m.RankingLis
 const resetRankingList = () => { RankingList.reset(); };
 
 // 搜尋面板只在按「搜尋」（或空清單的「搜尋並加入」、編輯模式的「加入股票」）後才用到：延遲載入（連同 lib/product-search
-// 約 4 KiB gzip），閒置時由 app.tsx 預載。第一次要求開啟時才掛載、之後保持掛載（面板開關動畫正常；同 app.tsx 的下單面板）。
+// 面板約 1.4 KiB gzip，另需上游搜尋本體 product-search chunk 約 18.7 KiB），閒置時由 app.tsx 預載。第一次要求開啟時才掛載、之後保持掛載（面板開關動畫正常；同 app.tsx 的下單面板）。
 // 載入失敗以底部面板顯示「載入失敗」＋［重試］（SheetLoadError），可關閉，不影響頁面。
 const SearchSheet = retryableLazy(() => loadSearchSheet().then(m => m.SearchSheet), 'SearchSheet');
 const resetSearchSheet = () => { SearchSheet.reset(); };

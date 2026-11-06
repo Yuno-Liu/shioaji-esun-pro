@@ -158,6 +158,13 @@ describe('validateEsunStockOrder', () => {
         expect(validateEsunStockOrder(futuresContract, order)).toContain('僅支援台股現貨交易');
     });
 
+    it('rejects warrants with a warrant-specific reason (2026-11: warrants share the stock order path upstream)', () => {
+        const order: StockOrderReq = { action: 'Sell', price: 0, quantity: 2, price_type: 'MKT', order_type: 'IOC' };
+        const reason = validateEsunStockOrder({ ...stockContract, code: '030392', security_type: 'WRT' }, order);
+        expect(reason).toContain('權證');
+        expect(reason).not.toContain('期貨');
+    });
+
     it('rejects invalid quantities', () => {
         const order: StockOrderReq = {
             action: 'Buy',
