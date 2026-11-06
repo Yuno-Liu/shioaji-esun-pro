@@ -54,6 +54,16 @@ vi.mock('./lib/deferred-modules', () => ({
         if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: ranking-list.js');
         return {};
     },
+    loadWatchSparkline: async () => {
+        m.deferredLoads.push('watch-sparkline');
+        if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: watch-sparkline.js');
+        return {};
+    },
+    loadSearchSheet: async () => {
+        m.deferredLoads.push('search-sheet');
+        if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: search-sheet.js');
+        return {};
+    },
 }));
 
 import { MobileShell } from './app';
@@ -139,14 +149,14 @@ describe('MobileShell lazy module failures', () => {
 });
 
 describe('MobileShell idle prefetch', () => {
-    it('首屏完成 1.5 秒後閒置預載：包含自選頁排行（延遲載入的新模組）', async () => {
+    it('首屏完成 1.5 秒後閒置預載：包含自選列迷你走勢（排第一）、自選頁搜尋面板與排行（延遲載入的新模組）', async () => {
         m.failOrders = false;
         await mount();
         expect(m.deferredLoads).toEqual([]);
         await act(async () => { await vi.advanceTimersByTimeAsync(1_499); });
         expect(m.deferredLoads).toEqual([]);
         await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-        expect(m.deferredLoads).toEqual(['ranking-list']);
+        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet', 'ranking-list']);
         expectPersistentChromeMounted();
     });
 
@@ -155,7 +165,7 @@ describe('MobileShell idle prefetch', () => {
         m.deferredFail = true;
         await mount();
         await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
-        expect(m.deferredLoads).toEqual(['ranking-list']);
+        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet', 'ranking-list']);
         expect(byTestId('ticket-load-error')).toHaveLength(0);
         expect(byTestId('route-load-error')).toHaveLength(0);
         expectPersistentChromeMounted();

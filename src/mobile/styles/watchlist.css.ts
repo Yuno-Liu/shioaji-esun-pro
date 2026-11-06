@@ -1,7 +1,10 @@
 // src/mobile/styles/watchlist.css.ts — 自選、排行與搜尋面板（設計規格 §7.2、§4.7、§4.8、§6.12–§6.14）
 // - 頁面表面 contentBg（淺色主題含漲跌色文字的清單放白底，§4.8 規則 9）；頁首與分段用 ui/* 共用元件。
-// - 列 56px：左 headline 代碼＋subhead 名稱；右 numMd 價格（漲跌色＋PriceFlash 覆蓋層）＋漲跌膠囊
-//   （實心 up／down＋inkStrong 白字 numSm 600，min-width 4.75rem、高 1.75rem、圓角 6；平盤 elevatedBg＋foreground）。
+// - 自選列 64px（依使用者參考圖改版）：左第一行名稱 headline、第二行代碼＋市場標記＋徽章（試撮、處置）；
+//   右第一行成交價（比 numMd 大一級、漲跌色＋PriceFlash 覆蓋層）、第二行「漲跌 漲跌幅」或總量（純文字、漲跌色）；
+//   迷你走勢 canvas（可在帳戶頁關閉）；列尾快速下單鍵 IconButton 44（指數、組合商品不顯示）。
+// - 排行列沿用漲跌膠囊（pill：實心 up／down＋inkStrong 白字 numSm 600；平盤 elevatedBg＋foreground）。
+// - 底部指數列（indexStrip）放在殼層配件槽（bar 材質上：標籤、數值、漲跌幅文字一律 foreground，方向以有色 ▲▼ 圖形表示）。
 // - 髮絲線左內縮 16；捲動容器內的列用 pressableRow（延後 80ms 加深）。
 // - 顏色只用 vars／sj；漲跌只用 vars.color.up／down 並附 ▲▼ 或正負號；不用 color-mix()、:has()、linear()；
 //   只動畫 opacity（按壓、骨架、跳價閃爍皆由共用元件處理）。
@@ -33,10 +36,9 @@ export const controls = style({
     minWidth: 0,
 });
 
-/** 清單切換（PopUpButton）靠左，不撐滿 */
-export const listPicker = style({
-    alignSelf: 'flex-start',
-    maxWidth: '100%',
+/** 多個自選清單的分頁（Segmented scroll 變體）：不撐出頁寬，自己橫向捲動 */
+export const listTabs = style({
+    minWidth: 0,
 });
 
 export const listName = style({
@@ -50,15 +52,15 @@ export const stateBlock = style({
     padding: `${SPACE.s2} calc(${PAD_X} + ${SAFE_RIGHT}) 0 calc(${PAD_X} + ${SAFE_LEFT})`,
 });
 
-// ---- 表頭（商品｜指標切換鍵） ----
+// ---- 表頭（名稱｜指標切換鍵｜編輯） ----
 
+/** 表頭高 TOUCH_MIN（編輯鍵 44px）；指標切換鍵外觀 28px，擴張點擊區仍落在表頭內 */
 export const listHeader = style([{
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: SPACE.s2,
-    minHeight: '28px',
-    padding: `0 calc(${PAD_X} + ${SAFE_RIGHT}) 0 calc(${PAD_X} + ${SAFE_LEFT})`,
+    gap: SPACE.s3,
+    minHeight: TOUCH_MIN,
+    padding: `0 calc(${SPACE.s1} + ${SAFE_RIGHT}) 0 calc(${PAD_X} + ${SAFE_LEFT})`,
     borderBottom: HAIRLINE,
     ...TEXT.footnote,
     color: vars.color.mutedForeground,
@@ -106,6 +108,34 @@ export const metricToggle = style({
     },
 });
 
+export const headerName = style({
+    flex: '1 1 auto',
+    minWidth: 0,
+});
+
+/** 編輯鍵（watch-edit）：鉛筆＋文字，點擊區 TOUCH_MIN；編輯中 aria-pressed 時 accent */
+export const editButton = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: SPACE.s1,
+    minHeight: TOUCH_MIN,
+    minWidth: TOUCH_MIN,
+    margin: 0,
+    padding: `0 ${SPACE.s3}`,
+    border: 'none',
+    borderRadius: RADIUS.md,
+    background: 'transparent',
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&[aria-pressed="true"]': { color: vars.color.accent, fontWeight: 600, background: vars.color.accentDim },
+    },
+});
+
 export const metricIcon = style({
     width: '0.875rem',
     height: '0.875rem',
@@ -149,10 +179,11 @@ export const row = style({
     flex: '1 1 auto',
     minWidth: 0,
     display: 'grid',
-    gridTemplateColumns: 'minmax(0, 1fr) auto auto',
+    // 名稱欄最窄＝其 min-content：名稱（rowTitle 不計入）與第二行的代碼＋市場標記（rowMetaKey），代碼不被擠到截斷
+    gridTemplateColumns: 'minmax(min-content, 1fr) auto auto',
     alignItems: 'center',
     columnGap: SPACE.s3,
-    minHeight: '56px',
+    minHeight: '64px',
     margin: 0,
     padding: `${SPACE.s1_5} calc(${PAD_X} + ${SAFE_RIGHT}) ${SPACE.s1_5} calc(${PAD_X} + ${SAFE_LEFT})`,
     border: 'none',
@@ -175,9 +206,19 @@ export const row = style({
     },
 });
 
-/** 編輯模式（列尾有「⋯」）：右邊距交給「⋯」鍵 */
-export const rowEditing = style({
+/** 列尾有鍵（快速下單、編輯模式「⋯」，或指數／組合商品的同寬佔位）：右邊距交給列尾鍵；自選列一律套用 */
+export const rowHasTrailing = style({
     paddingRight: SPACE.s1,
+});
+
+/** 開啟迷你走勢：名稱｜數字｜走勢 */
+export const rowWithSpark = style({
+    gridTemplateColumns: 'minmax(min-content, 1fr) auto auto',
+});
+
+/** 不顯示迷你走勢（設定關閉，或窄螢幕＋字級「大」）：名稱｜數字，數字欄靠右延伸 */
+export const rowNoSpark = style({
+    gridTemplateColumns: 'minmax(min-content, 1fr) auto',
 });
 
 export const rowName = style({
@@ -192,6 +233,64 @@ export const rowTitleLine = style({
     alignItems: 'center',
     gap: SPACE.s1_5,
     minWidth: 0,
+});
+
+/**
+ * 自選列第一行：名稱（headline、單行省略）。空間不足時由這裡省略吸收。
+ * width 0＋minWidth 100%：不計入名稱欄的 min-content（長名稱不撐寬欄位），版面上仍佔滿整欄。
+ */
+export const rowTitle = style({
+    ...TEXT.headline,
+    fontWeight: 500,
+    color: vars.color.foreground,
+    width: 0,
+    minWidth: '100%',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+});
+
+/** 自選列第二行：代碼＋市場標記（rowMetaKey）＋徽章；放不下時徽章換到下一行，不裁切 */
+export const rowMeta = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    columnGap: SPACE.s1,
+    rowGap: '0.125rem',
+    minWidth: 0,
+    ...TEXT.subhead,
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+});
+
+/** 代碼＋市場標記：同一組、不縮、不換行、不省略（代碼是關鍵資訊） */
+export const rowMetaKey = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: SPACE.s1,
+    flex: '0 0 auto',
+    whiteSpace: 'nowrap',
+});
+
+export const rowMetaCode = style({
+    ...NUMERIC,
+    flex: '0 0 auto',
+    whiteSpace: 'nowrap',
+});
+
+/** 市場標記（市／櫃／興／期／權／指） */
+export const marketTag = style({
+    flex: '0 0 auto',
+});
+
+/** 處置徽章：紅色（danger，狀態色不隨漲跌配色翻轉）外框，小字 foreground（§4.8 規則 4） */
+export const punishBadge = style({
+    flex: '0 0 auto',
+    padding: '0 0.25rem',
+    borderRadius: RADIUS.xs,
+    border: `1px solid ${vars.color.danger}`,
+    ...TEXT.caption,
+    color: vars.color.foreground,
 });
 
 export const rowCode = style({
@@ -243,6 +342,31 @@ export const rowPrice = style({
     whiteSpace: 'nowrap',
 });
 
+/** 自選列成交價：比 numMd 大一級（1.0625rem）、漲跌色 */
+export const rowPriceLarge = style({
+    fontSize: '1.0625rem',
+    lineHeight: 1.25,
+});
+
+/** 自選列第二行（漲跌 漲跌幅／總量）：純文字 numSm，字距略開 */
+export const rowChange = style({
+    ...NUM.numSm,
+    ...NUMERIC,
+    whiteSpace: 'nowrap',
+    textAlign: 'right',
+    wordSpacing: '0.375rem',
+});
+
+/** 迷你走勢 canvas（px 固定，不隨字級；字級「大」時縮窄讓出名稱欄） */
+export const spark = style({
+    display: 'block',
+    width: '56px',
+    height: '32px',
+    selectors: {
+        'html[data-sj-font-scale="1.3"] &': { width: '40px' },
+    },
+});
+
 /** 價格下的第二行（排行的漲跌、量）：numSm */
 export const priceSub = style({
     ...NUM.numSm,
@@ -287,6 +411,99 @@ export const rowTrailing = style({
     alignSelf: 'center',
     marginRight: `calc(${SPACE.s1} + ${SAFE_RIGHT})`,
     color: vars.color.mutedForeground,
+});
+
+/** 指數、組合商品沒有快速下單鍵：與 IconButton 同寬（TOUCH_MIN）的空白佔位，讓價格欄、走勢欄與其他列對齊 */
+export const ticketSpacer = style({
+    display: 'block',
+    flex: '0 0 auto',
+    width: TOUCH_MIN,
+    height: TOUCH_MIN,
+});
+
+// ---- 底部指數列（ShellSlot bottom → 配件槽，bar 材質上） ----
+
+export const indexStrip = style({
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+    padding: `0 calc(${SPACE.s2} + ${SAFE_RIGHT}) 0 calc(${SPACE.s2} + ${SAFE_LEFT})`,
+});
+
+export const indexCell = style({
+    position: 'relative',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: SPACE.s2,
+    minWidth: 0,
+    minHeight: TOUCH_MIN,
+    margin: 0,
+    padding: `0 ${SPACE.s2}`,
+    border: 'none',
+    background: 'transparent',
+    color: vars.color.foreground,
+    font: 'inherit',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        // 兩格之間一條髮絲線（不用 :has()）
+        '& + &': { boxShadow: `inset 0.5px 0 0 ${vars.color.border}` },
+    },
+});
+
+export const indexLabel = style({
+    flex: '0 0 auto',
+    ...TEXT.subhead,
+    fontWeight: 600,
+    color: vars.color.foreground,
+});
+
+/**
+ * 指數值與漲跌幅：bar 材質上的文字一律 foreground（設計規格 §4.6；§4.8 規則 6、8），方向只由有色的 ▲▼ 圖形（indexArrow）表示。
+ * 不截斷、不裁切：放得下時一行；放不下時漲跌幅自動換到值的下一行（flex-wrap，靠右）。
+ * 字級「大」固定上下排列（360／390 寬時一行放不下：標籤＋值＋漲跌幅約 200px，格內只有約 150px）。
+ */
+export const indexValue = style({
+    flex: '1 1 auto',
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'baseline',
+    justifyContent: 'flex-end',
+    columnGap: SPACE.s1_5,
+    rowGap: 0,
+    minWidth: 0,
+    ...NUM.numSm,
+    ...NUMERIC,
+    fontWeight: 600,
+    color: vars.color.foreground,
+    textAlign: 'right',
+    selectors: {
+        'html[data-sj-font-scale="1.3"] &': { flexDirection: 'column', alignItems: 'flex-end' },
+    },
+});
+
+/** 指數值：foreground、不換行 */
+export const indexNum = style({
+    color: vars.color.foreground,
+    whiteSpace: 'nowrap',
+});
+
+/** 漲跌幅（帶正負號）：foreground、不換行；前面是方向圖形 */
+export const indexPct = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '0.1875rem',
+    color: vars.color.foreground,
+    whiteSpace: 'nowrap',
+});
+
+/** 方向圖形（SVG 三角形，aria-hidden）：顏色由 tone.up／down 提供（圖形門檻 3:1，§4.8 規則 8）；尺寸隨字級 */
+export const indexArrow = style({
+    display: 'block',
+    flex: '0 0 auto',
+    width: '0.5rem',
+    height: '0.5rem',
 });
 
 // ---- 長按操作面板 ----

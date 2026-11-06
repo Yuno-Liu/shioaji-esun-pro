@@ -2,10 +2,12 @@
 //
 // 降低透明度寫入 lib/ui-settings 的 transparency（跟隨系統＝system、開＝reduced、關＝full）；
 // html[data-sj-transparency] 由殼層的 useHtmlAttributes 訂閱設定後立即改寫（不在本元件）。
+// 「自選迷你走勢」寫入 lib/watch-prefs（本裝置；關閉時自選頁不顯示走勢欄、不讀 K 線）。
 
 import { setPrivacyMode, setPrivacyMoney, usePrivacyMode, usePrivacyMoney } from '../../../lib/privacy';
 import { setThemeSettings, useThemeSettings, type Convention, type FontScale, type ThemeMode } from '../../../lib/theme-store';
 import { setMobileUiSettings, useMobileUiSettings, type MobileUiSettings } from '../../lib/ui-settings';
+import { setWatchSparklineEnabled, useWatchSparklineEnabled } from '../../lib/watch-prefs';
 import * as styles from '../../styles/account.css';
 import { Card, Segmented, Switch } from './account-ui';
 
@@ -22,6 +24,7 @@ export function DisplayCard() {
     const ui = useMobileUiSettings();
     const privMoney = usePrivacyMoney();
     const priv = usePrivacyMode();
+    const watchSpark = useWatchSparklineEnabled();
     const modes: { value: ThemeMode; text: string }[] = [
         { value: 'dark', text: '深色' },
         { value: 'light', text: '淺色' },
@@ -63,6 +66,13 @@ export function DisplayCard() {
                     testId='display-transparency'
                 />
                 <span className={styles.settingHint}>開：底部列與通知改為實心、不模糊（較省電，低階 Android 預設開啟）。iPhone 的 Safari 不會套用系統的「降低透明度」，請在這裡切換。</span>
+            </div>
+            <div className={styles.settingRow}>
+                <span className={styles.settingLabel}>
+                    <span>自選迷你走勢</span>
+                    <span className={styles.settingHint}>自選列顯示當日走勢；只讀取畫面上看得到的商品，每檔每天一次</span>
+                </span>
+                <Switch checked={watchSpark} label='自選迷你走勢' onChange={setWatchSparklineEnabled} testId='display-watch-spark' />
             </div>
             <div className={styles.settingRow}>
                 <span className={styles.settingLabel}>
