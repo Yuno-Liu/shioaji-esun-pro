@@ -52,6 +52,7 @@ import { SHARES_PER_LOT } from '../../lib/odd-lot';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
 import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../../lib/privacy';
 import { useServerInfo, yesterdayQuantityNotice } from '../../lib/server-info-store';
+import { contractMarket, isWarrant } from '../../lib/contract-market';
 import { creditExitLabel, stockExitFor, type CreditExitCond } from '../../lib/stock-exit-cond';
 import { notify, placeQuickOrder, placeStockExitByShares } from '../../lib/trade';
 import { discountText, useTradingCostSettings, type TradingCostSettings } from '../../lib/trading-cost-settings';
@@ -129,6 +130,7 @@ export const POSITIONS_TEXT = {
     badQuantity: '持倉數量或方向不明，未送出委託',
     noContract: '商品資料（含漲跌停價）尚未載入，暫時無法平倉',
     contractMismatch: '商品與持倉帳戶市場不符，未送出委託',
+    warrantOddLot: '權證沒有零股，未滿一張的部分無法平倉，未送出委託',
     noLimits: '漲跌停價未知，暫時無法平倉',
     gone: '這筆持倉已不在清單中（可能已平倉或已更新）',
     switchLocked: '下單面板開啟或確認進行中，暫時不能切換帳戶。',
@@ -214,7 +216,9 @@ export function closePlanFor(p: AccountedPosition, contract: ContractInfo | unde
         const exit = stockExitFor(p.direction, p.cond, p.quantity);
         if (typeof exit === 'string') return exit;
         if (!contract) return POSITIONS_TEXT.noContract;
-        if (contract.security_type !== 'STK') return POSITIONS_TEXT.contractMismatch;
+        // 權證與股票同一條下單路徑（lib contractMarket：STK、WRT 都是證券市場）；權證沒有零股，lib 送出前也會再擋
+        if (contractMarket(contract.security_type) !== 'S') return POSITIONS_TEXT.contractMismatch;
+        if (isWarrant(contract.security_type) && p.quantity % 1000 !== 0) return POSITIONS_TEXT.warrantOddLot;
         if (!(contract.limit_up > 0) || !(contract.limit_down > 0)) return POSITIONS_TEXT.noLimits;
         return { kind: 'stock', account, contract, action: exit.exit, shares: p.quantity, ...(exit.orderCond ? { orderCond: exit.orderCond } : {}) };
     }

@@ -27,7 +27,7 @@ export function TicketQuoteRow({ contract, snapshot }: { contract: ContractInfo;
     const sign = q.dir === 'up' ? '▲' : q.dir === 'down' ? '▼' : '';
     const plus = (v: number) => (v > 0 ? '+' : '');
     const single = q.source === 'tick' ? Number(lastReal.current?.volume) : NaN;
-    const unit = contract.security_type === 'STK' ? '張' : '口';
+    const unit = contract.security_type === 'STK' || contract.security_type === 'WRT' ? '張' : '口';
 
     return (
         <div className={styles.quoteRow} data-testid='ticket-quote'>

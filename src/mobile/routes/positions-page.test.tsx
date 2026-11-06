@@ -212,6 +212,14 @@ describe('純函式', () => {
         expect(closePlanFor(futPos({ direction: 'Sell' }), txf)).toEqual({ kind: 'futures', account: futAcc, contract: txf, action: 'Buy', lots: 2 });
     });
 
+    it('closePlanFor：權證走股票平倉（同 lib contractMarket）；權證沒有零股；其他非證券商品仍是市場不符', () => {
+        const wrt = { ...stk2330, code: '030392', security_type: 'WRT', name: '台積電元大5A購01', limit_up: 3.28, limit_down: 0.01 } as ContractInfo;
+        expect(closePlanFor(stockPos({ code: '030392', quantity: 2000 }), wrt)).toEqual({ kind: 'stock', account: stockAcc, contract: wrt, action: 'Sell', shares: 2000 });
+        expect(closePlanFor(stockPos({ code: '030392', quantity: 1500 }), wrt)).toBe(POSITIONS_TEXT.warrantOddLot);
+        expect(closePlanFor(stockPos(), { ...stk2330, security_type: 'IND' } as ContractInfo)).toBe(POSITIONS_TEXT.contractMismatch);
+        expect(closePlanFor(stockPos(), txf)).toBe(POSITIONS_TEXT.contractMismatch);
+    });
+
     it('addOnPlanFor：各種部位帶入的方向、單位、信用條件與當沖先賣', () => {
         const noDayTrade = { ...stk2330, day_trade: 'No' } as ContractInfo;
         // 現股多單＝Buy＋Cash（整股）
