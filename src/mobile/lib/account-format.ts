@@ -1,6 +1,8 @@
 // src/mobile/lib/account-format.ts — 帳戶頁共用格式（純函式）
 //
-// 金額一律交給呼叫端以 maskMoney 遮蔽；這裡只負責文字。
+// 金額一律交給呼叫端以 maskMoney 遮蔽；這裡只負責文字。數字經 num-format 的快取 Intl.NumberFormat（輸出同 toLocaleString）。
+
+import { formatNumber } from './num-format';
 
 function pad2(n: number) {
     return String(n).padStart(2, '0');
@@ -16,7 +18,7 @@ export function formatClock(ms: number | null | undefined): string {
 /** 金額：$1,234；帶正負號時 +$1,234／−$1,234 */
 export function formatTwd(v: number | undefined | null, signed = false): string {
     if (v === undefined || v === null || !Number.isFinite(v)) return '—';
-    const abs = Math.abs(v).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    const abs = formatNumber(Math.abs(v), 'en-US', { maximumFractionDigits: 0 });
     if (!signed) return `${v < 0 ? '−' : ''}$${abs}`;
     return v > 0 ? `+$${abs}` : v < 0 ? `−$${abs}` : '$0';
 }
@@ -24,13 +26,13 @@ export function formatTwd(v: number | undefined | null, signed = false): string 
 /** 股數：1,000 股；非有限值 — */
 export function formatShares(v: number | null | undefined): string {
     if (v === undefined || v === null || !Number.isFinite(v)) return '—';
-    return `${Math.abs(v).toLocaleString('en-US')} 股`;
+    return `${formatNumber(Math.abs(v), 'en-US')} 股`;
 }
 
 /** 價格：保留到兩位小數、去掉多餘的 0；非有限值 — */
 export function formatPrice(v: number | null | undefined): string {
     if (v === undefined || v === null || !Number.isFinite(v)) return '—';
-    return v.toLocaleString('en-US', { maximumFractionDigits: 2 });
+    return formatNumber(v, 'en-US', { maximumFractionDigits: 2 });
 }
 
 /** 百分比（帶正負號）：+1.23%；非有限值 — */

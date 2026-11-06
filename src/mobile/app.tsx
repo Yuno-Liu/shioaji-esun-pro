@@ -24,6 +24,7 @@ import { useRiskPnlFeed } from './hooks/use-risk-pnl-feed';
 import { useWakeLock } from './hooks/use-wake-lock';
 import { loadRankingList, loadSearchSheet, loadWatchListSheet, loadWatchSparkline } from './lib/deferred-modules';
 import { formatRoute, isCanonicalHash, navigate, parseHash, useHashRoute, type MobileRoute, type MobileTab } from './lib/hash-router';
+import { constrainedNetwork, currentConnection, schedulePrefetchSequence } from './lib/idle-prefetch';
 import { closeOrderAction, closeTicket, setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
 import { startResumeGate } from './lib/resume-gate-runtime';
 import { createScrollMemory, ScrollRestorer, useScrollNavigation, useScrollRecorder } from './lib/scroll-memory';
@@ -64,28 +65,44 @@ const resetActionSheet = () => { OrderActionSheet.reset(); };
 
 const PREFETCH_DELAY_MS = 1_500;
 
-/** 閒置預載的順序：最可能先用到的在前（自選列的迷你走勢、下單面板、交易頁、搜尋面板…），清單名稱面板、產業頁與排行最後 */
-const DEFERRED_MODULE_LOADERS: readonly (() => Promise<unknown>)[] = [
-    loadWatchSparkline, loadTicketSheet, loadSearchSheet, loadTradePage, loadOrdersPage, loadPositionsPage, loadAccountPage, loadActionSheet, loadWatchListSheet, loadSectorPage, loadRankingList,
+/**
+ * 閒置預載的順序：最可能先用到的在前（自選列的迷你走勢、下單面板、搜尋面板、交易頁…），清單名稱面板、產業頁與排行最後。
+ * 分頁與面板呼叫 retryableLazy 的 preload()：resolve 後第一次進入直接渲染、不 suspend（稽核 P3）；自選頁內的模組呼叫載入入口。
+ * essential：省流量或 2g／3g 時仍預載的（迷你走勢、下單面板、交易頁；稽核 P10），其餘等真正用到才載入。
+ */
+const DEFERRED_MODULES: readonly { load: () => Promise<unknown>; essential?: true }[] = [
+    { load: loadWatchSparkline, essential: true },
+    { load: OrderTicketSheet.preload, essential: true },
+    { load: loadSearchSheet },
+    { load: TradePage.preload, essential: true },
+    { load: OrdersPage.preload },
+    { load: PositionsPage.preload },
+    { load: AccountPage.preload },
+    { load: OrderActionSheet.preload },
+    { load: loadWatchListSheet },
+    { load: SectorPage.preload },
+    { load: loadRankingList },
 ];
 
 /**
- * 首屏完成後閒置時預先抓取其餘模組。失敗只吞掉、不重試：預先抓取不經過 lazy 元件，不會讓它們記住失敗；
- * 真正用到時 lazy 會自己 import，若仍失敗由 ModuleErrorBoundary 顯示「載入失敗」與［重試］（不會卸載整個 App）。
+ * 首屏完成後閒置時逐一預先抓取其餘模組（每個一個 idle callback，前一個結束才排下一個；lib/idle-prefetch.ts）。
+ * 失敗只吞掉、不重試：preload() 失敗不會讓 lazy 元件記住失敗；真正用到時 lazy 會自己 import，
+ * 若仍失敗由 ModuleErrorBoundary 顯示「載入失敗」與［重試］（不會卸載整個 App）。
  */
 function usePrefetchDeferredModules(): void {
     useEffect(() => {
-        const run = () => {
-            for (const load of DEFERRED_MODULE_LOADERS) {
-                load().catch(() => undefined);
-            }
-        };
+        let cancelSequence: (() => void) | null = null;
         const timer = setTimeout(() => {
-            const idle = (globalThis as { requestIdleCallback?: (cb: () => void) => unknown }).requestIdleCallback;
-            if (typeof idle === 'function') idle(run);
-            else run();
+            const constrained = constrainedNetwork(currentConnection());
+            const tasks = DEFERRED_MODULES
+                .filter(mod => !constrained || mod.essential)
+                .map(mod => () => mod.load().catch(() => undefined));
+            cancelSequence = schedulePrefetchSequence(tasks);
         }, PREFETCH_DELAY_MS);
-        return () => clearTimeout(timer);
+        return () => {
+            clearTimeout(timer);
+            cancelSequence?.();
+        };
     }, []);
 }
 

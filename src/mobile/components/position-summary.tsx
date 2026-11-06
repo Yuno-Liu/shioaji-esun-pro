@@ -18,7 +18,8 @@
 import { useRef } from 'react';
 import { maskMoney } from '../../lib/privacy';
 import type { Account, Margin } from '../../lib/types/portfolio';
-import { fmtInt, fmtPct, fmtSigned } from '../../lib/utils/format';
+import { fmtPct, fmtSigned } from '../../lib/utils/format';
+import { fmtInt } from '../lib/num-format';
 import * as styles from '../styles/positions.css';
 import { ProgressBar, type BarTone } from '../ui/bars';
 import { GroupedSection } from '../ui/grouped';

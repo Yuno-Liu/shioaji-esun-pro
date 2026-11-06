@@ -27,7 +27,8 @@ import { maskMoney, usePrivacyMoney } from '../../lib/privacy';
 import { discountText, percentText, shortSellingFee, useTradingCostSettings } from '../../lib/trading-cost-settings';
 import type { AccountedPosition, StockPosition } from '../../lib/types/portfolio';
 import { todayStr } from '../../lib/utils/date';
-import { fmtInt, fmtPct, fmtPrice, fmtSigned } from '../../lib/utils/format';
+import { fmtPct, fmtPrice, fmtSigned } from '../../lib/utils/format';
+import { fmtInt } from '../lib/num-format';
 import * as styles from '../styles/positions.css';
 
 export const ESUN_DETAIL_TEXT = {

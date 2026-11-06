@@ -1,5 +1,5 @@
 // 交易頁（規格 §6.2）：標頭文字、持倉摘要（遮金額）、未成交筆數、買進／賣出只開下單面板
-import { createElement, type ReactElement } from 'react';
+import { createElement, useSyncExternalStore, type ReactElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractInfo } from '../../lib/types/contract';
@@ -966,3 +966,71 @@ describe('TradePage 切換商品', () => {
     });
 });
 
+describe('交易狀態只重繪需要它的葉節點（稽核 P2）', () => {
+    /** 可發布的交易狀態 store（取代 mock 的 useTradingState，行為同 lib：useSyncExternalStore 訂閱） */
+    function tradingStore(initial: { trades: AccountedTrade[]; positions: AccountedPosition[] }) {
+        let state = initial;
+        const listeners = new Set<() => void>();
+        const subscribe = (l: () => void) => { listeners.add(l); return () => { listeners.delete(l); }; };
+        m.useTradingState.mockImplementation(() => useSyncExternalStore(subscribe, () => state));
+        return {
+            get: () => state,
+            publish: (next: typeof state) => act(async () => { state = next; listeners.forEach(l => l()); }),
+        };
+    }
+    const headerRenders = () => m.useQuote.mock.calls.filter(c => (c[1] as { narrow?: boolean } | undefined)?.narrow === true).length;
+    const depthRenders = () => m.useQuote.mock.calls.filter(c => c[1] !== undefined && 'oddLot' in (c[1] as object)).length;
+    const chartRenders = () => m.chartProps.length;
+
+    it('持倉市價重估（只換 positions）：標頭、五檔、圖表不重繪；持倉摘要數值更新', async () => {
+        const trades = [trade('a', '2330'), trade('c', '2317')];
+        const store = tradingStore({ trades, positions: [pos('2330', 3000, 1052.5, 97500, { cond: 'Cash' }), pos('2317', 1000, 100, 0, { cond: 'Cash' })] });
+        await render();
+        const h0 = headerRenders();
+        const d0 = depthRenders();
+        const c0 = chartRenders();
+        expect(h0).toBeGreaterThan(0);
+        expect(d0).toBeGreaterThan(0);
+        expect(c0).toBeGreaterThan(0);
+        expect(text(byId('trade-summary'))).toContain('+97,500');
+
+        // 市價重估：同一批委託（trades 參考不變），持倉換新物件、損益改變
+        for (const pnl of [98_000, 99_500, -1_200]) {
+            const prev = store.get();
+            await store.publish({ trades: prev.trades, positions: [pos('2330', 3000, 1052.5, pnl, { last_price: 1052.5 + pnl / 3000, cond: 'Cash' }), prev.positions[1]!] });
+        }
+        expect(headerRenders()).toBe(h0);
+        expect(depthRenders()).toBe(d0);
+        expect(chartRenders()).toBe(c0);
+        expect(text(byId('trade-summary'))).toContain('-1,200');
+        expect(text(byId('trade-summary'))).toContain('現股 3張 · 均價 1,052.5');
+        // 圖表拿到的線不變（成本線、委託線）
+        const lines = (m.chartProps.at(-1) as { lines: { key: string; price: number }[] }).lines;
+        expect(lines.map(l => l.key)).toContain('order:a');
+        expect(lines.find(l => l.key.startsWith('cost'))?.price).toBe(1052.5);
+    });
+
+    it('委託改變：五檔（委託標記）與圖表（委託線）重繪；標頭仍不重繪', async () => {
+        const store = tradingStore({ trades: [trade('a', '2330')], positions: [pos('2330', 3000, 1052.5, 97500, { cond: 'Cash' })] });
+        await render();
+        const h0 = headerRenders();
+        const d0 = depthRenders();
+        const c0 = chartRenders();
+        await store.publish({ trades: [...store.get().trades, trade('e', '2330')], positions: store.get().positions });
+        expect(headerRenders()).toBe(h0);
+        expect(depthRenders()).toBeGreaterThan(d0);
+        expect(chartRenders()).toBeGreaterThan(c0);
+        expect((m.chartProps.at(-1) as { lines: { key: string }[] }).lines.map(l => l.key)).toEqual(expect.arrayContaining(['order:a', 'order:e']));
+        expect(text(byId('trade-working-link'))).toContain('未成交：2 筆');
+    });
+
+    it('持倉成本改變（加碼成交、均價改變）：圖表成本線更新', async () => {
+        const store = tradingStore({ trades: [], positions: [pos('2330', 3000, 1052.5, 97500, { cond: 'Cash' })] });
+        await render();
+        const c0 = chartRenders();
+        await store.publish({ trades: [], positions: [pos('2330', 4000, 1060, 90000, { cond: 'Cash' })] });
+        expect(chartRenders()).toBeGreaterThan(c0);
+        expect((m.chartProps.at(-1) as { lines: { key: string; price: number }[] }).lines.find(l => l.key.startsWith('cost'))?.price).toBe(1060);
+        expect(text(byId('trade-summary'))).toContain('現股 4張 · 均價 1,060');
+    });
+});

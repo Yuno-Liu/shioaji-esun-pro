@@ -36,9 +36,11 @@
 //   精簡＝每個部位一列（名稱／代碼・條件・多空數量｜淨損益／報酬率・已過或未達兩平），帳戶分組、摘要、篩選、排序照常、摘要卡較緊湊。
 //   點列（aria-expanded）就地展開既有詳細卡片（不重複第一行），再點收合；平倉、加碼、看圖入口與流程不變，不新增送單入口。
 //   未展開的列不掛詳細卡片子樹；切換時以切換鍵為錨點保留捲動位置；減少動態時不做展開動畫。
+// - 重繪範圍（稽核 P2）：詳細列與精簡列以 memo 包起來，只比該列用到的值（持倉物件參考、淨損益數值、遮蔽、平倉停用…）；
+//   交易狀態重估市價時只有跳價的那列重繪（本頁最大損益改變時全部重繪以更新損益條比例）。列的按鈕經 rowActions 轉給最新的處理函式。
 
 import { ChevronRight, RotateCw, Wallet } from 'lucide-react';
-import { useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
+import { memo, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
 import { useTradingLive } from '../../hooks/use-stream';
 import { getAccountState, selectAccount, useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
@@ -57,8 +59,8 @@ import { RECONCILE_REASON_LABELS, refreshTradingState, useTradingState, type Tra
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Action } from '../../lib/types/order';
 import type { Account, AccountedPosition, Position, StockPosition } from '../../lib/types/portfolio';
-import { fmtInt, fmtPct, fmtPrice, fmtSigned, fmtStockLots } from '../../lib/utils/format';
-import { formatToTick } from '../../lib/utils/ticksize';
+import { fmtPct, fmtPrice, fmtSigned } from '../../lib/utils/format';
+import { fmtInt, fmtStockLots, formatToTick } from '../lib/num-format';
 import { mobileAccountLabel, useAccountSwitchLocked } from '../components/account-switch-sheet';
 import { BottomSheet, SheetFooter } from '../components/bottom-sheet';
 import { PositionEsunDetails } from '../components/position-esun-details';
@@ -539,12 +541,55 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
         : <li className={styles.row} data-testid='position-row' data-code={p.code}>{body}</li>;
 }
 
+// ---- 列的重繪範圍（稽核 P2）----
+// 交易狀態每次發布都重繪本頁；持倉列以 memo 包起來，只在「該列實際用到的值」改變時重繪。
+// - p 以參考比較：交易狀態重估市價時只替換有成交的那個代碼的持倉物件，其餘列沿用同一個物件。
+// - rp（淨損益）每次重算都是新物件：比較數值、原因、商品參考，stock 明細（小型純資料）做結構比較。
+// - 回呼不比較：頁面傳入的回呼只捕捉 p、由 p 算出的 key 與穩定的 rowActions／setter（見 PositionsPage），
+//   p 相同時舊回呼與新回呼行為相同；rowActions 每次呼叫都轉給最新一次提交的處理函式（帳戶、閘門等狀態不會過期）。
+
+/** 小型純資料（數字、字串、陣列、物件）的結構相等 */
+export function plainEqual(a: unknown, b: unknown): boolean {
+    if (Object.is(a, b)) return true;
+    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    const ka = Object.keys(a);
+    if (ka.length !== Object.keys(b).length) return false;
+    for (const k of ka) {
+        if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+        if (!plainEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
+    }
+    return true;
+}
+
+export function rowPnlEqual(a: RowPnl, b: RowPnl): boolean {
+    return a === b || (a.value === b.value && a.deriv === b.deriv && a.reason === b.reason && a.contract === b.contract && plainEqual(a.stock, b.stock));
+}
+
+/** 詳細列的 memo 比較：只比該列實際用到的欄位（回呼除外，見上方說明） */
+export function rowPropsEqual(a: RowProps, b: RowProps): boolean {
+    return a.p === b.p
+        && a.priv === b.priv
+        && a.privMoney === b.privMoney
+        && a.closeDisabled === b.closeDisabled
+        && a.accountReason === b.accountReason
+        && a.maxAbsPnl === b.maxAbsPnl
+        && a.ydNotice === b.ydNotice
+        && a.expanded === b.expanded
+        && a.embeddedId === b.embeddedId
+        && rowPnlEqual(a.rp, b.rp);
+}
+
+const MemoPositionRow = memo(PositionRow, rowPropsEqual);
+
 export const COMPACT_TEXT = {
     derivNote: '券商・未扣費稅',
     pending: '淨損益待確認',
     aboveBreakEven: '已過兩平',
     belowBreakEven: '未達兩平',
     atBreakEven: '等於兩平',
+    /** 精簡列報酬率的報讀標籤（視覺上只有數字） */
+    returnSrLabel: '報酬率（估）',
 } as const;
 
 /**
@@ -564,12 +609,18 @@ interface CompactRowProps {
     rp: RowPnl;
     open: boolean;
     onToggle: () => void;
-    /** 展開時才呼叫（未展開的列不掛詳細卡片子樹） */
-    renderDetail: (id: string) => ReactNode;
+    /** 展開時嵌入的詳細卡片 props（未展開的列不掛詳細卡片子樹） */
+    detail: Omit<RowProps, 'embeddedId'>;
+}
+
+/** 精簡列的 memo 比較：收合時只比精簡列用到的欄位；展開時再比嵌入的詳細卡片 */
+export function compactRowPropsEqual(a: CompactRowProps, b: CompactRowProps): boolean {
+    if (a.p !== b.p || a.privMoney !== b.privMoney || a.open !== b.open || !rowPnlEqual(a.rp, b.rp)) return false;
+    return !a.open || rowPropsEqual(a.detail, b.detail);
 }
 
 /** 精簡列：左＝名稱／代碼・條件・多空數量；右＝淨損益／報酬率（缺時現價）・兩平狀態；點一下就地展開既有詳細卡片 */
-function PositionCompactRow({ p, privMoney, rp, open, onToggle, renderDetail }: CompactRowProps) {
+function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail }: CompactRowProps) {
     const contract = useContract(p.code);
     const detailId = useId();
     const shown = rp.value;
@@ -602,18 +653,21 @@ function PositionCompactRow({ p, privMoney, rp, open, onToggle, renderDetail }: 
                         <span data-testid='position-compact-pnl'>{shown === null ? '—' : maskMoney(fmtSigned(shown, 0), privMoney)}</span>
                     </span>
                     <span className={styles.compactSub}>
+                        {/* 報讀標籤：視覺上只有數字，按鈕的無障礙名稱補上欄位名稱（同詳細卡片的「報酬率（估）」） */}
                         {ret !== null
-                            ? <span className={styles.tone[pnlTone(ret)]} data-testid='position-compact-return'>{fmtPct(ret)}</span>
+                            ? <span className={styles.tone[pnlTone(ret)]}><span className={srOnly}>{COMPACT_TEXT.returnSrLabel}</span><span data-testid='position-compact-return'>{fmtPct(ret)}</span></span>
                             : <span data-testid='position-compact-price'>現價 {fmtPrice(p.last_price)}</span>}
                         {status && <span data-testid='position-compact-status'>{status}</span>}
                     </span>
                 </span>
                 <ChevronRight className={styles.compactChevron} aria-hidden='true' focusable='false' />
             </button>
-            {open && renderDetail(detailId)}
+            {open && <MemoPositionRow {...detail} embeddedId={detailId} />}
         </li>
     );
 }
+
+const MemoPositionCompactRow = memo(PositionCompactRow, compactRowPropsEqual);
 
 /** 最近的可捲動祖先（殼層 main）；找不到時用文件捲動 */
 function scrollParentOf(el: HTMLElement): HTMLElement | null {
@@ -965,6 +1019,18 @@ export function PositionsPage() {
         openTicket(plan.request);
     };
 
+    // ---- 列的動作（memo 列用）：穩定的轉接函式，每次呼叫都轉給最新一次提交的處理函式 ----
+    const latestRowHandlers = useRef({ openClose, onAddOn, toggleDetail, toggleCompact });
+    useLayoutEffect(() => {
+        latestRowHandlers.current = { openClose, onAddOn, toggleDetail, toggleCompact };
+    });
+    const rowActions = useMemo(() => ({
+        close: (p: AccountedPosition) => latestRowHandlers.current.openClose(p),
+        addOn: (p: AccountedPosition, contract: ContractInfo | undefined) => latestRowHandlers.current.onAddOn(p, contract),
+        toggleDetail: (key: string) => latestRowHandlers.current.toggleDetail(key),
+        toggleCompact: (key: string) => latestRowHandlers.current.toggleCompact(key),
+    }), []);
+
     const reconcile = reconcileText(query);
     const loading = query.updatedAt === null && !query.error;
     // 第一次讀取就失敗（從未讀到）：不能說「目前沒有持倉」（比照委託頁 readFailed、桌面 holdingsPhase 'failed'）
@@ -1098,35 +1164,32 @@ export function PositionsPage() {
                         <ul className={styles.list} aria-label={groupLabel(g.account, priv)}>
                             {g.rows.map(p => {
                                 const key = positionKey(p);
-                                const detail = (embeddedId?: string) => (
-                                    <PositionRow
-                                        key={key}
-                                        p={p}
-                                        priv={priv}
-                                        privMoney={privMoney}
-                                        closeDisabled={closing || gateProblem !== null}
-                                        accountReason={accountReasonOf(p)}
-                                        maxAbsPnl={maxAbsPnl}
-                                        ydNotice={ydNotice}
-                                        expanded={expanded.has(key)}
-                                        rp={pnlOf(p)}
-                                        onClose={() => openClose(p)}
-                                        onAddOn={(contract) => onAddOn(p, contract)}
-                                        onToggleDetail={() => toggleDetail(key)}
-                                        onOpenPnl={() => setPnlKey(key)}
-                                        embeddedId={embeddedId}
-                                    />
-                                );
-                                if (view !== 'compact') return detail();
+                                // 回呼只捕捉 p、key 與穩定的 rowActions／setPnlKey（memo 比較不看回呼，見 rowPropsEqual）
+                                const detail: Omit<RowProps, 'embeddedId'> = {
+                                    p,
+                                    priv,
+                                    privMoney,
+                                    closeDisabled: closing || gateProblem !== null,
+                                    accountReason: accountReasonOf(p),
+                                    maxAbsPnl,
+                                    ydNotice,
+                                    expanded: expanded.has(key),
+                                    rp: pnlOf(p),
+                                    onClose: () => rowActions.close(p),
+                                    onAddOn: (contract) => rowActions.addOn(p, contract),
+                                    onToggleDetail: () => rowActions.toggleDetail(key),
+                                    onOpenPnl: () => setPnlKey(key),
+                                };
+                                if (view !== 'compact') return <MemoPositionRow key={key} {...detail} />;
                                 return (
-                                    <PositionCompactRow
+                                    <MemoPositionCompactRow
                                         key={key}
                                         p={p}
                                         privMoney={privMoney}
-                                        rp={pnlOf(p)}
+                                        rp={detail.rp}
                                         open={compactOpen.has(key)}
-                                        onToggle={() => toggleCompact(key)}
-                                        renderDetail={detail}
+                                        onToggle={() => rowActions.toggleCompact(key)}
+                                        detail={detail}
                                     />
                                 );
                             })}

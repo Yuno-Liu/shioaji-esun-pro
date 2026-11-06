@@ -9,8 +9,8 @@
 import { maskMoney } from '../../lib/privacy';
 import { discountText, percentText } from '../../lib/trading-cost-settings';
 import type { ContractInfo } from '../../lib/types/contract';
-import { fmtInt, fmtSigned } from '../../lib/utils/format';
-import { formatToTick } from '../../lib/utils/ticksize';
+import { fmtSigned } from '../../lib/utils/format';
+import { fmtInt, formatToTick } from '../lib/num-format';
 import type { StockPnl } from '../lib/position-pnl';
 import { breakEvenRelation } from '../lib/position-pnl';
 import * as styles from '../styles/positions.css';

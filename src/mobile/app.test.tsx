@@ -117,8 +117,8 @@ afterEach(async () => {
     vi.unstubAllGlobals();
 });
 
-async function mount() {
-    await act(async () => { view = create(createElement(MobileShell)); });
+async function mount(Shell: typeof MobileShell = MobileShell) {
+    await act(async () => { view = create(createElement(Shell)); });
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
 }
 
@@ -159,35 +159,121 @@ describe('MobileShell lazy module failures', () => {
     });
 });
 
+/** 閒置預載全部完成所需時間：1.5 秒延遲＋其後每個間隔 100ms（11 個模組）再多留一點 */
+const PREFETCH_ALL_MS = 1_500 + 11 * 100 + 200;
+const ALL_DEFERRED = ['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'ranking-list'];
+
+/**
+ * 推進假時鐘；每 100ms（預載間隔）等一次動態 import 完成（分頁與面板的 preload() 是真的 import()，會在真實時間 resolve，
+ * 逐一預載要等前一個結束才排下一個）。
+ */
+async function advance(ms: number) {
+    await act(async () => {
+        for (let left = ms; left > 0; left -= 100) {
+            await vi.advanceTimersByTimeAsync(Math.min(100, left));
+            await vi.dynamicImportSettled();
+        }
+    });
+}
+
 describe('MobileShell idle prefetch', () => {
-    it('首屏完成 1.5 秒後閒置預載：包含自選列迷你走勢（排第一）、自選頁搜尋面板與排行（延遲載入的新模組）', async () => {
+    // retryableLazy 的 resolve／預載狀態是模組層的：每個測試重新載入 app（mock 照常套用），不受前面測試已載入的面板影響
+    let Shell: typeof MobileShell;
+    let openTicketFresh: typeof openTicket;
+    beforeEach(async () => {
+        vi.resetModules();
+        Shell = (await import('./app')).MobileShell;
+        const store = await import('./lib/mobile-store');
+        store.resetMobileUiForTest();
+        openTicketFresh = store.openTicket;
+    });
+    it('首屏完成 1.5 秒後逐一預載（稽核 P10）：迷你走勢第一個，之後每 100ms 一個、同一時間只發一個；含搜尋面板、清單名稱面板與排行', async () => {
         m.failOrders = false;
-        await mount();
+        await mount(Shell);
+        const ticket0 = m.ticketLoads;
         expect(m.deferredLoads).toEqual([]);
-        await act(async () => { await vi.advanceTimersByTimeAsync(1_499); });
+        await advance(1_499);
         expect(m.deferredLoads).toEqual([]);
-        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'ranking-list']);
+        await advance(1);
+        // 沒有 requestIdleCallback（測試環境、iOS Safari）：第一個立即執行，其餘尚未發出
+        expect(m.deferredLoads).toEqual(['watch-sparkline']);
+        expect(m.ticketLoads).toBe(ticket0);
+        await advance(100);
+        // 第二個是下單面板（preload）
+        expect(m.ticketLoads).toBe(ticket0 + 1);
+        expect(m.deferredLoads).toEqual(['watch-sparkline']);
+        await advance(100);
+        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet']);
+        await advance(PREFETCH_ALL_MS);
+        expect(m.deferredLoads).toEqual(ALL_DEFERRED);
+        expect(m.ticketLoads).toBe(ticket0 + 1);
         expectPersistentChromeMounted();
     });
 
     it('閒置預載也包含產業分頁模組（不經過 lazy 元件，不顯示錯誤）', async () => {
         m.failOrders = false;
-        await mount();
-        await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+        await mount(Shell);
+        await advance(PREFETCH_ALL_MS);
         expect(m.sectorImported).toBe(true);
         expect(byTestId('route-load-error')).toHaveLength(0);
         expectPersistentChromeMounted();
     });
 
-    it('預載失敗只吞掉：不顯示錯誤、不卸載殼層', async () => {
+    it('預載失敗只吞掉並繼續下一個：不顯示錯誤、不卸載殼層', async () => {
         m.failOrders = false;
         m.deferredFail = true;
-        await mount();
-        await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
-        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'ranking-list']);
+        await mount(Shell);
+        await advance(PREFETCH_ALL_MS);
+        expect(m.deferredLoads).toEqual(ALL_DEFERRED);
         expect(byTestId('ticket-load-error')).toHaveLength(0);
         expect(byTestId('route-load-error')).toHaveLength(0);
         expectPersistentChromeMounted();
+    });
+
+    it.each([
+        ['saveData', { saveData: true, effectiveType: '4g' }],
+        ['3g', { effectiveType: '3g' }],
+        ['2g', { effectiveType: '2g' }],
+        ['slow-2g', { effectiveType: 'slow-2g' }],
+    ])('省流量／慢速網路（%s）只預載迷你走勢、下單面板與交易頁', async (_label, connection) => {
+        vi.stubGlobal('navigator', { connection });
+        m.failOrders = false;
+        await mount(Shell);
+        const ticket0 = m.ticketLoads;
+        await advance(PREFETCH_ALL_MS);
+        expect(m.deferredLoads).toEqual(['watch-sparkline']);
+        expect(m.ticketLoads).toBe(ticket0 + 1);
+        expectPersistentChromeMounted();
+    });
+
+    it('一般網路（4g）照常預載全部', async () => {
+        vi.stubGlobal('navigator', { connection: { saveData: false, effectiveType: '4g' } });
+        m.failOrders = false;
+        await mount(Shell);
+        await advance(PREFETCH_ALL_MS);
+        expect(m.deferredLoads).toEqual(ALL_DEFERRED);
+    });
+
+    it('卸載殼層後不再排下一個預載', async () => {
+        m.failOrders = false;
+        await mount(Shell);
+        await advance(1_500);
+        expect(m.deferredLoads).toEqual(['watch-sparkline']);
+        await act(async () => view?.unmount());
+        view = undefined;
+        await advance(PREFETCH_ALL_MS);
+        expect(m.deferredLoads).toEqual(['watch-sparkline']);
+    });
+
+    it('下單面板預載成功後（稽核 P3），開啟時直接用已載入的元件、不再經 lazy import', async () => {
+        m.failOrders = false;
+        m.failTicket = false;
+        await mount(Shell);
+        await advance(PREFETCH_ALL_MS);
+        const loads = m.ticketLoads;
+        expect(loads).toBeGreaterThan(0);
+        await act(async () => { openTicketFresh({ code: '2330', action: 'Buy' }); });
+        expect(byTestId('ticket-sheet')).toHaveLength(1);
+        expect(m.ticketLoads).toBe(loads);
     });
 });

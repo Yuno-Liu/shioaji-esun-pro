@@ -22,6 +22,8 @@ const m = vi.hoisted(() => {
         trading: {} as Record<string, unknown>,
         accounts: {} as { accounts: unknown[]; selectedStock: unknown; selectedFutures: unknown },
         contracts: {} as Record<string, unknown>,
+        /** useContract 呼叫次數（每個持倉列每次渲染呼叫一次；稽核 P2 重繪範圍） */
+        contractCalls: new Map<string, number>(),
         privMoney: false,
         locked: false,
         ydNotice: undefined as string | undefined,
@@ -59,7 +61,10 @@ vi.mock('../../lib/account-store', () => ({
 }));
 vi.mock('../../lib/account-tradable', () => ({ canTrade: (a?: Acc | null) => !!a && a.signed !== false }));
 vi.mock('../../lib/contracts-cache', () => ({
-    useContract: (code: string | null) => (code ? m.contracts[code] : undefined),
+    useContract: (code: string | null) => {
+        if (code) m.contractCalls.set(code, (m.contractCalls.get(code) ?? 0) + 1);
+        return code ? m.contracts[code] : undefined;
+    },
     getCachedContract: (code: string) => m.contracts[code],
     ensureContract: m.ensureContract,
 }));
@@ -1221,5 +1226,117 @@ describe('「詳細｜精簡」檢視', () => {
         expect(m.openTicket).not.toHaveBeenCalled();
         expect(m.notify).not.toHaveBeenCalled();
         expect(m.reconcileAfterUnknownOutcome).not.toHaveBeenCalled();
+    });
+});
+
+describe('列的重繪範圍（稽核 P2）', () => {
+    const renders = (code: string) => m.contractCalls.get(code) ?? 0;
+
+    it('期貨跳價（只換該列持倉物件）：股票列不重繪、期貨列重繪且數值正確；最大損益改變時全部列重繪（損益條比例）', async () => {
+        const stock = stockPos();
+        setPositions([stock, futPos()]);
+        await render();
+        const s0 = renders('2330');
+        const f0 = renders('TXFL6');
+        expect(s0).toBeGreaterThan(0);
+
+        setPositions([stock, futPos({ last_price: 22955, pnl: 31_000 })]);
+        await rerender();
+        expect(renders('2330')).toBe(s0);
+        expect(renders('TXFL6')).toBeGreaterThan(f0);
+        expect(textOf(inRow('TXFL6', 'position-pnl'))).toBe('+31,000');
+        expect(textOf(inRow('2330', 'position-pnl'))).toBe('+91,697');
+        expect(textOf(one('position-total'))).toBe('+122,697');
+
+        // 期貨損益超過股票：本頁最大 |損益| 改變 → 股票列的損益條比例要跟著變，因此重繪
+        const s1 = renders('2330');
+        setPositions([stock, futPos({ last_price: 25000, pnl: 440_000 })]);
+        await rerender();
+        expect(renders('2330')).toBeGreaterThan(s1);
+        expect(textOf(inRow('TXFL6', 'position-pnl'))).toBe('+440,000');
+    });
+
+    it('同一批持倉物件重繪頁面（例如其他狀態更新）：所有列都不重繪', async () => {
+        const rows = [stockPos(), futPos()];
+        setPositions(rows);
+        await render();
+        const s0 = renders('2330');
+        const f0 = renders('TXFL6');
+        setPositions(rows);
+        await rerender();
+        await rerender();
+        expect(renders('2330')).toBe(s0);
+        expect(renders('TXFL6')).toBe(f0);
+    });
+
+    it('遮蔽金額、平倉停用等列用到的值改變時重繪', async () => {
+        const rows = [stockPos(), futPos()];
+        setPositions(rows);
+        await render();
+        const s0 = renders('2330');
+        m.privMoney = true;
+        await rerender();
+        expect(renders('2330')).toBeGreaterThan(s0);
+        expect(textOf(inRow('2330', 'position-pnl'))).toBe('•••••');
+        const s1 = renders('2330');
+        m.live = false;
+        await rerender();
+        expect(renders('2330')).toBeGreaterThan(s1);
+        expect(inRow('2330', 'position-close').props.disabled).toBe(true);
+    });
+
+    it('略過重繪的列，按鈕仍用最新狀態：切換選取帳戶後按加碼走帳戶切換確認，不直接開下單面板', async () => {
+        const stock = stockPos();
+        setPositions([stock, futPos()]);
+        await render();
+        const s0 = renders('2330');
+        // 選取的證券帳戶改成另一個（列的 props 不變 → 不重繪）
+        m.accounts = { ...m.accounts, selectedStock: stockAcc2 };
+        setPositions([stock, futPos({ last_price: 22960 })]);
+        await rerender();
+        expect(renders('2330')).toBe(s0);
+        await click(inRow('2330', 'position-add'));
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(all('position-switch-sheet')).toHaveLength(1);
+    });
+
+    it('精簡檢視：收合的列只在自己的持倉或淨損益改變時重繪；展開的列另比詳細卡片的值', async () => {
+        vi.stubGlobal('localStorage', { getItem: () => 'compact', setItem: () => undefined });
+        const stock = stockPos();
+        setPositions([stock, futPos()]);
+        await render();
+        expect(all('position-compact-row')).toHaveLength(2);
+        const s0 = renders('2330');
+        setPositions([stock, futPos({ last_price: 22955, pnl: 31_000 })]);
+        await rerender();
+        expect(renders('2330')).toBe(s0);
+        const futRow = view!.root.find(n => n.props['data-testid'] === 'position-compact-row' && n.props['data-code'] === 'TXFL6' && typeof n.type === 'string');
+        expect(textOf(futRow.find(n => n.props['data-testid'] === 'position-compact-pnl'))).toBe('+31,000');
+    });
+});
+
+describe('精簡列的無障礙名稱', () => {
+    it('按鈕內含淨損益與報酬率（估）的報讀標籤；視覺數字不變', async () => {
+        vi.stubGlobal('localStorage', { getItem: () => 'compact', setItem: () => undefined });
+        await render();
+        const toggle = view!.root.find(n => n.props['data-testid'] === 'position-compact-toggle' && n.parent?.props['data-code'] === '2330' && typeof n.type === 'string');
+        const name = textOf(toggle);
+        expect(name).toContain('淨損益（含手續費、證交稅）');
+        expect(name).toContain(`${COMPACT_TEXT.returnSrLabel}+2.49%`);
+        expect(COMPACT_TEXT.returnSrLabel).toBe('報酬率（估）');
+        expect(textOf(toggle.find(n => n.props['data-testid'] === 'position-compact-return'))).toBe('+2.49%');
+    });
+
+    it('展開的精簡列：詳細卡片跟著列用到的值更新（平倉停用）', async () => {
+        vi.stubGlobal('localStorage', { getItem: () => 'compact', setItem: () => undefined });
+        const rows = [stockPos(), futPos()];
+        setPositions(rows);
+        await render();
+        await click(view!.root.find(n => n.props['data-testid'] === 'position-compact-toggle' && n.parent?.props['data-code'] === '2330' && typeof n.type === 'string'));
+        expect(inRow('2330', 'position-close').props.disabled).toBe(false);
+        m.live = false;
+        setPositions(rows);
+        await rerender();
+        expect(inRow('2330', 'position-close').props.disabled).toBe(true);
     });
 });

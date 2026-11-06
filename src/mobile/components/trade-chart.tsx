@@ -52,7 +52,8 @@ import { getChartColors, themeKey, useThemeSettings, type ChartColors } from '..
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Candle } from '../../lib/types/market';
 import { aggregate, kbarsToCandles, nowWallClockUtc, wallClockToUtc } from '../../lib/utils/kbars';
-import { formatToTick, roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
+import { roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
+import { formatToTick } from '../lib/num-format';
 import { currentOrientationEnv, shouldAutoFullscreen } from '../lib/chart-fullscreen';
 import { fetchMobileChartHistory } from '../lib/chart-history-cache';
 import { getHistoryEntry, planHistory, setHistoryEntry } from '../lib/chart-history-freshness';

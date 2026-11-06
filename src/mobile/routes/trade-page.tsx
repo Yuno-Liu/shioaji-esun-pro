@@ -14,9 +14,10 @@
 // 標頭的「代碼 名稱」是切換商品鍵（trade-switch；精簡標頭顯示時另有 trade-compact-switch）：開 TradeSwitchSheet 搜尋並切換，
 // 以 replace 導覽（返回鍵回到進交易頁之前的畫面）；只做查詢與導覽，不開下單面板。合約載入後記入「最近查看」（lib/recent-codes）。
 // code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。合約解析出的正規代碼與路由不同（小寫、舊指數代碼）時改寫路由。
+// 交易狀態（委託、持倉）只由葉節點訂閱：圖上的線、五檔的委託標記、持倉摘要（稽核 P2）；持倉市價重估不重繪標頭、五檔與圖表。
 
 import { ChevronDown } from 'lucide-react';
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type Ref } from 'react';
+import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type Ref } from 'react';
 import { flushSync } from 'react-dom';
 import { useQuote } from '../../hooks/use-stream';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
@@ -28,9 +29,7 @@ import { useTradingState } from '../../lib/trading-state';
 import type { ContractInfo, DayTrade, Exchange, SecurityType } from '../../lib/types/contract';
 import type { AccountedTrade } from '../../lib/types/order';
 import type { AccountedPosition } from '../../lib/types/portfolio';
-import { fmtCompactInt, fmtStockLots } from '../../lib/utils/format';
 import { nowWallClockUtc } from '../../lib/utils/kbars';
-import { formatToTick } from '../../lib/utils/ticksize';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
 import { loadCompanyTab } from '../components/company/load-company-tab';
 import { DepthLadder, depthOddCapable, DepthOddToggle } from '../components/depth-ladder';
@@ -38,11 +37,12 @@ import { ModuleErrorBoundary, ModuleLoadError, retryableLazy } from '../componen
 import { TickList } from '../components/tick-list';
 import { TradeChart } from '../components/trade-chart';
 import { TradeSwitchSheet } from '../components/trade-switch-sheet';
-import { chartPriceLines, formatLinePrice } from '../lib/chart-model';
+import { chartPriceLines, formatLinePrice, priceLinesKey } from '../lib/chart-model';
 import { CHART_PERIODS, DEFAULT_CHART_PERIOD, isChartPeriod, type ChartPeriod } from '../lib/chart-ranges';
 import { createFocusProxy, type FocusProxy } from '../lib/focus-proxy';
 import { formatRoute, navigate } from '../lib/hash-router';
 import { openTicket, setCurrentCode } from '../lib/mobile-store';
+import { fmtCompactInt, fmtInt, fmtStockLots, formatNumber, formatToTick } from '../lib/num-format';
 import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import { recordRecentCode } from '../lib/recent-codes';
 import * as controls from '../styles/controls.css';
@@ -187,7 +187,7 @@ export function statKeys(secType: SecurityType | undefined): StatKey[] {
     return ['open', 'high', 'low', 'reference'];
 }
 
-const fmtAvg = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtAvg = (v: number) => formatNumber(v, 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 function StatsGrid({ contract, stats }: { contract: ContractInfo; stats: HeaderStats }) {
     const unit = volumeUnit(contract.security_type);
@@ -391,6 +391,61 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef }:
     );
 }
 
+// ---- 交易狀態的葉節點（稽核 P2）----
+// 交易狀態每次發布（持倉市價重估最多每 50ms 一次）只重繪這三個葉節點；它們把結果傳給 memo 的圖表與五檔，
+// 內容沒變（委託未變、線的價位與標籤未變）時圖表與五檔不重繪。
+
+const MemoTradeChart = memo(TradeChart);
+const MemoDepthLadder = memo(DepthLadder);
+
+/** 圖上的水平線（委託、成本、漲跌停、參考價）：線的內容（priceLinesKey）沒變時沿用同一個陣列 */
+function TradeChartWithLines({ code, contract, period, onPeriodChange }: { code: string; contract: ContractInfo; period: ChartPeriod; onPeriodChange: (p: ChartPeriod) => void }) {
+    const { trades, positions } = useTradingState();
+    const lines = useMemo(() => chartPriceLines({ contract, trades, positions }), [contract, trades, positions]);
+    const linesKey = priceLinesKey(lines);
+    // 只依內容 key 換陣列：持倉市價重估時成本線不變，圖表不必重繪
+    const stableLines = useMemo(() => lines, [linesKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    return <MemoTradeChart code={code} contract={contract} period={period} lines={stableLines} onPeriodChange={onPeriodChange} />;
+}
+
+/** 五檔：只把委託（trades）交給五檔畫「我 買2」標記；持倉重估不改 trades，五檔不因此重繪 */
+function DepthWithTrades({ code, contract, oddLot }: { code: string; contract: ContractInfo | undefined; oddLot: boolean }) {
+    const { trades } = useTradingState();
+    return <MemoDepthLadder code={code} contract={contract} trades={trades} oddLot={oddLot} />;
+}
+
+/** 持倉摘要與未成交筆數：唯一需要跟著持倉市價重估更新的區塊 */
+function TradePositionSummary({ orderable, sym, isStock }: { orderable: string; sym: string; isStock: boolean }) {
+    const { trades, positions } = useTradingState();
+    const privMoney = usePrivacyMoney();
+    const summaries = useMemo(() => positionSummaries(orderable, sym, positions, isStock), [orderable, sym, positions, isStock]);
+    const working = useMemo(() => workingOrderCount(orderable, trades), [orderable, trades]);
+    return (
+        <div className={styles.summaryWrap}>
+            <GroupedSection testId='trade-summary'>
+                {summaries.length === 0
+                    ? <span className={`${styles.summaryRow} ${styles.summaryMuted}`}>持倉：無</span>
+                    : summaries.map(s => (
+                        <span key={s.label} className={styles.summaryRow}>
+                            <span>
+                                持倉：{s.label} {maskMoney(s.quantity, privMoney)} · 均價 {formatLinePrice(s.avg)} ·{' '}
+                                <span className={styles.dirText[s.pnl > 0 ? 'up' : s.pnl < 0 ? 'down' : 'flat']}>
+                                    {maskMoney(`${s.pnl > 0 ? '+' : ''}${fmtInt(Math.round(s.pnl))}`, privMoney)}
+                                </span>
+                            </span>
+                        </span>
+                    ))}
+                {/* 外層承接卡片髮絲線，連結的 ::after 只當按壓層（見 trade.css.ts workingLinkRow） */}
+                <div className={styles.workingLinkRow}>
+                    <a className={styles.workingLink} href={formatRoute({ name: 'orders' })} data-testid='trade-working-link'>
+                        未成交：{working} 筆 ›
+                    </a>
+                </div>
+            </GroupedSection>
+        </div>
+    );
+}
+
 function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string } & SwitchEntry) {
     // 載入合約（也讓狀態列能依商品判斷市場）
     const contract = useContract(code);
@@ -431,10 +486,10 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
         fetchSnapshots([ct]).catch(() => undefined);
     }, [canonical, code]);
 
-    const trading = useTradingState();
-    const privMoney = usePrivacyMoney();
+    // 交易狀態（委託、持倉）不在這裡訂閱：持倉商品每筆成交都會重估市價並發布，整頁重繪會連帶標頭、五檔、圖表外框。
+    // 改由需要它的葉節點各自訂閱（圖上的線、五檔的委託標記、持倉摘要；稽核 P2）。
     const [period, setPeriodState] = useState<ChartPeriod>(loadPeriod);
-    const setPeriod = (p: ChartPeriod) => { setPeriodState(p); savePeriod(p); };
+    const setPeriod = useCallback((p: ChartPeriod) => { setPeriodState(p); savePeriod(p); }, []);
     const [panel, setPanelState] = useState<PanelKey>('depth');
     // 公司分頁第一次切入後保持掛載（切走只隱藏）：子分頁、展開狀態不重設，也不重新讀取；換商品時整頁重建而重設
     // 隱藏時傳 active=false：公司分頁不再跟著成交重繪（不和五檔、圖表搶主執行緒）
@@ -448,15 +503,6 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
 
     const orderable = contract ? contract.target_code || contract.code : sym;
     const isStock = contract?.security_type === 'STK';
-    const lines = useMemo(
-        () => (contract ? chartPriceLines({ contract, trades: trading.trades, positions: trading.positions }) : []),
-        [contract, trading.trades, trading.positions],
-    );
-    const summaries = useMemo(
-        () => positionSummaries(orderable, sym, trading.positions, isStock),
-        [orderable, sym, trading.positions, isStock],
-    );
-    const working = useMemo(() => workingOrderCount(orderable, trading.trades), [orderable, trading.trades]);
     const tradable = contract ? contract.security_type !== 'IND' : true;
     const comboNote = contract?.combo ? '組合商品不支援手機下單' : null;
 
@@ -471,7 +517,7 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
             </div>
 
             {contract
-                ? <TradeChart code={sym} contract={contract} period={period} lines={lines} onPeriodChange={setPeriod} />
+                ? <TradeChartWithLines code={sym} contract={contract} period={period} onPeriodChange={setPeriod} />
                 : (
                     <div className={styles.chartWrap}>
                         <div className={styles.chartOverlay}>
@@ -497,7 +543,7 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
                     </div>
                 )}
             </div>
-            {panel === 'depth' && <DepthLadder code={sym} contract={contract} trades={trading.trades} oddLot={oddLot} />}
+            {panel === 'depth' && <DepthWithTrades code={sym} contract={contract} oddLot={oddLot} />}
             {panel === 'ticks' && contract && <TickList code={sym} contract={contract} />}
             {companyMounted && (
                 <div hidden={panel !== 'company'} data-testid='trade-company'>
@@ -509,28 +555,7 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
                 </div>
             )}
 
-            <div className={styles.summaryWrap}>
-                <GroupedSection testId='trade-summary'>
-                    {summaries.length === 0
-                        ? <span className={`${styles.summaryRow} ${styles.summaryMuted}`}>持倉：無</span>
-                        : summaries.map(s => (
-                            <span key={s.label} className={styles.summaryRow}>
-                                <span>
-                                    持倉：{s.label} {maskMoney(s.quantity, privMoney)} · 均價 {formatLinePrice(s.avg)} ·{' '}
-                                    <span className={styles.dirText[s.pnl > 0 ? 'up' : s.pnl < 0 ? 'down' : 'flat']}>
-                                        {maskMoney(`${s.pnl > 0 ? '+' : ''}${Math.round(s.pnl).toLocaleString('en-US')}`, privMoney)}
-                                    </span>
-                                </span>
-                            </span>
-                        ))}
-                    {/* 外層承接卡片髮絲線，連結的 ::after 只當按壓層（見 trade.css.ts workingLinkRow） */}
-                    <div className={styles.workingLinkRow}>
-                        <a className={styles.workingLink} href={formatRoute({ name: 'orders' })} data-testid='trade-working-link'>
-                            未成交：{working} 筆 ›
-                        </a>
-                    </div>
-                </GroupedSection>
-            </div>
+            <TradePositionSummary orderable={orderable} sym={sym} isStock={isStock} />
 
             {tradable && (
                 <ShellSlot slot='bottom'>
