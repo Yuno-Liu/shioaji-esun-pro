@@ -1,0 +1,16 @@
+# Caddyfile（手機 HTTPS 方案 B）— 只在私有網路使用的 TLS 前端；主機名請換成自己的
+# 說明：docs/fork/mobile.md；規格：docs/fork/mobile-trading-spec.md §3
+#
+# 搭配 .env：
+#   WEB_BIND=127.0.0.1          # nginx 只讓同機的 Caddy 連線
+#   WEB_SERVER_NAMES=trade.lan  # 與下方主機名相同；同時成為玉山 bridge 的 ESUN_ALLOWED_HOSTS
+trade.lan {
+    # 使用 Caddy 內建 CA 簽發憑證；手機需安裝並完全信任 Caddy 根憑證
+    tls internal
+
+    reverse_proxy 127.0.0.1:8080 {
+        # SSE（/api/v1/stream/data、/esun/stream/orders）每個事件立即送出，不緩衝
+        flush_interval -1
+        # Caddy 預設保留原始 Host：nginx 的 Host 白名單與 Origin 檢查依賴這一點
+    }
+}

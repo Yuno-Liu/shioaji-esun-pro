@@ -1,0 +1,810 @@
+// src/mobile/styles/trade.css.ts — 交易頁：標頭、精簡標頭、圖表、選價列、五檔、明細、持倉摘要、交易鍵列
+// （規格 §6.2、§11；設計規格 docs/fork/mobile-design.md §7.3）
+//
+// - 價量一律系統字 tabular（typography NUM／NUMERIC），不再用 theme 的等寬字族；字重不超過 700。
+// - 漲跌與買賣顏色只用 vars.color.up／down；實心填色以 primitives 的 fill（inkLarge／inkStrong 疊黑）。
+// - 精簡標頭、選價列為不透明 panel（canvas 與捲動內容上方不模糊）；只動畫 transform／opacity。
+// - 量條、比例條用 ui/bars（scaleX），不再以 width 轉場。
+import { keyframes, style, styleVariants } from '@vanilla-extract/css';
+import { vars } from '../../theme.css';
+import { expandHit } from '../ui/chip.css';
+import { fill, focusRing, hairlineBottom, pressable, pressableRow } from './primitives.css';
+import { elevation, sj } from './theme-vars.css';
+import { DUR, EASE, RADIUS, REDUCED_MOTION, SAFE_LEFT, SAFE_RIGHT, SIZE, SPACE, TOUCH_MIN, TRADE_BUTTON_GAP } from './tokens';
+import { NUM, NUMERIC, TEXT } from './typography.css';
+
+/** 字級「大」（§4.7）：統計格 2 欄、五檔表頭縮寫等版面切換 */
+const FONT_LARGE = 'html[data-sj-font-scale="1.3"] &';
+
+const ellipsis = {
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+} as const;
+
+/** 清單型頁面表面（§4.2 contentBg：深色 background、淺色 panel 白底，漲跌色字對比較高） */
+export const page = style({
+    display: 'flex',
+    flexDirection: 'column',
+    minHeight: '100%',
+    background: sj.contentBg,
+});
+
+// ---- 標頭 ----
+
+export const header = style({
+    padding: `${SPACE.s2} ${SPACE.s4} ${SPACE.s1}`,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+});
+
+export const titleRow = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    gap: SPACE.s2,
+    flexWrap: 'wrap',
+});
+
+export const title = style({
+    margin: 0,
+    ...TEXT.sheetTitle,
+});
+
+/**
+ * 標題內的「切換商品」鍵：文字沿用 h1（字型、字級、換行不變），只去掉按鈕外觀；名稱後接小 ChevronDown。
+ * 點擊區以 expandHit（ui/chip.css）上下擴到 TOUCH_MIN；zIndex 1 讓擴張區畫在後面的主價列（position relative）之上。
+ */
+export const titleButton = style([expandHit, {
+    display: 'inline-block',
+    maxWidth: '100%',
+    zIndex: 1,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    borderRadius: RADIUS.sm,
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    letterSpacing: 'inherit',
+    textAlign: 'start',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+}]);
+
+export const titleIcon = style({
+    display: 'inline-block',
+    width: '0.875em',
+    height: '0.875em',
+    marginLeft: '0.125em',
+    verticalAlign: '-0.0625em',
+    color: vars.color.mutedForeground,
+});
+
+export const subtle = style({
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
+export const priceRow = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    gap: `2px ${SPACE.s2}`,
+    flexWrap: 'wrap',
+    ...NUMERIC,
+});
+
+/** 主價（numHero）；同時是跳價閃爍覆蓋層的宿主 */
+export const lastPrice = style({
+    position: 'relative',
+    isolation: 'isolate',
+    padding: '0 2px',
+    borderRadius: RADIUS.sm,
+    ...NUM.numHero,
+    ...NUMERIC,
+});
+
+export const dirText = styleVariants({
+    up: { color: vars.color.up },
+    down: { color: vars.color.down },
+    flat: { color: vars.color.foreground },
+});
+
+export const change = style({
+    ...NUM.numMd,
+    ...NUMERIC,
+});
+
+/** 價格旁的標示（「參考價」「試撮 X」「可當沖」）：外框小膠囊，文字標示不只靠顏色 */
+export const badge = style({
+    alignSelf: 'center',
+    padding: '0 6px',
+    borderRadius: RADIUS.sm,
+    border: `1px solid ${vars.color.borderBright}`,
+    color: vars.color.mutedForeground,
+    ...TEXT.footnote,
+    fontWeight: 500,
+    lineHeight: 1.6,
+    whiteSpace: 'nowrap',
+    ...NUMERIC,
+});
+
+/** 漲停／跌停：實心 up／down＋inkStrong 白字（小字）；文字本身已標示「漲停」「跌停」 */
+export const badgeTone = styleVariants({
+    up: [fill.up.strong, { borderColor: 'transparent', color: '#ffffff', fontWeight: 700 }],
+    down: [fill.down.strong, { borderColor: 'transparent', color: '#ffffff', fontWeight: 700 }],
+});
+
+export const infoRow = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: `2px ${SPACE.s2}`,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+    ...NUMERIC,
+});
+
+export const infoUp = style({ color: vars.color.up });
+export const infoDown = style({ color: vars.color.down });
+
+/** 統計格：開 高 均 總／參 低 單 額（4×2；字級「大」改 2 欄） */
+export const statsGrid = style({
+    display: 'grid',
+    gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+    gap: `2px ${SPACE.s3}`,
+    margin: `${SPACE.s1} 0 0`,
+    ...NUMERIC,
+    selectors: {
+        [FONT_LARGE]: { gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' },
+    },
+});
+
+export const statCell = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: SPACE.s1,
+    minWidth: 0,
+});
+
+export const statLabel = style({
+    flex: '0 0 auto',
+    margin: 0,
+    ...TEXT.caption,
+    fontWeight: 500,
+    color: vars.color.mutedForeground,
+});
+
+export const statValue = style({
+    margin: 0,
+    ...ellipsis,
+    ...NUM.numSm,
+    ...NUMERIC,
+});
+
+/** 主價列下緣哨兵（IntersectionObserver 偵測離開 main 頂端 → 顯示精簡標頭） */
+export const sentinel = style({
+    height: '1px',
+    marginTop: '-1px',
+    pointerEvents: 'none',
+});
+
+// ---- 精簡標頭（ShellSlot top；實心 panel，不模糊） ----
+
+export const compactBar = style([hairlineBottom, {
+    display: 'flex',
+    alignItems: 'center',
+    gap: SPACE.s2,
+    boxSizing: 'border-box',
+    height: SIZE.compactBarH,
+    padding: `0 calc(${SPACE.s4} + ${SAFE_RIGHT}) 0 calc(${SPACE.s4} + ${SAFE_LEFT})`,
+    background: vars.color.panel,
+    color: vars.color.foreground,
+    opacity: 0,
+    transform: 'translateY(-8px)',
+    transition: `opacity ${DUR.tone}ms ${EASE.out}, transform ${DUR.tone}ms ${EASE.out}`,
+    selectors: {
+        '&[data-visible="true"]': { opacity: 1, transform: 'none' },
+        // 隱藏時不攔點擊（topSlot 的子元素預設可點）
+        '&:not([data-visible="true"])': { pointerEvents: 'none' },
+    },
+    '@media': {
+        [REDUCED_MOTION]: { transition: 'none' },
+    },
+}]);
+
+export const compactTitle = style({
+    flex: '0 1 auto',
+    ...ellipsis,
+    ...TEXT.subhead,
+    fontWeight: 600,
+});
+
+/** 精簡標頭的 ChevronDown（裝飾，提示可點） */
+export const compactIcon = style({
+    flex: '0 0 auto',
+    width: '0.875rem',
+    height: '0.875rem',
+    marginLeft: `calc(-1 * ${SPACE.s1})`,
+    color: vars.color.mutedForeground,
+});
+
+/** 精簡標頭切換鍵的點擊區高度：固定 44px（44pt），不隨 rem 放大 */
+const COMPACT_SWITCH_HIT_H = '44px';
+
+/**
+ * 精簡標頭上的「切換商品」鍵：只在精簡標頭顯示時渲染（隱藏時不在無障礙樹、不可聚焦或點擊）。
+ * 疊在 aria-hidden 的精簡標頭上（topSlot 內絕對定位、整條可點）；外觀 SIZE.compactBarH（固定 40px），::before 從頂端起高
+ * COMPACT_SWITCH_HIT_H（固定 44px）：只往下多 4px、不往上擴（上方是狀態列）。不用 TOUCH_MIN：它隨 rem 放大，字級 1.15／1.3 時
+ * 精簡標頭下緣之外會多攔 10.6／17.2px，吃掉週期、圖表、五檔價格格的點擊。
+ * 按壓時 ::after 淡淡加深（與 pressableRow 同值，只動畫 opacity）。
+ */
+export const compactSwitch = style([focusRing, {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    height: SIZE.compactBarH,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&::before': {
+            content: '""',
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            top: 0,
+            height: COMPACT_SWITCH_HIT_H,
+        },
+        '&::after': {
+            content: '""',
+            position: 'absolute',
+            inset: 0,
+            background: vars.color.foreground,
+            opacity: 0,
+            pointerEvents: 'none',
+            transition: `opacity ${DUR.fade}ms ease-out`,
+        },
+        '&:active::after': { opacity: 0.08, transition: 'none' },
+    },
+}]);
+
+export const compactPrice = style({
+    flex: '0 0 auto',
+    marginLeft: 'auto',
+    ...NUM.numMd,
+    ...NUMERIC,
+});
+
+export const compactChange = style({
+    flex: '0 0 auto',
+    ...NUM.numSm,
+    ...NUMERIC,
+});
+
+// ---- 分段列（週期、五檔／明細） ----
+
+/** Segmented 外距列：左右 16、上下 4（compact 的擴張點擊區不與相鄰列重疊） */
+export const controlRow = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: SPACE.s3,
+    padding: `${SPACE.s1} ${SPACE.s4}`,
+    minWidth: 0,
+});
+
+export const controlGrow = style({
+    flex: '1 1 auto',
+    minWidth: 0,
+});
+
+/**
+ * 「五檔｜明細」＋右側［整股｜盤中零股］同列（§7.3）。寬度全以 rem 計（隨字級等比放大）：
+ * 分頁至少 6rem、切換鍵固定 10rem（「盤中零股」4 字 callout 3.5rem＋左右內距 1rem＝每段 4.5rem）、間距 .75rem，
+ * 列寬不足 16.75rem（360 寬、字級大：(360 − 2×20.8) ÷ 20.8 ≈ 15.3rem）時切換鍵換到第二行靠右，不重疊、不溢出。
+ * 行距 s2：compact 上下各擴 4px 的點擊區不與另一行重疊。
+ */
+export const panelRow = style([controlRow, {
+    flexWrap: 'wrap',
+    rowGap: SPACE.s2,
+}]);
+
+export const panelTabs = style({
+    flex: '1 1 6rem',
+    minWidth: 0,
+});
+
+/** 切換鍵位置（股票才渲染）：明細分頁時只留空位，分頁寬度不跳動 */
+export const oddToggleSlot = style({
+    flex: '0 0 10rem',
+    marginLeft: 'auto',
+    minWidth: 0,
+});
+
+// ---- 圖表 ----
+
+export const chartWrap = style({
+    position: 'relative',
+    height: '42dvh',
+    minHeight: '220px',
+    maxHeight: '520px',
+    // 單指水平平移、雙指縮放交給 lightweight-charts（handleScroll／handleScale）；垂直滑動仍可捲動頁面
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+    WebkitTouchCallout: 'none',
+});
+
+export const chartHost = style({
+    position: 'absolute',
+    inset: 0,
+});
+
+export const chartOverlay = style({
+    position: 'absolute',
+    inset: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: SPACE.s2,
+    color: vars.color.mutedForeground,
+    ...TEXT.callout,
+    pointerEvents: 'none',
+});
+
+export const chartOverlayAction = style({
+    pointerEvents: 'auto',
+});
+
+export const chartNote = style({
+    margin: 0,
+    padding: `2px ${SPACE.s4}`,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
+/** 委託線標籤：可見膠囊較小，但點擊區至少 44px 高 */
+export const orderLabel = style([focusRing, {
+    position: 'absolute',
+    left: SPACE.s1,
+    transform: 'translateY(-50%)',
+    minHeight: TOUCH_MIN,
+    minWidth: TOUCH_MIN,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    display: 'flex',
+    alignItems: 'center',
+    zIndex: 2,
+}]);
+
+/** 委託線膠囊：實心 up／down＋inkStrong 白字（小字） */
+const orderPillBase = style({
+    padding: '2px 8px',
+    borderRadius: RADIUS.sm,
+    ...TEXT.footnote,
+    fontWeight: 700,
+    whiteSpace: 'nowrap',
+    color: '#ffffff',
+    ...NUMERIC,
+});
+
+export const orderPill = styleVariants({
+    buy: [fill.up.strong, orderPillBase],
+    sell: [fill.down.strong, orderPillBase],
+});
+
+// ---- 選價列（長按放開後浮出；實心 panel、不模糊；由圖表底部升起） ----
+
+const pickRise = keyframes({
+    from: { transform: 'translateY(100%)', opacity: 0 },
+    to: { transform: 'none', opacity: 1 },
+});
+
+const pickSink = keyframes({
+    from: { transform: 'none', opacity: 1 },
+    to: { transform: 'translateY(100%)', opacity: 0 },
+});
+
+const pickFadeIn = keyframes({ from: { opacity: 0 }, to: { opacity: 1 } });
+const pickFadeOut = keyframes({ from: { opacity: 1 }, to: { opacity: 0 } });
+
+/** 收回動畫時間（trade-chart 以此移除收回中的選價列） */
+export const PICK_EXIT_MS = 220;
+
+/**
+ * 選價列的定位外層：貼圖表框底部。本身沒有 transform（進場／收回動畫在內層 pickBar），
+ * trade-chart 以它的幾何 scrollIntoView，才不會被 translateY(100%) 多捲。
+ * 外層不攔點擊（收回殘影期間長按要能穿過）；開啟中的選價列在內層恢復可點。
+ * scroll-margin-bottom：捲到可見範圍時與底部 chrome 之間留一點間距。
+ */
+export const pickAnchor = style({
+    position: 'absolute',
+    left: SPACE.s2,
+    right: SPACE.s2,
+    bottom: SPACE.s2,
+    zIndex: 3,
+    pointerEvents: 'none',
+    scrollMarginBottom: SPACE.s2,
+});
+
+const pickBarBase = style({
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) auto',
+    alignItems: 'center',
+    gap: TRADE_BUTTON_GAP,
+    padding: SPACE.s2,
+    borderRadius: RADIUS.lg,
+    background: vars.color.panel,
+    border: `0.5px solid ${vars.color.borderBright}`,
+    boxShadow: elevation.e2,
+});
+
+export const pickBar = style([pickBarBase, {
+    pointerEvents: 'auto',
+    animation: `${pickRise} ${PICK_EXIT_MS}ms ${EASE.sheet} both`,
+    '@media': {
+        [REDUCED_MOTION]: { animation: `${pickFadeIn} ${DUR.fade}ms ease-out both` },
+    },
+}]);
+
+/** 沿原路收回（不可點：aria-hidden＋inert＋pointer-events none，內容是 span 不是按鈕） */
+export const pickBarClosing = style([pickBarBase, {
+    pointerEvents: 'none',
+    animation: `${pickSink} ${PICK_EXIT_MS}ms ${EASE.sheet} both`,
+    '@media': {
+        [REDUCED_MOTION]: { animation: `${pickFadeOut} ${DUR.fade}ms ease-out both` },
+    },
+}]);
+
+/** 選價買賣鍵：CONTROL_LARGE、實心＋inkLarge、白字 actionLabel（大字門檻） */
+const pickButtonBase = style([pressable, focusRing, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    boxSizing: 'border-box',
+    minWidth: 0,
+    minHeight: SIZE.controlLarge,
+    padding: `0 ${SPACE.s1_5}`,
+    borderRadius: RADIUS.lg,
+    border: 'none',
+    color: '#ffffff',
+    ...TEXT.actionLabel,
+    lineHeight: 1.15,
+    textAlign: 'center',
+    ...NUMERIC,
+}]);
+
+export const pickButton = styleVariants({
+    buy: [pickButtonBase, fill.up.large],
+    sell: [pickButtonBase, fill.down.large],
+    cancel: [pickButtonBase, {
+        minHeight: TOUCH_MIN,
+        minWidth: TOUCH_MIN,
+        padding: `0 ${SPACE.s2}`,
+        background: 'transparent',
+        color: vars.color.foreground,
+        ...TEXT.callout,
+        fontWeight: 600,
+    }],
+});
+
+// ---- 五檔（買賣同列） ----
+
+export const ladder = style({
+    display: 'flex',
+    flexDirection: 'column',
+    padding: `${SPACE.s1} ${SPACE.s4}`,
+    ...NUMERIC,
+});
+
+/** 下單面板內嵌：不留左右外距（面板自己有），其餘結構相同 */
+export const ladderCompact = style({
+    display: 'flex',
+    flexDirection: 'column',
+    padding: 0,
+    ...NUMERIC,
+});
+
+const DEPTH_CELL_PAD = SPACE.s2;
+
+export const depthHead = style([hairlineBottom, {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+    columnGap: '1px',
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+    padding: `${SPACE.s1} 0`,
+}]);
+
+export const depthHeadVol = style({ paddingLeft: DEPTH_CELL_PAD, textAlign: 'left' });
+export const depthHeadPrice = style({ padding: `0 ${DEPTH_CELL_PAD}`, textAlign: 'center' });
+export const depthHeadVolRight = style({ paddingRight: DEPTH_CELL_PAD, textAlign: 'right' });
+
+/**
+ * 表頭量欄完整與縮寫兩個 span 同時渲染（§4.7：字級「大」改縮寫，不用容器查詢）：
+ * 預設顯示完整、隱藏縮寫；字級「大」時完整標籤改為視覺隱藏（與 primitives srOnly 相同手法，仍留給輔助技術）、顯示縮寫（aria-hidden）。
+ */
+export const depthHeadFull = style({
+    selectors: {
+        [FONT_LARGE]: {
+            position: 'absolute',
+            width: '1px',
+            height: '1px',
+            padding: 0,
+            margin: '-1px',
+            overflow: 'hidden',
+            clip: 'rect(0, 0, 0, 0)',
+            whiteSpace: 'nowrap',
+            border: 0,
+        },
+    },
+});
+
+export const depthHeadShort = style({
+    display: 'none',
+    selectors: {
+        [FONT_LARGE]: { display: 'inline' },
+    },
+});
+
+export const depthRow = style([hairlineBottom, {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+    columnGap: '1px',
+}]);
+
+/** 每格：量條（VolumeBar，絕對定位）在下，量與價（position: relative）在上 */
+const depthCellBase = style([pressableRow, focusRing, {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+    alignItems: 'center',
+    columnGap: SPACE.s1,
+    minHeight: TOUCH_MIN,
+    width: '100%',
+    minWidth: 0,
+    padding: `0 ${DEPTH_CELL_PAD}`,
+    border: 'none',
+    background: 'transparent',
+    color: vars.color.foreground,
+    overflow: 'hidden',
+    ...NUM.numSm,
+    ...NUMERIC,
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+}]);
+
+/** 買側：委買量靠左、買價靠右；賣側：賣價靠左、委賣量靠右（兩價在中間相鄰，量條從中線往外長） */
+export const depthCell = styleVariants({
+    bid: [depthCellBase, { textAlign: 'right' }],
+    ask: [depthCellBase, { textAlign: 'left' }],
+});
+
+const depthVolBase = style({
+    position: 'relative',
+    ...ellipsis,
+});
+
+/** 量貼外側：買側靠左、賣側靠右 */
+export const depthVol = styleVariants({
+    bid: [depthVolBase, { textAlign: 'left' }],
+    ask: [depthVolBase, { textAlign: 'right' }],
+});
+
+const depthPriceBase = style({
+    position: 'relative',
+    minWidth: 0,
+    ...NUM.numMd,
+    fontWeight: 500,
+    display: 'flex',
+    flexDirection: 'column',
+    whiteSpace: 'nowrap',
+});
+
+/** 價格貼中線：買價靠右、賣價靠左 */
+export const depthPrice = styleVariants({
+    bid: [depthPriceBase, { alignItems: 'flex-end' }],
+    ask: [depthPriceBase, { alignItems: 'flex-start' }],
+});
+
+/** 最佳一檔價 600 */
+export const depthBest = style({ fontWeight: 600 });
+
+export const depthTotal = style([hairlineBottom, {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) auto minmax(0, 1fr)',
+    alignItems: 'center',
+    columnGap: SPACE.s2,
+    minHeight: '36px',
+    padding: `0 ${DEPTH_CELL_PAD}`,
+    ...NUM.numSm,
+    ...NUMERIC,
+}]);
+
+export const depthTotalVol = style({ ...ellipsis, fontWeight: 600, textAlign: 'left' });
+export const depthTotalVolRight = style({ ...ellipsis, fontWeight: 600, textAlign: 'right' });
+export const depthTotalLabel = style({ ...TEXT.footnote, color: vars.color.mutedForeground, whiteSpace: 'nowrap' });
+
+// ---- 比例條（五檔買賣比、內外盤比；條本身是 ui/bars 的 RatioBar） ----
+
+export const ratio = style({
+    display: 'flex',
+    alignItems: 'center',
+    gap: SPACE.s2,
+    minHeight: '28px',
+    padding: `0 ${DEPTH_CELL_PAD}`,
+    ...TEXT.footnote,
+});
+
+export const ratioText = style({
+    flex: '0 0 auto',
+    ...NUM.numSm,
+    fontWeight: 600,
+    ...NUMERIC,
+    whiteSpace: 'nowrap',
+});
+
+/** RatioBar 的外框（軌道寬 100%，由這層決定伸縮） */
+export const ratioTrack = style({
+    flex: '1 1 auto',
+    minWidth: '40px',
+    display: 'block',
+});
+
+export const innerOuter = style([ratio, {
+    flexWrap: 'wrap',
+    rowGap: '2px',
+    paddingTop: SPACE.s1,
+    paddingBottom: SPACE.s1,
+}]);
+
+export const innerOuterLabel = style({
+    flex: '0 0 auto',
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+});
+
+/** 自己的委託「我 買2」：accent 外框小膠囊 */
+export const ladderMine = style({
+    display: 'inline-block',
+    marginTop: '1px',
+    padding: '0 5px',
+    borderRadius: RADIUS.xs,
+    border: `1px solid ${vars.color.accent}`,
+    color: vars.color.accent,
+    ...TEXT.caption,
+});
+
+/** 次要動作鍵（重試、重新載入）：elevatedBg＋髮絲框 */
+export const toggle = style([pressable, focusRing, {
+    minHeight: TOUCH_MIN,
+    minWidth: TOUCH_MIN,
+    padding: `0 ${SPACE.s4}`,
+    borderRadius: RADIUS.md,
+    border: `0.5px solid ${vars.color.borderBright}`,
+    background: sj.elevatedBg,
+    boxShadow: elevation.e1,
+    color: vars.color.foreground,
+    ...TEXT.callout,
+}]);
+
+export const emptyText = style({
+    margin: 0,
+    padding: `${SPACE.s4} 0`,
+    textAlign: 'center',
+    color: vars.color.mutedForeground,
+    ...TEXT.callout,
+});
+
+// ---- 明細 ----
+
+export const tickList = style({
+    listStyle: 'none',
+    margin: 0,
+    padding: `0 ${SPACE.s4}`,
+    ...NUM.numSm,
+    ...NUMERIC,
+});
+
+/** 390px 寬：時間 8 字、價格、量可收縮（minmax(0, …)＋省略號），內外盤欄固定 */
+const tickGrid = {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 0.8fr) 2em',
+    columnGap: SPACE.s2,
+    alignItems: 'center',
+} as const;
+
+export const tickHead = style([hairlineBottom, {
+    ...tickGrid,
+    padding: `${SPACE.s1} ${SPACE.s4}`,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+}]);
+
+const tickFadeIn = keyframes({ from: { opacity: 0 }, to: { opacity: 1 } });
+
+export const tickRow = style([hairlineBottom, {
+    ...tickGrid,
+    minHeight: '2rem',
+}]);
+
+/** 最新一列 150ms 淡入（只動畫 opacity；減少動態由全域規則取消） */
+export const tickRowNew = style([tickRow, {
+    animation: `${tickFadeIn} ${DUR.fade}ms ease-out both`,
+    '@media': { [REDUCED_MOTION]: { animation: 'none' } },
+}]);
+
+export const tickTime = style({ ...ellipsis, color: vars.color.mutedForeground });
+export const tickNum = style({ ...ellipsis, textAlign: 'right' });
+export const tickPrice = style({ fontWeight: 600 });
+export const tickSide = style({ textAlign: 'right', ...TEXT.footnote, fontWeight: 600, whiteSpace: 'nowrap' });
+
+// ---- 持倉摘要、未成交（GroupedSection 內的列） ----
+
+export const summaryWrap = style({
+    padding: `${SPACE.s3} 0`,
+});
+
+export const summaryRow = style({
+    display: 'flex',
+    alignItems: 'center',
+    minHeight: TOUCH_MIN,
+    boxSizing: 'border-box',
+    padding: `${SIZE.rowPadY} ${SIZE.rowPadX}`,
+    ...TEXT.subhead,
+    ...NUMERIC,
+    color: vars.color.foreground,
+});
+
+export const summaryMuted = style({
+    color: vars.color.mutedForeground,
+});
+
+/**
+ * 「未成交」列的外層：卡片的列間髮絲線（GroupedSection 的 card > * + *::after）落在這一層。
+ * 連結本身帶 pressableRow，它的 ::after 是按壓層；兩者若打在同一個偽元素上會合併成 height 0＋opacity 0，
+ * 髮絲線與按壓回饋都會消失，所以分成兩層。
+ */
+export const workingLinkRow = style({
+    display: 'flex',
+    flexDirection: 'column',
+    minWidth: 0,
+});
+
+export const workingLink = style([pressableRow, {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    minHeight: TOUCH_MIN,
+    boxSizing: 'border-box',
+    padding: `${SIZE.rowPadY} ${SIZE.rowPadX}`,
+    color: vars.color.accent,
+    textDecoration: 'none',
+    ...TEXT.subhead,
+    fontWeight: 600,
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&:focus-visible': { outline: `2px solid ${vars.color.accent}`, outlineOffset: '-2px' },
+    },
+}]);
+
+// ---- 交易鍵列（ShellSlot bottom → 底部 chrome 的 bar 材質上；本身不另設底色） ----
+
+export const tradeBar = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: SPACE.s2,
+    padding: `8px calc(${SPACE.s4} + ${SAFE_RIGHT}) 8px calc(${SPACE.s4} + ${SAFE_LEFT})`,
+});
+
+/** 交易鍵高度 CONTROL_LARGE（字級大時隨 rem 放大，至少 56px） */
+export const tradeButtonSize = style({
+    minHeight: SIZE.controlLarge,
+});

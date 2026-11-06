@@ -55,7 +55,9 @@ git merge upstream/main                         # 不要 rebase：保留可追�
 | `README.md` | 7 | 4 | +237／−13 → 只剩開頭 16 行 | fork 內容放 `docs/fork/` |
 
 fork 自有、不會與上游衝突的檔案：`server/**`、`src/lib/esun/**`、`deploy/**`、`docs/fork/**`、`Dockerfile`、
-`docker-compose.yml`、`scripts/deploy-docker.*`、`esun-config*.example`、`.env.docker.example`、`.github/workflows/fork-ci.yml`。
+`docker-compose.yml`、`scripts/deploy-docker.*`、`esun-config*.example`、`.env.docker.example`、`.github/workflows/fork-ci.yml`，
+以及手機版（[mobile.md](mobile.md)）的 `mobile.html`、`vite.fork.config.ts`、`src/mobile/**`、`deploy/Caddyfile.mobile.example`。
+手機入口由 `vite.fork.config.ts` 合併上游 `vite.config.ts` 加入，不在上游設定檔加 fork 邏輯；`src/mobile/**` 只呼叫 `src/lib` 既有函式。
 
 估算某個上游檔案的 fork 差異行數：
 

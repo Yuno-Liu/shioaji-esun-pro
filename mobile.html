@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-Hant">
+    <head>
+        <meta charset="UTF-8" />
+        <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+        <link rel="alternate icon" type="image/x-icon" href="/favicon.ico" />
+        <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+        <!--
+            PWA（規格 §13 Phase 3）：只有 manifest，不註冊 service worker、不快取任何 API。
+            mobile.webmanifest 由 vite.fork.config.ts 產生；crossorigin="use-credentials"：
+            開啟 Basic Auth 時 manifest 請求也帶上已驗證的憑證（預設不帶，會被 401）。
+        -->
+        <link
+            rel="manifest"
+            href="/mobile.webmanifest"
+            crossorigin="use-credentials"
+        />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="mobile-web-app-capable" content="yes" />
+        <!-- black：狀態列固定黑底白字，深色與淺色主題都清楚（black-translucent 在淺色主題會看不到字） -->
+        <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+        <meta name="apple-mobile-web-app-title" content="SJ Pro" />
+        <!--
+            viewport-fit=cover：版面延伸到瀏海／Home 指示條區域，由 env(safe-area-inset-*) 留白。
+            maximum-scale=1, user-scalable=no：使用者要求禁止手勢縮放（Android Chrome 生效；
+            iOS Safari 會忽略，改由 src/mobile/lib/gesture-guard.ts 與全域 touch-action 處理）。
+        -->
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+        />
+        <!-- 網址列顏色：與 src/theme.css.ts 的深色／淺色背景一致（App 內主題由 initTheme 套用） -->
+        <meta
+            name="theme-color"
+            content="#000000"
+            media="(prefers-color-scheme: dark)"
+        />
+        <meta
+            name="theme-color"
+            content="#eef0f3"
+            media="(prefers-color-scheme: light)"
+        />
+        <meta name="format-detection" content="telephone=no" />
+        <!-- 手機版不載入 Google Fonts：使用系統字型，減少外部請求（規格 §4.4、§10） -->
+        <title>Shioaji Pro — 手機交易</title>
+        <!--
+            white-screen guard（複製自 index.html #4）：ES5 only — must parse on
+            the oldest WebView. If the bundle dies before React mounts, show the
+            error instead of a blank page. Never fires once #root has content.
+        -->
+        <script>
+            (function () {
+                var shown = false;
+                function rootIsEmpty() {
+                    var root = document.getElementById('root');
+                    return !root || root.childNodes.length === 0;
+                }
+                function showBootError(message) {
+                    // defer + re-check so a benign early rejection racing
+                    // React's first commit doesn't flash a false error page
+                    setTimeout(function () {
+                        renderBootError(message);
+                    }, 250);
+                }
+                function renderBootError(message) {
+                    if (shown || !rootIsEmpty() || !document.body) return;
+                    shown = true;
+                    var box = document.createElement('div');
+                    box.setAttribute(
+                        'style',
+                        'position:fixed;top:0;left:0;right:0;bottom:0;' +
+                            'background:#101418;color:#e6e9ec;' +
+                            'font-family:Menlo,Monaco,monospace;font-size:13px;' +
+                            'padding:32px;box-sizing:border-box;overflow:auto;' +
+                            'z-index:2147483647;line-height:1.6',
+                    );
+                    var title = document.createElement('div');
+                    title.setAttribute(
+                        'style',
+                        'font-size:16px;font-weight:bold;color:#ff6b6b;' +
+                            'margin-bottom:12px',
+                    );
+                    title.appendChild(
+                        document.createTextNode(
+                            'Shioaji Pro 啟動失敗 (startup failed)',
+                        ),
+                    );
+                    var msg = document.createElement('pre');
+                    msg.setAttribute(
+                        'style',
+                        'white-space:pre-wrap;word-break:break-word;' +
+                            'background:#1a2026;border:1px solid #2a323a;' +
+                            'border-radius:6px;padding:12px;margin:0 0 16px 0;' +
+                            'color:#ffd166',
+                    );
+                    msg.appendChild(document.createTextNode(message));
+                    var hint = document.createElement('div');
+                    hint.setAttribute('style', 'color:#9aa4ad');
+                    hint.appendChild(
+                        document.createTextNode(
+                            '請將上方錯誤訊息截圖回報至 ' +
+                                'github.com/Sinotrade/shioaji-pro-app/issues',
+                        ),
+                    );
+                    box.appendChild(title);
+                    box.appendChild(msg);
+                    box.appendChild(hint);
+                    document.body.appendChild(box);
+                }
+                window.onerror = function (message, source, line, col, error) {
+                    var text = String(message || 'Unknown error');
+                    if (source) {
+                        text +=
+                            '\n' +
+                            String(source) +
+                            ':' +
+                            String(line || 0) +
+                            ':' +
+                            String(col || 0);
+                    }
+                    if (error && error.stack) {
+                        text += '\n' + String(error.stack);
+                    }
+                    // bundle may fail before DOM is ready on old engines
+                    if (document.body) {
+                        showBootError(text);
+                    } else if (window.addEventListener) {
+                        window.addEventListener('DOMContentLoaded', function () {
+                            showBootError(text);
+                        });
+                    }
+                    return false;
+                };
+                if (window.addEventListener) {
+                    window.addEventListener(
+                        'unhandledrejection',
+                        function (event) {
+                            var reason =
+                                event && event.reason
+                                    ? event.reason.stack ||
+                                      event.reason.message ||
+                                      String(event.reason)
+                                    : 'Unhandled promise rejection';
+                            showBootError(String(reason));
+                        },
+                    );
+                }
+            })();
+        </script>
+    </head>
+    <body>
+        <div id="root"></div>
+        <script type="module" src="/src/mobile/main.tsx"></script>
+    </body>
+</html>

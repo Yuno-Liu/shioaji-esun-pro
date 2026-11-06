@@ -18,13 +18,15 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile --ignore-scripts
 
 # Copy application source files
-COPY tsconfig*.json vite.config.ts index.html approval.html SHIOAJI_VERSION ./
+COPY tsconfig*.json vite.config.ts vite.fork.config.ts index.html approval.html mobile.html SHIOAJI_VERSION ./
 COPY public ./public
 COPY schemas ./schemas
 COPY src ./src
 
 # Build production assets into /app/dist
-RUN pnpm run build
+# 以 fork 的 vite.fork.config.ts 建置：合併上游設定並加入手機入口 mobile.html
+# （型別檢查同 pnpm run build 的 tsc -b；docs/fork/mobile-trading-spec.md §4.3）
+RUN pnpm exec tsc -b && pnpm exec vite build --config vite.fork.config.ts
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2: SinoPac Shioaji API server (行情 sidecar)
