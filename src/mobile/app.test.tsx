@@ -12,6 +12,8 @@ const m = vi.hoisted(() => ({
     // 狀態列帳戶切換面板、自選頁排行的延遲載入入口（閒置預載應呼叫）
     deferredLoads: [] as string[],
     deferredFail: false,
+    /** 產業分頁模組已被 import（app.tsx 直接延遲載入，列入閒置預載；mock factory 在第一次 import 時執行） */
+    sectorImported: false,
 }));
 
 vi.mock('../lib/stream', () => ({ ensureStream: () => undefined }));
@@ -41,6 +43,10 @@ vi.mock('./components/order-ticket-sheet', () => ({
 vi.mock('./components/order-action-sheet', () => ({ OrderActionSheet: () => null }));
 vi.mock('./routes/watchlist-page', () => ({ WatchlistPage: () => null }));
 vi.mock('./routes/trade-page', () => ({ TradePage: () => null }));
+vi.mock('./routes/sector-page', () => {
+    m.sectorImported = true;
+    return { SectorPage: () => null };
+});
 vi.mock('./routes/positions-page', () => ({ PositionsPage: () => null }));
 vi.mock('./routes/account-page', () => ({ AccountPage: () => null }));
 vi.mock('./hooks/use-risk-pnl-feed', () => ({ useRiskPnlFeed: () => undefined }));
@@ -62,6 +68,11 @@ vi.mock('./lib/deferred-modules', () => ({
     loadSearchSheet: async () => {
         m.deferredLoads.push('search-sheet');
         if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: search-sheet.js');
+        return {};
+    },
+    loadWatchListSheet: async () => {
+        m.deferredLoads.push('watch-list-sheet');
+        if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: watch-list-sheet.js');
         return {};
     },
 }));
@@ -156,7 +167,16 @@ describe('MobileShell idle prefetch', () => {
         await act(async () => { await vi.advanceTimersByTimeAsync(1_499); });
         expect(m.deferredLoads).toEqual([]);
         await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet', 'ranking-list']);
+        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'ranking-list']);
+        expectPersistentChromeMounted();
+    });
+
+    it('閒置預載也包含產業分頁模組（不經過 lazy 元件，不顯示錯誤）', async () => {
+        m.failOrders = false;
+        await mount();
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+        expect(m.sectorImported).toBe(true);
+        expect(byTestId('route-load-error')).toHaveLength(0);
         expectPersistentChromeMounted();
     });
 
@@ -165,7 +185,7 @@ describe('MobileShell idle prefetch', () => {
         m.deferredFail = true;
         await mount();
         await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
-        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet', 'ranking-list']);
+        expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'ranking-list']);
         expect(byTestId('ticket-load-error')).toHaveLength(0);
         expect(byTestId('route-load-error')).toHaveLength(0);
         expectPersistentChromeMounted();

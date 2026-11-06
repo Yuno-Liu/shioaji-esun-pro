@@ -2,7 +2,7 @@
 //
 // 為什麼用 hash：nginx 的 SPA fallback 會把未知路徑導向桌面 index.html，
 // `#/trade/2330` 這類 hash 路由不會落到桌面版。
-// 路由：#/watchlist（預設）、#/trade/:code、#/orders、#/positions、#/account。
+// 路由：#/watchlist（預設）、#/trade/:code、#/sector（產業流向）、#/orders、#/positions、#/account。
 // 解析與組字串是純函式；useHashRoute() 只訂閱 hashchange。
 
 import { useSyncExternalStore } from 'react';
@@ -11,13 +11,15 @@ export type MobileRoute =
     | { name: 'watchlist' }
     /** code 為 null：交易分頁尚未選商品（例如直接點底部「交易」） */
     | { name: 'trade'; code: string | null }
+    /** 產業流向（底部分頁「產業」） */
+    | { name: 'sector' }
     | { name: 'orders' }
     | { name: 'positions' }
     | { name: 'account' };
 
 export type MobileTab = MobileRoute['name'];
 
-export const MOBILE_TABS: readonly MobileTab[] = ['watchlist', 'trade', 'orders', 'positions', 'account'];
+export const MOBILE_TABS: readonly MobileTab[] = ['watchlist', 'trade', 'sector', 'orders', 'positions', 'account'];
 
 export const DEFAULT_ROUTE: MobileRoute = { name: 'watchlist' };
 
@@ -47,6 +49,7 @@ export function parseHash(hash: string): MobileRoute {
     const [head, ...rest] = path.split('/');
     switch (head) {
         case 'watchlist':
+        case 'sector':
         case 'orders':
         case 'positions':
         case 'account':

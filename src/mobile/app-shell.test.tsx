@@ -7,6 +7,7 @@
 //   再點目前分頁 preventDefault 並捲回頂端（減少動態時不平滑），點其他分頁照常切換。
 // - 切換分頁：新分頁模組載入中（Suspense fallback）時，舊頁 portal 到配件槽／上方插槽的內容必須已卸載；
 //   同一分頁內換商品不重掛頁面。
+import { readFileSync } from 'node:fs';
 import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -51,6 +52,7 @@ vi.mock('./routes/trade-page', async () => {
     };
 });
 vi.mock('./routes/orders-page', () => ({ OrdersPage: () => createElement('p', { 'data-testid': 'orders-page' }) }));
+vi.mock('./routes/sector-page', () => ({ SectorPage: () => createElement('p', { 'data-testid': 'sector-page' }) }));
 vi.mock('./routes/positions-page', () => ({ PositionsPage: () => null }));
 vi.mock('./routes/account-page', async () => {
     await m.accountGate;
@@ -246,6 +248,35 @@ describe('TabBar', () => {
         const other = { preventDefault: vi.fn() };
         await act(async () => { one('tab-positions').props.onClick(other); });
         expect(other.preventDefault).not.toHaveBeenCalled();
+    });
+
+    it('6 個分頁依序：自選、交易、產業、委託、持倉、帳戶；分頁列欄數跟著分頁數', async () => {
+        await mount();
+        const tabs = one('mobile-tab-bar').findAll(n => typeof n.type === 'string' && n.type === 'a');
+        expect(tabs.map(t => t.props['data-testid'])).toEqual(['tab-watchlist', 'tab-trade', 'tab-sector', 'tab-orders', 'tab-positions', 'tab-account']);
+        expect(tabs.map(t => t.props['aria-label'])).toEqual(['自選', '交易', '產業', '委託', '持倉', '帳戶']);
+        expect(one('tab-sector').props.href).toBe('#/sector');
+        expect(one('tab-trade').props.href).toBe('#/trade');
+        // 欄數寫在 layout.css.ts 的 tabBar（不用 inline style）
+        expect(one('mobile-tab-bar').props.style).toBeUndefined();
+        const css = readFileSync(new URL('./styles/layout.css.ts', import.meta.url), 'utf8');
+        const tabBarBlock = css.slice(css.indexOf('export const tabBar = style('), css.indexOf('export const tab = style('));
+        expect(tabBarBlock).toContain("gridTemplateColumns: 'repeat(6, minmax(0, 1fr))'");
+        expect(tabBarBlock).not.toContain('repeat(5');
+    });
+
+    it('深層連結 #/sector：顯示產業頁、產業分頁 aria-current；再點產業分頁捲回頂端', async () => {
+        (location as { hash: string }).hash = '#/sector';
+        await mount({ dom: true });
+        expect(byTestId('sector-page')).toHaveLength(1);
+        expect(one('tab-sector').props['aria-current']).toBe('page');
+        expect(one('tab-orders').props['aria-current']).toBeUndefined();
+        expect(getMobileUi().activeTab).toBe('sector');
+        const main = nodes.find(n => n.tag === 'main')!;
+        const again = { preventDefault: vi.fn() };
+        await act(async () => { one('tab-sector').props.onClick(again); });
+        expect(again.preventDefault).toHaveBeenCalledTimes(1);
+        expect(main.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' });
     });
 
     it('減少動態：再點目前分頁直接回頂（behavior auto）', async () => {

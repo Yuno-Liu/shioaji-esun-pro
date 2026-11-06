@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_ROUTE, formatRoute, isCanonicalHash, isValidProductCode, parseHash, sameRoute } from './hash-router';
+import { DEFAULT_ROUTE, formatRoute, isCanonicalHash, isValidProductCode, MOBILE_TABS, parseHash, sameRoute } from './hash-router';
 
 describe('parseHash', () => {
     it('defaults to the watchlist for empty or unknown hashes', () => {
-        for (const hash of ['', '#', '#/', '#/nope', '#/orders/extra', 'garbage']) {
+        for (const hash of ['', '#', '#/', '#/nope', '#/orders/extra', '#/sector/extra', 'garbage']) {
             expect(parseHash(hash)).toEqual(DEFAULT_ROUTE);
         }
     });
@@ -13,6 +13,12 @@ describe('parseHash', () => {
         expect(parseHash('#/orders')).toEqual({ name: 'orders' });
         expect(parseHash('#/positions')).toEqual({ name: 'positions' });
         expect(parseHash('#/account')).toEqual({ name: 'account' });
+        expect(parseHash('#/sector')).toEqual({ name: 'sector' });
+        expect(parseHash('/sector/')).toEqual({ name: 'sector' });
+    });
+
+    it('6 個分頁：產業在交易之後', () => {
+        expect(MOBILE_TABS).toEqual(['watchlist', 'trade', 'sector', 'orders', 'positions', 'account']);
     });
 
     it('parses the trade route with a product code', () => {
@@ -34,7 +40,7 @@ describe('parseHash', () => {
 
 describe('formatRoute', () => {
     it('round-trips every route', () => {
-        for (const hash of ['#/watchlist', '#/trade/2330', '#/trade', '#/orders', '#/positions', '#/account']) {
+        for (const hash of ['#/watchlist', '#/trade/2330', '#/trade', '#/sector', '#/orders', '#/positions', '#/account']) {
             expect(formatRoute(parseHash(hash))).toBe(hash);
         }
     });

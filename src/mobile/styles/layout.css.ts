@@ -155,9 +155,10 @@ export const sheetRoot = style({
     flex: '0 0 auto',
 });
 
+/** 6 分頁（自選、交易、產業、委託、持倉、帳戶）；minmax(0,1fr) 讓 360 寬時各欄 60px ≥ 44px、長字不撐寬 */
 export const tabBar = style({
     display: 'grid',
-    gridTemplateColumns: 'repeat(5, 1fr)',
+    gridTemplateColumns: 'repeat(6, minmax(0, 1fr))',
     boxSizing: 'border-box',
     height: `var(${SHELL_VAR.tabbarH})`,
     paddingBottom: SAFE_BOTTOM,

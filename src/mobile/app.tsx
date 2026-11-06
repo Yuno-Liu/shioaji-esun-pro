@@ -2,13 +2,13 @@
 //
 // - 非 secure context：只顯示 SecureContextGate（不掛載任何會連線的元件或 hook）。
 // - secure context：MobileShell —— 狀態列（捲動容器外、不透明）＋ hash 路由頁面（main 唯一捲動容器，內容從底部
-//   chrome 下方捲過）＋底部 chrome（配件槽＋5 分頁，同一片 bar 材質），根層掛載 toast host、下單／委託操作／確認面板
+//   chrome 下方捲過）＋底部 chrome（配件槽＋6 分頁，同一片 bar 材質），根層掛載 toast host、下單／委託操作／確認面板
 //   host（portal 到 #sj-sheet-root）、風控損益餵送、ResumeGate、成交音效／震動（useFillSound）與螢幕常亮（useWakeLock）。
 // - 殼層結構、插槽、捲動記憶、html 屬性與背景隔離見設計規格 §6.6；main 與其祖先不得有 transform／filter／
 //   backdrop-filter／will-change／contain:paint（保護 fixed 全螢幕圖表）。
 
 import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { Briefcase, ChartCandlestick, ClipboardList, Star, UserRound, type LucideIcon } from 'lucide-react';
+import { Briefcase, ChartCandlestick, ClipboardList, Factory, Star, UserRound, type LucideIcon } from 'lucide-react';
 import { useTradingState } from '../lib/trading-state';
 import { ensureStream } from '../lib/stream';
 import type { Trade } from '../lib/types/order';
@@ -22,7 +22,7 @@ import { useFillSound } from './hooks/use-fill-sound';
 import { useHtmlAttributes } from './hooks/use-html-attributes';
 import { useRiskPnlFeed } from './hooks/use-risk-pnl-feed';
 import { useWakeLock } from './hooks/use-wake-lock';
-import { loadRankingList, loadSearchSheet, loadWatchSparkline } from './lib/deferred-modules';
+import { loadRankingList, loadSearchSheet, loadWatchListSheet, loadWatchSparkline } from './lib/deferred-modules';
 import { formatRoute, isCanonicalHash, navigate, parseHash, useHashRoute, type MobileRoute, type MobileTab } from './lib/hash-router';
 import { closeOrderAction, closeTicket, setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
 import { startResumeGate } from './lib/resume-gate-runtime';
@@ -41,6 +41,7 @@ import { ShellSlotsContext, type ShellSlotTargets } from './ui/shell-slots';
 // 其餘分頁與下單／委託操作面板在第一次用到時才載入，並在首屏完成後閒置時預先抓取（規格 §9.4：首次載入 JS ≤ 400 KB）。
 // 自選頁的「排行」分段、列的迷你走勢與搜尋面板同樣延遲載入（載入入口在 lib/deferred-modules.ts），也列入閒置預載。
 const loadTradePage = () => import('./routes/trade-page');
+const loadSectorPage = () => import('./routes/sector-page');
 const loadOrdersPage = () => import('./routes/orders-page');
 const loadPositionsPage = () => import('./routes/positions-page');
 const loadAccountPage = () => import('./routes/account-page');
@@ -49,22 +50,23 @@ const loadActionSheet = () => import('./components/order-action-sheet');
 
 // retryableLazy：載入失敗後按［重試］會換一個新的 lazy 重新 import（React.lazy 會永久快取失敗的 promise）
 const TradePage = retryableLazy(() => loadTradePage().then(m => m.TradePage), 'TradePage');
+const SectorPage = retryableLazy(() => loadSectorPage().then(m => m.SectorPage), 'SectorPage');
 const OrdersPage = retryableLazy(() => loadOrdersPage().then(m => m.OrdersPage), 'OrdersPage');
 const PositionsPage = retryableLazy(() => loadPositionsPage().then(m => m.PositionsPage), 'PositionsPage');
 const AccountPage = retryableLazy(() => loadAccountPage().then(m => m.AccountPage), 'AccountPage');
 const OrderTicketSheet = retryableLazy(() => loadTicketSheet().then(m => m.OrderTicketSheet), 'OrderTicketSheet');
 const OrderActionSheet = retryableLazy(() => loadActionSheet().then(m => m.OrderActionSheet), 'OrderActionSheet');
 
-const ROUTE_MODULES = [TradePage, OrdersPage, PositionsPage, AccountPage];
+const ROUTE_MODULES = [TradePage, SectorPage, OrdersPage, PositionsPage, AccountPage];
 const resetRouteModules = () => { for (const page of ROUTE_MODULES) page.reset(); };
 const resetTicketSheet = () => { OrderTicketSheet.reset(); };
 const resetActionSheet = () => { OrderActionSheet.reset(); };
 
 const PREFETCH_DELAY_MS = 1_500;
 
-/** 閒置預載的順序：最可能先用到的在前（自選列的迷你走勢、下單面板、交易頁、搜尋面板…），排行最後 */
+/** 閒置預載的順序：最可能先用到的在前（自選列的迷你走勢、下單面板、交易頁、搜尋面板…），清單名稱面板、產業頁與排行最後 */
 const DEFERRED_MODULE_LOADERS: readonly (() => Promise<unknown>)[] = [
-    loadWatchSparkline, loadTicketSheet, loadSearchSheet, loadTradePage, loadOrdersPage, loadPositionsPage, loadAccountPage, loadActionSheet, loadRankingList,
+    loadWatchSparkline, loadTicketSheet, loadSearchSheet, loadTradePage, loadOrdersPage, loadPositionsPage, loadAccountPage, loadActionSheet, loadWatchListSheet, loadSectorPage, loadRankingList,
 ];
 
 /**
@@ -156,12 +158,13 @@ function RouteFallback() {
 const TAB_META: Record<MobileTab, { label: string; icon: LucideIcon }> = {
     watchlist: { label: '自選', icon: Star },
     trade: { label: '交易', icon: ChartCandlestick },
+    sector: { label: '產業', icon: Factory },
     orders: { label: '委託', icon: ClipboardList },
     positions: { label: '持倉', icon: Briefcase },
     account: { label: '帳戶', icon: UserRound },
 };
 
-const TAB_ORDER: readonly MobileTab[] = ['watchlist', 'trade', 'orders', 'positions', 'account'];
+const TAB_ORDER: readonly MobileTab[] = ['watchlist', 'trade', 'sector', 'orders', 'positions', 'account'];
 
 /** 未成交筆數（委託分頁徽章）：狀態屬 ACTIVE_ORDER_STATUSES 且剩餘量 > 0 */
 export function countWorkingOrders(trades: readonly Trade[]): number {
@@ -231,6 +234,7 @@ function RoutePage({ route }: { route: MobileRoute }) {
     switch (route.name) {
         case 'watchlist': return <WatchlistPage />;
         case 'trade': return <TradePage code={route.code} />;
+        case 'sector': return <SectorPage />;
         case 'orders': return <OrdersPage />;
         case 'positions': return <PositionsPage />;
         case 'account': return <AccountPage />;
