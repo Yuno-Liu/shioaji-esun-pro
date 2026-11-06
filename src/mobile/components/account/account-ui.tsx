@@ -23,10 +23,10 @@ export function useNow(intervalMs: number): number {
     return now;
 }
 
-/** 區塊（GroupedSection 外觀）：標題在卡片外（footnote），extra 在標題列右側；props 與 testId 不變 */
-export function Card({ title, extra, children, testId }: { title: string; extra?: ReactNode; children: ReactNode; testId?: string }) {
+/** 區塊（GroupedSection 外觀）：標題在卡片外（footnote），extra 在標題列右側；props 與 testId 不變。id：跳轉錨點（可程式聚焦） */
+export function Card({ title, extra, children, testId, id }: { title: string; extra?: ReactNode; children: ReactNode; testId?: string; id?: string }) {
     return (
-        <section className={styles.card} data-testid={testId} aria-label={title}>
+        <section className={styles.card} data-testid={testId} aria-label={title} id={id} tabIndex={id ? -1 : undefined}>
             <div className={styles.cardHeader}>
                 <h2 className={styles.cardTitle}>{title}</h2>
                 {extra}

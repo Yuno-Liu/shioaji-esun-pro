@@ -252,13 +252,42 @@ export const line = style({
     color: vars.color.foreground,
 });
 
-/** 委託列第一行（代碼＋名稱）放大到 headline；第二行的價量用 numMd */
-globalStyle(`${rowMain} > ${line}:first-child`, { ...TEXT.headline });
+/**
+ * 委託列、成交列（dealRow 沿用 rowMain）第一行：名稱＋代碼放大到 headline；第二行的價量用 numMd。
+ * 第一行不換行：名稱到達時只有名稱縮短（省略號），代碼、買賣膠囊、徽章與成交時間不縮、不換行，列高不變。
+ */
+const FIRST_LINE = `${rowMain} > ${line}:first-child`;
+globalStyle(FIRST_LINE, { ...TEXT.headline, flexWrap: 'nowrap' });
+globalStyle(`${FIRST_LINE} > *`, { flexShrink: 0, whiteSpace: 'nowrap' });
 
-export const code = style({
-    ...TEXT.headline,
-    ...NUMERIC,
+/**
+ * 商品（名稱為主、代碼為次，同自選列）：單行不換行、名稱過長以省略號截斷；
+ * 名稱載入前只顯示代碼，名稱到達時仍在同一行，列高不變。
+ */
+export const instrument = style({
+    display: 'inline-flex',
+    alignItems: 'baseline',
+    gap: SPACE.s1_5,
+    minWidth: 0,
+    maxWidth: '100%',
+    whiteSpace: 'nowrap',
 });
+
+export const instrumentName = style({
+    ...TEXT.headline,
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+});
+
+export const instrumentCode = style({
+    flexShrink: 0,
+    ...TEXT.subhead,
+    ...NUMERIC,
+    color: vars.color.mutedForeground,
+});
+/** 委託列／成交列第一行：只有商品（名稱）可縮，名稱以省略號截斷；代碼在商品內不縮（instrumentCode） */
+globalStyle(`${FIRST_LINE} > ${instrument}`, { flexShrink: 1, minWidth: 0 });
 
 export const sub = style({
     ...TEXT.subhead,

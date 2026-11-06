@@ -3,6 +3,7 @@
 // - 資料：useTradingState().trades（AccountedTrade，每列帶帳戶）；不自行輪詢（規格 §9.1）。
 // - 分頁：[未成交 N]（ACTIVE_ORDER_STATUSES 且剩餘量 > 0，部分成交仍有剩餘也在這裡）［已成交］（同桌面：status Filled）［全部］
 //   ［成交］（目前委託資料中的逐筆成交 status.deals，附合計）；帳戶篩選「全部」或單一帳戶。最新在前；「全部」時未成交置頂。
+// - 商品一律「名稱為主、代碼為次」（TradeInstrument／TradeName；名稱來源與查詢次數見 lib/contract-names.ts）。
 // - 委託列（OrderLines）：類別徽章、成交均價、成交進度條、已取消／原始委託量、券商訊息；點列開啟委託明細面板
 //   （order-detail-sheet.tsx：完整欄位、成交時間軸、玉山中繼資料；改價／減量／刪單一樣經由委託操作面板）。
 // - 對帳 banner：queries.orders.needsReconcile／reasons 以 RECONCILE_REASON_LABELS 顯示，附「對帳」鍵（＝更新）。
@@ -45,11 +46,14 @@ import {
     orderUnitOf,
     tradeAccountKey,
     tradeAccountOf,
+    TradeInstrument,
+    useTradeName,
     type TradeAccount,
 } from '../components/order-action-sheet';
 import { OrderDetailSheet } from '../components/order-detail-sheet';
 import { routeBadgeText, useOrderRoute } from '../components/route-badge';
 import { SlideToConfirm } from '../components/slide-to-confirm';
+import { instrumentText } from '../lib/contract-names';
 import { isNotStarted } from '../lib/errors';
 import { openOrderAction } from '../lib/mobile-store';
 import { collectDealRows, dealTotals, quantitiesText, type DealRow } from '../lib/order-fills';
@@ -360,6 +364,7 @@ function OrderRow({ trade, selecting, selected, disabled, onToggle, onOpen }: Or
     const avail = orderActionAvailability(trade, meta);
     const id = trade.order.id;
     const sideText = trade.order.action === 'Buy' ? '買' : '賣';
+    const label = instrumentText(trade.contract.code, useTradeName(trade));
     const showActions = working && !selecting;
     const main = (
         <button
@@ -384,7 +389,7 @@ function OrderRow({ trade, selecting, selected, disabled, onToggle, onOpen }: Or
                             type='checkbox'
                             className={styles.checkbox}
                             data-testid='order-select'
-                            aria-label={`選取 ${trade.contract.code} ${sideText}`}
+                            aria-label={`選取 ${label} ${sideText}`}
                             checked={selected}
                             disabled={disabled}
                             onChange={() => onToggle(id)}
@@ -395,7 +400,7 @@ function OrderRow({ trade, selecting, selected, disabled, onToggle, onOpen }: Or
             ) : main}
             {/* 列上動作：與列主體為兄弟節點（不巢狀在按鈕內）；只開委託操作面板，送出仍需面板內滑動確認 */}
             {showActions && (
-                <div className={styles.rowActions} role='group' aria-label={`${trade.contract.code} ${sideText} 委託操作`}>
+                <div className={styles.rowActions} role='group' aria-label={`${label} ${sideText} 委託操作`}>
                     {avail.price && <Chip label='改價' testId='order-price-button' onClick={() => openOrderAction(id, 'price')} />}
                     {avail.qty && <Chip label='減量' testId='order-qty-button' onClick={() => openOrderAction(id, 'qty')} />}
                     <Chip label='刪單' testId='order-cancel-button' className={styles.chipDanger} onClick={() => openOrderAction(id, 'cancel')} />
@@ -462,10 +467,9 @@ function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void 
                 title='查看委託明細'
                 onClick={() => onOpen(t.order.id)}
             >
-                {/* 精簡兩行：(買) 代碼 名稱 … 時間／價 × 量 單位 … 帳戶（方向膠囊以 CSS order 排在最前） */}
+                {/* 精簡兩行：(買) 名稱 代碼 … 時間／價 × 量 單位 … 帳戶（方向膠囊以 CSS order 排在最前） */}
                 <span className={styles.line}>
-                    <span className={styles.code}>{t.contract.code}</span>
-                    {t.contract.name && <span>{t.contract.name}</span>}
+                    <TradeInstrument trade={t} testId='deal-instrument' />
                     <span className={styles.side[t.order.action === 'Buy' ? 'Buy' : 'Sell']} data-testid='deal-side'>{sideText}</span>
                     <span className={styles.lineEnd} data-testid='deal-time'>{time || '—'}</span>
                 </span>
@@ -483,6 +487,11 @@ function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void 
 }
 
 // ---- 確認面板 ----
+
+/** 清單文字用的「名稱 代碼」（名稱載入前只有代碼） */
+function TradeName({ trade }: { trade: Trade }) {
+    return <span data-testid='trade-name'>{instrumentText(trade.contract.code, useTradeName(trade))}</span>;
+}
 
 function AccountItem({ account, count }: { account: TradeAccount | null; count: number }) {
     const priv = usePrivacyMode();
@@ -680,7 +689,7 @@ function BatchCancelSheet({ open, targets, onBusyChange, onSent, onClose }: Batc
                                 {results.items.map(r => (
                                     <li key={r.trade.order.id} className={styles.resultItem} data-testid='batch-cancel-result' data-trade-id={r.trade.order.id} data-tone={r.tone}>
                                         <span>
-                                            {r.trade.contract.code} {r.trade.order.action === 'Buy' ? '買' : '賣'} {orderPriceText(r.trade)} · 剩餘 {fmtInt(remainingWorkingOrderQuantity(r.trade))} {orderUnitOf(r.trade)}
+                                            <TradeName trade={r.trade} /> {r.trade.order.action === 'Buy' ? '買' : '賣'} {orderPriceText(r.trade)} · 剩餘 {fmtInt(remainingWorkingOrderQuantity(r.trade))} {orderUnitOf(r.trade)}
                                         </span>
                                         <span className={r.tone === 'ok' ? styles.resultOk : r.tone === 'warn' ? styles.resultWarn : styles.resultErr}>{r.title}</span>
                                         {r.body && <span className={styles.sub}>{r.body}</span>}
@@ -706,7 +715,7 @@ function BatchCancelSheet({ open, targets, onBusyChange, onSent, onClose }: Batc
                                     <li key={t.order.id} className={styles.resultItem}>
                                         <span>
                                             <span className={styles.side[t.order.action === 'Buy' ? 'Buy' : 'Sell']}>{t.order.action === 'Buy' ? '買' : '賣'}</span>
-                                            {' '}{t.contract.code} {t.contract.name ?? ''} {orderPriceText(t)} · 剩餘 {fmtInt(remainingWorkingOrderQuantity(t))} {orderUnitOf(t)}
+                                            {' '}<TradeName trade={t} /> {orderPriceText(t)} · 剩餘 {fmtInt(remainingWorkingOrderQuantity(t))} {orderUnitOf(t)}
                                         </span>
                                     </li>
                                 ))}
