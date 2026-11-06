@@ -231,3 +231,24 @@ it('a cash exit keeps sending without order_cond', async () => {
     expect(m.stock.mock.calls[0]![1]).not.toHaveProperty('order_cond');
     expect(m.confirm.mock.calls[0]![0]).not.toHaveProperty('credit');
 });
+
+const warrant = { code:'030392',security_type:'WRT',exchange:'TSE',limit_down:0.01,limit_up:3.28 } as ContractBase & {limit_down:number;limit_up:number};
+it('exits a warrant position like a stock: whole lots at market on the stock account', async () => {
+    await placeStockExitByShares(warrant,'Sell',2000,account);
+    expect(m.future).not.toHaveBeenCalled();
+    expect(m.stock).toHaveBeenCalledOnce();
+    expect(m.stock.mock.calls[0]![0]).toBe(warrant);
+    expect(m.stock.mock.calls[0]![1]).toMatchObject({quantity:2,order_lot:'Common',price_type:'MKT',order_type:'IOC'});
+    expect(m.stock.mock.calls[0]![2]).toBe(account);
+});
+it('refuses a warrant remainder below one lot before any leg: warrants have no odd lots', async () => {
+    await expect(placeStockExitByShares(warrant,'Sell',1500,account)).rejects.toMatchObject({ mutationNotStarted: true, message: expect.stringContaining('權證沒有零股') });
+    expect(m.confirm).not.toHaveBeenCalled();
+    expect(m.stock).not.toHaveBeenCalled();
+});
+it('quick-orders a warrant on the stock path with stock_order parameters', async () => {
+    await placeQuickOrder(warrant,'Buy',1.68,2,{ account });
+    expect(m.future).not.toHaveBeenCalled();
+    expect(m.stock).toHaveBeenCalledOnce();
+    expect(m.stock.mock.calls[0]![1]).toMatchObject({action:'Buy',price:1.68,quantity:2,price_type:'LMT',order_type:'ROD',order_lot:'Common'});
+});

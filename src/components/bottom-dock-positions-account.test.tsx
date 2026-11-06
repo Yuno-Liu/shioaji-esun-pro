@@ -9,7 +9,7 @@ vi.mock('../lib/trade', () => ({ placeQuickOrder: mocks.place, placeStockExitByS
 vi.mock('../hooks/use-stream', () => ({ useTradingLive: () => true }));
 vi.mock('../lib/contracts-cache', () => ({ ensureContract: async (code: string) => {
     if (code === '9999') throw new Error('contract fetch failed');
-    return { code, name: code, security_type: code === '2330' ? 'STK' : 'FUT' };
+    return { code, name: code, security_type: code === '2330' ? 'STK' : code === '030392' ? 'WRT' : 'FUT' };
 } }));
 vi.mock('../lib/server-info-store', () => ({ useServerInfo: () => null, yesterdayQuantityNotice: () => null, knownServerInfo: () => ({ simulation: mocks.simulation }) }));
 vi.mock('./bottom-dock-shared', async original => ({ ...await original<object>(), useMeasuredWidth: () => ({ ref: { current: null }, width: 1400 }) }));
@@ -166,4 +166,11 @@ it('group subtotal market value is Σ|shares × price| (short counts positive) a
     expect(text).toContain('784,000');
     expect(text).toContain('部分缺價未計');
     expect(text).not.toContain('NaN');
+});
+it('closes a warrant position through the stock exit, not as a market mismatch', async () => {
+    const stock = { ...owner, account_type: 'S' };
+    mocks.stock.mockResolvedValue([]);
+    await mount({ ...position, code: '030392', account: stock, quantity: 2000, yd_quantity: 2000, cond: 'Cash' }); await click('平');
+    expect(mocks.stock.mock.calls[0]!.slice(1)).toEqual(['Sell', 2000, stock]);
+    expect(mocks.notify.mock.calls.flat().join()).not.toContain('不符');
 });

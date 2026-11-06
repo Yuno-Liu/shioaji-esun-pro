@@ -27,7 +27,7 @@ function flow(netAt: Record<number, number>, turnoverAt: Record<number, number>,
         run += net[i]!;
         cumNet[i] = run;
     }
-    return { count: 10, turnover, net, cumNet, flow5, turnover5: 0, accel: null, total: 0, pct: null, breadth: { up: 0, flat: 0, down: 0 } };
+    return { count: 10, turnover, net, cumNet, flow5, turnover5: 0, accel: null, total: 0, pct: null, volumeRatio: null, breadth: { up: 0, flat: 0, down: 0 } };
 }
 
 const g = (category: string, name: string, value: number) => ({ category, name, item_count: 5, value });

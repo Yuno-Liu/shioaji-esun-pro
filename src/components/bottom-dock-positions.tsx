@@ -6,6 +6,7 @@ import { reconcileAfterUnknownOutcome } from '../lib/order-outcome';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { useTradingLive } from '../hooks/use-stream';
+import { contractMarket } from '../lib/contract-market';
 import { ensureContract } from '../lib/contracts-cache';
 import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../lib/privacy';
 import { useServerInfo, yesterdayQuantityNotice } from '../lib/server-info-store';
@@ -215,7 +216,7 @@ export function PositionsPane({
         } catch (e) {
             throw refused(`商品資料讀取失敗，未送出委託：${e instanceof Error ? e.message : String(e)}`);
         }
-        if ((contract.security_type === 'STK' ? 'S' : 'F') !== account.account_type) throw refused('商品與持倉帳戶市場不符，未送出委託');
+        if (contractMarket(contract.security_type) !== account.account_type) throw refused('商品與持倉帳戶市場不符，未送出委託');
         const exit = p.direction === 'Buy' ? 'Sell' : 'Buy';
         if (stockExit) {
             if (stockExit.orderCond) await placeStockExitByShares(contract, stockExit.exit, p.quantity, account, { orderCond: stockExit.orderCond });
