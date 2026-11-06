@@ -37,11 +37,33 @@ function mobileManifestPlugin(): Plugin {
     };
 }
 
+/**
+ * lucide 圖示不進上游的 vendor 群組（規格 §13 首次載入體積）。
+ * 上游 vendor 群組（test: node_modules）會把桌面＋手機用到的全部圖示（約 160 個）合成一個 chunk，
+ * mobile.html 首屏只用到十幾個卻得整包下載。排除後 lucide-react 回到 rolldown 的自動切分（依實際引用它的
+ * 入口／延遲載入模組放置），各入口只載入自己用到的圖示。只改 chunk 切法，不改任何程式碼的行為。
+ * 找不到上游 vendor 群組（或其 test 不是 RegExp）時不動：只會失去這項體積最佳化，不影響建置。
+ */
+const LUCIDE_MODULE = /node_modules[\\/]lucide-react[\\/]/;
+
+function excludeFromVendorGroup(config: UserConfig, excluded: RegExp): UserConfig {
+    const output = config.build?.rolldownOptions?.output;
+    if (!output || Array.isArray(output)) return config;
+    const splitting = output.codeSplitting;
+    if (!splitting || typeof splitting !== 'object' || !splitting.groups) return config;
+    const index = splitting.groups.findIndex(group => group.name === 'vendor');
+    const vendor = splitting.groups[index];
+    if (!vendor || !(vendor.test instanceof RegExp)) return config;
+    const original = vendor.test;
+    splitting.groups[index] = { ...vendor, test: (id: string) => original.test(id) && !excluded.test(id) };
+    return config;
+}
+
 export default defineConfig(async (env: ConfigEnv) => {
     // 上游設定是函式型（依 mode／command 產生），用同一組 env 取得實際設定
     const base = (typeof upstream === 'function' ? await upstream(env) : upstream) as UserConfig;
     // mergeConfig 會深層合併：rolldownOptions.input 保留 main、approval，再加上 mobile；plugins 陣列串接
-    return mergeConfig(base, {
+    const merged = mergeConfig(base, {
         plugins: [mobileManifestPlugin()],
         build: {
             rolldownOptions: {
@@ -49,4 +71,5 @@ export default defineConfig(async (env: ConfigEnv) => {
             },
         },
     });
+    return excludeFromVendorGroup(merged, LUCIDE_MODULE);
 });

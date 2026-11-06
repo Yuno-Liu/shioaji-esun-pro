@@ -4,7 +4,15 @@ import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const m = vi.hoisted(() => ({ failOrders: true, failTicket: true, ordersLoads: 0, ticketLoads: 0 }));
+const m = vi.hoisted(() => ({
+    failOrders: true,
+    failTicket: true,
+    ordersLoads: 0,
+    ticketLoads: 0,
+    // 狀態列帳戶切換面板、自選頁排行的延遲載入入口（閒置預載應呼叫）
+    deferredLoads: [] as string[],
+    deferredFail: false,
+}));
 
 vi.mock('../lib/stream', () => ({ ensureStream: () => undefined }));
 vi.mock('../lib/trading-state', () => ({ useTradingState: () => ({ trades: [] }) }));
@@ -40,6 +48,13 @@ vi.mock('./hooks/use-fill-sound', () => ({ useFillSound: () => undefined }));
 vi.mock('./hooks/use-wake-lock', () => ({ useWakeLock: () => undefined }));
 vi.mock('./lib/resume-gate-runtime', () => ({ startResumeGate: () => () => undefined }));
 vi.mock('./lib/watchlist-context', () => ({ WatchlistProvider: ({ children }: { children?: unknown }) => children }));
+vi.mock('./lib/deferred-modules', () => ({
+    loadRankingList: async () => {
+        m.deferredLoads.push('ranking-list');
+        if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: ranking-list.js');
+        return {};
+    },
+}));
 
 import { MobileShell } from './app';
 import { MODULE_LOAD_ERROR_TEXT } from './components/route-error-boundary';
@@ -70,6 +85,8 @@ beforeEach(() => {
     m.failTicket = true;
     m.ordersLoads = 0;
     m.ticketLoads = 0;
+    m.deferredLoads = [];
+    m.deferredFail = false;
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
@@ -118,5 +135,29 @@ describe('MobileShell lazy module failures', () => {
         await act(async () => { await vi.advanceTimersByTimeAsync(0); });
         expect(byTestId('ticket-sheet')).toHaveLength(1);
         expect(byTestId('ticket-load-error')).toHaveLength(0);
+    });
+});
+
+describe('MobileShell idle prefetch', () => {
+    it('首屏完成 1.5 秒後閒置預載：包含自選頁排行（延遲載入的新模組）', async () => {
+        m.failOrders = false;
+        await mount();
+        expect(m.deferredLoads).toEqual([]);
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_499); });
+        expect(m.deferredLoads).toEqual([]);
+        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+        expect(m.deferredLoads).toEqual(['ranking-list']);
+        expectPersistentChromeMounted();
+    });
+
+    it('預載失敗只吞掉：不顯示錯誤、不卸載殼層', async () => {
+        m.failOrders = false;
+        m.deferredFail = true;
+        await mount();
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+        expect(m.deferredLoads).toEqual(['ranking-list']);
+        expect(byTestId('ticket-load-error')).toHaveLength(0);
+        expect(byTestId('route-load-error')).toHaveLength(0);
+        expectPersistentChromeMounted();
     });
 });

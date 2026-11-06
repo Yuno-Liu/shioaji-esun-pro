@@ -22,6 +22,7 @@ import { useFillSound } from './hooks/use-fill-sound';
 import { useHtmlAttributes } from './hooks/use-html-attributes';
 import { useRiskPnlFeed } from './hooks/use-risk-pnl-feed';
 import { useWakeLock } from './hooks/use-wake-lock';
+import { loadRankingList } from './lib/deferred-modules';
 import { formatRoute, isCanonicalHash, navigate, parseHash, useHashRoute, type MobileRoute, type MobileTab } from './lib/hash-router';
 import { closeOrderAction, closeTicket, setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
 import { startResumeGate } from './lib/resume-gate-runtime';
@@ -38,6 +39,7 @@ import { ShellSlotsContext, type ShellSlotTargets } from './ui/shell-slots';
 
 // 首次載入只含殼層、預設分頁（自選）與確認面板（確認面板必須常駐，requestOrderConfirm 才會結束）。
 // 其餘分頁與下單／委託操作面板在第一次用到時才載入，並在首屏完成後閒置時預先抓取（規格 §9.4：首次載入 JS ≤ 400 KB）。
+// 自選頁的「排行」分段同樣延遲載入（載入入口在 lib/deferred-modules.ts），也列入閒置預載。
 const loadTradePage = () => import('./routes/trade-page');
 const loadOrdersPage = () => import('./routes/orders-page');
 const loadPositionsPage = () => import('./routes/positions-page');
@@ -60,6 +62,11 @@ const resetActionSheet = () => { OrderActionSheet.reset(); };
 
 const PREFETCH_DELAY_MS = 1_500;
 
+/** 閒置預載的順序：最可能先用到的在前（下單面板、交易頁…），排行最後 */
+const DEFERRED_MODULE_LOADERS: readonly (() => Promise<unknown>)[] = [
+    loadTicketSheet, loadTradePage, loadOrdersPage, loadPositionsPage, loadAccountPage, loadActionSheet, loadRankingList,
+];
+
 /**
  * 首屏完成後閒置時預先抓取其餘模組。失敗只吞掉、不重試：預先抓取不經過 lazy 元件，不會讓它們記住失敗；
  * 真正用到時 lazy 會自己 import，若仍失敗由 ModuleErrorBoundary 顯示「載入失敗」與［重試］（不會卸載整個 App）。
@@ -67,7 +74,7 @@ const PREFETCH_DELAY_MS = 1_500;
 function usePrefetchDeferredModules(): void {
     useEffect(() => {
         const run = () => {
-            for (const load of [loadTicketSheet, loadTradePage, loadOrdersPage, loadPositionsPage, loadAccountPage, loadActionSheet]) {
+            for (const load of DEFERRED_MODULE_LOADERS) {
                 load().catch(() => undefined);
             }
         };

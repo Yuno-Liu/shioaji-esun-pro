@@ -11,14 +11,14 @@
 //   「買進…／賣出…」**只呼叫 openTicket()**（只開下單面板；之後仍需預覽與滑動確認才會送出，設計規格 §10 S1）。
 // - 搜尋：search-sheet.tsx（searchProducts(query, 10)）。
 // - 試撮（tick.simtrade）：比照桌面，代碼旁加「試撮」徽章，不當成真實成交顯示。
-// - 分段「自選｜排行」（§13 Phase 3）：排行見 components/ranking-list.tsx，只在「排行」分段掛載時讀取；
+// - 分段「自選｜排行」（§13 Phase 3）：排行見 components/ranking-list.tsx（延遲載入），只在「排行」分段掛載時讀取；
 //   「排行」分段不掛載自選列，自選列的行情訂閱隨之釋放。分段選擇在模組層保留（切換分頁再回來不變）。
 // - 版面（設計規格 §7.2）：PageHeader＋IconButton；Segmented tabs；表頭「商品｜指標切換鍵」（watch-metric-toggle，
 //   在表頭不在列按鈕內，避免巢狀互動）；列 56px、價格 PriceFlash、漲跌膠囊（實心 up／down＋inkStrong）；
 //   載入 Skeleton、空清單 EmptyState、錯誤 InlineNote。不顯示迷你走勢（不新增任何 K 線請求）。
 
 import { ChevronsUpDown, MoreHorizontal, Pencil, Search, Star } from 'lucide-react';
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { useQuote, type PriceQuoteState } from '../../hooks/use-stream';
 import type { WatchItem } from '../../hooks/use-watchlist';
 import { neighborCode } from '../../lib/list-move';
@@ -27,8 +27,9 @@ import type { ContractInfo } from '../../lib/types/contract';
 import type { Snapshot } from '../../lib/types/market';
 import { fmtCompactInt, fmtPct, fmtPrice } from '../../lib/utils/format';
 import { BottomSheet } from '../components/bottom-sheet';
-import { RankingList } from '../components/ranking-list';
+import { ModuleErrorBoundary, ModuleLoadError, retryableLazy } from '../components/route-error-boundary';
 import { SearchSheet } from '../components/search-sheet';
+import { loadRankingList } from '../lib/deferred-modules';
 import { navigate } from '../lib/hash-router';
 import { openTicket } from '../lib/mobile-store';
 import { useMobileWatchlist } from '../lib/watchlist-context';
@@ -460,6 +461,11 @@ function RowActionsSheet({ code, items, onClose, onOpen, onRemove, onMove }: {
 
 export type WatchSegment = 'watchlist' | 'ranking';
 
+// 排行只在「排行」分段才用到：延遲載入（規格 §13 首次載入體積），閒置時由 app.tsx 預載。
+// 載入失敗只在分段內容區顯示「載入失敗」＋［重試］（retryableLazy 換新的 lazy 重新 import）。
+const RankingList = retryableLazy(() => loadRankingList().then(m => m.RankingList), 'RankingList');
+const resetRankingList = () => { RankingList.reset(); };
+
 const SEGMENTS = [
     { value: 'watchlist', label: '自選', testId: 'watch-segment-watchlist' },
     { value: 'ranking', label: '排行', testId: 'watch-segment-ranking' },
@@ -559,7 +565,13 @@ export function WatchlistPage() {
                 {!ranking && editing && <p className={styles.listName}>按「⋯」或長按一列可調整順序或移除。</p>}
             </div>
 
-            {ranking && <RankingList watchedCodes={watchedCodes} canAdd={canAdd} onAdd={onAddRanked} onOpen={openTrade} />}
+            {ranking && (
+                <ModuleErrorBoundary onRetry={resetRankingList} fallback={props => <ModuleLoadError {...props} testId='ranking-load-error' />}>
+                    <Suspense fallback={<Skeleton label='排行讀取中…' rows={6} testId='ranking-module-loading' />}>
+                        <RankingList watchedCodes={watchedCodes} canAdd={canAdd} onAdd={onAddRanked} onOpen={openTrade} />
+                    </Suspense>
+                </ModuleErrorBoundary>
+            )}
 
             {!ranking && wl.loadError && (
                 <div className={styles.stateBlock}>
