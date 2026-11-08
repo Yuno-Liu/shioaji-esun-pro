@@ -806,6 +806,8 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
   - 量比，只有 STK（`lib/volume-ratio`）：今日累計量 ÷ 前一交易日量；快照日期與成交不同時不顯示。
   - 處置股，只有 STK。
   - 期貨只有漲跌停與振幅；選擇權、指數只有振幅；指數沒有資料時整列不渲染。
+  - 同一交易日檢查（同桌面 quote-board 的 sameDay；`lib/trade-info` 的 `sameTradingDay`）：報價推出的參考價（現價 − 串流或快照的漲跌）與合約參考價相差半個跳動以上時，兩者不是同一個交易日（盤前開 App 的除權息、分割日；期貨夜盤時合約仍是日盤的參考價與漲跌停）。此時不判停板、小條改畫最低到最高、振幅以報價自身的參考價計。
+  - 選擇權不判停板：跌停只是最小跳動的地板（同桌面），只顯示振幅。
 - 面板 `trade-chips-sheet`（`components/trade-info/trade-chips-sheet.tsx`）：第一次點資訊列才 import（retryableLazy＋ModuleErrorBoundary＋SheetLoadError），唯讀。內容：
   - 融資融券：成數、單位、可否；停資、停券時寫出原因（成數或單位為 0）。
   - 可借券源（`short_stock_sources`）與合約上的資券餘額。
@@ -813,6 +815,8 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
   - 當沖資格與規則：證交稅取自 `lib/day-trade-tax`；期權、權證、指數各自說明。
   - 資訊列各項目的定義。
   - 查詢失敗時顯示［重新查詢融資融券與券源］，只重讀失敗的那一項。
+  - 融資融券與券源顯示資料時間（`update_time`、`datetime`，MM/DD HH:mm）：每檔每天只讀一次，早上的數字整天沿用；並註明下單時券商會重新查詢，以下單當下為準（下單流程本來就會以 `loadCreditEnquire({ fresh: true })` 再查）。
+  - 按［重新查詢］後按鍵會消失，焦點先移到「融資融券」標題（tabIndex −1），不掉到面板外。
 - 交易安全：資訊列與面板不呼叫 `openTicket`／`openOrderAction` 或任何送單、改單、刪單函式（§10 S1 表）。
 
 **標頭 ☆ 與指標快速範本**（第 1 期；以程式碼為準）：
@@ -820,6 +824,7 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 - 標頭上半改成［名稱列＋主價列｜☆］兩欄。☆（`trade-watch-star`，44px IconButton）把目前商品加入／移出目前的自選清單：
   - 使用殼層常駐的 WatchlistProvider（`useOptionalMobileWatchlist`）；加入時把已載入的合約直接傳給 `addSymbol`，不重新解析；移出呼叫 `removeSymbol`。
   - aria-pressed＝已在清單，已在時星號實心。清單載入中、更新中、載入失敗、合約未載入、組合商品、處理中都停用，原因寫進無障礙名稱。
+  - 處理中（自己的加入或移出還沒完成）只標 aria-disabled、不設 disabled（IconButton 的 `ariaDisabled`），聚焦中的按鈕不會失去焦點；再按由 toggle 開頭的檢查忽略。
   - 結果以 `notify` 回報（ToastHost 顯示，也記進通知中心）。長名稱或多徽章時名稱列、主價列可能多換一行（標頭最多高約 35px），不重疊。
 - 指標面板「快速範本」：
   - 當沖＝VWAP、MA(5)、MA(20)＋MACD(12,26,9)；波段＝MA(5)、MA(20)、MA(60)＋KD(9,3,3)；長線＝MA(20)、MA(60)、MA(120)＋RSI(14)；三者成交量都開。
@@ -1010,6 +1015,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 頁首「市場」＋Segmented tabs［產業流向｜盤中異動］。第三段「大盤節奏」是第 2 期，不顯示也不放佔位。
 - 路由：`#/market`＝產業流向、`#/market/signals`＝盤中異動。舊書籤 `#/sector` 解析為 `#/market`，以 replace 正規化。內部 MobileTab id 由 `sector` 改為 `market`。
 - 切換分段用 `navigate(..., { replace: true })`，不新增歷史紀錄；底部分頁仍是一般導覽。
+- 兩個分段的根元素不同，切換時頁首重新掛載：切換前焦點在分段上時，掛載後把焦點移到新選取的分段（觸控點擊沒有聚焦時不搶焦點）。
 - 市場分頁連結帶回本 session 上次的分段（sessionStorage `sj-mobile-market-segment`，例外時回到產業流向）。
 - 產業流向只在該分段掛載（下方原本的產業流向內容不變）；切到盤中異動時卸載並釋放它的訂閱。兩個分段根元素不同，切換時頁首重新掛載，分段拇指沒有滑動動畫。
 
@@ -1036,6 +1042,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 延遲載入的獨立 chunk，市場頁掛載後閒置時預載（不在殼層預載清單，首屏 0 位元組；省流量時不預載；iOS 沒有 requestIdleCallback，掛載當下就抓）。
 - 資料：`lib/market-pulse` 的 scanner 訊號（retainMarketPulseStreams 只掛上既有 SSE 的監聽，不另開連線）；以 `subscribeMarketSignal`／`unsubscribeMarketSignal` 訂閱「規則 × 市場」鍵（`components/market/signal-subscriptions.ts`）。
 - 訂閱只在盤中異動分段掛載且頁面在前景時：離開、切換分段、退到背景或卸載時，對成功的鍵各退訂 1 次；失敗的鍵不退訂（lib 沒有替它加 ref-count）。回前景依目前篩選重新訂閱。
+- 釋放寬限 1.5 秒（`RELEASE_GRACE_MS`，模組層，同行情訂閱的釋放寬限）：釋放的鍵先寄放，寬限內再要（切回盤中異動分段、篩選來回切換、短暫切到背景）就沿用原本的訂閱，不送 unsubscribe 與重新 subscribe；寬限結束才退訂。失敗的鍵不寄放。
 - 篩選：訊號家族（漲跌停、急漲跌、爆量、狀態）多選 Chip＋市場（上市、上櫃）；存 localStorage `sj-mobile-signal-filters-v1`；預設與桌面相同：急漲跌＋上市＋上櫃（8 個鍵，全選 26 個）。篩選改變只送差異。
 - 狀態列「已訂閱 n/m」；部分失敗用 InlineNote warn 說明不會自動重試＋［重試］（只重送失敗的鍵）；串流重連遺漏用 InlineNote「串流重連期間遺漏 N 筆訊號（起–迄）」。
 - 列（最新在前，最多 100 列，畫面每 500ms 最多依 snapshot.version 重算一次）：第一行名稱＋代碼｜（試撮徽章）成交價；第二行時間・上市／上櫃・訊號文字（方向色輔助）・補充（急漲跌幅度、爆量金額、觸發價）｜漲跌（帶正負號與漲跌幅）。
@@ -1188,6 +1195,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 - 估值與體質卡：新增請求 0（用同一份財報檔）；P/B 用公司分頁已有的報價（同一檔 refcount）。
 - 每次進入盤中異動分段（或回到前景）：
   - scanner subscribe：每個「規則 × 市場」鍵 1 次（預設 8、全選 26）；篩選改變只送差異；離開、切換分段、退到背景時對成功的鍵各 unsubscribe 1 次。
+  - 釋放寬限 1.5 秒：寬限內切回分段、篩選來回或短暫切到背景都是 0 個請求；超過寬限才退訂，之後再進入照上列計。
   - 失敗不自動重試；［重試］每按一次只對失敗的鍵各送 1 次。例外：lib `updateCapabilitySubscription` 對暫時性錯誤（逾時、5xx）本身會退避重試 2、4、8、15 秒，單一鍵單次 subscribe 最多 5 個 POST（桌面相同，lib 既有行為）。
   - SSE 不另開連線；名稱：合約 GET 0；`/metadata/equity/*` GET ≤3（與搜尋共用，60 分鐘內 0）。
   - K 線、報價訂閱、快照 0；送單、改單、刪單 0。產業流向分段的請求同原本「每次進入產業頁」，只在該分段顯示時發生。
@@ -1344,6 +1352,9 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
     - 排行：在模擬環境唯讀確認 ChangePriceRank、TickCountRank 的 ascending 方向與 `rank_value` 語意；ETF（00 開頭）與權證代碼判斷是啟發式。
     - 日內區間小條：iOS 15.4 的 `--p` inline 變數、兩種主題下細軌的對比；期貨夜盤時 tick 的高低是該盤，不是整個交易日。
     - 交易頁 ☆：實心狀態的觀感；`removeSymbol` 遇到忙碌會靜默返回，☆ 雖已在忙碌時停用，仍有極小的競態窗口可能顯示「已移出」但實際沒移除。
+    - 深度審查列為需要實機確認的項目：
+      - 切到背景（visibilitychange → hidden）時送出的 unsubscribe 可能被 iOS 丟掉；lib 仍會註銷該鍵，若 sidecar 的訂閱是全域的，可能留下伺服器端的訂閱（與上面的跨客戶端風險相關）。釋放寬限讓退訂延後 1.5 秒，iOS 在背景暫停計時器時會在回前景才處理。
+      - 「鎖漲停／漲停未鎖」沒有排除 `bidask.simtrade`：13:25–13:30 收盤集合競價時會依試撮的五檔判斷，是否合理要看交易所的語意。
     - 通知中心與憑證提醒：
       - 鈴與徽章在 iOS 15.4 Safari、Android Chrome 的位置；360 寬、字級 1.15、「資料過期」加「已鎖單」時路由的 ⌄ 會被切掉一部分（純外觀，未修）。
       - 面板 chunk 還沒預載就按鈴時，會有短暫「點了沒反應」（已用閒置預載降低機率）。
