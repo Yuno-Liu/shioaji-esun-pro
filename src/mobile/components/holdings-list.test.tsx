@@ -210,6 +210,15 @@ describe('HoldingsList', () => {
         expect(rowCodes()).toEqual(['2330']);
     });
 
+    it('沒有即時成交時以持倉的現價當備援：顯示價格與對參考價的漲跌（不另發請求）', async () => {
+        setTrading([stock('2330', 2000), deriv('TXFL6', 1)]);
+        await render();
+        // 合約參考價 100：2330 現價 101 → +1（+1.00%）；TXFL6 現價 20010 → +19910
+        expect(textOf(inRow('2330', 'holding-price'))).toBe('101.00');
+        expect(textOf(inRow('2330', 'holding-change'))).toContain('+1.00');
+        expect(textOf(inRow('TXFL6', 'holding-price'))).not.toBe('—');
+    });
+
     it('點列開交易頁；長按面板只有開啟交易頁、買進…、賣出…；買賣與快速下單只呼叫 openTicket', async () => {
         setTrading([stock('2330', 2000)]);
         await render();

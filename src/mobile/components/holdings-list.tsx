@@ -22,6 +22,7 @@ import { useContract } from '../../lib/contracts-cache';
 import { maskMoney, usePrivacyMoney } from '../../lib/privacy';
 import { useTradingState } from '../../lib/trading-state';
 import type { ContractInfo } from '../../lib/types/contract';
+import type { Snapshot } from '../../lib/types/market';
 import type { AccountedPosition } from '../../lib/types/portfolio';
 import { navigate } from '../lib/hash-router';
 import { openTicket } from '../lib/mobile-store';
@@ -94,6 +95,10 @@ const HoldingRow = memo(function HoldingRow({ holding, index, tracker, metric, s
     // 合約未載入前不顯示快速下單鍵（同寬佔位）：避免把指數、組合商品當成可交易
     const tradable = contract ? tradableContract(contract) : false;
     const parts = holdingTagParts(holding, contract, privMoney);
+    // 還沒有即時成交（盤後、週末、冷門商品、剛進頁）時以持倉的現價當快照備援：與持倉頁同一個現價、不另發請求；
+    // 漲跌由 rowQuoteView 以合約參考價推算。有即時成交後以即時價為準。
+    const lastPrice = holding.positions.find(p => p.last_price > 0)?.last_price;
+    const fallback = useMemo(() => (lastPrice !== undefined ? ({ close: lastPrice } as Snapshot) : undefined), [lastPrice]);
     return (
         <QuoteRow
             testPrefix='holding'
@@ -109,6 +114,7 @@ const HoldingRow = memo(function HoldingRow({ holding, index, tracker, metric, s
             sparkReference={contract?.reference || undefined}
             punished={punished}
             quoteContract={contract ?? { reference: 0 }}
+            snapshot={fallback}
             probe={HoldingQuoteProbe}
             metaExtra={parts.map((t, i) => <span key={i} className={styles.rankExtra} data-testid='holding-tag'>{t}</span>)}
             ariaSuffix={`，持倉 ${parts.join(' ')}`}
