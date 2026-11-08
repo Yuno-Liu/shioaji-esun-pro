@@ -17,7 +17,7 @@ const m = vi.hoisted(() => ({
     apiGet: vi.fn(async () => ({ code: [] })),
     deleteWatchlist: vi.fn(),
     emit: vi.fn(),
-    focus: { title: vi.fn(), del: vi.fn() },
+    focus: { title: vi.fn(), del: vi.fn(), select: vi.fn(), list: vi.fn() },
     fetchSnapshots: vi.fn(async () => []),
     state: {} as Record<string, unknown>,
     listeners: new Set<() => void>(),
@@ -132,10 +132,12 @@ const fakeRow = (id: string): FakeRow => {
 function nodeMock(el: { type: unknown; props: Record<string, unknown> }) {
     if (el.props['data-testid'] === 'watch-group-del-title') return { focus: m.focus.title };
     if (el.props['data-testid'] === 'watch-group-del') return { focus: m.focus.del };
+    if (el.props['data-testid'] === 'watch-group-select') return { focus: m.focus.select, disabled: el.props.disabled === true };
     if (el.type === 'ul' && el.props['data-testid'] === 'watch-group-sort-list') {
         return {
             get children() { return groupOrder().map(fakeRow); },
             closest: () => null,
+            focus: m.focus.list,
         };
     }
     return {};
@@ -203,6 +205,8 @@ beforeEach(() => {
     m.emit.mockReset();
     m.focus.title.mockClear();
     m.focus.del.mockClear();
+    m.focus.select.mockClear();
+    m.focus.list.mockClear();
     resetMultiSelectForTest();
     resetWatchlistSegmentForTest();
     resetWatchPrefsForTest();
@@ -361,6 +365,22 @@ describe('排序群組：刪除確認與執行', () => {
         expect(one('watch-group-select').props['aria-pressed']).toBe(false);
         expect(sheetOrder()).toEqual(['a']);
         expect(sheet()!.props.open).toBe(true);
+        // 只剩一個群組：「選取」停用，焦點改到群組列表（不掉到 body）
+        expect(m.focus.select).not.toHaveBeenCalled();
+        expect(m.focus.list).toHaveBeenCalledTimes(1);
+    });
+
+    it('刪除完成後還剩兩個以上群組：焦點回到「選取」鍵', async () => {
+        useServer();
+        await render();
+        await enterSelect();
+        await click(check('c'));
+        await click(one('watch-group-del'));
+        await click(one('watch-group-del-ok'));
+        await settle();
+        expect(m.deleteWatchlist.mock.calls.map(c => c[0])).toEqual(['c']);
+        expect(m.focus.select).toHaveBeenCalledTimes(1);
+        expect(m.focus.list).not.toHaveBeenCalled();
     });
 
     it('hook 重新讀取完成前：剛刪掉的群組不再顯示在面板', async () => {

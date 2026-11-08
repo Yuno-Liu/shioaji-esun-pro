@@ -462,11 +462,17 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
     /** 確認畫面的標題（進入時焦點移到這裡）與選取模式的刪除鍵（返回時焦點回到這裡） */
     const confirmTitle = useRef<HTMLHeadingElement | null>(null);
     const deleteBtn = useRef<HTMLButtonElement | null>(null);
-    const focusAfter = useRef<'title' | 'delete' | null>(null);
+    /** 刪除完成後焦點回到「選取」鍵；只剩一個群組時它停用，改到群組列表（tabIndex −1），不讓焦點掉到 body */
+    const selectBtn = useRef<HTMLButtonElement | null>(null);
+    const focusAfter = useRef<'title' | 'delete' | 'select' | null>(null);
     useLayoutEffect(() => {
         const f = focusAfter.current;
         focusAfter.current = null;
-        const el = f === 'title' ? confirmTitle.current : f === 'delete' ? deleteBtn.current : null;
+        const sel = selectBtn.current;
+        const el = f === 'title' ? confirmTitle.current
+            : f === 'delete' ? deleteBtn.current
+            : f === 'select' ? (sel && !sel.disabled ? sel : listRef.current)
+            : null;
         if (el && typeof el.focus === 'function') el.focus();
     }, [mode]);
     const exitSelect = () => {
@@ -486,6 +492,7 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
         onOrder();
         setRun(null);
         setSel(new Set());
+        focusAfter.current = 'select';
         setMode('sort');
         const summary = groupDeleteSummary(result, targets.length, activeName);
         if (summary) notify(summary);
@@ -566,6 +573,7 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
                     </p>
                     <div className={styles.listTools}>
                         <button
+                            ref={selectBtn}
                             type='button'
                             className={`${styles.listTool} ${edit.toolOn} ${pressable} ${focusRing}`}
                             aria-pressed={!sorting}
@@ -577,7 +585,7 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
                             選取
                         </button>
                     </div>
-                    <ul ref={listRef} className={edit.sheetList} aria-label={sorting ? '群組順序' : '選取要刪除的群組'} data-testid='watch-group-sort-list'>
+                    <ul ref={listRef} tabIndex={-1} className={edit.sheetList} aria-label={sorting ? '群組順序' : '選取要刪除的群組'} data-testid='watch-group-sort-list'>
                         {lists.map((l, i) => {
                             const checked = sel.has(l.id);
                             const Check = checked ? CircleCheck : Circle;

@@ -97,6 +97,8 @@ export const sheetList = style({
     borderRadius: RADIUS.lg,
     background: sj.elevatedBg,
     overflow: 'hidden',
+    // 刪除群組後只剩一個群組時，焦點以程式移到群組列表（tabIndex −1）：不畫焦點框
+    outline: 'none',
 });
 
 export const sheetItem = style({
