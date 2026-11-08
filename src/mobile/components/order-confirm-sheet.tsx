@@ -22,6 +22,10 @@
 //   環境仍與固定 footer 的滑塊同時看得到（§10 S6）。全寬實心：正式 danger＋ShieldAlert、模擬 accent、未確認 amber 黑字（文字為 confirmEnvText()）。
 // - 即時價：桌面取自 trigger-engine 的 usePendingPrices()，但 livePriceCode 只有觸價單會帶，手機不載入
 //   trigger-engine（載入即啟動觸價執行器，違反 R7）；因此有 livePriceCode 時一律視為「行情中斷」並停用（fail-closed）。
+// - 持倉多選市價出清（lib/batch-exit-auth，§10 S10）：批次進行中不渲染面板（也不沿用退場快取），每個確認請求交給
+//   decideBatchConfirm()：approve → resolve(true)、reject → resolve(false)、wait → 等下一次 store 更新再判斷。
+//   ResumeGate 不允許時不判斷（由上面的 ResumeGate 檢查取消）；核准未被 lib 接受（仍是同一筆）就立即取消。
+//   沒有批次時 decide 回 'none'，面板行為與原本相同。
 
 import { ShieldAlert } from 'lucide-react';
 import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
@@ -35,6 +39,7 @@ import {
 import { usePrivacyMode } from '../../lib/privacy';
 import { notify } from '../../lib/trade';
 import { fmtPrice } from '../../lib/utils/format';
+import { decideBatchConfirm, isBatchExitActive, subscribeBatchExit } from '../lib/batch-exit-auth';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { getResumeGate, subscribeResumeGate } from '../lib/resume-gate-runtime';
 import * as styles from '../styles/order-confirm.css';
@@ -139,6 +144,7 @@ function ConfirmSlide(props: SlideToConfirmProps) {
 
 export function OrderConfirmSheet() {
     const current = useSyncExternalStore(subscribeEntry, syncEntry);
+    const batch = useSyncExternalStore(subscribeBatchExit, isBatchExitActive);
     const priv = usePrivacyMode();
     const approvedIds = useRef(new Set<number>());
     const gateCancelledIds = useRef(new Set<number>());
@@ -146,7 +152,8 @@ export function OrderConfirmSheet() {
     const [rearm, setRearm] = useState(0);
     // 退場動畫期間沿用最後一筆的內容（onExited 後清空）
     const lastEntryRef = useRef<ConfirmEntry | null>(null);
-    if (current) lastEntryRef.current = current;
+    if (batch) lastEntryRef.current = null;
+    else if (current) lastEntryRef.current = current;
 
     // ResumeGate：兩個 store 任一變動都同步檢查（在 T2 的 resolveOrderConfirm(false) 之前就能提示原因）
     useEffect(() => {
@@ -166,6 +173,26 @@ export function OrderConfirmSheet() {
         };
     }, []);
 
+    // 批次出清：不顯示面板，依授權結果核准或取消（見檔頭）
+    // resolve 會先清空待確認再通知（重入時 syncEntry() 為 null），同一筆不會判斷兩次。
+    useEffect(() => {
+        const run = () => {
+            const e = syncEntry();
+            if (!e || !isBatchExitActive() || !gateStillAllows(e)) return;
+            const d = decideBatchConfirm(e.request);
+            if (d !== 'approve' && d !== 'reject') return;
+            resolveOrderConfirm(d === 'approve');
+            if (syncEntry()?.id === e.id) resolveOrderConfirm(false);
+        };
+        const offConfirm = subscribeOrderConfirm(run);
+        const offBatch = subscribeBatchExit(run);
+        run();
+        return () => {
+            offConfirm();
+            offBatch();
+        };
+    }, []);
+
     // 卸載時仍有待確認：取消，不讓 promise 懸置
     useEffect(() => () => {
         if (syncEntry()) resolveOrderConfirm(false);
@@ -177,7 +204,7 @@ export function OrderConfirmSheet() {
     }, []);
 
     const shown = current ?? lastEntryRef.current;
-    if (!shown) return null;
+    if (!shown || batch) return null;
     const open = current !== null;
     const { id, request } = shown;
     const blockReason = confirmBlockReason(request, NO_LIVE_PRICE);

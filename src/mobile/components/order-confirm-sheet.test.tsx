@@ -29,10 +29,13 @@ vi.mock('../../lib/order-confirm', () => ({
         q.listeners.forEach(l => l());
     },
     privacyAccountLabel: (label: string, priv: boolean) => (priv ? label.replace(/\*+\d{2}(\d{2})$/, '•••••$1') : label),
+    // 批次出清授權（lib/batch-exit-auth）比對帳戶標籤用；格式同 lib（分公司-***末四碼）
+    accountConfirmLabel: (a: { broker_id: string; account_id: string }) => `${a.broker_id}-***${a.account_id.slice(-4)}`,
 }));
 vi.mock('../../lib/privacy', () => ({ usePrivacyMode: () => q.priv }));
 vi.mock('../../lib/trade', () => ({ notify: m.notify }));
 
+import { armBatchExit, batchExitAbortReason, setBatchExit, type ExpectedConfirm } from '../lib/batch-exit-auth';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
 import { CONFIRM_TEXT, confirmActionText, OrderConfirmSheet } from './order-confirm-sheet';
 import type { ReactElement } from 'react';
@@ -93,6 +96,7 @@ beforeEach(() => {
 afterEach(async () => {
     await act(async () => view?.unmount());
     view = undefined;
+    setBatchExit(false);
 });
 
 describe('OrderConfirmSheet — 內容', () => {
@@ -508,5 +512,100 @@ describe('OrderConfirmSheet — S4 退場凍結（createNodeMock＋假時鐘）'
         expect(panel('order-confirm-sheet')!.props['data-tone']).toBe('sell');
         expect(text(one('confirm-env'))).toBe('正式環境');
         expect(slideDisabled()).toBe(false);
+    });
+});
+
+describe('OrderConfirmSheet — 持倉多選市價出清（lib/batch-exit-auth，§10 S10）', () => {
+    const acc = { account_type: 'S', broker_id: '9A95', account_id: '1233456', person_id: 'A', signed: true, username: '' };
+    const expected: ExpectedConfirm = { code: '2330', action: 'Sell', quantity: 3500, unit: '股', credit: undefined, account: acc, simulation: true };
+    // 與 lib placeStockExitByShares 的確認請求相同（市價、股、帳戶標籤 9A95-***3456）
+    const exitReq: OrderConfirmRequest = { ...base, action: 'Sell', price: null, quantity: 3500, unit: '股', note: '拆為 3 張市價＋500 股盤中零股限價' };
+    const start = async (arm = true) => {
+        await act(async () => {
+            setBatchExit(true);
+            if (arm) armBatchExit(expected);
+        });
+    };
+
+    it('沒有批次：一般單照常顯示面板、不自動核准', async () => {
+        await render();
+        await emit(exitReq);
+        expect(sheetOpen()).toBe(true);
+        expect(q.resolve).not.toHaveBeenCalled();
+    });
+
+    it('批次中相符：不渲染面板（也不閃現），自動 resolve(true) 一次', async () => {
+        await render();
+        await start();
+        await emit(exitReq);
+        expect(q.resolve.mock.calls).toEqual([[true]]);
+        expect(byTestId('order-confirm-sheet')).toHaveLength(0);
+        expect(byTestId('order-confirm-sheet-closing')).toHaveLength(0);
+        expect(byTestId('confirm-slide-handle')).toHaveLength(0);
+        expect(view!.toJSON()).toBeNull();
+    });
+
+    it('批次中不符（數量）：不渲染，resolve(false) 並中止批次', async () => {
+        await render();
+        await start();
+        await emit({ ...exitReq, quantity: 3000 });
+        expect(q.resolve.mock.calls).toEqual([[false]]);
+        expect(view!.toJSON()).toBeNull();
+        expect(batchExitAbortReason()).toBe('quantity');
+    });
+
+    it('批次中沒有 arm 的請求（其他流程）：resolve(false)', async () => {
+        await render();
+        await start(false);
+        await emit(exitReq);
+        expect(q.resolve.mock.calls).toEqual([[false]]);
+        expect(view!.toJSON()).toBeNull();
+    });
+
+    it('批次中 awaitingMode：等待、不渲染；模式取得（同一筆換新 request）後相符 → resolve(true)', async () => {
+        await render();
+        await start();
+        await emit({ ...exitReq, simulation: null, awaitingMode: true });
+        expect(q.resolve).not.toHaveBeenCalled();
+        expect(view!.toJSON()).toBeNull();
+        await emit(exitReq);
+        expect(q.resolve.mock.calls).toEqual([[true]]);
+    });
+
+    it('批次中 awaitingMode 超過 10 秒：resolve(false)', async () => {
+        vi.useFakeTimers();
+        try {
+            await render();
+            await start();
+            await emit({ ...exitReq, simulation: null, awaitingMode: true });
+            await act(async () => { vi.advanceTimersByTime(10_000); });
+            expect(q.resolve.mock.calls).toEqual([[false]]);
+            expect(batchExitAbortReason()).toBe('timeout');
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('批次中 ResumeGate 不允許：不核准，由既有 ResumeGate 檢查取消', async () => {
+        await gate({ state: 'resyncing', resumeSeq: getResumeGate().resumeSeq + 1 });
+        await render();
+        await start();
+        await emit(exitReq);
+        expect(q.resolve).toHaveBeenCalledWith(false);
+        expect(q.resolve).not.toHaveBeenCalledWith(true);
+    });
+
+    it('批次開始前正在退場的一般面板：批次中不再顯示；批次結束後的一般單照常顯示並需滑動', async () => {
+        await render();
+        await emit(base);
+        await emit(null);
+        await start();
+        expect(view!.toJSON()).toBeNull();
+        await act(async () => { setBatchExit(false); });
+        await emit(base);
+        expect(sheetOpen()).toBe(true);
+        expect(q.resolve).not.toHaveBeenCalled();
+        await slideToEnd();
+        expect(q.resolve.mock.calls).toEqual([[true]]);
     });
 });
