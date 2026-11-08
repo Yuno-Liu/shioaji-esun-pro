@@ -31,7 +31,10 @@ vi.mock('./components/order-confirm-sheet', () => ({ OrderConfirmSheet: () => cr
 vi.mock('./components/bottom-sheet', () => ({ BottomSheet: () => null }));
 vi.mock('./components/order-ticket-sheet', () => ({ OrderTicketSheet: () => null }));
 vi.mock('./components/order-action-sheet', () => ({ OrderActionSheet: () => null }));
-vi.mock('./routes/watchlist-page', () => ({ WatchlistPage: () => createElement('p', { 'data-testid': 'watchlist-page' }) }));
+vi.mock('./routes/watchlist-page', () => ({
+    WatchlistPage: () => createElement('p', { 'data-testid': 'watchlist-page' }),
+    preloadWatchEditControls: async () => undefined,
+}));
 // 交易頁替身：與真頁相同，以 ShellSlot 把交易鍵列放到配件槽、精簡標頭放到上方插槽
 vi.mock('./routes/trade-page', async () => {
     const { Fragment, useEffect } = await import('react');

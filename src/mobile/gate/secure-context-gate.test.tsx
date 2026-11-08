@@ -33,7 +33,7 @@ vi.mock('../components/order-confirm-sheet', () => ({ OrderConfirmSheet: () => n
 vi.mock('../components/order-ticket-sheet', () => ({ OrderTicketSheet: () => null }));
 vi.mock('../components/order-action-sheet', () => ({ OrderActionSheet: () => null }));
 // 各分頁與根層 hook 也各自讀 src/lib（串流狀態、持倉、ResumeGate）：一併隔離，殼層測試只看掛載與否
-vi.mock('../routes/watchlist-page', () => ({ WatchlistPage: () => null }));
+vi.mock('../routes/watchlist-page', () => ({ WatchlistPage: () => null, preloadWatchEditControls: async () => undefined }));
 vi.mock('../routes/trade-page', () => ({ TradePage: () => null }));
 vi.mock('../routes/orders-page', () => ({ OrdersPage: () => null }));
 vi.mock('../routes/positions-page', () => ({ PositionsPage: () => null }));
