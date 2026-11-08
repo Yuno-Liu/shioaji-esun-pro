@@ -545,8 +545,10 @@ describe('AccountPage realized P&L', () => {
     it('changing the period waits for the query button', async () => {
         await render();
         await click('account-pnl-toggle');
-        const week = byTestId('pnl-period').findAll(n => n.type === 'button')[1]!;
-        await act(async () => { week.props.onClick(); });
+        // 用「近 30 天」（範圍一定與今日不同）：原本點「本週」，星期一時本週＝今日，範圍沒變就不會等查詢，每到週一必失敗
+        const last30 = byTestId('pnl-period').findAll(n => n.type === 'button')[3]!;
+        expect(textOf(last30)).toContain('30');
+        await act(async () => { last30.props.onClick(); });
         expect(m.fetchProfitLoss).toHaveBeenCalledTimes(2);
         expect(allByTestId('pnl-idle')).toHaveLength(1);
         await click('pnl-query');
