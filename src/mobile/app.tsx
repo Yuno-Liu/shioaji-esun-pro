@@ -21,7 +21,7 @@ import { useFillSound } from './hooks/use-fill-sound';
 import { useHtmlAttributes } from './hooks/use-html-attributes';
 import { useRiskPnlFeed } from './hooks/use-risk-pnl-feed';
 import { useWakeLock } from './hooks/use-wake-lock';
-import { loadNoticeCenterSheet, loadRankingList, loadSearchSheet, loadWatchListSheet, loadWatchSparkline } from './lib/deferred-modules';
+import { loadHoldingsList, loadNoticeCenterSheet, loadRankingList, loadSearchSheet, loadWatchListSheet, loadWatchSparkline } from './lib/deferred-modules';
 import { formatRoute, isCanonicalHash, lastMarketSegment, navigate, parseHash, useHashRoute, type MobileRoute, type MobileTab } from './lib/hash-router';
 import { constrainedNetwork, currentConnection, schedulePrefetchSequence } from './lib/idle-prefetch';
 import { closeOrderAction, closeTicket, setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
@@ -86,6 +86,7 @@ const DEFERRED_MODULES: readonly { load: () => Promise<unknown>; essential?: tru
     { load: preloadWatchEditControls },
     { load: MarketPage.preload },
     { load: loadRankingList },
+    { load: loadHoldingsList },
     // 最後一項：通知中心面板的 chunk，載入後執行前景憑證到期提醒（每個台北日最多一次，見 lib/ca-expiry-check.ts）。
     // essential：省流量時也提醒；promise 在檢查結束（或放棄）時才 resolve，它是最後一項，不擋其他預載。
     { load: () => loadNoticeCenterSheet().then(m => m.runCaExpiryCheck()), essential: true },

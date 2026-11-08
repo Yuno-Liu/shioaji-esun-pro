@@ -7,7 +7,7 @@
 // - 可見列追蹤：整頁共用一個 IntersectionObserver（createVisibilityTracker）；只有可見列掛載行情探針（自選）與走勢 canvas。
 // - 迷你走勢延遲載入（lib/deferred-modules.ts loadWatchSparkline）；不可見、載入中、載入失敗、無合約都是同尺寸空白佔位。
 // - 快速下單鍵（<prefix>-row-ticket）是列按鈕的兄弟節點，只呼叫 onTicket（呼叫端只開下單面板，設計規格 §10 S1）。
-// - testid 以 testPrefix 開頭（自選 'watch'、排行 'ranking'），自選列的 testid 與改版前相同。
+// - testid 以 testPrefix 開頭（自選 'watch'、排行 'ranking'、持倉 'holding'），自選列的 testid 與改版前相同。
 // - 本檔不 import 行情 hook：自選以 probe 傳入行情探針（WatchQuoteProbe），排行是快照資料、不訂閱。
 
 import { ArrowLeftRight } from 'lucide-react';
@@ -294,8 +294,8 @@ export function TicketButton({ code, name, onTicket, testId }: { code: string; n
 // 列
 
 export interface QuoteRowProps {
-    /** testid 前綴：自選 'watch'、排行 'ranking' */
-    testPrefix: 'watch' | 'ranking';
+    /** testid 前綴：自選 'watch'、排行 'ranking'、持倉分段 'holding' */
+    testPrefix: 'watch' | 'ranking' | 'holding';
     code: string;
     name: string;
     tag: MarketTag | null;

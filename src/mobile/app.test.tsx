@@ -69,6 +69,12 @@ vi.mock('./lib/deferred-modules', () => ({
         if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: ranking-list.js');
         return {};
     },
+    // 自選頁「持倉」分段：排行之後閒置預載
+    loadHoldingsList: async () => {
+        m.deferredLoads.push('holdings-list');
+        if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: holdings-list.js');
+        return {};
+    },
     loadWatchSparkline: async () => {
         m.deferredLoads.push('watch-sparkline');
         if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: watch-sparkline.js');
@@ -175,9 +181,9 @@ describe('MobileShell lazy module failures', () => {
     });
 });
 
-/** 閒置預載全部完成所需時間：1.5 秒延遲＋其後每個間隔 100ms（12 個模組）再多留一點 */
+/** 閒置預載全部完成所需時間：1.5 秒延遲＋其後每個模組間隔 100ms（以 14 個計，比目前的預載項目多留幾格）再多留一點 */
 const PREFETCH_ALL_MS = 1_500 + 14 * 100 + 200;
-const ALL_DEFERRED = ['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'watch-edit-controls', 'ranking-list', 'notice-center-sheet'];
+const ALL_DEFERRED = ['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'watch-edit-controls', 'ranking-list', 'holdings-list', 'notice-center-sheet'];
 
 /**
  * 推進假時鐘；每 100ms（預載間隔）等一次動態 import 完成（分頁與面板的 preload() 是真的 import()，會在真實時間 resolve，

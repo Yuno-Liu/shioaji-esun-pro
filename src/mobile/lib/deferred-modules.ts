@@ -9,6 +9,8 @@
 // 為了這點體積不值得。
 /** 漲跌幅排行（自選頁「排行」分段） */
 export const loadRankingList = () => import('../components/ranking-list');
+/** 自選頁「持倉」分段（依持倉自動列出；只在該分段掛載） */
+export const loadHoldingsList = () => import('../components/holdings-list');
 /**
  * 自選列迷你走勢（canvas＋1 分 K 資料、時段計算）：只有可見列才載入與掛載；
  * 載入前與載入失敗時走勢欄是同尺寸空白佔位，不影響列與頁面。

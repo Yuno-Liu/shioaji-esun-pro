@@ -689,6 +689,18 @@ Stepper({ value: string; onChange(text: string): void; onStep(delta: 1 | -1): vo
   - `watch-reorder` 不 import `motion/prefs`（減少動態由呼叫端傳入 `reducedMotion`），避免 prefs 被拆成另一個首屏 chunk。
 - 清單管理請求只在使用者操作時發出；交易安全：以上入口都不呼叫送單、改單、刪單函式（`watchlist-edit.test.tsx`）。
 
+**「持倉」分段**（第 3 批，使用者要求「除了自選、排行以外增加一個持倉，根據持倉分頁有的股票自動動態的加入，預設不可使用者手動新增或刪除」；使用者選定「全部持倉」「同自選列＋持倉標記」；以程式碼為準）：
+
+- 分段改為「自選｜排行｜持倉」，分段選擇在模組層保留；從編輯模式切走會結束編輯。「持倉」分段沒有任何編輯入口：不顯示清單分頁、「＋」、編輯、多選、排序，也不顯示表頭的指標切換鍵（列沿用自選目前的指標）。頁首搜尋鍵照舊（加入的是目前的自選清單）。
+- 列表 `components/holdings-list.tsx` 延遲載入（`loadHoldingsList`，比照排行，閒置時預載）；條件、方向、數量、對帳文字抽到 `lib/position-text.ts`，與持倉頁共用（持倉頁仍匯出同名函式）。
+- 資料：與持倉頁同一份 `useTradingState().positions`（各帳戶，股票、ETF、權證、期貨、選擇權全部）。持倉由殼層在 App 啟動時讀取（分頁列的 `useTradingState()` 啟動 lib/trading-state，連線後讀一次，之後由成交回報與持倉頁「⟳」更新），本分段不觸發讀取、不輪詢；合約由 lib/trading-state 預先 `ensureContract`，本分段只讀快取。
+- 合併：依「股票帳戶（S）／期權帳戶（F）＋代碼」合併成一列（多帳戶、多條件、玉山與永豐同時持有都只一列），順序為第一次出現的順序（持倉頁的券商順序）；持倉增減時即時更新；合併只看帳戶、代碼、方向、條件、數量，只有現價變動時不重算。
+- 列：與自選列相同（`QuoteRow`：成交價、漲跌、迷你走勢依設定、快速下單鍵），代碼後加持倉標記，分成「條件 方向」「數量」「等 N 筆」幾段，放不下時在段之間換行（360 寬字級 1.3 實測列高約 92px，不重疊）；遮蔽金額時數量以 `maskMoney` 遮蔽；無障礙名稱附「，持倉 …」。合約未載入的列不顯示快速下單鍵（同寬佔位）。
+- 價格：沒有即時成交（盤後、週末、冷門商品、剛進頁）時以持倉的現價當快照備援（與持倉頁同一個值，不另發請求），漲跌以合約參考價推算；有即時成交後以即時價為準（瀏覽器實測發現原本全是「—」後補上）。
+- 狀態：讀取中 Skeleton；沒有持倉 EmptyState「目前沒有持倉」；讀取失敗或待對帳 InlineNote（`reconcileText`）＋「前往持倉頁」（只 `navigate`）。
+- 互動：點列開交易頁；長按操作面板只有「開啟交易頁」「買進…」「賣出…」（不能移動或移除）；快速下單鍵與買賣只呼叫 `openTicket`（用目前選取的帳戶，與持倉頁「加碼」依持倉帳戶不同）。
+- 請求：切到「持倉」分段 0 個額外請求（只有可見列的行情訂閱與迷你走勢，與自選相同）。
+
 **多選刪除與排序群組**（第 2 批，使用者要求；以程式碼為準）：
 
 - 編輯模式的清單工具列：［重新命名］［刪除清單］［多選］［排序群組］；多選中「排序群組」換成三態［全選］。「多選」「排序群組」「全選」與編輯說明文字都在延遲載入的編輯 chunk（`WatchEditTools`，與列首、列尾鍵同一個 chunk，閒置預載）。
@@ -1208,6 +1220,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 | 交易頁標頭 ☆ 與「加入自選」面板（勾選、取消、完成） | 只開面板；面板只呼叫 hook 的 `addSymbol`／`removeSymbol`（目前清單）、lib 的 `addWatchlistContracts`／`removeWatchlistContracts`（其他清單）與 `emitWatchlistChanged` | `trade-page.test.tsx`、`watch-picker-sheet.test.tsx`、`trade-watch-picker-lazy.test.tsx` |
 | 交易圖表輕點資訊列（輕點、✕、再點同一點）與走勢成交量副圖 | 只顯示資訊；量副圖內長按不選價；長按選價列流程不變 | `trade-chart.test.tsx` |
 | 自選多選刪除、全選、確認面板、排序群組（↑↓、握把） | 只做清單管理（`removeSymbol`）或裝置偏好（localStorage），不開下單或委託面板 | `watchlist-multi.test.tsx`、`watchlist-group-sort.test.tsx`、`watch-edit-controls.test.tsx` |
+| 自選頁「持倉」分段（點列、長按面板、快速下單鍵、分段切換、「前往持倉頁」） | 只呼叫 `navigate` 或 `openTicket`（只開下單面板，之後仍需預覽與滑動確認），沒有任何編輯入口 | `holdings-list.test.tsx`、`watchlist-holdings-lazy.test.tsx` |
 | 走勢副圖指標（分時買賣力、大單／小單的開關與門檻） | 只改本機設定與讀取當日逐筆（唯讀），不呼叫送單函式、不開下單面板；副圖內長按不選價 | `indicator-sheet.test.tsx`、`trade-chart.test.tsx`、`line-flow.test.ts` |
 | 排序群組的多選刪除群組（選取、勾選、取消、刪除、返回、確定刪除） | 只刪除自選清單（lib `deleteWatchlist`、hook `deleteCurrentList`），不呼叫送單、改單、刪單，也不開 `openTicket`／`openOrderAction` | `watchlist-group-delete.test.tsx`、`watch-group-delete.test.tsx` |
 | 持倉選取模式（選取、勾選、全選、取消、開關預覽） | 滑動前不送單、不開下單面板與委託面板；送出只在預覽滑動後經 `runBatchExit` → `executeClose`（S10） | `positions-page.test.tsx` |
@@ -1339,6 +1352,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
   - 預覽面板用自己的 `batch-exit.css.ts`、部分勾選用 CSS 橫線、☆ 面板用原生勾選框：避免與其他 chunk 共用 lucide 圖示或樣式而拆出新的共用 chunk，讓首屏預載清單變長。
   - 之後加入排序群組的多選刪除群組（常駐 WatchlistProvider 多了 `getLatestMobileWatchlist`、首屏 src chunk 多匯出 `deleteWatchlist`）與走勢成交量副圖（全在交易頁 chunk）：首屏 **222,513 bytes（217.3 KiB，15 個 JS）**，剩約 0.7 KiB。
   - 再加入走勢副圖指標（分時買賣力、大單／小單，全在交易頁 chunk）：首屏 **222,512 bytes**（不變）；交易頁 chunk 25.2 → 29.8 KiB。
+- **第 3 批**（2026-11-08，自選頁「持倉」分段）：首屏 **222,666 bytes（217.4 KiB，15 個 JS）**，+154 bytes：分段標籤、lazy 入口與預載項目、預載對照表多兩個 chunk（holdings-list 1.9 KiB、與持倉頁共用的 position-text 0.6 KiB）。剩約 0.55 KiB。
 - 未處理（需要修改 `src/lib`，R2 不允許，列入 §16）：trading-state 每筆 tick 重算全部持倉並發布、每秒以 BroadcastChannel 傳出整份 state（P2 根因、P14）；SSE 第一次連線就發 RECONNECT 合約刷新，冷啟動同一份合約抓 3 次（P4）；自選快照等全部合約 info 才讀，LCP 被最慢的一筆卡住（P5）；首屏帶入 Tauri 橋接、閃電下單模組、MockEsunDriver 與玉山整合（P6、P7、P8、P15，稽核估計合計約 50 KiB gzip）。
 
 ---
@@ -1467,6 +1481,7 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
       - 360 寬、字級「大」時選取模式的版面（勾選鍵、底部工具列換行、組標頭「全選」）；最後一列能否捲到工具列上方。
       - VoiceOver／TalkBack 如何朗讀 role=checkbox 的按鈕與 `aria-checked="mixed"`；「全選」放在 GroupedSection 標頭內。
     - 交易圖表輕點：iOS／Android 上輕點與長按的區分（450ms、10px），與捲動、平移的衝突；資訊列在 360 寬、字級「大」時的換行。
+    - 自選頁「持倉」分段：假資料實測（390 寬字級小、360 寬字級 1.3：合併 2330 永豐＋玉山為「等 2 筆」、融資、融券、零股、期貨、選擇權都列出，0 額外請求、0 委託）。待實機確認：標記換行後的列高；同一檔多空並存時只看得到第一筆的方向（明細在持倉頁）；快速下單用目前選取的帳戶；合約解析失敗的代碼沒有名稱與下單鍵。
     - 走勢副圖指標：假資料實測（三個副圖的高度、圖例、副圖內長按與輕點、全螢幕、每次載入 1 次逐筆請求）正確，真實逐筆以唯讀查詢核對過格式與單位。待實機確認：大型股逐筆的 JSON 解析與彙總在手機主執行緒的耗時；橫向全螢幕三個副圖各約 28px 的可讀性；開著指標離開這檔再回來時因漏量多 1 次請求（最多每 120 秒）；排除集合競價後的數字與使用者習慣的看盤軟體是否一致；處置股（分盤集合競價）的內外盤標記沒有另外處理。
     - 走勢成交量副圖：假資料實測（深淺色、直向與橫向全螢幕、退出全螢幕、量副圖內長按與輕點）正確。待實機確認：「量全為 0、之後第一筆成交才建副圖」時外框加高與副圖高度校正（只有單元測試）；橫向全螢幕量副圖約 42px 時刻度省略是否可接受；量柱方向（對前一分鐘）與資訊列漲跌（對參考價）基準不同，使用者是否能理解。
     - 自選：
