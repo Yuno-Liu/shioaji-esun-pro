@@ -79,4 +79,18 @@ describe('loadOnDemand', () => {
         resetOnDemandForTest(() => now);
         expect(gateLeftSec(gate, now)).toBe(0);
     });
+
+    it('a gate ignores passes stamped in the future (device clock moved back) instead of locking for the jump', async () => {
+        resetOnDemandForTest(() => now);
+        const gate = { name: 'g', max: 2, windowMs: 60_000 };
+        const fetcher = vi.fn(async () => 1);
+        expect(await loadOnDemand('a', fetcher, 30_000, gate)).toBe(true);
+        expect(await loadOnDemand('b', fetcher, 30_000, gate)).toBe(true);
+        expect(gateLeftSec(gate, now)).toBe(60);
+        // 系統時間往回調一小時：舊紀錄變成「未來」→ 不計入（bridge 端仍有自己的限制），不會鎖 1 小時
+        now -= 3_600_000;
+        expect(gateLeftSec(gate, now)).toBe(0);
+        expect(await loadOnDemand('c', fetcher, 30_000, gate)).toBe(true);
+        expect(fetcher).toHaveBeenCalledTimes(3);
+    });
 });

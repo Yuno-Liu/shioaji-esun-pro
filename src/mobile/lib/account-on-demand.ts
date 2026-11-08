@@ -68,9 +68,12 @@ export function cooldownLeftSec(state: Pick<OnDemandState<unknown>, 'attemptedAt
     return Math.max(0, Math.ceil((cooldownMs - (now - state.attemptedAt)) / 1000));
 }
 
-/** 視窗內仍有效的通過時間（順便剪掉已滑出視窗的舊紀錄） */
+/**
+ * 視窗內仍有效的通過時間（順便剪掉已滑出視窗的舊紀錄）。
+ * 晚於 now 的紀錄（裝置時間往回調）也丟掉：否則會鎖住整段回調的時間；超量時仍由 bridge 端的限制擋下。
+ */
 function gateHits(gate: OnDemandGate, now: number): number[] {
-    const hits = (gates.get(gate.name) ?? []).filter(t => now - t < gate.windowMs);
+    const hits = (gates.get(gate.name) ?? []).filter(t => t <= now && now - t < gate.windowMs);
     gates.set(gate.name, hits);
     return hits;
 }
