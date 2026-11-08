@@ -3,6 +3,7 @@
 // ┌ 標頭：名稱・市場・［可當沖］／大字成交價・漲跌・漲跌%・［漲停／跌停］［參考價］［試撮］
 // │       統計格（股票）開 高 均 總／參 低 單 額（期權無「額」；顏色相對參考價）
 // │       漲跌停價・非「可當沖」的當沖狀態（股票）或到期月份・時段（期權）
+// │       當沖資訊列（components/trade-info）：可當沖／先賣・漲跌停狀態・振幅小條・量比・處置 → 唯讀「籌碼與當沖」面板（延遲載入）
 // ├ 週期 Segmented（toggle）［走勢］［1分］［5分］［15分］［60分］［日］＋交易圖表（委託線、成本線、漲跌停、參考價）
 // ├ 五檔／明細／公司 Segmented（tabs）＋同列右側［整股｜盤中零股］（股票；明細、公司分頁時隱藏但保留狀態、窄螢幕換行）
 // │   （五檔買賣同列：委買量｜買價｜賣價｜委賣量、量條、五檔總量、買賣比與內外盤比）
@@ -34,9 +35,12 @@ import { nowWallClockUtc } from '../../lib/utils/kbars';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
 import { loadCompanyTab } from '../components/company/load-company-tab';
 import { DepthLadder, depthOddCapable, DepthOddToggle } from '../components/depth-ladder';
-import { ModuleErrorBoundary, ModuleLoadError, retryableLazy } from '../components/route-error-boundary';
+import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from '../components/route-error-boundary';
 import { TickList } from '../components/tick-list';
 import { TradeChart } from '../components/trade-chart';
+import { loadTradeChipsSheet } from '../components/trade-info/load-trade-chips-sheet';
+import { TradeInfoStrip } from '../components/trade-info/trade-info-strip';
+import { useDocumentVisible } from '../components/trade-info/use-document-visible';
 import { TradeSwitchSheet } from '../components/trade-switch-sheet';
 import { chartPriceLines, formatLinePrice, priceLinesKey } from '../lib/chart-model';
 import { CHART_PERIODS, DEFAULT_CHART_PERIOD, isChartPeriod, type ChartPeriod } from '../lib/chart-ranges';
@@ -46,6 +50,7 @@ import { openTicket, setCurrentCode } from '../lib/mobile-store';
 import { fmtCompactInt, fmtInt, fmtStockLots, formatNumber, formatToTick } from '../lib/num-format';
 import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import { recordRecentCode } from '../lib/recent-codes';
+import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
 import { focusRing, pressable } from '../styles/primitives.css';
@@ -176,6 +181,10 @@ const PANEL_ITEMS = [
 const CompanyTab = retryableLazy(() => loadCompanyTab().then(m => m.CompanyTab), 'CompanyTab');
 const resetCompanyTab = () => { CompanyTab.reset(); };
 
+// 「籌碼與當沖」說明面板（唯讀）：第一次點當沖資訊列才 import，不閒置預載；融資融券與券源的讀取也在面板模組內。
+const TradeChipsSheet = retryableLazy(() => loadTradeChipsSheet().then(m => m.TradeChipsSheet), 'TradeChipsSheet');
+const resetChipsSheet = () => { TradeChipsSheet.reset(); };
+
 type StatKey = 'open' | 'high' | 'low' | 'reference' | 'avg' | 'total' | 'last' | 'amount';
 
 const STAT_LABEL: Record<StatKey, string> = { open: '開', high: '高', low: '低', reference: '參', avg: '均', total: '總', last: '單', amount: '額' };
@@ -272,7 +281,14 @@ interface SwitchEntry {
     switchRef?: Ref<HTMLButtonElement>;
 }
 
-function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef }: { code: string; contract: ContractInfo | undefined } & SwitchEntry) {
+/** 當沖資訊列（標頭最下方）：處置名單與「籌碼與當沖」面板狀態由 TradeView 持有 */
+interface InfoEntry {
+    punished: boolean | null;
+    open: boolean;
+    onOpen: () => void;
+}
+
+function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef, info }: { code: string; contract: ContractInfo | undefined; info?: InfoEntry } & SwitchEntry) {
     const quote = useQuote(code, { narrow: true });
     const tick = quote?.tick;
     // 試撮期間仍以本頁看過的上一筆真實成交為最新價
@@ -393,6 +409,21 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef }:
                     <span>{sessionText(contract.security_type, nowWallClockUtc())}</span>
                 </div>
             )}
+            {/* 當沖資訊列：一般文件流、在統計格與漲跌停列之下；點擊只開唯讀說明面板（S1） */}
+            {contract && info && (
+                <TradeInfoStrip
+                    code={code}
+                    contract={contract}
+                    price={price}
+                    priceIsTrade={q.source === 'tick' || q.source === 'snapshot'}
+                    stats={stats}
+                    tickDate={stats.source === 'tick' ? (tick && !tick.simtrade ? tick : lastReal.current)?.date : undefined}
+                    snapshot={snapshot}
+                    punished={info.punished}
+                    open={info.open}
+                    onOpen={info.onOpen}
+                />
+            )}
         </header>
     );
 }
@@ -512,9 +543,26 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
     const tradable = contract ? contract.security_type !== 'IND' : true;
     const comboNote = contract?.combo ? '組合商品不支援手機下單' : null;
 
+    // 當沖資訊列的處置徽章：只有股票、且頁面在前景時讀處置名單（與自選頁共用模組層快取，30 分鐘內 0 次）
+    const isStk = contract?.security_type === 'STK';
+    const pageVisible = useDocumentVisible();
+    const punishedCodes = usePunishedCodes(isStk && pageVisible);
+    // 名單還沒成功取得過：null（面板寫「處置名單尚未取得」，不當成未處置）
+    const punishLoaded = usePunishedListLoaded();
+    const punished = isStk && contract && punishLoaded ? punishedCodes.has(contract.code) : null;
+    // 「籌碼與當沖」面板：第一次點資訊列才載入並掛載（換商品時整頁重建而關閉）
+    const [infoOpen, setInfoOpen] = useState(false);
+    const [infoMounted, setInfoMounted] = useState(false);
+    const openInfo = useCallback(() => {
+        setInfoMounted(true);
+        setInfoOpen(true);
+    }, []);
+    const closeInfo = useCallback(() => setInfoOpen(false), []);
+    const info: InfoEntry = { punished, open: infoOpen, onOpen: openInfo };
+
     return (
         <section className={styles.page} data-testid='page-trade'>
-            <Header code={sym} contract={contract} onOpenSwitch={onOpenSwitch} switchOpen={switchOpen} switchRef={switchRef} />
+            <Header code={sym} contract={contract} onOpenSwitch={onOpenSwitch} switchOpen={switchOpen} switchRef={switchRef} info={info} />
 
             <div className={styles.controlRow}>
                 <div className={styles.controlGrow}>
@@ -562,6 +610,17 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
             )}
 
             <TradePositionSummary orderable={orderable} sym={sym} isStock={isStock} />
+
+            {infoMounted && contract && (
+                <ModuleErrorBoundary
+                    onRetry={resetChipsSheet}
+                    fallback={props => <SheetLoadError {...props} open={infoOpen} onClose={closeInfo} testId='trade-chips-load-error' />}
+                >
+                    <Suspense fallback={null}>
+                        <TradeChipsSheet open={infoOpen} onClose={closeInfo} contract={contract} punished={punished} />
+                    </Suspense>
+                </ModuleErrorBoundary>
+            )}
 
             {tradable && (
                 <ShellSlot slot='bottom'>
