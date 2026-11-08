@@ -49,7 +49,7 @@
 //   與單筆平倉共用 closingRef（任一進行中另一個不能開始）；下單面板或確認進行中（useAccountSwitchLocked）也不能開始。
 
 import { Check, ChevronRight, RotateCw, Wallet } from 'lucide-react';
-import { memo, Suspense, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { memo, Suspense, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore, type MouseEvent, type ReactNode } from 'react';
 import { useTradingLive } from '../../hooks/use-stream';
 import { getAccountState, selectAccount, useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
@@ -59,6 +59,7 @@ import { findEsunInventoryDetail, getEsunInventoryDetailsSnapshot, subscribeEsun
 import { accountMatches } from '../../lib/flash-account';
 import { SHARES_PER_LOT } from '../../lib/odd-lot';
 import { getPendingOrderConfirm } from '../../lib/order-confirm';
+import { getRiskSettings } from '../../lib/risk';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
 import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../../lib/privacy';
 import { useServerInfo, yesterdayQuantityNotice } from '../../lib/server-info-store';
@@ -100,6 +101,7 @@ import { ModuleErrorBoundary, retryableLazy, SheetLoadError } from '../component
 import { classifyTicketOutcome, OUTCOME_UNKNOWN_TITLE } from '../hooks/use-mobile-ticket';
 import { useResumeGate } from '../hooks/use-resume-gate';
 import { batchSummaryText, runBatchExit, type BatchExitItem, type BatchItemState } from '../lib/batch-exit';
+import { abortBatchExit, BATCH_STOPPED, isBatchExitActive, subscribeBatchExit } from '../lib/batch-exit-auth';
 import { navigate } from '../lib/hash-router';
 import { breakEvenRelation, computeStockPnl, stockPnlInputOf, todayStockFills, type StockPnl, type TodayFills } from '../lib/position-pnl';
 import { getMobileUi, openTicket, type TicketCond, type TicketLot } from '../lib/mobile-store';
@@ -158,6 +160,10 @@ export const POSITIONS_TEXT = {
     batchOption: '選擇權不列入批次市價出清，請逐筆平倉',
     batchBusy: '其他平倉、下單面板或確認進行中，暫時不能出清',
     batchEnvUnknown: '有帳戶的環境未確認（模擬／正式），未送出',
+    batchRunning: '多選市價出清進行中，請等完成後再平倉',
+    batchHidden: '畫面已切到背景，已停止',
+    batchResumed: '畫面重新同步過，已停止（請重新確認後再出清）',
+    batchNoConfirm: '下單確認設定未開啟，已停止',
     batchFailed: '出清中斷（程式錯誤），未處理的持倉未送出；請到委託頁按「更新」核對',
 } as const;
 
@@ -214,6 +220,21 @@ export function closeGateProblem(live: boolean, gate: Pick<ResumeGateSnapshot, '
     if (gate.state === 'resyncing') return POSITIONS_TEXT.resyncing;
     if (gate.state === 'stale-data') return POSITIONS_TEXT.staleData;
     return POSITIONS_TEXT.resumeFailed;
+}
+
+/**
+ * 多選市價出清每筆送出前的閘門（滑動一次核准整批，所以比單筆更嚴格）：
+ * - 手動下單確認設定仍開啟（否則 lib 不發確認、批次授權比對不到，直接停止；start.ts 會把它釘回開啟，這是縱深防護）；
+ * - 畫面在前景（在背景時不繼續送出，使用者看不到進度）；
+ * - 仍是滑動當下的那一次前景（resumeSeq 沒變：回前景重新同步過就停止，不沿用背景前的那一次滑動）；
+ * - 其餘同單筆平倉（連線、ResumeGate 允許新單）。
+ */
+export function batchGateProblem(live: boolean, startSeq: number): string | null {
+    if (getRiskSettings().confirmManualOrders !== true) return POSITIONS_TEXT.batchNoConfirm;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return POSITIONS_TEXT.batchHidden;
+    const gate = getResumeGate();
+    if (gate.resumeSeq !== startSeq) return POSITIONS_TEXT.batchResumed;
+    return closeGateProblem(live, gate);
 }
 
 export type ClosePlan =
@@ -308,10 +329,11 @@ export function batchSelectReason(p: AccountedPosition, contract: ContractInfo |
 
 /**
  * 實際送出的各腳（與 lib 相同）：股票整張以市價 IOC（信用部位帶信用條件）、零股以跌停（賣）／漲停（買）價盤中零股限價；
- * 期貨以市價 IOC、倉別平倉。數量依遮蔽金額處理，價格不遮蔽。
+ * 期貨以市價 IOC、倉別平倉。數量一律明碼（遮蔽金額時也一樣）：預覽是送出前唯一看得到數量的畫面，
+ * 與單筆確認面板相同規則（確認面板的數量不遮蔽）。
  */
-export function batchLegs(plan: ClosePlan, privMoney: boolean): string[] {
-    const n = (v: number) => maskMoney(fmtInt(v), privMoney);
+export function batchLegs(plan: ClosePlan): string[] {
+    const n = (v: number) => fmtInt(v);
     if (plan.kind === 'futures') return [`${n(plan.lots)} 口 市價 IOC（平倉）`];
     const lots = Math.floor(plan.shares / SHARES_PER_LOT);
     const odd = plan.shares % SHARES_PER_LOT;
@@ -1158,24 +1180,27 @@ export function PositionsPage() {
 
     // ---- 平倉 ----
     const mounted = useRef(true);
-    // 多選市價出清：卸載時要求停止剩餘（送出中的那一筆無法取消）
+    // 多選市價出清：卸載時停止剩餘並取消尚未核准的那一筆（abortBatchExit；送出中的那一筆無法取消）
     const batchStopRef = useRef(false);
     useEffect(() => {
         mounted.current = true;
         return () => {
             mounted.current = false;
             batchStopRef.current = true;
+            abortBatchExit(BATCH_STOPPED);
         };
     }, []);
     const [closeKey, setCloseKey] = useState<string | null>(null);
     const [closing, setClosing] = useState(false);
     const closingRef = useRef(false);
+    // 批次是模組層狀態：離開持倉頁前開始的批次在送出中的那一筆完成前仍在進行；這段期間本頁也不開始單筆平倉或另一個批次
+    const batchActive = useSyncExternalStore(subscribeBatchExit, isBatchExitActive);
     const [closeFeedback, setCloseFeedback] = useState<CloseSheetProps['feedback']>(null);
     const gateProblem = closeGateProblem(live, gate);
     const closeTarget = closeKey ? positions.find(p => positionKey(p) === closeKey) : undefined;
 
     const openClose = (p: AccountedPosition) => {
-        if (closingRef.current) return;
+        if (closingRef.current || isBatchExitActive()) return;
         setCloseFeedback(null);
         setCloseKey(positionKey(p));
     };
@@ -1186,8 +1211,8 @@ export function PositionsPage() {
     };
     const continueClose = async (plan: ClosePlan) => {
         if (closingRef.current) return;
-        // 按下當下再驗一次閘門（按鈕停用是第一道，beforeSend 是送出前最後一道）
-        const problem = closeGateProblem(live, getResumeGate());
+        // 按下當下再驗一次閘門（按鈕停用是第一道，beforeSend 是送出前最後一道）；批次進行中不開始（確認會被批次授權拒絕）
+        const problem = isBatchExitActive() ? POSITIONS_TEXT.batchRunning : closeGateProblem(live, getResumeGate());
         if (problem) { setCloseFeedback({ kind: 'notSent', text: `未送出：${problem}` }); return; }
         closingRef.current = true;
         setClosing(true);
@@ -1327,16 +1352,17 @@ export function PositionsPage() {
                     key,
                     code: p.code,
                     ...(c?.name ? { name: c.name } : {}),
-                    summary: `${positionCondText(p, c)} ${sideText(p.direction)} ${maskMoney(positionQtyText(p), privMoney)}`,
+                    // 數量明碼（遮蔽金額時也一樣）：同 batchLegs 與單筆確認面板
+                    summary: `${positionCondText(p, c)} ${sideText(p.direction)} ${positionQtyText(p)}`,
                     actionText: closeActionText(plan),
-                    legs: batchLegs(plan, privMoney),
+                    legs: batchLegs(plan),
                 });
             }
             if (items.length) batchGroups.push({ key: g.key, account: g.account, label: groupLabel(g.account, priv), items });
         }
     }
-    // 不能開始的原因（預覽面板停用滑塊並顯示）：單筆平倉進行中、下單面板或確認進行中、閘門
-    const batchBlock = closing || switchLocked ? POSITIONS_TEXT.batchBusy : gateProblem;
+    // 不能開始的原因（預覽面板停用滑塊並顯示）：單筆平倉進行中、另一個批次仍在處理（例如離開本頁前開始的）、下單面板或確認進行中、閘門
+    const batchBlock = closing || batchActive || switchLocked ? POSITIONS_TEXT.batchBusy : gateProblem;
     const latestLive = useRef({ positions, live });
     useLayoutEffect(() => {
         latestLive.current = { positions, live };
@@ -1346,7 +1372,7 @@ export function PositionsPage() {
         // 與單筆平倉共用 closingRef：其他平倉、下單面板、委託操作面板或確認進行中都不開始（滑動當下再讀一次最新狀態）
         if (closingRef.current || batchRunning) return;
         const ui = getMobileUi();
-        const busy = switchLocked || ui.ticket !== null || ui.orderAction !== null || getPendingOrderConfirm() !== null;
+        const busy = switchLocked || isBatchExitActive() || ui.ticket !== null || ui.orderAction !== null || getPendingOrderConfirm() !== null;
         const problem = busy ? POSITIONS_TEXT.batchBusy : closeGateProblem(live, getResumeGate());
         const items: BatchExitItem[] = [];
         let envProblem = false;
@@ -1363,6 +1389,8 @@ export function PositionsPage() {
         closingRef.current = true;
         batchStopRef.current = false;
         setClosing(true);
+        // 滑動當下的前景（resumeSeq）：之後回到背景再回前景（重新同步）就停止剩餘，不沿用背景前的那一次滑動
+        const startSeq = getResumeGate().resumeSeq;
         const states: Record<string, BatchItemState> = {};
         for (const it of items) states[it.key] = { status: 'waiting' };
         setBatch({ phase: 'running', groups: batchGroups, states, stop: false, feedback: null });
@@ -1372,7 +1400,7 @@ export function PositionsPage() {
                     const p = latestLive.current.positions.find(x => positionKey(x) === item.key);
                     return p ? { position: p, plan: closePlanFor(p, getCachedContract(p.code)) } : null;
                 },
-                gateProblem: () => closeGateProblem(latestLive.current.live, getResumeGate()),
+                gateProblem: () => batchGateProblem(latestLive.current.live, startSeq),
                 execute: executeClose,
                 stopRequested: () => batchStopRef.current,
                 onState: (i, st) => {
@@ -1403,6 +1431,8 @@ export function PositionsPage() {
     };
     const stopBatch = () => {
         batchStopRef.current = true;
+        // 尚未核准的那一筆（例如仍在等待伺服器模式）也立即取消；已送出中的那一筆不受影響
+        abortBatchExit(BATCH_STOPPED);
         setBatch(b => b && { ...b, stop: true });
     };
     const closeBatch = () => {
@@ -1588,7 +1618,7 @@ export function PositionsPage() {
                                     p,
                                     priv,
                                     privMoney,
-                                    closeDisabled: closing || gateProblem !== null,
+                                    closeDisabled: closing || batchActive || gateProblem !== null,
                                     accountReason: accountReasonOf(p),
                                     maxAbsPnl,
                                     ydNotice,

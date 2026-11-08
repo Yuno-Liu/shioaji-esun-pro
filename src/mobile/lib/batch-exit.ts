@@ -9,7 +9,9 @@
 // - 結果（classifyTicketOutcome）：成功＝已送出；cancelled（授權不符或確認被取消）＝停止其餘；
 //   not-sent＝記錄原因，閘門此時不允許就停止，否則繼續；結果未知＝通知 OUTCOME_UNKNOWN、reconcileAfterUnknownOutcome()，
 //   並停止（S8：不重送）。
-// - 「停止剩餘」：送出中的那一筆無法取消，送完（或略過）後不再送下一筆。
+// - 「停止剩餘」與離開持倉頁（abortBatchExit）：已核准、送出中的那一筆無法取消；尚未核准的那一筆（例如仍在等待伺服器模式）
+//   由根層確認面板立即取消；之後不再送下一筆。
+// - 每筆送出前的閘門（持倉頁 batchGateProblem）另含：手動確認設定仍開啟、畫面在前景、與滑動時同一次前景（resumeSeq）。
 // - 結束時送一則摘要通知（只有筆數，沒有金額與帳號）。
 
 import { creditLabel, orderQtyUnit } from '../../lib/odd-lot';
@@ -19,7 +21,7 @@ import type { AccountedPosition } from '../../lib/types/portfolio';
 import { accountKeyOf } from '../components/position-metrics';
 import { classifyTicketOutcome, OUTCOME_UNKNOWN_TITLE } from '../hooks/use-mobile-ticket';
 import type { ClosePlan } from '../routes/positions-page';
-import { armBatchExit, batchExitAbortReason, setBatchExit, type ExpectedConfirm } from './batch-exit-auth';
+import { armBatchExit, BATCH_STOPPED, batchExitAbortReason, setBatchExit, type ExpectedConfirm } from './batch-exit-auth';
 
 /** 筆與筆之間的最短間隔 */
 export const BATCH_GAP_MS = 300;
@@ -125,8 +127,9 @@ export async function runBatchExit(items: readonly BatchExitItem[], deps: BatchR
         for (let j = from; j < items.length; j++) if (states[j]!.status === 'waiting') set(j, { status: 'not-sent', reason });
     };
     const wait = deps.wait ?? sleep;
-    setBatchExit(true);
     try {
+        // 在 try 內：訂閱者在通知時丟錯也會走 finally 結束批次，旗標不會卡在進行中
+        setBatchExit(true);
         for (let i = 0; i < items.length; i++) {
             const item = items[i]!;
             if (i > 0) await wait(BATCH_GAP_MS);
@@ -148,9 +151,11 @@ export async function runBatchExit(items: readonly BatchExitItem[], deps: BatchR
             } catch (err) {
                 const outcome = classifyTicketOutcome(err);
                 if (outcome === 'cancelled') {
+                    // 使用者停止或離開頁面（abortBatchExit）時，尚未核准的這一筆也被取消：標「已停止剩餘」
                     const why = batchExitAbortReason();
-                    set(i, { status: 'not-sent', reason: why ? abortReasonText(why) : BATCH_TEXT.confirmCancelled });
-                    stopFrom(i + 1, BATCH_TEXT.aborted);
+                    const stopped = why === BATCH_STOPPED;
+                    set(i, { status: 'not-sent', reason: stopped ? BATCH_TEXT.stopped : why ? abortReasonText(why) : BATCH_TEXT.confirmCancelled });
+                    stopFrom(i + 1, stopped ? BATCH_TEXT.stopped : BATCH_TEXT.aborted);
                     break;
                 }
                 if (outcome === 'not-sent') {

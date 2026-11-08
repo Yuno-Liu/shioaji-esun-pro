@@ -51,8 +51,22 @@ export function subscribeBatchExit(listener: () => void): () => void {
 }
 
 export const isBatchExitActive = (): boolean => active;
-/** 中止原因（欄位代碼、'mode'、'unarmed'、'timeout'）；沒有中止為 null */
+/** 中止原因（欄位代碼、'mode'、'unarmed'、'timeout'、BATCH_STOPPED）；沒有中止為 null */
 export const batchExitAbortReason = (): string | null => abortReason;
+
+/** 使用者按「停止剩餘」或持倉頁卸載 */
+export const BATCH_STOPPED = 'stopped';
+
+/**
+ * 中止整批（使用者停止、頁面卸載）：記錄原因、解除 arm 並通知訂閱者——根層確認面板因此立即取消尚未核准的那一筆
+ * （例如仍在等待伺服器模式），之後的 arm 一律無效。已核准、送出中的那一筆不受影響。批次未進行時不做事。
+ */
+export function abortBatchExit(reason: string): void {
+    if (!active) return;
+    abortReason ??= reason;
+    armBatchExit(null);
+    emit();
+}
 
 /** 這一筆送出前設定預期內容（null＝解除）；批次未進行或已中止時一律解除。一併清除等待模式的計時 */
 export function armBatchExit(expected: ExpectedConfirm | null): void {

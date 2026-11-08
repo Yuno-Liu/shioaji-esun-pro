@@ -33,6 +33,8 @@ const m = vi.hoisted(() => {
         esunEnv: 'SIMULATION',
         /** getMobileUi()：下單面板、委託操作面板（多選市價出清開始前檢查） */
         ui: { ticket: null as unknown, orderAction: null as unknown },
+        /** getRiskSettings()：手機一律開啟手動下單確認（start.ts 釘住）；多選市價出清每筆送出前檢查 */
+        risk: { confirmManualOrders: true },
         placeStockExitByShares: vi.fn(),
         placeQuickOrder: vi.fn(),
         notify: vi.fn(),
@@ -56,6 +58,7 @@ function same(a?: Acc | null, b?: Acc | null): boolean {
 }
 
 vi.mock('../../hooks/use-stream', () => ({ useTradingLive: () => m.live }));
+vi.mock('../../lib/risk', () => ({ getRiskSettings: () => m.risk }));
 vi.mock('../../lib/account-store', () => ({
     useAccounts: () => m.accounts,
     getAccountState: () => m.accounts,
@@ -154,10 +157,10 @@ vi.mock('../../lib/shioaji', async (importOriginal) => ({
 import { accountConfirmLabel, type OrderConfirmRequest } from '../../lib/order-confirm';
 import { resetTradingCostSettings, setTradingCostSettings } from '../../lib/trading-cost-settings';
 import { SlideToConfirm } from '../components/slide-to-confirm';
-import { decideBatchConfirm, isBatchExitActive, setBatchExit } from '../lib/batch-exit-auth';
+import { BATCH_STOPPED, batchExitAbortReason, decideBatchConfirm, isBatchExitActive, setBatchExit } from '../lib/batch-exit-auth';
 import { resetTradingLimitsForTest } from '../hooks/use-trading-limits';
 import { POSITIONS_VIEW_KEY, readPositionsView } from '../lib/positions-view';
-import { addOnBlockReason, addOnPlanFor, batchLegs, batchSelectReason, closePlanFor, COMPACT_TEXT, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
+import { addOnBlockReason, addOnPlanFor, batchGateProblem, batchLegs, batchSelectReason, closePlanFor, COMPACT_TEXT, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
 
 const stockAcc = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '' };
 const stockAcc2 = { account_type: 'S', broker_id: 'ESUN1', account_id: '7777777', person_id: 'A', signed: true, username: '' };
@@ -215,6 +218,7 @@ beforeEach(() => {
     m.serverInfo = null;
     m.esunEnv = 'SIMULATION';
     m.ui = { ticket: null, orderAction: null };
+    m.risk = { confirmManualOrders: true };
     setPositions([stockPos(), futPos()]);
     for (const f of [m.placeStockExitByShares, m.placeQuickOrder, m.notify, m.reconcileAfterUnknownOutcome, m.openTicket, m.navigate, m.selectAccount, m.assertResumeReady, m.acknowledgeStaleData, m.retryResume]) f.mockReset();
     m.placeStockExitByShares.mockResolvedValue([]);
@@ -1497,11 +1501,10 @@ describe('多選市價出清（§7.7、§10 S10）', () => {
         expect(batchSelectReason(stockPos(), undefined)).toBe(POSITIONS_TEXT.noContract);
         expect(batchSelectReason(stockPos({ account: { ...stockAcc, signed: false } }), stk2330)).toBe(POSITIONS_TEXT.accountNotTradable);
         const plan = (p: AccountedPosition, c: ContractInfo) => closePlanFor(p, c) as Exclude<ReturnType<typeof closePlanFor>, string>;
-        expect(batchLegs(plan(stockPos(), stk2330), false)).toEqual(['整張 3 張 市價 IOC', '零股 500 股以跌停價 963 盤中零股限價']);
-        expect(batchLegs(plan(stockPos({ cond: 'MarginTrading', quantity: 2000 }), stk2330), false)).toEqual(['整張 2 張 市價 IOC（融資）']);
-        expect(batchLegs(plan(stockPos({ direction: 'Sell', quantity: 300 }), stk2330), false)).toEqual(['零股 300 股以漲停價 1,175 盤中零股限價']);
-        expect(batchLegs(plan(futPos(), txf), false)).toEqual(['2 口 市價 IOC（平倉）']);
-        expect(batchLegs(plan(stockPos(), stk2330), true)).toEqual(['整張 ••••• 張 市價 IOC', '零股 ••••• 股以跌停價 963 盤中零股限價']);
+        expect(batchLegs(plan(stockPos(), stk2330))).toEqual(['整張 3 張 市價 IOC', '零股 500 股以跌停價 963 盤中零股限價']);
+        expect(batchLegs(plan(stockPos({ cond: 'MarginTrading', quantity: 2000 }), stk2330))).toEqual(['整張 2 張 市價 IOC（融資）']);
+        expect(batchLegs(plan(stockPos({ direction: 'Sell', quantity: 300 }), stk2330))).toEqual(['零股 300 股以漲停價 1,175 盤中零股限價']);
+        expect(batchLegs(plan(futPos(), txf))).toEqual(['2 口 市價 IOC（平倉）']);
     });
 
     it('「選取」切換選取模式（aria-pressed）：每列勾選鍵（role=checkbox、aria-checked、名稱）；選擇權停用並說明；隱藏平倉與加碼', async () => {
@@ -1742,12 +1745,18 @@ describe('多選市價出清（§7.7、§10 S10）', () => {
         expect(isBatchExitActive()).toBe(false);
     });
 
-    it('送出中按「停止剩餘」：送完目前這筆就停，其餘未送出', async () => {
+    it('已核准、送出中按「停止剩餘」：這筆照常送完，其餘未送出', async () => {
         fakeLib();
         let release!: () => void;
-        const gateOpen = new Promise<void>(r => { release = r; });
-        const base = m.placeStockExitByShares.getMockImplementation()!;
-        m.placeStockExitByShares.mockImplementationOnce(async (...args: unknown[]) => { await gateOpen; return base(...args); });
+        const inFlight = new Promise<void>(r => { release = r; });
+        // 第一筆：授權核准後（lib 已在送單）才卡住
+        m.placeStockExitByShares.mockImplementationOnce(async (contract: ContractInfo, action: 'Buy' | 'Sell', shares: number, account: typeof stockAcc, opts: { beforeSend: () => void }) => {
+            await libConfirm({ code: contract.code, action, price: null, quantity: shares, unit: '股', accountLabel: accountConfirmLabel(account) });
+            await inFlight;
+            opts.beforeSend();
+            sent.push(`${contract.code} ${action} ${shares}`);
+            return [];
+        });
         await render();
         await click(one('position-select-mode'));
         await click(one('position-select-all'));
@@ -1755,11 +1764,119 @@ describe('多選市價出清（§7.7、§10 S10）', () => {
         await waitFor('batch-exit-sheet');
         await act(async () => { slide()!.props.onConfirm(); });
         await click(one('batch-exit-stop'));
-        expect(textOf(one('batch-exit-stop'))).toBe('將在目前這筆之後停止');
+        expect(textOf(one('batch-exit-stop'))).toBe('已停止：送出中的那一筆無法取消，其餘不再送出');
+        expect(batchExitAbortReason()).toBe(BATCH_STOPPED);
         await act(async () => { release(); });
         await waitFor('batch-exit-summary');
         expect(sent).toEqual(['2330 Sell 3500']);
         expect(all('batch-exit-status').map(textOf)).toEqual(['已送出', '未送出（已停止剩餘）', '未送出（已停止剩餘）', '未送出（已停止剩餘）']);
+        expect(isBatchExitActive()).toBe(false);
+    });
+
+    it('尚未核准（例如仍在等待伺服器模式）時按「停止剩餘」：這一筆也取消，全部未送出', async () => {
+        fakeLib();
+        let release!: () => void;
+        const beforeConfirm = new Promise<void>(r => { release = r; });
+        const base = m.placeStockExitByShares.getMockImplementation()!;
+        m.placeStockExitByShares.mockImplementationOnce(async (...args: unknown[]) => { await beforeConfirm; return base(...args); });
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        await act(async () => { slide()!.props.onConfirm(); });
+        await click(one('batch-exit-stop'));
+        await act(async () => { release(); });
+        await waitFor('batch-exit-summary');
+        expect(sent).toEqual([]);
+        expect(all('batch-exit-status').map(textOf)).toEqual(['未送出（已停止剩餘）', '未送出（已停止剩餘）', '未送出（已停止剩餘）', '未送出（已停止剩餘）']);
+        expect(textOf(one('batch-exit-summary'))).toBe('已送出 0 筆・未送出 4 筆');
+    });
+
+    it('遮蔽金額時預覽仍顯示明碼數量（送出前唯一看得到數量的畫面，同確認面板）', async () => {
+        m.privMoney = true;
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        const texts = all('batch-exit-item').map(textOf).join('｜');
+        expect(texts).toContain('多 3張+500股');
+        expect(texts).toContain('整張 3 張 市價 IOC');
+        expect(texts).toContain('零股 500 股');
+        expect(texts).not.toContain('•');
+    });
+
+    it('批次進行中（例如離開本頁前開始的）：平倉鍵停用，預覽滑塊停用並說明，不能開始另一個批次', async () => {
+        setBatchExit(true);
+        try {
+            await render();
+            expect(inRow('TXFL6', 'position-close').props.disabled).toBe(true);
+            await click(one('position-select-mode'));
+            await click(one('position-select-all'));
+            await click(one('position-clear-out'));
+            await waitFor('batch-exit-sheet');
+            expect(slide()!.props.disabledReason).toBe(POSITIONS_TEXT.batchBusy);
+            await act(async () => { slide()!.props.onConfirm(); });
+            for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        } finally {
+            setBatchExit(false);
+        }
+    });
+
+    it('卸載持倉頁：中止進行中的批次（尚未核准的那一筆會被根層確認面板取消）', async () => {
+        await render();
+        setBatchExit(true);
+        try {
+            await act(async () => view!.unmount());
+            view = undefined;
+            expect(batchExitAbortReason()).toBe(BATCH_STOPPED);
+        } finally {
+            setBatchExit(false);
+        }
+    });
+
+    it('每筆送出前的批次閘門：確認設定關閉、畫面在背景、重新同步過都停止；其餘同單筆平倉', () => {
+        expect(batchGateProblem(true, 0)).toBeNull();
+        expect(batchGateProblem(false, 0)).toBe(POSITIONS_TEXT.notLive);
+        m.gate = { ...m.gate, resumeSeq: 1 };
+        expect(batchGateProblem(true, 0)).toBe(POSITIONS_TEXT.batchResumed);
+        expect(batchGateProblem(true, 1)).toBeNull();
+        m.risk = { confirmManualOrders: false };
+        expect(batchGateProblem(true, 1)).toBe(POSITIONS_TEXT.batchNoConfirm);
+        m.risk = { confirmManualOrders: true };
+        vi.stubGlobal('document', { visibilityState: 'hidden' });
+        try {
+            expect(batchGateProblem(true, 1)).toBe(POSITIONS_TEXT.batchHidden);
+        } finally {
+            vi.unstubAllGlobals();
+            vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+        }
+    });
+
+    it('執行中回前景重新同步過（resumeSeq 改變）：停止剩餘（目前這筆之後不再送出）', async () => {
+        fakeLib();
+        let release!: () => void;
+        const inFlight = new Promise<void>(r => { release = r; });
+        m.placeStockExitByShares.mockImplementationOnce(async (contract: ContractInfo, action: 'Buy' | 'Sell', shares: number, account: typeof stockAcc, opts: { beforeSend: () => void }) => {
+            await libConfirm({ code: contract.code, action, price: null, quantity: shares, unit: '股', accountLabel: accountConfirmLabel(account) });
+            await inFlight;
+            opts.beforeSend();
+            sent.push(`${contract.code} ${action} ${shares}`);
+            return [];
+        });
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        await act(async () => { slide()!.props.onConfirm(); });
+        // 第一筆送出中回到前景又重新同步過（resumeSeq 改變）
+        m.gate = { ...m.gate, resumeSeq: m.gate.resumeSeq + 1 };
+        await act(async () => { release(); });
+        await waitFor('batch-exit-summary');
+        expect(sent).toEqual(['2330 Sell 3500']);
+        expect(all('batch-exit-status').map(textOf)).toEqual(['已送出', `未送出（${POSITIONS_TEXT.batchResumed}）`, `未送出（${POSITIONS_TEXT.batchResumed}）`, `未送出（${POSITIONS_TEXT.batchResumed}）`]);
     });
 
     it('結果未知：停止、通知並觸發對帳，不重送', async () => {

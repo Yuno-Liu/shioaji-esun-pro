@@ -35,7 +35,7 @@ vi.mock('../../lib/order-confirm', () => ({
 vi.mock('../../lib/privacy', () => ({ usePrivacyMode: () => q.priv }));
 vi.mock('../../lib/trade', () => ({ notify: m.notify }));
 
-import { armBatchExit, batchExitAbortReason, setBatchExit, type ExpectedConfirm } from '../lib/batch-exit-auth';
+import { abortBatchExit, armBatchExit, BATCH_STOPPED, batchExitAbortReason, setBatchExit, type ExpectedConfirm } from '../lib/batch-exit-auth';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
 import { CONFIRM_TEXT, confirmActionText, OrderConfirmSheet } from './order-confirm-sheet';
 import type { ReactElement } from 'react';
@@ -584,6 +584,17 @@ describe('OrderConfirmSheet — 持倉多選市價出清（lib/batch-exit-auth�
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it('批次中 awaitingMode 時使用者停止或離開持倉頁（abortBatchExit）：立即 resolve(false)，模式取得後也不核准', async () => {
+        await render();
+        await start();
+        await emit({ ...exitReq, simulation: null, awaitingMode: true });
+        expect(q.resolve).not.toHaveBeenCalled();
+        await act(async () => { abortBatchExit(BATCH_STOPPED); });
+        expect(q.resolve.mock.calls).toEqual([[false]]);
+        expect(batchExitAbortReason()).toBe(BATCH_STOPPED);
+        expect(view!.toJSON()).toBeNull();
     });
 
     it('批次中 ResumeGate 不允許：不核准，由既有 ResumeGate 檢查取消', async () => {

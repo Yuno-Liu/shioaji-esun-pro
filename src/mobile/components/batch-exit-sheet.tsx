@@ -72,7 +72,7 @@ export const BATCH_SHEET_TEXT = {
     flow: '滑動後依序逐筆送出，不再逐筆確認；每筆送出前會再核對持倉與連線，持倉有變動的會略過；任一筆結果未知即停止，不會重送。',
     production: '包含正式環境帳戶：將以真實資金送出市價委託。',
     stop: '停止剩餘',
-    stopping: '將在目前這筆之後停止',
+    stopping: '已停止：送出中的那一筆無法取消，其餘不再送出',
     done: '完成',
     cancel: '取消',
 } as const;
@@ -114,8 +114,9 @@ export function BatchExitSheet({ phase, groups, states, blockReason, note, stopR
                 testId='batch-exit-slide'
                 disabled={reason !== null}
                 disabledReason={reason}
-                // 清單、停用原因或說明（例如滑動後未開始的原因）改變時解除「已觸發」鎖定，可再滑一次
-                resetKey={`${count}:${reason ?? ''}:${note ?? ''}`}
+                // 清單、各組環境、停用原因或說明（例如滑動後未開始的原因）改變時歸零：拖曳中也中止，
+                // 環境由模擬直接變正式（不經過未確認）時不會以開始滑動時看到的環境以外的環境送出
+                resetKey={`${count}:${tones.join(',')}:${reason ?? ''}:${note ?? ''}`}
                 onConfirm={confirm}
             />
             <button type='button' className={styles.textButton} onClick={onClose} data-testid='batch-exit-cancel'>{BATCH_SHEET_TEXT.cancel}</button>

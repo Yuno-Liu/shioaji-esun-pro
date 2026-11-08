@@ -3,7 +3,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { accountConfirmLabel, type OrderConfirmRequest } from '../../lib/order-confirm';
 import {
+    abortBatchExit,
     armBatchExit,
+    BATCH_STOPPED,
     BATCH_WAIT_MS,
     batchExitAbortReason,
     decideBatchConfirm,
@@ -140,6 +142,46 @@ describe('decideBatchConfirm', () => {
         vi.advanceTimersByTime(BATCH_WAIT_MS);
         expect(decideBatchConfirm(request({ awaitingMode: true, simulation: null }))).toBe('reject');
         expect(batchExitAbortReason()).toBe('timeout');
+    });
+
+    it('abortBatchExit：批次未進行時不做事；進行中記錄原因、解除 arm、通知訂閱者，之後的 arm 無效', () => {
+        const listener = vi.fn();
+        const off = subscribeBatchExit(listener);
+        abortBatchExit(BATCH_STOPPED);
+        expect(listener).not.toHaveBeenCalled();
+        expect(batchExitAbortReason()).toBeNull();
+        setBatchExit(true);
+        armBatchExit(expected);
+        listener.mockClear();
+        abortBatchExit(BATCH_STOPPED);
+        expect(listener).toHaveBeenCalledTimes(1);
+        expect(batchExitAbortReason()).toBe(BATCH_STOPPED);
+        // 原本相符的請求也被拒絕（arm 已解除），原因維持「已停止」
+        expect(decideBatchConfirm(request())).toBe('reject');
+        expect(batchExitAbortReason()).toBe(BATCH_STOPPED);
+        armBatchExit(expected);
+        expect(decideBatchConfirm(request())).toBe('reject');
+        off();
+    });
+
+    it('abortBatchExit 不覆蓋先前的中止原因（例如欄位不符）', () => {
+        setBatchExit(true);
+        armBatchExit(expected);
+        expect(decideBatchConfirm(request({ quantity: 1 }))).toBe('reject');
+        abortBatchExit(BATCH_STOPPED);
+        expect(batchExitAbortReason()).toBe('quantity');
+    });
+
+    it('等待伺服器模式中被中止：下一次判斷立即拒絕（不等到逾時）', () => {
+        vi.useFakeTimers();
+        setBatchExit(true);
+        armBatchExit(expected);
+        expect(decideBatchConfirm(request({ awaitingMode: true, simulation: null }))).toBe('wait');
+        abortBatchExit(BATCH_STOPPED);
+        expect(decideBatchConfirm(request({ awaitingMode: true, simulation: null }))).toBe('reject');
+        // 模式取得後也不會核准
+        expect(decideBatchConfirm(request())).toBe('reject');
+        expect(batchExitAbortReason()).toBe(BATCH_STOPPED);
     });
 
     it('換下一筆 arm 會重新起算等待時間', () => {

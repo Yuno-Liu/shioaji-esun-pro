@@ -25,7 +25,7 @@ vi.mock('../hooks/use-mobile-ticket', () => ({
         err instanceof m.OrderConfirmCancelled ? 'cancelled' : (err as { mutationNotStarted?: boolean } | null)?.mutationNotStarted === true ? 'not-sent' : 'unknown',
 }));
 
-import { batchExitAbortReason, decideBatchConfirm, isBatchExitActive, setBatchExit } from './batch-exit-auth';
+import { abortBatchExit, BATCH_STOPPED, batchExitAbortReason, decideBatchConfirm, isBatchExitActive, setBatchExit } from './batch-exit-auth';
 import { BATCH_GAP_MS, BATCH_TEXT, expectedConfirmOf, runBatchExit, type BatchExitItem, type BatchItemState, type BatchRunDeps } from './batch-exit';
 
 const acc = (over: Partial<Account> = {}): Account => ({ account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '', ...over }) as Account;
@@ -251,6 +251,24 @@ describe('runBatchExit', () => {
         expect(result.map(s => s.status)).toEqual(['sent', 'not-sent', 'not-sent', 'not-sent']);
         expect(result[1]!.reason).toBe(BATCH_TEXT.stopped);
         expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('等待伺服器模式時使用者停止（abortBatchExit）：這一筆也取消並標「已停止剩餘」，其餘不送', async () => {
+        env.awaitingFirst = true;
+        let stop = false;
+        // 模式取得的那一刻之前使用者按了停止
+        tamper = r => {
+            if (!r.awaitingMode && !stop) { stop = true; abortBatchExit(BATCH_STOPPED); }
+            return r;
+        };
+        const { d, items } = deps(mixed(), { stopRequested: () => stop });
+        const result = await runBatchExit(items, d);
+        expect(result.map(s => s.status)).toEqual(['not-sent', 'not-sent', 'not-sent', 'not-sent']);
+        expect(result[0]!.reason).toBe(BATCH_TEXT.stopped);
+        expect(result[1]!.reason).toBe(BATCH_TEXT.stopped);
+        expect(sends).toEqual([]);
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(isBatchExitActive()).toBe(false);
     });
 
     it('授權不符（lib 送出的確認與預期不同）：取消、這筆未送出並記錄原因、中止其餘', async () => {
