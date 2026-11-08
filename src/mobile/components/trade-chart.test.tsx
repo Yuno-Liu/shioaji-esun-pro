@@ -1418,6 +1418,8 @@ describe('TradeChart 走勢 X 軸固定與漲跌停範圍', () => {
         const o = chartOptions();
         expect(o.handleScroll).toBe(false);
         expect(o.handleScale).toBe(false);
+        // 走勢不縮放：不放行雙指給圖表（平台手勢防護照常擋）
+        expect(wrap().props['data-allow-pinch']).toBeUndefined();
         expect(o.kineticScroll).toEqual({ touch: false, mouse: false });
         expect(o.timeScale).toMatchObject({ rightOffset: 0, fixLeftEdge: true, lockVisibleTimeRangeOnResize: true });
         // fixRightEdge 會把右端鎖在最後一根有資料的點（右側未到的時段被切掉）

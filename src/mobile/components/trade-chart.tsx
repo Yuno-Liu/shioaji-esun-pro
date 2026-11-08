@@ -44,7 +44,7 @@
 //   長按追蹤時同一列跟著十字線。**輕點只顯示資訊，不開選價列、不開下單面板**。
 //   程式庫在觸控放開、資料更新、滑鼠移動時會自己移動或清除十字線：釘住期間在 crosshairMove 裡放回那一根。
 //   資訊列以小 store（useSyncExternalStore）只重繪該列，不重繪整個圖表元件。
-//   不支援拖曳委託線改價（規格 R7）。可互動區加 data-allow-pinch="true"（平台手勢防護略過這一區）。
+//   不支援拖曳委託線改價（規格 R7）。K 線的可互動區加 data-allow-pinch="true"（平台手勢防護略過這一區）；走勢不縮放，不加。
 // - 橫向全螢幕：手機轉橫向（lib/chart-fullscreen.ts）或按「全螢幕」→ CSS 固定定位覆蓋全畫面（留安全區），
 //   上方週期＋指標＋「退出」，下方買進／賣出（只開下單面板）。iPhone Safari 沒有元素 Fullscreen API，
 //   手動進入時若支援才另對 <html> 呼叫 requestFullscreen（底部面板才仍看得到），不依賴它。
@@ -1730,7 +1730,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 onPointerUp={e => onPointerEnd(e, true)}
                 onPointerCancel={e => onPointerEnd(e, false)}
                 onContextMenu={e => e.preventDefault()}
-                data-allow-pinch='true'
+                // 走勢不縮放：不放行雙指（平台手勢防護照常擋下，頁面也不會被捏合縮放）
+                data-allow-pinch={isLine ? undefined : 'true'}
                 data-testid='trade-chart'
             >
                 <div ref={hostRef} className={styles.chartHost} />
