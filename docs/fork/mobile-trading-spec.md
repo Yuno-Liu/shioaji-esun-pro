@@ -724,7 +724,7 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 | 帳號 | 證券／期貨槽位切換（§5.4） | `useAccounts()` |
 | 資金 | 股票：交割帳戶餘額、交割款（T+1／T+2）；期貨：權益數、可用保證金、維持率 | `useTradingState().balance`／`margin`；玉山另以 `esunTradeService.fetchAccountBalance()`、`fetchSettlements()` |
 | 額度（P1） | 買賣額度、資券額度 | `fetchTradingLimits()` |
-| 損益（P1） | 已實現損益（日期區間；玉山上限 180 天） | `fetchProfitLoss()`、`fetchProfitLossSummary()` |
+| 損益（P1） | 已實現損益（日期區間；今日／本週／本月／近 30 天／自訂，自訂最多 180 天含起訖日；含玉山帳戶時每分鐘最多查詢 4 次） | `fetchProfitLoss()`、`fetchProfitLossSummary()` |
 | 連線 | 永豐串流狀態、最後心跳時間（`getLastHeartbeat()`）、連線世代；玉山 bridge：登入、環境、`sessionExpired`、`wsConnected`、回報串流狀態（`getEsunStreamStatus()`） | `src/lib/stream.ts:157,909`、`EsunBridgeHealth`（`src/lib/esun/adapter.ts:29-55`） |
 | 伺服器 | 版本（`/api/v1/info`）、模擬／正式、憑證剩餘天數、每日流量 | `fetchInfo()`、`fetchHealth()`、`/api/v1/auth/usage` |
 | 玉山重新連線（P1） | 只提供一般重新連線（不提供 force），60 秒冷卻，按下前提醒「密碼錯誤 3 次會鎖帳」 | `esunTradeService.reconnect()` |
@@ -732,7 +732,7 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 | 顯示 | 深／淺色、台灣（紅漲綠跌）／國際配色、字級、遮蔽金額 | `useThemeSettings()`、`usePrivacyMoney()` |
 | 診斷 | secure context、Web Locks、BroadcastChannel、User Agent、建置版本 `__SHIOAJI_BUILD_VERSION__` | — |
 
-現況（mobile-design.md §7.8）：讀取、刷新時機不變，外觀改為分組卡片；顯示區新增「降低透明度：跟隨系統／開／關」，本裝置區新增「介面觸覺回饋（Android）」開關。依使用者要求，「今日剩餘交易額度」卡移到頁面最上方（永豐以可用為主值並附已用／總額度；玉山只顯示上限），從持倉頁額度列跳來時捲到並聚焦這張卡；已實現損益列改為名稱為主、代碼為次。
+現況（mobile-design.md §7.8）：讀取、刷新時機不變，外觀改為分組卡片；顯示區新增「降低透明度：跟隨系統／開／關」，本裝置區新增「介面觸覺回饋（Android）」開關。依使用者要求，「今日剩餘交易額度」卡移到頁面最上方（永豐以可用為主值並附已用／總額度；玉山只顯示上限），從持倉頁額度列跳來時捲到並聚焦這張卡；已實現損益列改為名稱為主、代碼為次。第 3 批依使用者要求加入已實現損益「自訂」日期區間（原生日期欄，最多 180 天、不合法時停用查詢並說明原因、不自動修正；含玉山帳戶時每分鐘最多查詢 4 次）。
 
 ---
 

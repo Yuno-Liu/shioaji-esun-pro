@@ -50,23 +50,32 @@ describe('loadOnDemand', () => {
         expect(getOnDemandState(null).data).toBeNull();
     });
 
-    it('a shared gate spaces requests across keys; skipped loads do not restart it', async () => {
+    it('a shared sliding-window gate allows max loads per window across keys; skipped loads use no quota', async () => {
         resetOnDemandForTest(() => now);
-        const gate = { name: 'g', intervalMs: 15_000 };
+        const gate = { name: 'g', max: 3, windowMs: 60_000 };
         const fetcher = vi.fn(async () => 1);
+        const start = now;
         expect(gateLeftSec(gate, now)).toBe(0);
-        expect(await loadOnDemand('a', fetcher, 30_000, gate)).toBe(true);
-        now += 4_000;
-        expect(gateLeftSec(gate, now)).toBe(11);
-        expect(await loadOnDemand('b', fetcher, 30_000, gate)).toBe(false);
-        expect(getOnDemandState('b')).toMatchObject({ loading: false, attemptedAt: null });
-        // 被擋下的嘗試不重新起算
-        now += 11_000;
+        for (const k of ['a', 'b', 'c']) {
+            expect(await loadOnDemand(k, fetcher, 30_000, gate)).toBe(true);
+            now += 10_000;
+        }
+        // 第 4 次（t+30s）：等最舊一次（t+0）滑出視窗 → 30 秒
+        expect(gateLeftSec(gate, now)).toBe(30);
+        expect(await loadOnDemand('d', fetcher, 30_000, gate)).toBe(false);
+        expect(getOnDemandState('d')).toMatchObject({ loading: false, attemptedAt: null });
+        // 被擋下的嘗試不占額度；最舊一次剛好滿 60 秒就滑出
+        now = start + 59_999;
+        expect(gateLeftSec(gate, now)).toBe(1);
+        now = start + 60_000;
         expect(gateLeftSec(gate, now)).toBe(0);
-        expect(await loadOnDemand('b', fetcher, 30_000, gate)).toBe(true);
-        expect(fetcher).toHaveBeenCalledTimes(2);
-        // 沒帶 gate 的 key 不受影響；reset 清空閘門
-        expect(await loadOnDemand('c', fetcher, 30_000)).toBe(true);
+        expect(await loadOnDemand('d', fetcher, 30_000, gate)).toBe(true);
+        // 視窗又滿了：下一個要等 b（t+10s）滑出
+        expect(gateLeftSec(gate, now)).toBe(10);
+        expect(fetcher).toHaveBeenCalledTimes(4);
+        // 沒帶 gate 的 key 不受影響；不同名稱的閘門各自計數；reset 清空閘門
+        expect(await loadOnDemand('e', fetcher, 30_000)).toBe(true);
+        expect(gateLeftSec({ name: 'other', max: 3, windowMs: 60_000 }, now)).toBe(0);
         resetOnDemandForTest(() => now);
         expect(gateLeftSec(gate, now)).toBe(0);
     });

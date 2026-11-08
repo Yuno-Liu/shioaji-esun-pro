@@ -27,12 +27,13 @@ export const PNL_PERIODS: readonly { value: PnlPeriod; text: string }[] = [
 export const PNL_COOLDOWN_MS = 30_000;
 
 /**
- * 已實現損益：不分區間的全域最短間隔（自訂區間每換一次就是新的 key，不受 PNL_COOLDOWN_MS 保護）。
- * 依據：玉山 bridge 損益查詢限 10 次／分（esun_trade_server.py profit_loss_limiter）；每次「查詢」對玉山證券帳戶
- * 發出 2 個 GET /esun/portfolio/profit-loss（fetchProfitLoss＋fetchProfitLossSummary，同一區間）。bridge 的 10 秒
- * 快取＋single-flight 通常讓第二個不占額度，但以最壞情況 2 次計：60 秒 ÷ 15 秒 ＝ 4 次查詢 ＝ 8 個請求 ≤ 約 8 次／分。
+ * 玉山已實現損益：任意 60 秒內最多查詢幾次（不分區間；自訂區間每換一次就是新的 key，不受 PNL_COOLDOWN_MS 保護）。
+ * 依據：bridge 的 profit_loss_limiter 限 10 次／分，且只在快取未命中時取額度（esun_trade_server.py _cached_query：
+ * single-flight 填充鎖之後、快取鍵＝日期區間、TTL 10 秒）。每次「查詢」對玉山證券帳戶發出 2 個同區間的
+ * GET /esun/portfolio/profit-loss（fetchProfitLoss＋fetchProfitLossSummary），通常只占 1 個額度，最壞 2 個（第一個失敗）。
+ * 4 次查詢 ≤ 8 個額度 < 10 次／分，留空間給同一個 bridge 上的桌面版。永豐沒有這道限制（只有同區間 30 秒不重查）。
  */
-export const PNL_MIN_INTERVAL_MS = 15_000;
+export const PNL_ESUN_QUERIES_PER_MIN = 4;
 
 /** 自訂區間最多天數（含起訖日） */
 export const PNL_MAX_RANGE_DAYS = 180;

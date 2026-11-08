@@ -7,7 +7,7 @@ import {
     customRangeProblem,
     marketPnlTotal,
     PNL_MAX_RANGE_DAYS,
-    PNL_MIN_INTERVAL_MS,
+    PNL_ESUN_QUERIES_PER_MIN,
     PNL_PERIODS,
     pnlDateRange,
     pnlRangeDays,
@@ -152,9 +152,10 @@ describe('custom range', () => {
         expect(pnlRangeDays(b.beginMin, '2026-10-01')).toBe(PNL_MAX_RANGE_DAYS);
     });
 
-    it('the global interval keeps E.SUN realized P&L under ~8 requests per minute (2 GETs per query)', () => {
-        const esunRequestsPerQuery = 2; // fetchProfitLoss + fetchProfitLossSummary → 各一個 GET /esun/portfolio/profit-loss
-        expect(PNL_MIN_INTERVAL_MS).toBe(15_000);
-        expect(Math.ceil(60_000 / PNL_MIN_INTERVAL_MS) * esunRequestsPerQuery).toBeLessThanOrEqual(8);
+    it('the E.SUN window stays under the bridge limit of 10 per minute even in the worst case (2 quota per query)', () => {
+        // fetchProfitLoss＋fetchProfitLossSummary → 2 個同區間 GET /esun/portfolio/profit-loss；快取未命中才占額度，最壞 2 個
+        const worstQuotaPerQuery = 2;
+        expect(PNL_ESUN_QUERIES_PER_MIN).toBe(4);
+        expect(PNL_ESUN_QUERIES_PER_MIN * worstQuotaPerQuery).toBeLessThan(10);
     });
 });

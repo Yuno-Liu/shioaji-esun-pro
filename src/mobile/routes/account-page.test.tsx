@@ -134,7 +134,7 @@ vi.mock('../components/account/esun-reconnect-section', () => ({ EsunReconnectSe
 
 import { loadTradingLimits, resetTradingLimitsForTest, TRADING_LIMITS_MIN_REFRESH_MS } from '../hooks/use-trading-limits';
 import { resetOnDemandForTest } from '../lib/account-on-demand';
-import { PNL_MIN_INTERVAL_MS } from '../lib/account-pnl';
+import { PNL_ESUN_QUERIES_PER_MIN } from '../lib/account-pnl';
 import { resetContractNamesForTest } from '../lib/contract-names';
 import { createScrollMemory, ScrollRestorer } from '../lib/scroll-memory';
 import { openTodayLimits, resetTodayLimitsFocusForTest, TODAY_LIMITS_ID } from '../components/account/today-limits';
@@ -570,18 +570,16 @@ describe('AccountPage realized P&L', () => {
     });
 
     it('changing the period waits for the query button', async () => {
-        let t = 5_000_000;
-        resetOnDemandForTest(() => t);
         await render();
         await click('account-pnl-toggle');
-        // 「近 30 天」永遠與「今日」不同（「本週」在星期一等於今日）
-        await pickPeriod('近 30 天');
+        // 用「近 30 天」（範圍一定與今日不同）：原本點「本週」，星期一時本週＝今日，範圍沒變就不會等查詢，每到週一必失敗
+        const last30 = byTestId('pnl-period').findAll(n => n.type === 'button').find(b => textOf(b).includes('30'))!;
+        expect(last30).toBeDefined();
+        await act(async () => { last30.props.onClick(); });
         expect(m.fetchProfitLoss).toHaveBeenCalledTimes(2);
         expect(allByTestId('pnl-idle')).toHaveLength(1);
-        t += PNL_MIN_INTERVAL_MS;
         await click('pnl-query');
         expect(m.fetchProfitLoss).toHaveBeenCalledTimes(4);
-        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('F', fut, twDate(-29), twDate(0));
     });
 
     it('keeps other accounts when one account fails', async () => {
@@ -653,8 +651,6 @@ describe('AccountPage realized P&L custom range', () => {
         expect(textOf(byTestId('pnl-range'))).toBe('2026-10-11 ～ 2026-11-09（台北日期，共 30 天）');
         expect(allByTestId('pnl-idle')).toHaveLength(1);
         expect(pnlCalls()).toBe(4);
-        t += PNL_MIN_INTERVAL_MS;
-        await rerender();
         expect(queryButton().props.disabled).toBe(false);
         await click('pnl-query');
         expect(m.fetchProfitLoss).toHaveBeenCalledWith('S', stock, '2026-10-11', '2026-11-09');
@@ -685,7 +681,6 @@ describe('AccountPage realized P&L custom range', () => {
 
     it('changing a date returns to idle; the next query uses the new dates', async () => {
         await openCustom();
-        t += PNL_MIN_INTERVAL_MS;
         await click('pnl-query');
         expect(allByTestId('pnl-total')).toHaveLength(1);
         await setDate('pnl-begin', '2026-10-01');
@@ -693,7 +688,6 @@ describe('AccountPage realized P&L custom range', () => {
         expect(allByTestId('pnl-total')).toHaveLength(0);
         expect(textOf(byTestId('pnl-range'))).toBe('2026-10-01 ～ 2026-11-09（台北日期，共 40 天）');
         expect(pnlCalls()).toBe(8);
-        t += PNL_MIN_INTERVAL_MS;
         await click('pnl-query');
         expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('F', fut, '2026-10-01', '2026-11-09');
         expect(pnlCalls()).toBe(12);
@@ -701,7 +695,6 @@ describe('AccountPage realized P&L custom range', () => {
 
     it('invalid ranges disable 查詢 with a role=status reason, keep the typed dates, and send nothing', async () => {
         await openCustom();
-        t += PNL_MIN_INTERVAL_MS; // 排除全域間隔：停用只因區間不合法
         const cases: [Partial<Record<'pnl-begin' | 'pnl-end', string>>, string][] = [
             [{ 'pnl-begin': '2026-05-13', 'pnl-end': '2026-11-09' }, '區間最多 180 天（目前 181 天）。'],
             [{ 'pnl-begin': '2026-11-05', 'pnl-end': '2026-11-01' }, '起日不能晚於迄日。'],
@@ -732,26 +725,56 @@ describe('AccountPage realized P&L custom range', () => {
         expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('F', fut, '2026-05-14', '2026-11-09');
     });
 
-    it('global minimum interval: a second query for a different range is blocked and shows the seconds left', async () => {
-        await openCustom(); // 展開時已查「今日」（t）
+    it('E.SUN: 4 queries per minute across ranges; the 5th waits for the oldest to leave the window', async () => {
+        m.accounts = { accounts: [esunStock], selectedStock: esunStock, selectedFutures: null, loaded: true, loadError: false };
+        const start = t;
+        await render();
+        await click('account-pnl-toggle'); // 第 1 次：今日（t+0）
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(1);
+        expect(textOf(byTestId('pnl-esun-limit'))).toBe(`玉山已實現損益最長查詢 180 天，每分鐘最多查詢 ${PNL_ESUN_QUERIES_PER_MIN} 次。`);
+        await pickPeriod('自訂');
+        for (const [i, begin] of ['2026-10-12', '2026-10-13', '2026-10-14'].entries()) {
+            t = start + (i + 1) * 10_000; // 第 2～4 次：t+10s、t+20s、t+30s，各一個不同區間
+            await setDate('pnl-begin', begin);
+            await click('pnl-query');
+        }
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(4);
+        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('S', esunStock, '2026-10-14', '2026-11-09');
+        // 第 5 次（另一個區間）：等 t+0 那次滑出視窗 → 還有 30 秒
+        await setDate('pnl-begin', '2026-10-15');
         expect(queryButton().props.disabled).toBe(true);
-        expect(textOf(queryButton())).toBe(`查詢（${PNL_MIN_INTERVAL_MS / 1000} 秒）`);
+        expect(textOf(queryButton())).toBe('查詢（30 秒）');
         await click('pnl-query'); // 強按也不送出
-        expect(pnlCalls()).toBe(4);
-        t += 5_000;
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(4);
+        t = start + 50_000;
         await rerender();
-        expect(textOf(queryButton())).toBe(`查詢（${PNL_MIN_INTERVAL_MS / 1000 - 5} 秒）`);
-        t += PNL_MIN_INTERVAL_MS - 5_000;
+        expect(textOf(queryButton())).toBe('查詢（10 秒）');
+        t = start + 60_000;
         await rerender();
+        expect(textOf(queryButton())).toBe('查詢');
+        expect(queryButton().props.disabled).toBe(false);
+        await click('pnl-query');
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(5);
+        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('S', esunStock, '2026-10-15', '2026-11-09');
+        // 視窗又滿：下一個區間要等 t+10s 那次滑出
+        await setDate('pnl-begin', '2026-10-16');
+        expect(textOf(queryButton())).toBe('查詢（10 秒）');
+    });
+
+    it('SinoPac only: a different range can be queried right away (no E.SUN window)', async () => {
+        await openCustom(); // 展開時已查「今日」
+        expect(queryButton().props.disabled).toBe(false);
         expect(textOf(queryButton())).toBe('查詢');
         await click('pnl-query');
         expect(pnlCalls()).toBe(8);
-        // 立刻換另一個區間：再被擋下
-        await setDate('pnl-begin', '2026-10-20');
-        expect(queryButton().props.disabled).toBe(true);
-        expect(textOf(queryButton())).toBe(`查詢（${PNL_MIN_INTERVAL_MS / 1000} 秒）`);
-        await click('pnl-query');
-        expect(pnlCalls()).toBe(8);
+        for (const begin of ['2026-10-20', '2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24']) {
+            await setDate('pnl-begin', begin);
+            expect(textOf(queryButton())).toBe('查詢');
+            await click('pnl-query');
+        }
+        expect(pnlCalls()).toBe(28);
+        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('F', fut, '2026-10-24', '2026-11-09');
+        expect(textOf(byTestId('pnl-range'))).toContain('2026-10-24');
     });
 
     it('keeps the custom dates for the session (period switch and remount), without storage', async () => {
@@ -776,12 +799,10 @@ describe('AccountPage realized P&L custom range', () => {
 
     it('S1: every control in the custom range flow sends, amends or cancels no order', async () => {
         await openCustom();
-        t += PNL_MIN_INTERVAL_MS;
         await click('pnl-query');
         await setDate('pnl-begin', '2026-01-01'); // 不合法（> 180 天）
         await click('pnl-query');
         await setDate('pnl-begin', '2026-08-01');
-        t += PNL_MIN_INTERVAL_MS;
         await click('pnl-query');
         const buttons = () => byTestId('account-pnl').findAll(n => n.type === 'button');
         const count = buttons().length;

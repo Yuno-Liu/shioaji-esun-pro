@@ -4,7 +4,7 @@
 // - 自訂：原生 <input type="date"> 起日／迄日，最多 180 天（含起訖日；customRangeProblem）；不合法時停用「查詢」並以
 //   role=status 說明原因，不自動修正日期。起訖存在模組層（本次使用期間保留，不寫 storage），第一次切到自訂帶近 30 天。
 // - 只在使用者展開區塊（且這個區間尚未讀過）或按「查詢」時讀取；同一區間＋帳戶 PNL_COOLDOWN_MS 內不重查；
-//   另有不分區間的全域最短間隔 PNL_MIN_INTERVAL_MS（自訂區間每換一次就是新的 key，避免觸發玉山 10 次／分限制）。
+//   含玉山帳戶時另有不分區間的滑動視窗：任意 60 秒最多 PNL_ESUN_QUERIES_PER_MIN 次（避免觸發 bridge 10 次／分限制）。
 // - 資料經由 src/lib 的 fetchProfitLoss／fetchProfitLossSummary（玉山帳戶由 lib 轉往 bridge）；玉山區間先以
 //   clampEsunDateRange180Days 限制在 180 天內，並以同一組日期字串讀取玉山成交明細 store（useEsunTransactionDetails）。
 // - 合計規則見 src/mobile/lib/account-pnl.ts（sum 優先、列表加總後備、逐帳戶判斷）。
@@ -34,7 +34,7 @@ import {
     customRangeBounds,
     customRangeProblem,
     PNL_COOLDOWN_MS,
-    PNL_MIN_INTERVAL_MS,
+    PNL_ESUN_QUERIES_PER_MIN,
     PNL_PERIODS,
     pnlDateRange,
     pnlRangeDays,
@@ -71,8 +71,8 @@ export function pnlPlans(accounts: readonly (Account | null)[], range: { begin: 
 
 const MARKET_TEXT = { S: '證券', F: '期貨' } as const;
 
-/** 所有已實現損益查詢共用的最短間隔（不分區間、帳戶） */
-const PNL_GATE: OnDemandGate = { name: 'realized-pnl', intervalMs: PNL_MIN_INTERVAL_MS };
+/** 含玉山帳戶的已實現損益查詢共用的滑動視窗（不分區間）；只有永豐帳戶時不套用 */
+const PNL_ESUN_GATE: OnDemandGate = { name: 'realized-pnl-esun', max: PNL_ESUN_QUERIES_PER_MIN, windowMs: 60_000 };
 
 type DateRange = { begin: string; end: string };
 
@@ -268,13 +268,14 @@ export function RealizedPnlCard() {
     const state = useOnDemand<RealizedPnlResult>(key);
     // useNow 只負責每秒重繪；冷卻以快取的時鐘計算（與 loadOnDemand 同一來源）
     const clockNow = onDemandNow();
-    const gateLeft = gateLeftSec(PNL_GATE, clockNow);
+    const gate = hasEsun ? PNL_ESUN_GATE : undefined;
+    const gateLeft = gate ? gateLeftSec(gate, clockNow) : 0;
     const canLoad = !!key && canLoadOnDemand(state, PNL_COOLDOWN_MS, clockNow) && gateLeft === 0;
     const load = () => {
         if (!key) return;
         const snapshot = plans;
-        // 冷卻與全域間隔由 loadOnDemand 在呼叫當下再判斷一次（被擋下時不發請求）
-        void loadOnDemand(key, () => fetchRealizedPnl(snapshot), PNL_COOLDOWN_MS, PNL_GATE);
+        // 冷卻與玉山視窗由 loadOnDemand 在呼叫當下再判斷一次（被擋下時不發請求）
+        void loadOnDemand(key, () => fetchRealizedPnl(snapshot), PNL_COOLDOWN_MS, gate);
     };
     const toggle = () => {
         const next = !open;
@@ -361,7 +362,7 @@ export function RealizedPnlCard() {
                     {state.error && <p className={styles.warning} role='alert'>已實現損益查詢失敗：{state.error}</p>}
                     {hasEsun && (
                         <p className={styles.note} data-testid='pnl-esun-limit'>
-                            {!problem && plans.some(p => p.clamped) ? '玉山查詢區間最長 180 天，已自動縮短。' : '玉山已實現損益最長查詢 180 天。'}
+                            {!problem && plans.some(p => p.clamped) ? '玉山查詢區間最長 180 天，已自動縮短。' : `玉山已實現損益最長查詢 180 天，每分鐘最多查詢 ${PNL_ESUN_QUERIES_PER_MIN} 次。`}
                         </p>
                     )}
                     <div className={styles.actions}>

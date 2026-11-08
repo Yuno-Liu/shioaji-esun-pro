@@ -4,7 +4,7 @@
 // - 同一個 key 同時只發一次請求；距離上次「發出」請求未滿 cooldownMs 時直接略過（券商與 bridge 有查詢頻率限制）。
 // - 失敗時保留上一份資料並寫入 error；不自動重送（這些都是唯讀查詢，重查也只由使用者觸發）。
 // - key 由呼叫端組成，須包含帳戶（及玉山環境、查詢區間），避免不同帳戶或環境的資料互相覆蓋。
-// - gate（選用）：跨 key 共用的最短間隔（例如已實現損益的不同區間），距離上次通過未滿 intervalMs 時同樣略過。
+// - gate（選用）：跨 key 共用的滑動視窗（例如玉山已實現損益的不同區間）：windowMs 內已通過 max 次時同樣略過。
 
 import { useSyncExternalStore } from 'react';
 
@@ -25,15 +25,16 @@ interface Entry {
 
 const EMPTY: OnDemandState<never> = { data: null, error: null, loading: false, updatedAt: null, attemptedAt: null };
 
-/** 跨 key 的最短間隔：同名閘門的請求之間至少相隔 intervalMs */
+/** 跨 key 的滑動視窗：同名閘門在任意 windowMs 內最多通過 max 次 */
 export interface OnDemandGate {
     name: string;
-    intervalMs: number;
+    max: number;
+    windowMs: number;
 }
 
 const entries = new Map<string, Entry>();
-/** 閘門名稱 → 上次通過（發出請求）的時間 */
-const gates = new Map<string, number>();
+/** 閘門名稱 → 視窗內各次通過（發出請求）的時間（由舊到新） */
+const gates = new Map<string, number[]>();
 const listeners = new Set<() => void>();
 let clock: () => number = () => Date.now();
 
@@ -67,11 +68,18 @@ export function cooldownLeftSec(state: Pick<OnDemandState<unknown>, 'attemptedAt
     return Math.max(0, Math.ceil((cooldownMs - (now - state.attemptedAt)) / 1000));
 }
 
-/** 閘門剩餘秒數（0＝可通過） */
+/** 視窗內仍有效的通過時間（順便剪掉已滑出視窗的舊紀錄） */
+function gateHits(gate: OnDemandGate, now: number): number[] {
+    const hits = (gates.get(gate.name) ?? []).filter(t => now - t < gate.windowMs);
+    gates.set(gate.name, hits);
+    return hits;
+}
+
+/** 閘門剩餘秒數（0＝可通過）：已滿 max 次時，等最舊一次滑出視窗 */
 export function gateLeftSec(gate: OnDemandGate, now: number = clock()): number {
-    const last = gates.get(gate.name);
-    if (last === undefined) return 0;
-    return Math.max(0, Math.ceil((gate.intervalMs - (now - last)) / 1000));
+    const hits = gateHits(gate, now);
+    if (hits.length < gate.max) return 0;
+    return Math.max(0, Math.ceil((hits[hits.length - gate.max]! + gate.windowMs - now) / 1000));
 }
 
 /**
@@ -89,7 +97,7 @@ export function loadOnDemand<T>(key: string, fetcher: () => Promise<T>, cooldown
     if (gate && gateLeftSec(gate) > 0) return Promise.resolve(false);
     const target = entry;
     const at = clock();
-    if (gate) gates.set(gate.name, at);
+    if (gate) gates.set(gate.name, [...gateHits(gate, at), at]);
     target.state = { ...target.state, loading: true, error: null, attemptedAt: at };
     emit();
     let request: Promise<T>;
