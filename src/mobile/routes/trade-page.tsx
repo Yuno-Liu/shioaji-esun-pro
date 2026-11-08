@@ -12,12 +12,14 @@
 // └［買 進］［賣 出］→ openTicket()（只開下單面板，送單一律經確認面板）；以 ShellSlot bottom 放進底部 chrome
 //
 // 主價列下緣的哨兵離開 main 頂端時，ShellSlot top 顯示精簡標頭（trade-compact；實心 panel，沒有 IntersectionObserver 時不顯示）。
+// 標頭右上的 ☆（trade-watch-star）：把目前商品加入／移出目前的自選清單（殼層常駐的 WatchlistProvider；aria-pressed＝已在清單）。
+// 清單載入中、更新中、載入失敗、合約未載入或組合商品時停用；結果以既有通知（lib/trade notify → ToastHost）回報。只改自選，不下單（S1）。
 // 標頭的「代碼 名稱」是切換商品鍵（trade-switch；精簡標頭顯示時另有 trade-compact-switch）：開 TradeSwitchSheet 搜尋並切換，
 // 以 replace 導覽（返回鍵回到進交易頁之前的畫面）；只做查詢與導覽，不開下單面板。合約載入後記入「最近查看」（lib/recent-codes）。
 // code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。合約解析出的正規代碼與路由不同（小寫、舊指數代碼）時改寫路由。
 // 交易狀態（委託、持倉）只由葉節點訂閱：圖上的線、五檔的委託標記、持倉摘要（稽核 P2）；持倉市價重估不重繪標頭、五檔與圖表。
 
-import { ChevronDown } from 'lucide-react';
+import { ChevronDown, Star } from 'lucide-react';
 import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type Ref } from 'react';
 import { flushSync } from 'react-dom';
 import { useQuote } from '../../hooks/use-stream';
@@ -27,6 +29,7 @@ import { sessionWindowFor } from '../../lib/intraday-session';
 import { getMarketSnapshot, subscribeMarketSnapshots } from '../../lib/market-snapshot-store';
 import { fetchSnapshots } from '../../lib/shioaji';
 import { maskMoney, usePrivacyMoney } from '../../lib/privacy';
+import { notify } from '../../lib/trade';
 import { useTradingState } from '../../lib/trading-state';
 import type { ContractInfo, DayTrade, Exchange, SecurityType } from '../../lib/types/contract';
 import type { AccountedTrade } from '../../lib/types/order';
@@ -51,12 +54,14 @@ import { fmtCompactInt, fmtInt, fmtStockLots, formatNumber, formatToTick } from 
 import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import { recordRecentCode } from '../lib/recent-codes';
 import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
+import { useOptionalMobileWatchlist } from '../lib/watchlist-context';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
 import { focusRing, pressable } from '../styles/primitives.css';
 import { SIZE } from '../styles/tokens';
 import * as styles from '../styles/trade.css';
 import { GroupedSection } from '../ui/grouped';
+import { IconButton } from '../ui/icon-button';
 import { InlineNote } from '../ui/inline-note';
 import { usePriceFlash } from '../ui/price-flash';
 import * as flash from '../ui/price-flash.css';
@@ -288,6 +293,62 @@ interface InfoEntry {
     onOpen: () => void;
 }
 
+/** 自選 ☆ 停用時的原因（寫進無障礙名稱）；可操作時 null */
+export function watchStarBlocked(
+    wl: { loading: boolean; structureBusy: boolean; loadError: boolean },
+    contract: Pick<ContractInfo, 'combo'> | undefined,
+    busy: boolean,
+): string | null {
+    if (!contract) return '商品載入中';
+    if (contract.combo) return '組合商品不能加入自選';
+    if (wl.loadError) return '自選清單載入失敗';
+    if (busy || wl.loading || wl.structureBusy) return '自選清單更新中';
+    return null;
+}
+
+/** 標頭 ☆：加入／移出目前的自選清單。不在 WatchlistProvider 內（測試、獨立掛載）時不顯示 */
+function WatchStar({ contract }: { contract: ContractInfo | undefined }) {
+    const wl = useOptionalMobileWatchlist();
+    const [busy, setBusy] = useState(false);
+    const mounted = useRef(true);
+    useEffect(() => () => { mounted.current = false; }, []);
+    if (!wl) return null;
+    const code = contract?.code;
+    const watched = !!code && wl.items.some(i => i.contract.code === code);
+    const listName = wl.serverLists.find(l => l.id === wl.activeListId)?.name || '自選';
+    const blocked = watchStarBlocked(wl, contract, busy);
+    const toggle = async () => {
+        if (blocked || !contract) return;
+        const what = `${contract.code}${contract.name ? ` ${contract.name}` : ''}`;
+        setBusy(true);
+        try {
+            if (watched) {
+                await wl.removeSymbol(contract.code);
+                notify({ kind: 'ok', title: '已移出自選', body: `${what} 已從「${listName}」移除` });
+            } else {
+                await wl.addSymbol(contract.code, contract.security_type, contract);
+                notify({ kind: 'ok', title: '已加入自選', body: `${what} 已加入「${listName}」` });
+            }
+        } catch (e) {
+            notify({ kind: 'err', title: watched ? '移出自選失敗' : '加入自選失敗', body: e instanceof Error && e.message ? e.message : '請稍後再試' });
+        } finally {
+            if (mounted.current) setBusy(false);
+        }
+    };
+    return (
+        <span className={styles.watchStar}>
+            <IconButton
+                ariaLabel={`自選（${listName}）${blocked ? `，${blocked}` : ''}`}
+                icon={Star}
+                pressed={watched}
+                disabled={blocked !== null}
+                onClick={() => { void toggle(); }}
+                testId='trade-watch-star'
+            />
+        </span>
+    );
+}
+
 function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef, info }: { code: string; contract: ContractInfo | undefined; info?: InfoEntry } & SwitchEntry) {
     const quote = useQuote(code, { narrow: true });
     const tick = quote?.tick;
@@ -323,51 +384,56 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef, i
 
     return (
         <header className={styles.header}>
-            <div className={styles.titleRow}>
-                <h1 className={styles.title}>
-                    {onOpenSwitch
-                        ? (
-                            <button
-                                ref={switchRef}
-                                type='button'
-                                className={`${styles.titleButton} ${pressable} ${focusRing}`}
-                                onClick={() => onOpenSwitch()}
-                                aria-haspopup='dialog'
-                                aria-expanded={switchOpen}
-                                aria-label={switchLabel}
-                                data-testid='trade-switch'
-                            >
-                                {title}
-                                <ChevronDown className={styles.titleIcon} aria-hidden='true' focusable='false' />
-                            </button>
-                        )
-                        : title}
-                </h1>
-                {contract && <span className={styles.subtle}>{exchangeText(contract.exchange)}</span>}
-                {contract && isStock && contract.day_trade === 'Yes' && <span className={styles.badge} data-testid='trade-daytrade'>可當沖</span>}
-            </div>
-            <div className={styles.priceRow} data-testid='trade-price'>
-                <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>
-                    <span ref={flashRef} className={flash.overlay} aria-hidden='true' />
-                    {priceText}
-                </span>
-                {q.source === 'reference' && <span className={styles.badge} data-testid='trade-price-reference'>參考價</span>}
-                {chg && (
-                    <span className={`${styles.change} ${styles.dirText[chg.dir]}`}>
-                        {changeText}
-                        {pctText}
-                    </span>
-                )}
-                {limit && (
-                    <span className={`${styles.badge} ${styles.badgeTone[limit]}`} data-testid='trade-limit'>
-                        {limit === 'up' ? '漲停' : '跌停'}
-                    </span>
-                )}
-                {q.sim && (
-                    <span className={styles.badge} title='試撮揭示價，非成交價' data-testid='trade-simtrade'>
-                        試撮 {fmt(q.sim.price)}
-                    </span>
-                )}
+            <div className={styles.headTop}>
+                <div className={styles.headMain}>
+                    <div className={styles.titleRow}>
+                        <h1 className={styles.title}>
+                            {onOpenSwitch
+                                ? (
+                                    <button
+                                        ref={switchRef}
+                                        type='button'
+                                        className={`${styles.titleButton} ${pressable} ${focusRing}`}
+                                        onClick={() => onOpenSwitch()}
+                                        aria-haspopup='dialog'
+                                        aria-expanded={switchOpen}
+                                        aria-label={switchLabel}
+                                        data-testid='trade-switch'
+                                    >
+                                        {title}
+                                        <ChevronDown className={styles.titleIcon} aria-hidden='true' focusable='false' />
+                                    </button>
+                                )
+                                : title}
+                        </h1>
+                        {contract && <span className={styles.subtle}>{exchangeText(contract.exchange)}</span>}
+                        {contract && isStock && contract.day_trade === 'Yes' && <span className={styles.badge} data-testid='trade-daytrade'>可當沖</span>}
+                    </div>
+                    <div className={styles.priceRow} data-testid='trade-price'>
+                        <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>
+                            <span ref={flashRef} className={flash.overlay} aria-hidden='true' />
+                            {priceText}
+                        </span>
+                        {q.source === 'reference' && <span className={styles.badge} data-testid='trade-price-reference'>參考價</span>}
+                        {chg && (
+                            <span className={`${styles.change} ${styles.dirText[chg.dir]}`}>
+                                {changeText}
+                                {pctText}
+                            </span>
+                        )}
+                        {limit && (
+                            <span className={`${styles.badge} ${styles.badgeTone[limit]}`} data-testid='trade-limit'>
+                                {limit === 'up' ? '漲停' : '跌停'}
+                            </span>
+                        )}
+                        {q.sim && (
+                            <span className={styles.badge} title='試撮揭示價，非成交價' data-testid='trade-simtrade'>
+                                試撮 {fmt(q.sim.price)}
+                            </span>
+                        )}
+                    </div>
+                </div>
+                <WatchStar contract={contract} />
             </div>
             <div ref={sentinelRef} className={styles.sentinel} aria-hidden='true' />
             {compact.available && (
