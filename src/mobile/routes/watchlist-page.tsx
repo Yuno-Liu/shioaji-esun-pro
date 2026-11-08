@@ -612,7 +612,7 @@ export function WatchlistPage() {
                     value={segment}
                     onChange={setSegment}
                     semantics='tabs'
-                    ariaLabel='自選或排行'
+                    ariaLabel='自選、排行或持倉'
                 />
                 {!otherSegment && wl.serverLists.length > 0 && (
                     <div className={styles.listBar}>

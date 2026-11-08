@@ -294,7 +294,7 @@ export function TicketButton({ code, name, onTicket, testId }: { code: string; n
 // 列
 
 export interface QuoteRowProps {
-    /** testid 前綴：自選 'watch'、排行 'ranking' */
+    /** testid 前綴：自選 'watch'、排行 'ranking'、持倉分段 'holding' */
     testPrefix: 'watch' | 'ranking' | 'holding';
     code: string;
     name: string;

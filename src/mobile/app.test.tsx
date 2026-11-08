@@ -181,7 +181,7 @@ describe('MobileShell lazy module failures', () => {
     });
 });
 
-/** 閒置預載全部完成所需時間：1.5 秒延遲＋其後每個間隔 100ms（12 個模組）再多留一點 */
+/** 閒置預載全部完成所需時間：1.5 秒延遲＋其後每個模組間隔 100ms（以 14 個計，比目前的預載項目多留幾格）再多留一點 */
 const PREFETCH_ALL_MS = 1_500 + 14 * 100 + 200;
 const ALL_DEFERRED = ['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'watch-edit-controls', 'ranking-list', 'holdings-list', 'notice-center-sheet'];
 
