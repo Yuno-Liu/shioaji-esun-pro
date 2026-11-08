@@ -8,7 +8,9 @@
 // - 量的單位是「張」（股票、ETF 的 tick volume 與 kbar 相同為張）；單筆成交金額＝價格 × 張 × 1000（元）。
 // - tick_type：1＝外盤（主動買）、2＝內盤（主動賣）；0 或其他＝無法判斷，不計入買賣力。
 //   零股（intraday_odd）、試撮（simtrade）、量 ≤ 0 的成交不計（onAnyTick 本來就不送，這裡再擋一次）。
-//   開盤前（≤ 09:00）的成交不計；收盤後只收 CLOSE_GRACE 內（收盤集合競價），之後（盤後定價）不計。
+//   開盤前（≤ 09:00）的成交不計。集合競價的撮合沒有主動買賣方，tick_type 只是標記：當日第一筆且在 09:00:30 前
+//   （開盤集合競價）與 13:25 起（收盤集合競價、盤後定價）都不計。真實資料（2330，2026-11-06）開盤那筆 9,656 張、
+//   收盤那筆 5,833 張，約占全天 16%，計入會讓累積線一開盤就大幅偏移。成交量副圖不受影響（量照常計）。
 // - 分鐘：與走勢 K 棒相同的 label（tickBucket：時間無條件進位到分，夾在 (09:00, 13:30]）。
 // - 大單：單筆成交金額 ≥ 門檻（LINE_FLOW_THRESHOLDS 每個門檻各記一份，改門檻不必重抓）；其餘為小單。
 //   這是依單筆金額的估算，不是實際的投資人身分。
@@ -25,7 +27,6 @@
 // - 失敗不自動重試：下次 retain（重新開關指標、重新進入走勢）且距失敗 ≥ FLOW_RETRY_MIN_MS 才重抓。
 
 import { isWarrant } from '../../lib/contract-market';
-import { CLOSE_GRACE } from '../../lib/intraday-session';
 import { fetchHistoryTicks } from '../../lib/shioaji';
 import { onAnyTick } from '../../lib/stream';
 import type { ContractBase } from '../../lib/types/contract';
@@ -43,6 +44,10 @@ const MAX_BUFFER = 200_000;
 
 const DAY = 86400;
 const H = 3600;
+/** 盤中連續交易結束（13:25 起為收盤集合競價）：這之後的成交不計入買賣力 */
+export const CONTINUOUS_END_SOD = 13 * H + 25 * 60;
+/** 當日第一筆成交若在 09:00 之後這幾秒內，視為開盤集合競價的撮合，不計入買賣力 */
+export const OPEN_AUCTION_WINDOW_S = 30;
 
 /** 股票＋ETF 才提供（權證、指數、期貨、選擇權不提供） */
 export function lineFlowSupported(securityType: string | null | undefined): boolean {
@@ -86,20 +91,28 @@ export interface FlowAgg {
     minutes: Map<number, FlowMinute>;
     /** 計入的成交筆數（外盤＋內盤） */
     ticks: number;
+    /** 已看過當日盤中第一筆成交（開盤集合競價的判斷只做一次） */
+    openingSeen: boolean;
 }
 
 export function newFlowAgg(): FlowAgg {
-    return { minutes: new Map(), ticks: 0 };
+    return { minutes: new Map(), ticks: 0, openingSeen: false };
 }
 
 /** 一筆成交計入彙總；回傳是否計入。dayUtc＝當日 00:00，sod＝當日秒數（含小數） */
 export function addFlowTick(agg: FlowAgg, dayUtc: number, sod: number, price: number, volume: number, tickType: number): boolean {
-    if (tickType !== 1 && tickType !== 2) return false;
     if (!(volume > 0) || !(price > 0) || !Number.isFinite(sod)) return false;
     const start = dayUtc + 9 * H;
     const end = dayUtc + 13.5 * H;
     const t = dayUtc + sod;
-    if (t <= start || t > end + CLOSE_GRACE) return false;
+    // 盤前、收盤集合競價（13:25 起）與盤後定價不計
+    if (t <= start || sod >= CONTINUOUS_END_SOD) return false;
+    // 當日盤中第一筆（不論 tick_type）：在 09:00:30 前＝開盤集合競價的撮合，不計；之後才開始的第一筆是連續交易，照常計
+    if (!agg.openingSeen) {
+        agg.openingSeen = true;
+        if (sod < 9 * H + OPEN_AUCTION_WINDOW_S) return false;
+    }
+    if (tickType !== 1 && tickType !== 2) return false;
     const label = Math.min(Math.max(Math.ceil(t / 60) * 60, start + 60), end);
     let m = agg.minutes.get(label);
     if (!m) {

@@ -117,7 +117,7 @@ function LineFlowSection({ supported }: { supported: boolean }) {
             {supported
                 ? <p className={styles.emptyActive}>開啟時下載當日全部逐筆（大型股可能數 MB），之後以即時成交累加。單位：張。</p>
                 : <p id={noteId} className={styles.limitNote} role='note' data-testid='line-flow-unsupported'>只提供股票與 ETF；指數、期貨、選擇權、權證沒有。</p>}
-            {toggle('flow', '分時買賣力', '每分鐘外盤（主動買）／內盤（主動賣）量與累積淨買力')}
+            {toggle('flow', '分時買賣力', '每分鐘外盤（主動買）／內盤（主動賣）量與累積淨買力；不含開盤、收盤集合競價')}
             {toggle('bigSmall', '大單／小單買賣力', '依單筆成交金額分大單、小單的累積淨買；為估算，非實際投資人身分')}
             {supported && ls.bigSmall && (
                 <div className={styles.paramRow}>

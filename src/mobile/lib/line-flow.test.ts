@@ -65,23 +65,46 @@ describe('line-flow 純函式', () => {
         expect(dateOfWallClock(at('09:30:00'))).toBe('2026-11-05');
     });
 
-    it('每分鐘分桶與走勢 K 棒同 label：時間無條件進位到分，夾在 (09:00, 13:30]；開盤前與收盤後（逾 4 分）不計', () => {
+    it('每分鐘分桶與走勢 K 棒同 label：時間無條件進位到分；開盤前、13:25 起（收盤集合競價、盤後）不計', () => {
         const agg = newFlowAgg();
+        agg.openingSeen = true; // 這個測試只看分桶（開盤集合競價另測）
         const add = (hms: string) => addFlowTick(agg, DAY, sod(hms), 100, 1, 1);
         expect(add('08:59:59.9')).toBe(false); // 開盤前
         expect(add('09:00:00')).toBe(false); // 時段起點本身不屬於這個時段
-        expect(add('09:00:00.2')).toBe(true); // 開盤集合競價 → 09:01
+        expect(add('09:00:00.2')).toBe(true); // → 09:01
         expect(add('09:01:00')).toBe(true); // 09:01
         expect(add('09:01:00.1')).toBe(true); // 09:02
-        expect(add('13:30:00.3')).toBe(true); // 收盤集合競價 → 夾到 13:30
-        expect(add('13:34:01')).toBe(false); // 超過 CLOSE_GRACE（盤後定價等）
+        expect(add('13:24:59.9')).toBe(true); // 連續交易最後 → 13:25
+        expect(add('13:25:00')).toBe(false); // 收盤集合競價時段
+        expect(add('13:30:00')).toBe(false); // 收盤集合競價的撮合
+        expect(add('14:30:00')).toBe(false); // 盤後定價
         const labels = [...agg.minutes.keys()].sort((a, b) => a - b).map(t => new Date(t * 1000).toISOString().slice(11, 16));
-        expect(labels).toEqual(['09:01', '09:02', '13:30']);
+        expect(labels).toEqual(['09:01', '09:02', '13:25']);
         expect(agg.minutes.get(at('09:01:00'))!.buy).toBe(2);
+    });
+
+    it('集合競價不計：當日第一筆在 09:00:30 前（開盤集合競價，不論 tick_type）略過；之後才開始的第一筆照常計', () => {
+        // 真實資料（2330，2026-11-06）：開盤那筆 09:00:04.75 9,656 張（標內盤）、收盤 13:30:00 5,833 張（標外盤）
+        const a = newFlowAgg();
+        expect(addFlowTick(a, DAY, sod('09:00:04.752354'), 2020, 9656, 2)).toBe(false);
+        expect(a.openingSeen).toBe(true);
+        expect(addFlowTick(a, DAY, sod('09:00:04.797877'), 2020, 1, 2)).toBe(true);
+        expect(addFlowTick(a, DAY, sod('13:30:00'), 2135, 5833, 1)).toBe(false);
+        const m = a.minutes.get(at('09:01:00'))!;
+        expect([m.buy, m.sell, a.ticks]).toEqual([0, 1, 1]);
+        // 第一筆的 tick_type 為 0 也算開盤（判斷只做一次）
+        const z = newFlowAgg();
+        expect(addFlowTick(z, DAY, sod('09:00:03'), 50, 100, 0)).toBe(false);
+        expect(addFlowTick(z, DAY, sod('09:00:05'), 50, 2, 1)).toBe(true);
+        // 冷門股：開盤沒有撮合，第一筆在 09:00:30 之後是連續交易，照常計
+        const late = newFlowAgg();
+        expect(addFlowTick(late, DAY, sod('09:12:00'), 30, 5, 1)).toBe(true);
+        expect(late.openingSeen).toBe(true);
     });
 
     it('tick_type 分流：1 外盤、2 內盤；0 或其他、量 ≤ 0、價格 ≤ 0 不計', () => {
         const agg = newFlowAgg();
+        agg.openingSeen = true;
         addFlowTick(agg, DAY, sod('09:00:10'), 100, 3, 1);
         addFlowTick(agg, DAY, sod('09:00:20'), 100, 2, 2);
         expect(addFlowTick(agg, DAY, sod('09:00:30'), 100, 9, 0)).toBe(false);
@@ -95,6 +118,7 @@ describe('line-flow 純函式', () => {
     it('大單以單筆成交金額（價格 × 張 × 1000）≥ 門檻分類，每個門檻各記一份', () => {
         expect(LINE_FLOW_THRESHOLDS).toEqual([100, 300, 500, 1000, 2000]);
         const agg = newFlowAgg();
+        agg.openingSeen = true;
         addFlowTick(agg, DAY, sod('09:00:10'), 1000, 5, 1); // 500 萬：≥100、300、500
         addFlowTick(agg, DAY, sod('09:00:20'), 1000, 4, 2); // 400 萬：≥100、300
         addFlowTick(agg, DAY, sod('09:00:30'), 1000, 1, 1); // 100 萬：≥100
