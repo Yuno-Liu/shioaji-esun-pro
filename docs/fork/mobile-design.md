@@ -700,6 +700,14 @@ Stepper({ value: string; onChange(text: string): void; onStep(delta: 1 | -1): vo
   - 伺服器的自選清單沒有順序欄位，也沒有排序 API；不可用刪除再重建來換順序（會換 id、有遺失資料的風險）。順序只存在這台裝置的 localStorage `sj-mobile-watch-list-order-v1`（清單 id 陣列，`lib/watch-list-order.ts`），桌面與其他裝置仍是伺服器順序；0 個請求。
   - 顯示：已存的 id 依序在前，其他清單依伺服器順序接在後面（新清單在最後）；已刪除的 id 略過，下次存檔時移除；格式不對或儲存空間不可用時當作沒有設定。hook 刪除清單後的預設清單仍取伺服器順序的第一個。
   - 自選頁的清單分頁與交易頁 ☆ 面板都依這個順序。
+  - 多選刪除群組（使用者要求「排序群組的時候也支援多選刪除，刪除時須使用者確認」）：
+    - 面板的「選取」（`watch-group-select`，aria-pressed）進入選取模式：每列勾選鍵（`watch-group-check`，role=checkbox，名稱如「選取群組「主要」（7 檔）」，44px），點列也可切換；握把與 ↑／↓ 隱藏；目前清單標「（目前）」（排序模式也標）；不提供全選。
+    - 底部「已選 N 個」［取消］［刪除 N 個群組］：沒選、全部選取（至少保留一個群組）、清單忙碌或載入失敗時停用並寫出原因。
+    - **刪除前一定要確認**：同一面板切到確認畫面（不開巢狀面板），標題「刪除 N 個群組？」（焦點移到標題）、各群組與檔數、合計、警語「自選清單與桌面共用，刪除後桌面也會看不到，無法復原。」；含目前群組時另寫「刪除後會切換到其他群組並結束編輯模式」。［返回］（焦點回到刪除鍵）或［確定刪除 N 個群組］；按確定前 0 個請求。
+    - 執行：先依序刪非目前群組（lib `deleteWatchlist`，每個 1 次 DELETE），目前群組最後交給 hook 的 `deleteCurrentList`（排進該清單的寫入佇列，刪完切到伺服器順序的第一個清單）；第一個失敗就停止。hook 還不知道的刪除（沒刪到目前群組，或中途失敗）最後 `emitWatchlistChanged` 重新讀取一次。進行中顯示進度、面板不可關閉。
+    - 結束：一則摘要（只刪目前群組時由 hook 的「已刪除清單」說明，不重複）；刪掉的 id 從裝置的群組順序移除；焦點回到「選取」（只剩一個群組時改到群組列表）。
+    - 含目前群組時，hook 切換清單、列表載入中，自選頁照既有規則結束編輯模式（同工具列「刪除清單」），面板跟著關閉；刪除流程改讀常駐 WatchlistProvider 的最新狀態（`getLatestMobileWatchlist()`），面板卸載後仍能正確判斷與回報（瀏覽器實測曾發現誤報「更新中」，已修正並加測試）。
+    - 請求數：刪 2 個非目前群組＝DELETE×2＋重新讀取一次（GET 清單＋目前清單每檔合約資訊＋快照）；刪目前群組＋另 1 個＝DELETE×2＋GET 清單＋新清單載入，不另外重新讀取。
 - 版面：編輯模式列首、列尾都有鍵，比一般列少約 44px；窄螢幕＋字級「大」時「漲跌 漲跌幅」放不下就換成兩行（只套用在列首有鍵的列），不往左溢出蓋到代碼（360 寬、字級 1.3 實測）。
 - 交易安全：多選、全選、確認面板、排序群組只做清單管理或裝置偏好，不呼叫送單、改單、刪單，也不開下單或委託面板（§10 S1 表）。
 
@@ -1177,6 +1185,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 | 交易頁標頭 ☆ 與「加入自選」面板（勾選、取消、完成） | 只開面板；面板只呼叫 hook 的 `addSymbol`／`removeSymbol`（目前清單）、lib 的 `addWatchlistContracts`／`removeWatchlistContracts`（其他清單）與 `emitWatchlistChanged` | `trade-page.test.tsx`、`watch-picker-sheet.test.tsx`、`trade-watch-picker-lazy.test.tsx` |
 | 交易圖表輕點資訊列（輕點、✕、再點同一點） | 只顯示資訊；長按選價列流程不變 | `trade-chart.test.tsx` |
 | 自選多選刪除、全選、確認面板、排序群組（↑↓、握把） | 只做清單管理（`removeSymbol`）或裝置偏好（localStorage），不開下單或委託面板 | `watchlist-multi.test.tsx`、`watchlist-group-sort.test.tsx`、`watch-edit-controls.test.tsx` |
+| 排序群組的多選刪除群組（選取、勾選、取消、刪除、返回、確定刪除） | 只刪除自選清單（lib `deleteWatchlist`、hook `deleteCurrentList`），不呼叫送單、改單、刪單，也不開 `openTicket`／`openOrderAction` | `watchlist-group-delete.test.tsx`、`watch-group-delete.test.tsx` |
 | 持倉選取模式（選取、勾選、全選、取消、開關預覽） | 滑動前不送單、不開下單面板與委託面板；送出只在預覽滑動後經 `runBatchExit` → `executeClose`（S10） | `positions-page.test.tsx` |
 | 通知中心（狀態列鈴、面板、［全部清除］兩段、SheetLoadError 重試） | 只開唯讀面板與清除記憶體通知紀錄 | `status-bar-notices.test.tsx`、`notice-center-sheet.test.tsx` |
 
@@ -1436,6 +1445,7 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
       - 排序群組面板內的握把拖曳是否與面板的下拉關閉手勢衝突；↑／↓ 後的焦點；群組順序只存在這台裝置（另一台裝置與桌面仍是伺服器順序）。
       - 多選刪除：底部配件槽與指數列並存時的高度；iOS 15.4 的 accent-color 勾選框外觀。
       - ☆ 面板：重新讀取的成本會隨目前清單的檔數增加（每檔一次合約資訊），大清單時留意。
+      - 多選刪除群組：瀏覽器假資料實測（390 寬字級小、360 寬字級 1.3）確認畫面、0 請求直到確定、DELETE 次數、伺服器狀態、摘要與焦點都正確。待實機確認：確認畫面標題（tabIndex −1、無焦點框）的 VoiceOver／TalkBack 朗讀；360 寬字級「大」時底部「已選 N 個」、停用原因與兩顆鍵的換行；刪除目前群組後編輯模式結束，焦點落到頁面（與工具列「刪除清單」相同，未另外處理）。
 ---
 
 ## 17. 第二輪候選與不做清單
