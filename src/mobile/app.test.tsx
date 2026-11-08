@@ -50,9 +50,9 @@ vi.mock('./routes/watchlist-page', () => ({
     },
 }));
 vi.mock('./routes/trade-page', () => ({ TradePage: () => null }));
-vi.mock('./routes/sector-page', () => {
+vi.mock('./routes/market-page', () => {
     m.sectorImported = true;
-    return { SectorPage: () => null };
+    return { MarketPage: () => null };
 });
 vi.mock('./routes/positions-page', () => ({ PositionsPage: () => null }));
 vi.mock('./routes/account-page', () => ({ AccountPage: () => null }));
@@ -217,7 +217,7 @@ describe('MobileShell idle prefetch', () => {
         expectPersistentChromeMounted();
     });
 
-    it('閒置預載也包含產業分頁模組（不經過 lazy 元件，不顯示錯誤）', async () => {
+    it('閒置預載也包含市場分頁模組（不經過 lazy 元件，不顯示錯誤）', async () => {
         m.failOrders = false;
         await mount(Shell);
         await advance(PREFETCH_ALL_MS);

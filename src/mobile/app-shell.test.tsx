@@ -55,7 +55,9 @@ vi.mock('./routes/trade-page', async () => {
     };
 });
 vi.mock('./routes/orders-page', () => ({ OrdersPage: () => createElement('p', { 'data-testid': 'orders-page' }) }));
-vi.mock('./routes/sector-page', () => ({ SectorPage: () => createElement('p', { 'data-testid': 'sector-page' }) }));
+vi.mock('./routes/market-page', () => ({
+    MarketPage: ({ segment }: { segment: string }) => createElement('p', { 'data-testid': 'market-page', 'data-segment': segment }),
+}));
 vi.mock('./routes/positions-page', () => ({ PositionsPage: () => null }));
 vi.mock('./routes/account-page', async () => {
     await m.accountGate;
@@ -253,12 +255,12 @@ describe('TabBar', () => {
         expect(other.preventDefault).not.toHaveBeenCalled();
     });
 
-    it('6 個分頁依序：自選、交易、產業、委託、持倉、帳戶；分頁列欄數跟著分頁數', async () => {
+    it('6 個分頁依序：自選、交易、市場、委託、持倉、帳戶；分頁列欄數跟著分頁數', async () => {
         await mount();
         const tabs = one('mobile-tab-bar').findAll(n => typeof n.type === 'string' && n.type === 'a');
-        expect(tabs.map(t => t.props['data-testid'])).toEqual(['tab-watchlist', 'tab-trade', 'tab-sector', 'tab-orders', 'tab-positions', 'tab-account']);
-        expect(tabs.map(t => t.props['aria-label'])).toEqual(['自選', '交易', '產業', '委託', '持倉', '帳戶']);
-        expect(one('tab-sector').props.href).toBe('#/sector');
+        expect(tabs.map(t => t.props['data-testid'])).toEqual(['tab-watchlist', 'tab-trade', 'tab-market', 'tab-orders', 'tab-positions', 'tab-account']);
+        expect(tabs.map(t => t.props['aria-label'])).toEqual(['自選', '交易', '市場', '委託', '持倉', '帳戶']);
+        expect(one('tab-market').props.href).toBe('#/market');
         expect(one('tab-trade').props.href).toBe('#/trade');
         // 欄數寫在 layout.css.ts 的 tabBar（不用 inline style）
         expect(one('mobile-tab-bar').props.style).toBeUndefined();
@@ -268,18 +270,44 @@ describe('TabBar', () => {
         expect(tabBarBlock).not.toContain('repeat(5');
     });
 
-    it('深層連結 #/sector：顯示產業頁、產業分頁 aria-current；再點產業分頁捲回頂端', async () => {
+    it('舊書籤 #/sector：顯示市場頁（產業流向分段）、市場分頁 aria-current，hash 正規化為 #/market；再點市場分頁捲回頂端', async () => {
         (location as { hash: string }).hash = '#/sector';
         await mount({ dom: true });
-        expect(byTestId('sector-page')).toHaveLength(1);
-        expect(one('tab-sector').props['aria-current']).toBe('page');
+        expect(byTestId('market-page')).toHaveLength(1);
+        expect(one('market-page').props['data-segment']).toBe('flow');
+        expect(location.hash).toBe('#/market');
+        expect(one('tab-market').props['aria-current']).toBe('page');
         expect(one('tab-orders').props['aria-current']).toBeUndefined();
-        expect(getMobileUi().activeTab).toBe('sector');
+        expect(getMobileUi().activeTab).toBe('market');
         const main = nodes.find(n => n.tag === 'main')!;
         const again = { preventDefault: vi.fn() };
-        await act(async () => { one('tab-sector').props.onClick(again); });
+        await act(async () => { one('tab-market').props.onClick(again); });
         expect(again.preventDefault).toHaveBeenCalledTimes(1);
         expect(main.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' });
+    });
+
+    it('深層連結 #/market/signals：市場頁的盤中異動分段；市場分頁的連結帶回本 session 上次的分段', async () => {
+        const store = new Map<string, string>();
+        vi.stubGlobal('sessionStorage', { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => { store.set(k, v); } });
+        (location as { hash: string }).hash = '#/market/signals';
+        await mount();
+        expect(one('market-page').props['data-segment']).toBe('signals');
+        expect(location.hash).toBe('#/market/signals');
+        expect(one('tab-market').props['aria-current']).toBe('page');
+        // 分段記憶由市場頁寫入（這裡是替身、不寫）：沒有紀錄 → 產業流向；有紀錄 → 盤中異動
+        expect(one('tab-market').props.href).toBe('#/market');
+        store.set('sj-mobile-market-segment', 'signals');
+        await act(async () => {
+            (location as { hash: string }).hash = '#/orders';
+            window.dispatchEvent(new Event('hashchange'));
+        });
+        expect(one('tab-market').props.href).toBe('#/market/signals');
+    });
+
+    it('sessionStorage 不可用時，市場分頁連結回到產業流向（不丟例外）', async () => {
+        vi.stubGlobal('sessionStorage', { getItem: () => { throw new Error('denied'); } });
+        await mount();
+        expect(one('tab-market').props.href).toBe('#/market');
     });
 
     it('減少動態：再點目前分頁直接回頂（behavior auto）', async () => {

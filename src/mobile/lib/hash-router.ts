@@ -2,7 +2,8 @@
 //
 // 為什麼用 hash：nginx 的 SPA fallback 會把未知路徑導向桌面 index.html，
 // `#/trade/2330` 這類 hash 路由不會落到桌面版。
-// 路由：#/watchlist（預設）、#/trade/:code、#/sector（產業流向）、#/orders、#/positions、#/account。
+// 路由：#/watchlist（預設）、#/trade/:code、#/market（產業流向）、#/market/signals（盤中異動）、#/orders、#/positions、#/account。
+// 舊書籤 #/sector 解析為 #/market（App 以 replace 正規化，不新增歷史紀錄）。
 // 解析與組字串是純函式；useHashRoute() 只訂閱 hashchange。
 
 import { useSyncExternalStore } from 'react';
@@ -11,15 +12,28 @@ export type MobileRoute =
     | { name: 'watchlist' }
     /** code 為 null：交易分頁尚未選商品（例如直接點底部「交易」） */
     | { name: 'trade'; code: string | null }
-    /** 產業流向（底部分頁「產業」） */
-    | { name: 'sector' }
+    /** 底部分頁「市場」：flow＝產業流向（#/market）、signals＝盤中異動（#/market/signals） */
+    | { name: 'market'; segment: MarketSegment }
     | { name: 'orders' }
     | { name: 'positions' }
     | { name: 'account' };
 
+export type MarketSegment = 'flow' | 'signals';
+
 export type MobileTab = MobileRoute['name'];
 
-export const MOBILE_TABS: readonly MobileTab[] = ['watchlist', 'trade', 'sector', 'orders', 'positions', 'account'];
+export const MOBILE_TABS: readonly MobileTab[] = ['watchlist', 'trade', 'market', 'orders', 'positions', 'account'];
+
+/** 「市場」分頁上次的分段（本 session；sessionStorage，讀寫失敗時回到產業流向）。寫入在市場頁（延遲載入）。 */
+export const MARKET_SEGMENT_KEY = 'sj-mobile-market-segment';
+
+export function lastMarketSegment(): MarketSegment {
+    try {
+        return sessionStorage.getItem(MARKET_SEGMENT_KEY) === 'signals' ? 'signals' : 'flow';
+    } catch {
+        return 'flow';
+    }
+}
 
 export const DEFAULT_ROUTE: MobileRoute = { name: 'watchlist' };
 
@@ -48,8 +62,11 @@ export function parseHash(hash: string): MobileRoute {
     const path = raw.split('?')[0]!.replace(/\/+$/, '');
     const [head, ...rest] = path.split('/');
     switch (head) {
-        case 'watchlist':
+        case 'market':
         case 'sector':
+            if (rest.length === 0) return { name: 'market', segment: 'flow' };
+            return head === 'market' && rest.length === 1 && rest[0] === 'signals' ? { name: 'market', segment: 'signals' } : DEFAULT_ROUTE;
+        case 'watchlist':
         case 'orders':
         case 'positions':
         case 'account':
@@ -70,6 +87,7 @@ export function formatRoute(route: MobileRoute): string {
     if (route.name === 'trade') {
         return route.code && isValidProductCode(route.code) ? `#/trade/${encodeURIComponent(route.code)}` : '#/trade';
     }
+    if (route.name === 'market') return route.segment === 'signals' ? '#/market/signals' : '#/market';
     return `#/${route.name}`;
 }
 
