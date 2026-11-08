@@ -35,7 +35,7 @@ import { notify } from '../../lib/trade';
 import { emitWatchlistChanged } from '../../lib/watchlist-sync';
 import { LIST_ORDER_KEY, orderLists, readListOrder } from '../lib/watch-list-order';
 import { useListReorder, type ListReorder } from '../lib/watch-reorder';
-import { useMobileWatchlist, type MobileWatchlist } from '../lib/watchlist-context';
+import { getLatestMobileWatchlist, useMobileWatchlist, type MobileWatchlist } from '../lib/watchlist-context';
 import { button } from '../styles/controls.css';
 import { focusRing, pressable } from '../styles/primitives.css';
 import * as edit from '../styles/watch-edit.css';
@@ -486,9 +486,11 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
         if (run || groupDeleteBlocked(n, lists.length, latest.current)) return;
         const targets = picked.map(l => ({ id: l.id, name: l.name }));
         setRun({ done: 0, total: targets.length });
-        const result = await deleteGroups(() => latest.current, targets, done => setRun({ done, total: targets.length }));
+        // 讀常駐 Provider 的最新狀態：刪除目前群組會切換清單並結束編輯模式，本面板可能在流程中途被卸載（latest 不再更新）
+        const live = () => getLatestMobileWatchlist() ?? latest.current;
+        const result = await deleteGroups(live, targets, done => setRun({ done, total: targets.length }));
         // 刪掉的群組從這台裝置的順序移除（只留仍存在的清單）
-        const left = orderLists(latest.current.serverLists, saved).map(l => l.id).filter(id => !result.ids.includes(id));
+        const left = orderLists(live().serverLists, saved).map(l => l.id).filter(id => !result.ids.includes(id));
         setDropped(result.ids);
         setSaved(left);
         saveListOrder(left);
@@ -563,7 +565,7 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
                     </ul>
                     <p className={edit.note} data-testid='watch-group-del-total'>{`合計 ${total} 檔。自選清單與桌面共用，刪除後桌面也會看不到，無法復原。`}</p>
                     {picked.some(l => l.id === activeListId) && (
-                        <p className={edit.note} data-testid='watch-group-del-active'>包含目前的群組，刪除後會切換到其他群組。</p>
+                        <p className={edit.note} data-testid='watch-group-del-active'>包含目前的群組：刪除後會切換到其他群組並結束編輯模式。</p>
                     )}
                     <p className={edit.note} role='status' data-testid='watch-group-del-progress'>{run ? `刪除中 ${run.done}／${run.total}…` : ''}</p>
                 </div>

@@ -8,17 +8,28 @@
 //
 // 只能在 MobileShell（secure context）內掛載：非 secure context 不得讀取任何資料（R1）。
 
-import { createContext, createElement, useContext, type ReactNode } from 'react';
+import { createContext, createElement, useContext, useLayoutEffect, type ReactNode } from 'react';
 import { useWatchlist } from '../../hooks/use-watchlist';
 
 export type MobileWatchlist = ReturnType<typeof useWatchlist>;
 
 const WatchlistContext = createContext<MobileWatchlist | null>(null);
 
+/** 常駐 Provider 最近一次提交的狀態（getLatestMobileWatchlist） */
+let latest: MobileWatchlist | null = null;
+
 export function WatchlistProvider({ children }: { children?: ReactNode }) {
     const wl = useWatchlist();
+    useLayoutEffect(() => { latest = wl; });
+    useLayoutEffect(() => () => { latest = null; }, []);
     return createElement(WatchlistContext.Provider, { value: wl }, children);
 }
+
+/**
+ * 常駐 Provider 最近一次提交的自選狀態（沒有掛載時 null）。給延遲載入面板裡的非同步流程用：
+ * 流程中途面板可能被卸載（例如刪除目前群組會切換清單、結束編輯模式），之後仍要讀到最新狀態才能正確判斷與回報。
+ */
+export const getLatestMobileWatchlist = (): MobileWatchlist | null => latest;
 
 /** 取得常駐的自選清單狀態；必須在 WatchlistProvider 之內 */
 export function useMobileWatchlist(): MobileWatchlist {

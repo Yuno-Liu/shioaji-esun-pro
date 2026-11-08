@@ -325,7 +325,7 @@ describe('排序群組：刪除確認與執行', () => {
         expect(m.focus.title).toHaveBeenCalledTimes(1);
         expect(one('watch-group-del-list').findAll(n => n.type === 'li').map(textOf)).toEqual(['主要（目前）2 檔', '觀察1 檔']);
         expect(textOf(one('watch-group-del-total'))).toBe('合計 3 檔。自選清單與桌面共用，刪除後桌面也會看不到，無法復原。');
-        expect(textOf(one('watch-group-del-active'))).toBe('包含目前的群組，刪除後會切換到其他群組。');
+        expect(textOf(one('watch-group-del-active'))).toBe('包含目前的群組：刪除後會切換到其他群組並結束編輯模式。');
         expect(textOf(one('watch-group-del-ok'))).toBe('確定刪除 2 個群組');
         expect(sheet()!.props.dismissible).toBe(true);
         noRequests();

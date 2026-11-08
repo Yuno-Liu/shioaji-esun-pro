@@ -33,7 +33,7 @@ vi.mock('../../lib/stream', () => ({ onContractEvent: () => () => undefined, reg
 vi.mock('../../lib/trade', () => ({ notify: api.notify }));
 
 import type { ContractInfo } from '../../lib/types/contract';
-import { useMobileWatchlist, WatchlistProvider, type MobileWatchlist } from '../lib/watchlist-context';
+import { getLatestMobileWatchlist, useMobileWatchlist, WatchlistProvider, type MobileWatchlist } from '../lib/watchlist-context';
 import { deleteGroups, groupDeleteBlocked, groupDeleteSummary } from './watch-edit-controls';
 
 type Base = { code: string; security_type: string; exchange: string };
@@ -172,6 +172,25 @@ describe('deleteGroups（真的 useWatchlist）', () => {
         expect(api.notify).toHaveBeenCalledTimes(1);
         expect(api.notify.mock.calls[0]![0]).toMatchObject({ title: '已刪除清單' });
         expect(groupDeleteSummary(r, 2, '主要')).toEqual({ kind: 'ok', title: '已刪除 2 個群組', body: '短線、主要。已切換到「觀察」。' });
+    });
+
+    it('面板在流程中途卸載（自己的狀態停在舊值）：改讀常駐 Provider 的最新狀態，刪目前群組＋另 1 個仍正確判斷與回報', async () => {
+        await mount();
+        // 刪目前群組會切換清單並結束編輯模式，面板被卸載後自己的 latest 不再更新（瀏覽器實測發現誤報「更新中」）
+        const frozen = state;
+        expect(getLatestMobileWatchlist()).toBe(state);
+        const r = await run(deleteGroups(() => getLatestMobileWatchlist() ?? frozen, [P('main', '主要'), P('other', '短線')], () => undefined));
+        await flush();
+        expect(r).toEqual({ deleted: ['短線', '主要'], ids: ['other', 'main'], skipped: [], reason: null, switchedTo: '觀察' });
+        expect(getLatestMobileWatchlist()?.activeListId).toBe('watch');
+    });
+
+    it('getLatestMobileWatchlist：Provider 卸載後為 null', async () => {
+        await mount();
+        expect(getLatestMobileWatchlist()).not.toBeNull();
+        await act(async () => { root?.unmount(); });
+        root = undefined;
+        expect(getLatestMobileWatchlist()).toBeNull();
     });
 
     it('只刪目前群組：摘要為 null（hook 的「已刪除清單」已足夠）', async () => {
