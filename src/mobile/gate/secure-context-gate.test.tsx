@@ -173,6 +173,13 @@ describe('SecureContextGate', () => {
     it('MobileApp outside a secure context renders only the gate: no bootstrap, no stream, no trading state', async () => {
         await act(async () => { view = create(createElement(MobileApp, { secure: false, diagnostics: readSecureContextDiagnostics(lanHttp) })); });
         expect(text(view!)).toContain('需要 HTTPS');
+        // 說明頁延遲載入（首屏不帶）：載入完成後是完整的說明與診斷
+        await vi.waitFor(async () => {
+            await act(async () => { await Promise.resolve(); });
+            expect(view!.root.findAll(n => n.props['data-testid'] === 'secure-context-gate')).toHaveLength(1);
+        });
+        expect(view!.root.findAll(n => n.props['data-testid'] === 'secure-context-diagnostics')).toHaveLength(1);
+        expect(view!.root.findAll(n => n.props['data-testid'] === 'secure-context-gate-fallback')).toHaveLength(0);
         expect(view!.root.findAll(n => n.props['data-testid'] === 'mock-status-bar')).toHaveLength(0);
         expect(view!.root.findAll(n => n.props['data-testid'] === 'mobile-shell')).toHaveLength(0);
         expect(m.bootstrap).not.toHaveBeenCalled();

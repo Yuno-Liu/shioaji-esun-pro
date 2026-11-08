@@ -17,7 +17,6 @@ import { OrderConfirmSheet } from './components/order-confirm-sheet';
 import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from './components/route-error-boundary';
 import { StatusBar } from './components/status-bar';
 import { ToastHost } from './components/toast-host';
-import { SecureContextGate } from './gate/secure-context-gate';
 import { useFillSound } from './hooks/use-fill-sound';
 import { useHtmlAttributes } from './hooks/use-html-attributes';
 import { useRiskPnlFeed } from './hooks/use-risk-pnl-feed';
@@ -389,7 +388,29 @@ export function MobileShell() {
     );
 }
 
+// 非 secure context 的「需要 HTTPS」說明頁：只有這種情況才載入（說明文字與診斷不進首屏，設計規格 §13）。
+// 載入中與載入失敗時顯示最小的靜態說明；兩者都不建立任何連線、不掛載交易畫面（規格 R1）。
+const loadSecureContextGate = () => import('./gate/secure-context-gate');
+const SecureContextGate = retryableLazy(() => loadSecureContextGate().then(m => m.SecureContextGate), 'SecureContextGate');
+
+function GateFallback() {
+    return (
+        <main data-testid='secure-context-gate-fallback'>
+            <h1>需要 HTTPS</h1>
+            <p>手機交易頁只能經 HTTPS 開啟；目前的連線不是安全環境，無法下單。</p>
+        </main>
+    );
+}
+
 export function MobileApp({ secure, diagnostics }: { secure: boolean; diagnostics?: SecureContextDiagnostics }) {
-    if (!secure) return <SecureContextGate diagnostics={diagnostics} />;
+    if (!secure) {
+        return (
+            <ModuleErrorBoundary fallback={() => <GateFallback />}>
+                <Suspense fallback={<GateFallback />}>
+                    <SecureContextGate diagnostics={diagnostics} />
+                </Suspense>
+            </ModuleErrorBoundary>
+        );
+    }
     return <MobileShell />;
 }
