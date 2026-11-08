@@ -41,7 +41,14 @@ vi.mock('./components/order-ticket-sheet', () => ({
     },
 }));
 vi.mock('./components/order-action-sheet', () => ({ OrderActionSheet: () => null }));
-vi.mock('./routes/watchlist-page', () => ({ WatchlistPage: () => null }));
+vi.mock('./routes/watchlist-page', () => ({
+    WatchlistPage: () => null,
+    // 自選編輯鍵的閒置預載走自選頁匯出的 preload（三個 lazy 共用 lib/deferred-modules 的 loadWatchEditControls）
+    preloadWatchEditControls: async () => {
+        m.deferredLoads.push('watch-edit-controls');
+        if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: watch-edit-controls.js');
+    },
+}));
 vi.mock('./routes/trade-page', () => ({ TradePage: () => null }));
 vi.mock('./routes/sector-page', () => {
     m.sectorImported = true;
@@ -159,9 +166,9 @@ describe('MobileShell lazy module failures', () => {
     });
 });
 
-/** 閒置預載全部完成所需時間：1.5 秒延遲＋其後每個間隔 100ms（11 個模組）再多留一點 */
-const PREFETCH_ALL_MS = 1_500 + 11 * 100 + 200;
-const ALL_DEFERRED = ['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'ranking-list'];
+/** 閒置預載全部完成所需時間：1.5 秒延遲＋其後每個間隔 100ms（12 個模組）再多留一點 */
+const PREFETCH_ALL_MS = 1_500 + 12 * 100 + 200;
+const ALL_DEFERRED = ['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'watch-edit-controls', 'ranking-list'];
 
 /**
  * 推進假時鐘；每 100ms（預載間隔）等一次動態 import 完成（分頁與面板的 preload() 是真的 import()，會在真實時間 resolve，
@@ -187,7 +194,7 @@ describe('MobileShell idle prefetch', () => {
         store.resetMobileUiForTest();
         openTicketFresh = store.openTicket;
     });
-    it('首屏完成 1.5 秒後逐一預載（稽核 P10）：迷你走勢第一個，之後每 100ms 一個、同一時間只發一個；含搜尋面板、清單名稱面板與排行', async () => {
+    it('首屏完成 1.5 秒後逐一預載（稽核 P10）：迷你走勢第一個，之後每 100ms 一個、同一時間只發一個；含搜尋面板、清單名稱面板、自選編輯鍵與排行', async () => {
         m.failOrders = false;
         await mount(Shell);
         const ticket0 = m.ticketLoads;

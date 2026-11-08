@@ -32,7 +32,7 @@ import type { SecureContextDiagnostics } from './lib/secure-context';
 import { useSheetStack } from './lib/sheet-stack';
 import { WatchlistProvider } from './lib/watchlist-context';
 import { prefersReducedMotion } from './motion/prefs';
-import { WatchlistPage } from './routes/watchlist-page';
+import { preloadWatchEditControls, WatchlistPage } from './routes/watchlist-page';
 import * as layout from './styles/layout.css';
 import { SHELL_VAR } from './styles/tokens';
 import { SheetRootContext } from './ui/sheet-context';
@@ -66,8 +66,9 @@ const resetActionSheet = () => { OrderActionSheet.reset(); };
 const PREFETCH_DELAY_MS = 1_500;
 
 /**
- * 閒置預載的順序：最可能先用到的在前（自選列的迷你走勢、下單面板、搜尋面板、交易頁…），清單名稱面板、產業頁與排行最後。
- * 分頁與面板呼叫 retryableLazy 的 preload()：resolve 後第一次進入直接渲染、不 suspend（稽核 P3）；自選頁內的模組呼叫載入入口。
+ * 閒置預載的順序：最可能先用到的在前（自選列的迷你走勢、下單面板、搜尋面板、交易頁…），清單名稱面板、自選編輯模式的拖曳排序、產業頁與排行最後。
+ * 分頁與面板呼叫 retryableLazy 的 preload()：resolve 後第一次進入直接渲染、不 suspend（稽核 P3）；自選頁內的模組呼叫載入入口，
+ * 自選編輯鍵例外：呼叫自選頁匯出的 preloadWatchEditControls（三個 lazy 的 preload），第一次進入編輯模式不閃空白佔位。
  * essential：省流量或 2g／3g 時仍預載的（迷你走勢、下單面板、交易頁；稽核 P10），其餘等真正用到才載入。
  */
 const DEFERRED_MODULES: readonly { load: () => Promise<unknown>; essential?: true }[] = [
@@ -80,6 +81,7 @@ const DEFERRED_MODULES: readonly { load: () => Promise<unknown>; essential?: tru
     { load: AccountPage.preload },
     { load: OrderActionSheet.preload },
     { load: loadWatchListSheet },
+    { load: preloadWatchEditControls },
     { load: SectorPage.preload },
     { load: loadRankingList },
 ];

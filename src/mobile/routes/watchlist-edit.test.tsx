@@ -4,10 +4,12 @@
 // - 股票：編輯模式列首「−」→ 移除確認面板（沿用移除流程與文字）；清單底部「加入股票」開搜尋面板。
 // - 拖曳排序（lib/watch-reorder.ts）：握把 pointer 事件模擬 → 列跟手指、其他列讓位、放手只呼叫一次 reorderSymbol、
 //   位置不變不呼叫、取消還原、拖曳中不觸發列點擊與操作面板、減少動態不做讓位動畫、寫入中停用、靠近底緣自動捲動。
+// - 編輯模式的列首、列尾鍵與拖曳排序是延遲載入（components/watch-edit-controls.tsx）：beforeAll 先進一次編輯模式讓 lazy
+//   載入完成，之後各測試進入編輯模式時同步出現（載入中、失敗見 watchlist-deferred.test.tsx）。
 // - S1：以上入口都不呼叫 lib 的送單、改單、刪單函式。
 import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({
     navigate: vi.fn(),
@@ -133,6 +135,16 @@ async function settleSheet(testId: string) {
         await act(async () => { await vi.dynamicImportSettled(); });
     }
 }
+/** 延遲載入的元件：等動態 import 結算到條件成立；以時間為上限，不以迴圈次數決定成敗（CI 較慢時才等得到） */
+async function settleUntil(pred: () => boolean, timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!pred() && Date.now() < deadline) {
+        await act(async () => {
+            await vi.dynamicImportSettled();
+            await new Promise(resolve => setTimeout(resolve, 10));
+        });
+    }
+}
 /** 按「＋」或「重新命名」開清單名稱面板 */
 async function openListSheet(id: 'watch-list-add' | 'watch-list-rename') {
     await act(async () => { one(id).props.onClick(); });
@@ -140,6 +152,25 @@ async function openListSheet(id: 'watch-list-add' | 'watch-list-rename') {
 }
 const edit = async () => { await act(async () => { one('watch-edit').props.onClick(); }); };
 const btnByText = (text: string) => view!.root.findAll(n => n.type === 'button' && textOf(n) === text);
+
+/** 編輯模式的列首、列尾鍵與拖曳排序先載入完成（retryableLazy 模組層快取）：之後各測試進入編輯模式時同步渲染 */
+beforeAll(async () => {
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    setWatchSparklineEnabled(false);
+    m.wl = {
+        items, loading: false, structureBusy: false, loadError: false, serverLists: LISTS, activeListId: 'a',
+        reorderSymbol: m.reorderSymbol, removeSymbol: m.removeSymbol, addSymbol: m.addSymbol, retryLoad: m.retryLoad,
+        setActiveList: m.setActiveList, createList: m.createList, renameCurrentList: m.renameCurrentList, deleteCurrentList: m.deleteCurrentList,
+    };
+    await render();
+    await edit();
+    await settleUntil(() => all('watch-row-grip').length === 3 && all('watch-row-grip')[0]!.props.disabled === false);
+    expect(all('watch-row-grip')).toHaveLength(3);
+    expect(all('watch-row-grip')[0]!.props.disabled).toBe(false);
+    await act(async () => view!.unmount());
+    view = undefined;
+    vi.unstubAllGlobals();
+}, 30_000);
 
 beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);

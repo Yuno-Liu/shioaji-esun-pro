@@ -18,3 +18,8 @@ export const loadWatchSparkline = () => import('../components/watch-sparkline');
 export const loadSearchSheet = () => import('../components/search-sheet');
 /** 自選清單名稱面板（新增清單、重新命名；按「＋」或編輯模式的「重新命名」才掛載） */
 export const loadWatchListSheet = () => import('../components/watch-list-sheet');
+/**
+ * 自選編輯模式的列首「−」、列尾「⋯」＋握把與拖曳排序（lib/watch-reorder 的 useListReorder）：只在編輯模式掛載。
+ * 載入前與載入失敗時列首、列尾是同尺寸空白佔位，失敗在清單上方顯示「載入失敗」＋［重試］；非編輯模式的列不受影響。
+ */
+export const loadWatchEditControls = () => import('../components/watch-edit-controls');

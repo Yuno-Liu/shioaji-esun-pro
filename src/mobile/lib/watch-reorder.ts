@@ -11,7 +11,6 @@
 //   上一次移動尚未反映到清單（REORDER_KEY_PENDING_MS 內）也忽略；清單順序更新後焦點回到被移動那列的握把，可連續移動。
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from 'react';
-import { prefersReducedMotion } from '../motion/prefs';
 
 /** 自動捲動區：距可視上下緣這個距離內開始捲動（px） */
 export const REORDER_EDGE_PX = 56;
@@ -104,17 +103,22 @@ export interface ListReorder {
     };
 }
 
-export function useListReorder({ listRef, codes, disabled, onMove }: {
+export function useListReorder({ listRef, codes, disabled, onMove, reducedMotion }: {
     listRef: RefObject<HTMLElement | null>;
     codes: readonly string[];
     disabled: boolean;
     onMove: (from: string, to: string) => void;
+    /**
+     * 系統減少動態（呼叫端傳 motion/prefs 的 prefersReducedMotion）。本檔不 import motion/prefs：本檔在延遲載入的
+     * chunk（components/watch-edit-controls.tsx），若 import 會讓 prefs 從首屏共用 chunk 拆成另一個首屏請求。
+     */
+    reducedMotion: () => boolean;
 }): ListReorder {
     const [dragging, setDragging] = useState<string | null>(null);
     const drag = useRef<DragState | null>(null);
     const guardUntil = useRef(0);
-    const latest = useRef({ codes, disabled, onMove });
-    latest.current = { codes, disabled, onMove };
+    const latest = useRef({ codes, disabled, onMove, reducedMotion });
+    latest.current = { codes, disabled, onMove, reducedMotion };
 
     const grip = useRef<ListReorder['grip'] | null>(null);
     const helpers = useRef<{ finish(commit: boolean): void } | null>(null);
@@ -130,7 +134,7 @@ export function useListReorder({ listRef, codes, disabled, onMove }: {
             const target = reorderIndex(d.rows, d.from, dy);
             if (target === d.target) return;
             d.target = target;
-            const transition = prefersReducedMotion() ? 'none' : `transform ${REORDER_SHIFT_MS}ms cubic-bezier(0.2, 0.8, 0.2, 1)`;
+            const transition = latest.current.reducedMotion() ? 'none' : `transform ${REORDER_SHIFT_MS}ms cubic-bezier(0.2, 0.8, 0.2, 1)`;
             d.rows.forEach((r, i) => {
                 if (i === d.from) return;
                 const shift = reorderShift(i, d.from, target, dragged.height);
