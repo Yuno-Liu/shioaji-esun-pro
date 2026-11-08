@@ -725,6 +725,27 @@ globalStyle(`${table} th:first-child, ${table} td:first-child`, {
     paddingLeft: 0,
 });
 
+/** 表格標題（單位等）：靠左、在表格上方，隨表格一起橫向捲動 */
+export const tableCaption = style({
+    captionSide: 'top',
+    textAlign: 'left',
+    paddingBottom: SPACE.s1,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+    whiteSpace: 'normal',
+});
+
+// ---- 估值與體質（財務子分頁頂部） ----
+
+/** 盈餘品質的文字結論（不只靠顏色：現金流高於／低於淨利寫成文字） */
+export const valuationNote = style({
+    margin: 0,
+    ...TEXT.subhead,
+    ...NUMERIC,
+    color: vars.color.foreground,
+    overflowWrap: 'anywhere',
+});
+
 // ---- 頁尾（資料標示、版本、離線快取、重新檢查） ----
 
 export const foot = style({

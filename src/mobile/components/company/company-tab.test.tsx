@@ -472,6 +472,54 @@ describe('2330（已研究）', () => {
         expect(quarter.findAllByType('tr')).toHaveLength(9);
     });
 
+    it('財務頂部「估值與體質」：P/B（收盤）＋每股淨值、負債比、盈餘品質（比值＋文字）、累計 EPS 對照去年同期、近 8 季獲利金額（億元）', async () => {
+        await renderReady(stock);
+        expect(all('company-valuation')).toHaveLength(0);
+        await tab('financials');
+        // 放在財務子分頁的第一張卡
+        const panel = one('company-panel-financials');
+        const cards = panel.findAll(n => n.type === 'section');
+        expect(cards[0]!.props['data-testid']).toBe('company-valuation');
+        expect(text(one('company-valuation'))).toContain('估值與體質');
+        expect(text(one('company-valuation-official'))).toContain('官方資料');
+        // P/B＝收盤 2405 ÷ 248.05
+        const pb = text(one('company-valuation-pb'));
+        expect(pb).toContain('9.70 倍');
+        expect(pb).toContain('每股淨值 248.05（2026Q2）');
+        expect(pb).toContain('收盤 2026-10-20');
+        expect(text(one('company-valuation-debt'))).toContain('30.9%');
+        expect(text(one('company-valuation-debt'))).toContain('2026Q2');
+        const quality = text(one('company-valuation-quality'));
+        expect(quality).toContain('1.18 倍');
+        expect(quality).toContain('營業現金流高於淨利');
+        expect(text(one('company-valuation-quality-detail'))).toBe('近四季（2025Q3–2026Q2）營業現金流合計 26,347 億元，高於淨利合計 22,371 億元');
+        const ytd = text(one('company-valuation-ytd-eps'));
+        expect(ytd).toContain('49.33 元');
+        expect(ytd).toContain('2026 年前 2 季');
+        expect(ytd).toContain('去年同期 29.31，年增 +68.3%');
+        const table = one('company-profit-table');
+        expect(text(table.findByType('caption'))).toContain('億元');
+        expect(table.findAllByType('th').map(text)).toEqual(['季別', '營收', '毛利', '營業利益', '淨利']);
+        const rows = table.findAllByType('tr').slice(1).map(r => r.findAllByType('td').map(text));
+        expect(rows).toHaveLength(8);
+        expect(rows[0]).toEqual(['2026Q2', '12,704', '8,603', '7,666', '7,066']);
+        expect(rows[7]![0]).toBe('2024Q3');
+        expect(text(one('company-valuation-source'))).toContain('營業現金流合計 ÷ 近四季淨利合計');
+        // 只顯示：卡內沒有按鈕
+        expect(one('company-valuation').findAll(n => n.type === 'button')).toHaveLength(0);
+    });
+
+    it('估值卡：有即時成交時 P/B 用即時價（同標頭的同一檔報價）', async () => {
+        m.quote = { tick: { code: '2330', close: '1085', price_chg: '15' } };
+        await renderReady(stock);
+        await tab('financials');
+        const pb = text(one('company-valuation-pb'));
+        expect(pb).toContain(`${(1085 / 248.05).toFixed(2)} 倍`);
+        expect(pb).toContain('即時價');
+        expect(pb).not.toContain('收盤');
+        for (const [code] of m.useQuote.mock.calls) expect(code).toBe('2330');
+    });
+
     it('上下游：分組與筆數；台股列點擊開交易頁（只導覽），非台股列不可點；實體索引在切到此分頁才讀', async () => {
         await renderReady(stock);
         expect(fileRequests()).not.toContain('v1/global/entities/entities.json');
@@ -555,6 +603,22 @@ describe('重繪範圍：即時成交只重繪標頭與指標；分頁隱藏時�
         expect(m.financialsRenders).toBe(fins);
     });
 
+    it('財務分頁開著：成交時估值卡只更新 P/B 一格（財報計算不重跑），其他格不變', async () => {
+        reactiveQuote();
+        m.quote = { tick: { code: '2330', close: '1080', price_chg: '10' } };
+        await renderReady(stock);
+        await tab('financials');
+        const fins = m.financialsRenders;
+        const others = ['debt', 'quality', 'ytd-eps'].map(id => text(one(`company-valuation-${id}`)));
+        const table = text(one('company-profit-table'));
+        expect(text(one('company-valuation-pb'))).toContain(`${(1080 / 248.05).toFixed(2)} 倍`);
+        for (const close of [1085, 1090]) await tick(close);
+        expect(text(one('company-valuation-pb'))).toContain(`${(1090 / 248.05).toFixed(2)} 倍`);
+        expect(m.financialsRenders).toBe(fins);
+        expect(['debt', 'quality', 'ytd-eps'].map(id => text(one(`company-valuation-${id}`)))).toEqual(others);
+        expect(text(one('company-profit-table'))).toBe(table);
+    });
+
     it('展開產業鏈名單後：成交不重排名單（不重跑代碼解析）', async () => {
         reactiveQuote();
         await renderReady(stock);
@@ -614,6 +678,8 @@ describe('1108（只有官方資料）', () => {
         expect(text(one('company-kpi-pe'))).toContain('近四季 EPS —');
         await tab('financials');
         expect(text(one('company-financials-empty'))).toContain('這家公司沒有財報資料');
+        // 沒有財報檔：不顯示估值卡（不顯示一整張「—」）
+        expect(all('company-valuation')).toHaveLength(0);
         await tab('relations');
         expect(text(one('company-official-only'))).toContain('沒有客戶、供應商與合作關係資料');
         // 未研究：上下游不讀即時漲跌、子分頁標籤不帶筆數（同桌面）

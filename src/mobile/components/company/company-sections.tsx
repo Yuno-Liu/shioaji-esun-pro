@@ -68,7 +68,7 @@ export function StaleTag({ meta }: { meta: DataMeta | null | undefined }) {
     );
 }
 
-function Card({ title, meta, children, testId }: { title: ReactNode; meta?: ReactNode; children: ReactNode; testId?: string }) {
+export function Card({ title, meta, children, testId }: { title: ReactNode; meta?: ReactNode; children: ReactNode; testId?: string }) {
     return (
         <section className={s.card} data-testid={testId}>
             <div className={s.sectionHead}>

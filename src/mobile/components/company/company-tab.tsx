@@ -3,24 +3,25 @@
 // ┌ 標頭：代碼 名稱 ［上市／上櫃］ 英文簡稱 　價格・漲跌（或「收盤 日期」）
 // │       ［交易所產業別］ 研究分類 › … ［XXX 標的］（個股期權時）
 // │       指標 2×2：市值、本益比（近四季 EPS）、月營收（年增）、毛利率／淨利率
-// ├ 子分頁 Segmented（tabs）：概覽｜財務｜上下游｜來源（內容見 company-sections.tsx）
+// ├ 子分頁 Segmented（tabs）：概覽｜財務｜上下游｜來源（內容見 company-sections.tsx；財務頂部另有「估值與體質」卡，
+// │       見 valuation-card.tsx，只在有財報檔時顯示）
 // └ 頁尾：第三方／官方資料標示・官方日期・shioaji-data 版本・離線快取・［重新檢查］
 //
 // - 讀取只走 hooks/use-company-data（shioaji-data：sha256 驗證、IndexedDB 快取）；本元件掛載（使用者切到「公司」）時才開始讀。
 // - 不支援的商品（同桌面 companyTarget：指數、指數期權、沒有標的的商品）與不在收錄範圍（ETF 等）顯示「此商品沒有公司資料」。
-// - 價格：股票用本頁已訂閱的同一檔報價（refcount 共用，不新增訂閱）與快照 store；個股期權的標的公司同桌面訂閱標的報價
+// - 價格（live-price.ts）：股票用本頁已訂閱的同一檔報價（refcount 共用，不新增訂閱）與快照 store；個股期權的標的公司同桌面訂閱標的報價
 //   （useQuote(標的)，只在公司分頁 active 時；沒有即時成交時以 shioaji-data 每日收盤顯示「收盤 日期」）。
 //   上下游列同桌面顯示即時漲跌幅（company-sections.tsx RelationsTab → relation-quotes.ts）。
 // - 子分頁標籤同桌面帶筆數：「上下游 N」（已研究時，所有關係列數）、「來源 N」（研究出處筆數，0 時不顯示）。
 // - 交易安全：只導覽（關聯公司開交易頁）與開外部連結，不呼叫 openTicket／openOrderAction，也不呼叫任何送單、改單、刪單函式。
-// - 重繪範圍：即時價只在 SummaryCard（標頭價格、市值、本益比）訂閱，每筆成交只重繪這張卡；子分頁與頁尾以 memo 隔開。
+// - 重繪範圍：即時價只在 SummaryCard（標頭價格、市值、本益比）訂閱，每筆成交只重繪這張卡（財務子分頁開著時另加估值卡的 P/B 一格）；
+//   子分頁與頁尾以 memo 隔開。
 //   交易頁切走（active=false，分頁以 hidden 保持掛載）時改呼叫 useQuote(null)、不讀快照，隱藏期間不隨成交重繪；
 //   標頭仍持有同一檔的報價 refcount，切回時直接讀 store 的最新值，不新增訂閱（標的報價則在隱藏時釋放）。
 
 import { Building2, ChevronRight, WifiOff } from 'lucide-react';
-import { Fragment, memo, useMemo, useState, useSyncExternalStore } from 'react';
+import { Fragment, memo, useMemo, useState } from 'react';
 import { staleParts, useCompanyData, useCompanyEntities, type CompanyDataView } from '../../../hooks/use-company-data';
-import { useQuote } from '../../../hooks/use-stream';
 import {
     companyData,
     MARKET_LABEL,
@@ -30,11 +31,9 @@ import {
     trailingEps,
     type CompanyDataClient,
 } from '../../../lib/company-data';
-import type { Company, MarketDaily } from '../../../lib/company-data/types';
-import { getMarketSnapshot, subscribeMarketSnapshots } from '../../../lib/market-snapshot-store';
+import type { Company } from '../../../lib/company-data/types';
 import type { ContractInfo } from '../../../lib/types/contract';
 import { fmtPct, fmtPrice, fmtSigned } from '../../../lib/utils/format';
-import { headerQuote } from '../../lib/quote-display';
 import * as s from '../../styles/company.css';
 import { srOnly } from '../../styles/primitives.css';
 import { EmptyState } from '../../ui/empty-state';
@@ -43,6 +42,8 @@ import { Segmented } from '../../ui/segmented';
 import { Skeleton } from '../../ui/skeleton';
 import { companyTarget, fmtGrowth, fmtK, fmtRatio, fmtTwd } from './company-format';
 import { evidenceCount, FinancialsTab, OfficialTag, Overview, relationCount, RelationsTab, SourcesTab, ThirdPartyTag, type Focus } from './company-sections';
+import { useLivePrice, type LivePrice } from './live-price';
+import { ValuationCard } from './valuation-card';
 
 export const NO_COMPANY_TEXT = '此商品沒有公司資料';
 export const UNSUPPORTED_DETAIL = '公司資料僅支援上市櫃股票，以及個股期貨、個股選擇權的標的公司';
@@ -123,34 +124,6 @@ export function CompanyTab({ contract, active = true, client = companyData }: Co
     );
 }
 
-// ---- 價格（市值、本益比用） ----
-
-interface LivePrice {
-    price: number | null;
-    change: number | null;
-    pct: number | null;
-    /** null＝即時（成交或快照）；否則為每日收盤的日期 */
-    closeDate: string | null;
-}
-
-function useLivePrice(contract: ContractInfo, sameCode: boolean, active: boolean, code: string, market: MarketDaily | null): LivePrice {
-    // 股票：本頁同一檔（refcount 共用）；個股期權：同桌面訂閱標的公司的報價（code）。
-    // 分頁隱藏時傳 null（不跟著成交重繪；股票的標頭仍持有同一檔的 refcount，標的報價則釋放）
-    const live = sameCode && active;
-    const underlyingLive = !sameCode && active;
-    const quote = useQuote(live ? contract.code : underlyingLive ? code : null, { narrow: true });
-    const snapshot = useSyncExternalStore(subscribeMarketSnapshots, () => (live ? getMarketSnapshot(contract) : undefined));
-    if (live || underlyingLive) {
-        // 標的：沒有合約參考價（漲跌幅以串流自身的參考計算，同 headerQuote）、不讀衍生商品的快照
-        const q = headerQuote({ reference: live ? contract.reference : undefined, tick: quote?.tick, index: quote?.index, snapshot });
-        if ((q.source === 'tick' || q.source === 'snapshot') && q.price !== null) {
-            return { price: q.price, change: q.change, pct: q.pct, closeDate: null };
-        }
-    }
-    const daily = market?.quotes[code];
-    return { price: daily?.close ?? null, change: null, pct: null, closeDate: daily?.date ?? null };
-}
-
 const dirOf = (v: number | null): 'up' | 'down' | 'flat' => (v === null || v === 0 || !Number.isFinite(v) ? 'flat' : v > 0 ? 'up' : 'down');
 
 // ---- 主畫面 ----
@@ -182,6 +155,9 @@ function CompanyView({ view, contract, viaUnderlying, active, refreshing, stale,
             </div>
             <div className={s.panel} role='tabpanel' aria-label={tabLabel} data-testid={`company-panel-${tab}`}>
                 {tab === 'overview' && <Overview view={view} researched={researched} focus={focus} onFocus={setFocus} entities={entities} />}
+                {tab === 'financials' && view.financials && (
+                    <ValuationCard view={view} contract={contract} viaUnderlying={viaUnderlying} active={active} />
+                )}
                 {tab === 'financials' && <FinancialsTab view={view} />}
                 {tab === 'relations' && <RelationsTab company={c} researched={researched} entities={entities} live={active} />}
                 {tab === 'sources' && <SourcesTab view={view} researched={researched} />}
