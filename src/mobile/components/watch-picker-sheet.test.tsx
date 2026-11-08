@@ -192,6 +192,37 @@ describe('applyWatchPicks（真的 useWatchlist）', () => {
     });
 });
 
+describe('applyWatchPicks：目前清單移出的前置檢查（hook 忙碌時 removeSymbol 會靜默返回）', () => {
+    const fake = (over: Partial<MobileWatchlist>) => ({
+        activeListId: 'main',
+        items: [{ contract: contract('B') }],
+        loading: false,
+        structureBusy: false,
+        addSymbol: vi.fn(),
+        removeSymbol: vi.fn(async () => undefined),
+        ...over,
+    }) as unknown as MobileWatchlist;
+    const removeB = [{ list: { id: 'main', name: '主要' }, add: false }];
+
+    it.each([
+        ['載入中', { loading: true }],
+        ['結構更新中（改名／刪除清單）', { structureBusy: true }],
+        ['本機列表沒有這檔', { items: [] }],
+    ] as const)('%s：記為失敗、不呼叫 removeSymbol、不回報已移出', async (_label, over) => {
+        const wl = fake(over as Partial<MobileWatchlist>);
+        const result = await applyWatchPicks(wl, contract('B'), removeB);
+        expect(wl.removeSymbol).not.toHaveBeenCalled();
+        expect(result).toEqual({ added: 0, removed: 0, failed: [{ name: '主要', add: false, reason: '自選清單更新中，請稍後再試' }] });
+    });
+
+    it('狀態正常：呼叫 removeSymbol 並記為移出', async () => {
+        const wl = fake({});
+        const result = await applyWatchPicks(wl, contract('B'), removeB);
+        expect(wl.removeSymbol).toHaveBeenCalledWith('B');
+        expect(result).toEqual({ added: 0, removed: 1, failed: [] });
+    });
+});
+
 describe('inList／pickSummary', () => {
     it('以代碼＋商品類別比對', () => {
         expect(inList({ contracts: [{ code: '2330', security_type: 'STK', exchange: 'TSE' }] }, { code: '2330', security_type: 'STK' })).toBe(true);

@@ -48,7 +48,11 @@ const errText = (e: unknown) => (e instanceof Error && e.message ? e.message : '
  * 依序套用勾選差異：目前清單走 hook（POST／DELETE＋GET），其他清單各一次 POST／DELETE，
  * 有改到其他清單或有失敗時最後 emitWatchlistChanged({ source: 'user' }) 一次（hook 重新讀取）。
  */
-export async function applyWatchPicks(wl: Pick<MobileWatchlist, 'activeListId' | 'addSymbol' | 'removeSymbol'>, contract: ContractInfo, changes: readonly PickChange[]): Promise<PickResult> {
+export async function applyWatchPicks(
+    wl: Pick<MobileWatchlist, 'activeListId' | 'items' | 'loading' | 'structureBusy' | 'addSymbol' | 'removeSymbol'>,
+    contract: ContractInfo,
+    changes: readonly PickChange[],
+): Promise<PickResult> {
     const result: PickResult = { added: 0, removed: 0, failed: [] };
     const active = changes.filter(c => c.list.id === wl.activeListId);
     const others = changes.filter(c => c.list.id !== wl.activeListId);
@@ -56,7 +60,12 @@ export async function applyWatchPicks(wl: Pick<MobileWatchlist, 'activeListId' |
         try {
             if (c.list.id === wl.activeListId) {
                 if (c.add) await wl.addSymbol(contract.code, contract.security_type, contract);
-                else await wl.removeSymbol(contract.code);
+                else {
+                    // hook 的 removeSymbol 在載入中、結構更新中或本機列表沒有這檔時直接返回、不丟錯：先檢查，不回報假的「已移出」。
+                    // 目前清單排在最前面、之前沒有 await，wl 仍是按「完成」當下的狀態。
+                    if (wl.loading || wl.structureBusy || !wl.items.some(i => i.contract.code === contract.code)) throw new Error('自選清單更新中，請稍後再試');
+                    await wl.removeSymbol(contract.code);
+                }
             } else if (c.add) {
                 await addWatchlistContracts(c.list.id, [contract]);
             } else {
