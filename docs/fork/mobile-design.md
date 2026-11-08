@@ -543,7 +543,7 @@ backdrop  data-testid=`${testId}-backdrop`（退場中 `${testId}-closing-backdr
 - `.shell`、`.mainWrap`、`main` 也不得建立疊層脈絡（z-index、isolation、opacity 等），`src/mobile` 也不得設定 `-webkit-overflow-scrolling`。WebKit（iOS Safari）會把帶 `touch` 值的捲動容器當成 z-index 0 的疊層脈絡，main 內所有 fixed 子孫（全螢幕圖表、原地渲染的面板）因此永遠畫在 `.bottomStack`（z 10）與 `.topSlot`（z 11）之下。實機案例：舊版「持倉 → 平倉說明」的「取消／繼續」被分頁列擋住。Chrome 不支援這個屬性，模擬器重現不了，因此由 `styles/layout-stacking.test.ts` 靜態檢查。iOS 13 起捲動容器預設就有慣性捲動，不需要它。
 - `ui/shell-slots.tsx`：`ShellSlotsContext`（`{ top, bottom } | 'inline'`）與 `ShellSlot({ slot: 'top' | 'bottom', children })`：有目標時 portal，否則原地渲染（測試維持原地，testId 不變）。
 - TabBar：lucide 24px（strokeWidth 1.75，active 2.25）＋caption 標籤；active 用 accent；未成交徽章 danger＋inkStrong 白字、>99 顯示 99+；待對帳 amber 點；點擊立即切換、無轉場；**再點目前分頁**：`preventDefault` 並 `main.scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' })`。
-- 分頁 6 個（加入「產業」後）：自選、交易、產業、委託、持倉、帳戶（`lib/hash-router.ts` 的 `MOBILE_TABS`）。欄數寫在 `layout.css.ts` 的 `tabBar`：`gridTemplateColumns: 'repeat(6, minmax(0, 1fr))'`，不用 inline style（`app-shell.test.tsx` 檢查）。360 寬每欄 60px；字級放大到 root 20px 時 TOUCH_MIN 為 55px，6 × 55 = 330 ≤ 360。
+- 分頁 6 個（加入「產業」後；第 1 期改名為「市場」，lucide Activity）：自選、交易、市場、委託、持倉、帳戶（`lib/hash-router.ts` 的 `MOBILE_TABS`）。欄數寫在 `layout.css.ts` 的 `tabBar`：`gridTemplateColumns: 'repeat(6, minmax(0, 1fr))'`，不用 inline style（`app-shell.test.tsx` 檢查）。360 寬每欄 60px；字級放大到 root 20px 時 TOUCH_MIN 為 55px，6 × 55 = 330 ≤ 360。
 - 捲動記憶（`lib/scroll-memory.ts`，Map<routeKey, top>；routeKey＝`formatRoute(route)`，交易頁依代碼分開）：main 上被動 scroll 監聽（rAF 合併）記錄目前 routeKey 的 scrollTop；routeKey 改變時於殼層 layout effect 標記 `pending = newKey`，pending 期間不記錄；`<ScrollRestorer routeKey>` 放在 Suspense 內、RoutePage 之後，於 layout effect 還原（沒有紀錄則 0）並清除 pending。
 - 頁面的 `Suspense` 以分頁名為 key（`<Suspense key={route.name}>`，第二階段後修正）：第一次切到延遲載入的分頁時，React 會把舊頁以隱藏的 Offscreen 保留，但隱藏不及於 portal，舊交易頁的交易鍵列（ShellSlot bottom）與精簡標頭（ShellSlot top）會留在殼層、仍可點擊。改用 key 後換分頁會卸載整個頁面樹；同一分頁內換商品（`#/trade/2330` → `#/trade/2317`）key 不變，不重掛。由 `app-shell.test.tsx` 覆蓋。
 - `hooks/use-html-attributes.ts`：在 `<html>` 寫入 `data-sj-font-scale`（`useThemeSettings().fontScale`）與 `data-sj-transparency`（`ui-settings.transparency` 為 system 時移除屬性）；殼層 `data-sheet-open` 由 sheet-stack depth 決定。
@@ -677,6 +677,18 @@ Stepper({ value: string; onChange(text: string): void; onStep(delta: 1 | -1): vo
 **第二階段實作差異**（以程式碼為準）：
 
 - 排行更新鍵不是純圖示 IconButton，而是 compact 文字鍵，可見文字仍為「⟳ 更新（N）」（`ranking-list.test` 精確比對，§14）。
+- 第 1 期新增（以程式碼為準）：
+  - 排行種類依序為漲幅、跌幅、漲價差、跌價差、成交量、成交值、成交筆數、高低價差。
+    - 漲價差／跌價差用 ChangePriceRank（ascending 依 shioaji#207 反轉：漲價差 true、跌價差 false），前端再依漲跌（元）排序。
+    - 成交筆數用 TickCountRank，保留伺服器名次，第二行仍顯示量（`rank_value` 的語意未確認，不當成筆數顯示）。
+    - 新種類沿用同一個 scanner 端點與 30 秒快取、15 秒冷卻。
+  - 排行篩選晶片（aria-pressed）：排除處置、排除 ETF（代碼 00 開頭）、排除權證（6 碼、03–08 或 7 開頭）。
+    - 只過濾已取回的名單，名次維持過濾前；狀態列寫「已排除 N 檔」；全部被排除時顯示篩選專用的空狀態。
+    - 處置名單還沒取得時「排除處置」不隱藏任何列，並就地說明。篩選只記在模組層，重開 App 後全部關閉。
+    - scanner 不帶交易所，所以沒有上市／上櫃篩選。
+  - 自選列與排行列的日內區間小條：價格欄正下方 2px 細軌，2×6px 標記現價在今日最低→最高之間的位置（aria-hidden，絕對定位，不改列高與名稱欄寬）。
+    - 列按鈕的無障礙名稱補上「今日最低 X 最高 Y，現價位於區間 N%」。
+    - 資料：自選用即時 tick 優先，其次指數、快照；排行用 scanner 的 high／low。缺資料、最高＝最低、試撮時不顯示；不畫參考價刻度（首屏體積）。
 - 搜尋結果列尾的鍵是原生 button 套用 `ui/chip.css` 的 chip class，不是 `ui/Chip` 元件；文字維持「加入自選／已在自選」，不是上文的「加入／已加入」（`search-sheet.test` 斷言 children 為字串）。
 - 操作面板的「從自選移除」用自訂 danger 列按鈕，不是 ListRow（測試以 `data-testid="watch-remove"` 取得 onClick，ListRow 的 testId 掛在外層）。
 - 排行列不接表頭的指標切換，固定顯示「漲跌 漲跌幅」純文字（`ranking-change`）；原本的漲跌% 膠囊（`ranking-pct`）已隨改用 QuoteRow 移除（§14 刻意更新 8）。
@@ -787,6 +799,17 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
   - 資訊列各項目的定義。
   - 查詢失敗時顯示［重新查詢融資融券與券源］，只重讀失敗的那一項。
 - 交易安全：資訊列與面板不呼叫 `openTicket`／`openOrderAction` 或任何送單、改單、刪單函式（§10 S1 表）。
+
+**標頭 ☆ 與指標快速範本**（第 1 期；以程式碼為準）：
+
+- 標頭上半改成［名稱列＋主價列｜☆］兩欄。☆（`trade-watch-star`，44px IconButton）把目前商品加入／移出目前的自選清單：
+  - 使用殼層常駐的 WatchlistProvider（`useOptionalMobileWatchlist`）；加入時把已載入的合約直接傳給 `addSymbol`，不重新解析；移出呼叫 `removeSymbol`。
+  - aria-pressed＝已在清單，已在時星號實心。清單載入中、更新中、載入失敗、合約未載入、組合商品、處理中都停用，原因寫進無障礙名稱。
+  - 結果以 `notify` 回報（ToastHost 顯示，也記進通知中心）。長名稱或多徽章時名稱列、主價列可能多換一行（標頭最多高約 35px），不重疊。
+- 指標面板「快速範本」：
+  - 當沖＝VWAP、MA(5)、MA(20)＋MACD(12,26,9)；波段＝MA(5)、MA(20)、MA(60)＋KD(9,3,3)；長線＝MA(20)、MA(60)、MA(120)＋RSI(14)；三者成交量都開。
+  - 套用＝整份取代並寫進 `sj-mobile-indicators-v1`，不跳確認；之後就地顯示「已套用」＋［復原］（一步），復原後焦點回到該範本的套用鍵。
+  - 套用後設定再被改動，復原就失效。復原只在面板列表頁有效，進入參數編輯或關閉面板就沒了。
 
 ### 7.4 下單面板（`order-ticket-sheet.tsx`、`ticket/*`、`order-ticket.css.ts`）
 
@@ -964,7 +987,18 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 從持倉頁額度列跳來（`openTodayLimits()`）：卡片掛載時消化跳轉請求，把捲動與聚焦延到 `queueMicrotask`，在殼層 `ScrollRestorer` 還原記住的捲動位置之後才 `scrollIntoView` 並聚焦（`preventScroll`），StrictMode 下只執行一次（`account-page.test.tsx`）。不發額外請求。
 - 已實現損益列的商品名稱：名稱為主、代碼為次，規則同 §7.6 末的「名稱規則」；玉山列直接用成交明細的名稱，不查詢。
 
-### 7.9 產業流向（`#/sector`，`routes/sector-page.tsx`）
+### 7.9 市場（`#/market`、`#/market/signals`，`routes/market-page.tsx`）
+
+第 1 期把底部「產業」分頁改為「市場」（以程式碼為準）：
+
+- 頁首「市場」＋Segmented tabs［產業流向｜盤中異動］。第三段「大盤節奏」是第 2 期，不顯示也不放佔位。
+- 路由：`#/market`＝產業流向、`#/market/signals`＝盤中異動。舊書籤 `#/sector` 解析為 `#/market`，以 replace 正規化。內部 MobileTab id 由 `sector` 改為 `market`。
+- 切換分段用 `navigate(..., { replace: true })`，不新增歷史紀錄；底部分頁仍是一般導覽。
+- 市場分頁連結帶回本 session 上次的分段（sessionStorage `sj-mobile-market-segment`，例外時回到產業流向）。
+- 產業流向只在該分段掛載（下方原本的產業流向內容不變）；切到盤中異動時卸載並釋放它的訂閱。兩個分段根元素不同，切換時頁首重新掛載，分段拇指沒有滑動動畫。
+
+#### 產業流向（分段一，`routes/sector-page.tsx`）
+
 
 - 資料來源（重用桌面既有的純資料邏輯，不修改 `src/lib`）：`lib/sector-flow-ic` 的 `useIcSectorFlow(true)` 在本頁掛載期間 retain 上市（IX0001）／上櫃（IX0043）的群組指標串流（成交值、加權漲跌兩個投影），並由 `icFlowRecorder` 記錄每分鐘資金流向（成交值增量 × 加權漲跌方向）；`lib/index-components` 的 `getIcState` 提供名稱、加權漲跌、成交值（建底快照或串流，`calculated_at` 新者勝）。建底查詢由 lib 依 ADR 0001 管理，本頁不自行查詢、不輪詢、不逐檔查詢。畫面最多每秒依 store 重算一次。
 - 版面：PageHeader「產業流向」；市場 Segmented（上市｜上櫃）；「資金流向摘要（自開啟本頁起）」GroupedSection，流入前 3、流出前 3；排序 Segmented scroll（資金流入、資金流出、漲幅、跌幅、成交值）；產業列 GroupedSection「上市 N 個產業」。列：第一行產業名稱＋加權漲跌（漲跌色）；第二行「成交」「5分」（近 5 分淨流入）「累計」（累計淨流入）；下方淨流入橫條（中線為 0，流出往左、流入往右，scaleX）。點列開產業說明面板（BottomSheet）：加權漲跌、成交值、成分檔數、占本市場產業成交值合計、漲幅名次、建底參考權重、近 5 分與累計淨流入、每分鐘累計淨流入走勢，全部來自既有資料（0 個額外請求）。每次進入回到「上市」與「資金流入」，不記住上次選擇。
@@ -980,6 +1014,18 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
   - ［重試］是租約：以 retain 再持有一次到頁面卸載（不 retain 後立刻 release）。只有建底失敗時，retain 一條訂閱正常的投影（只加 ref-count，不送 subscribe）觸發 lib 重新建底；有投影訂閱失敗時只 retain 失敗的那條，實際重送 1 次 subscribe，卸載時與頁面本身的 release 一起只退訂 1 次。其他投影的錯誤提示不會被清掉。
 - 不做成分股明細：需要群組內排行的額外訂閱（桌面「產業全景」的下鑽），手機版不做，說明面板寫明原因。
 - 交易安全：產業列與說明面板沒有任何下單、改單、刪單入口（`sector-page.test.tsx` S1）。延遲載入（頁面 chunk 加 `sector-flow-ic` 共用 chunk），列入殼層閒置預載。
+
+#### 盤中異動（分段二，`components/market/market-signals.tsx`）
+
+- 延遲載入的獨立 chunk，市場頁掛載後閒置時預載（不在殼層預載清單，首屏 0 位元組；省流量時不預載；iOS 沒有 requestIdleCallback，掛載當下就抓）。
+- 資料：`lib/market-pulse` 的 scanner 訊號（retainMarketPulseStreams 只掛上既有 SSE 的監聽，不另開連線）；以 `subscribeMarketSignal`／`unsubscribeMarketSignal` 訂閱「規則 × 市場」鍵（`components/market/signal-subscriptions.ts`）。
+- 訂閱只在盤中異動分段掛載且頁面在前景時：離開、切換分段、退到背景或卸載時，對成功的鍵各退訂 1 次；失敗的鍵不退訂（lib 沒有替它加 ref-count）。回前景依目前篩選重新訂閱。
+- 篩選：訊號家族（漲跌停、急漲跌、爆量、狀態）多選 Chip＋市場（上市、上櫃）；存 localStorage `sj-mobile-signal-filters-v1`；預設與桌面相同：急漲跌＋上市＋上櫃（8 個鍵，全選 26 個）。篩選改變只送差異。
+- 狀態列「已訂閱 n/m」；部分失敗用 InlineNote warn 說明不會自動重試＋［重試］（只重送失敗的鍵）；串流重連遺漏用 InlineNote「串流重連期間遺漏 N 筆訊號（起–迄）」。
+- 列（最新在前，最多 100 列，畫面每 500ms 最多依 snapshot.version 重算一次）：第一行名稱＋代碼｜（試撮徽章）成交價；第二行時間・上市／上櫃・訊號文字（方向色輔助）・補充（急漲跌幅度、爆量金額、觸發價）｜漲跌（帶正負號與漲跌幅）。
+- 名稱只讀記憶體（合約快取、ETF 內建目錄、上市櫃公司目錄），不逐檔查詢合約：訊號可能帶來數百個代碼，逐檔解析會讓合約快取膨脹。
+- 沒有訊號時說明：盤中異動只在交易時段即時推送；只列出本分段開啟期間收到的訊號，離開或 App 在背景的時段不會補上（lib 保留最近 250 筆，再次進入會看到之前收到的）。
+- 交易安全：點列只 `navigate({ name: 'trade', code })`；沒有下單、聲音、震動（前景提醒是第 2 期）。
 
 ---
 
@@ -1046,6 +1092,11 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 | 交易頁當沖資訊列、「籌碼與當沖」面板（含［重新查詢］） | 只開唯讀面板；［重新查詢］只重讀融資融券與券源 | `trade-chips-sheet.test.tsx`；`trade-page.test.tsx` 的「TradePage 當沖資訊列」，以及原本按遍全頁按鈕的 S1 |
 | 公司分頁「估值與體質」卡 | 沒有按鈕 | `valuation-card.test.tsx` |
 | 自選編輯鍵延遲載入（佔位、［重試］） | 只做清單管理；［重試］只重新 import | `watchlist-deferred.test.tsx`、`watchlist-edit-preload.test.tsx` |
+| 市場頁分段、盤中異動篩選、［重試］、訊號列 | 分段只 `navigate`（replace）；訊號列只 `navigate({ name: 'trade', code })`；POST 只有 scanner 的 subscribe／unsubscribe | `market-signals.test.tsx`、`market-page.test.tsx` |
+| 排行新種類、篩選晶片 | 只切換與過濾；列尾下單鍵、星號沿用原規則 | `ranking-list.test.tsx` |
+| 指標快速範本（套用、復原） | 只改圖表設定 | `indicator-sheet.test.tsx` |
+| 自選列與排行列日內區間小條 | 不可點；點列只開交易頁 | `quote-row.test.tsx` |
+| 交易頁標頭 ☆ | 只呼叫 `addSymbol`／`removeSymbol` | `trade-page.test.tsx` |
 
 ---
 
@@ -1118,6 +1169,12 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
   - 失敗不自動重試；使用者每按一次［重新查詢］，只重讀失敗的那一項各 1 次。
   - 期權與指數 0；送單、改單、刪單 0。
 - 估值與體質卡：新增請求 0（用同一份財報檔）；P/B 用公司分頁已有的報價（同一檔 refcount）。
+- 每次進入盤中異動分段（或回到前景）：
+  - scanner subscribe：每個「規則 × 市場」鍵 1 次（預設 8、全選 26）；篩選改變只送差異；離開、切換分段、退到背景時對成功的鍵各 unsubscribe 1 次。
+  - 失敗不自動重試；［重試］每按一次只對失敗的鍵各送 1 次。例外：lib `updateCapabilitySubscription` 對暫時性錯誤（逾時、5xx）本身會退避重試 2、4、8、15 秒，單一鍵單次 subscribe 最多 5 個 POST（桌面相同，lib 既有行為）。
+  - SSE 不另開連線；名稱：合約 GET 0；`/metadata/equity/*` GET ≤3（與搜尋共用，60 分鐘內 0）。
+  - K 線、報價訂閱、快照 0；送單、改單、刪單 0。產業流向分段的請求同原本「每次進入產業頁」，只在該分段顯示時發生。
+- 排行新種類只在使用者切到那一種時讀同一個 scanner 端點（同快取與冷卻）；篩選、日內區間小條、指標範本新增請求 0；☆ 只在點擊時走既有的自選新增／移除流程。
 - 低階 Android 預設降低透明度；Chrome DevTools 4× CPU 降速下面板拖曳、滑塊、自選 200 列捲動 p95 幀時間 ≤16.7ms、無 >50ms long task；實機 30 分鐘記憶體不持續成長。
 - 首屏 JS（gzip）增量估計：spring＋tween 0.9、gesture 0.9、prefs／haptics／ui-settings 0.5、sheet-stack＋sheet-context 0.5、BottomSheet v2 增量 2.0、SlideToConfirm v2 增量 0.6、ToastHost v2 增量 0.9、殼層（slots、捲動記憶、html 屬性、狀態列）0.9、Segmented＋IconButton＋PageHeader 0.7、新增 lucide 圖示約 9 個 1.5 → **合計約 9.4 KiB**（目標首屏 ≤218 KiB，上限增量 10 KiB）。Stepper、DirectionToggle、QuickChips、PopUpButton、Grouped、InlineNote 等落在既有 lazy chunk。CSS（gzip）增量 ≤12 KiB。
 - 量測：`pnpm exec vite build --config vite.fork.config.ts` 後依規格 §9.4 加總 `dist/mobile.html` 引用的 script 與 modulepreload gzip 大小，PR 附前後數字。
@@ -1152,6 +1209,9 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
     - 「籌碼與當沖」面板約 3.6 KiB。
     - `volume-ratio` 共用 chunk 約 9.5 KiB（lib 的 volume-ratio、day-range 等），隨交易頁載入。
   - 螢幕常亮 `lib/wake-lock` 改為開關開啟且瀏覽器支援時才動態載入（`hooks/use-wake-lock`；開關預設關閉）：首屏 −494 bytes → 222,521 bytes（217.3 KiB）。帳戶頁設定區塊照常匯入同一個模組顯示狀態；載入完成前關掉開關或卸載不會啟動。
+  - 加入「市場」分頁與盤中異動後：222,681 bytes（+171：分頁圖示與路由；市場頁 6.6 KiB＋CSS 1.2 KiB 取代原產業頁 5.5 KiB，盤中異動 4.2 KiB＋CSS 0.9 KiB、market-pulse 1.0 KiB，都延遲載入）。共用的 `stock-runtime-catalog` chunk 12.2 KiB（含 ETF 內建目錄）由搜尋與盤中異動共用，`product-search` chunk 因此由 19.3 降為 7.7 KiB。
+  - 加入排行新種類與篩選、指標範本、日內區間小條、交易頁 ☆ 後：222,909 bytes（+228，全部來自自選列的日內區間小條；其餘都在延遲載入的 chunk）。
+  - 注意：在延遲載入的 chunk 新增 `.css.ts`，或匯入被打包在別的 chunk 的 tokens，會讓首屏 mobile.js 的預載對照表變長（約 +20 bytes）。
 - 未處理（需要修改 `src/lib`，R2 不允許，列入 §16）：trading-state 每筆 tick 重算全部持倉並發布、每秒以 BroadcastChannel 傳出整份 state（P2 根因、P14）；SSE 第一次連線就發 RECONNECT 合約刷新，冷啟動同一份合約抓 3 次（P4）；自選快照等全部合約 info 才讀，LCP 被最慢的一筆卡住（P5）；首屏帶入 Tauri 橋接、閃電下單模組、MockEsunDriver 與玉山整合（P6、P7、P8、P15，稽核估計合計約 50 KiB gzip）。
 
 ---
@@ -1256,6 +1316,14 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
       - 握把拖曳、邊緣自動捲動、減少動態時跨 chunk 的行為。
       - 離線時佔位與「載入失敗」的版面。
     - 估值卡：金融業與虧損公司實際財報的顯示；P/B 在盤中與收盤後的價格來源。
+    - 盤中異動：
+      - 跨客戶端（未驗證）：capability ref-count 只存在各自瀏覽器的記憶體；若 sidecar 的 scanner 訂閱是全域的，手機退訂某個鍵可能讓桌面同一個鍵的訊號停掉，桌面仍以為自己有訂閱。產業頁的 index_components 也有同樣風險。實機確認方式：桌面開市場訊號，手機開再關盤中異動，看桌面是否仍收到。
+      - 回前景會重新訂閱 8～26 個鍵；頻繁切換 App 時請求數跟著增加。
+      - iOS 15.4 的 visibilitychange 時序、實際盤中訊號量與試撮、實際 gap 事件格式（研究文件說 1.7.1 沒有實例）。
+      - 補充說明的急漲跌幅度（extra.change_percent）與當日漲跌幅是兩個不同數字，盤中確認讀者不會混淆。
+    - 排行：在模擬環境唯讀確認 ChangePriceRank、TickCountRank 的 ascending 方向與 `rank_value` 語意；ETF（00 開頭）與權證代碼判斷是啟發式。
+    - 日內區間小條：iOS 15.4 的 `--p` inline 變數、兩種主題下細軌的對比；期貨夜盤時 tick 的高低是該盤，不是整個交易日。
+    - 交易頁 ☆：實心狀態的觀感；`removeSymbol` 遇到忙碌會靜默返回，☆ 雖已在忙碌時停用，仍有極小的競態窗口可能顯示「已移出」但實際沒移除。
 ---
 
 ## 17. 第二輪候選與不做清單
