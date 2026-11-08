@@ -6,6 +6,8 @@
 // 點擊只開唯讀的「籌碼與當沖」說明面板（交易安全 S1：不呼叫 openTicket／openOrderAction 或任何送單函式）。
 // 資料全部來自標頭已有的報價、快照與合約，不發新請求；只有價位在停板時才讀完整報價（含五檔）判斷是否鎖住，
 // 與五檔共用同一檔的訂閱（refcount），平常資訊列不隨五檔重繪。
+// 報價與合約不是同一交易日（quoteRef 與合約參考價差半個跳動以上；lib/trade-info sameTradingDay）時不判停板、
+// 小條改畫最低到最高、振幅以報價自身的參考價計（同桌面 quote-board）。
 
 import type { ReactNode } from 'react';
 import { useQuote } from '../../../hooks/use-stream';
@@ -21,6 +23,7 @@ import {
     rangeInfo,
     rangePositionText,
     ratioChip,
+    sameTradingDay,
     volumeRatio,
     type InfoChip,
     type RangeInfo,
@@ -36,6 +39,8 @@ export interface TradeInfoStripProps {
     price: number | null;
     /** 主價來自成交或快照（參考價、指數不判斷漲跌停） */
     priceIsTrade: boolean;
+    /** 報價自身的參考價（現價 − 串流或快照的漲跌）；沒有時 undefined */
+    quoteRef?: number;
     /** 標頭統計格（開高低、參考價、累計量與來源） */
     stats: Pick<HeaderStats, 'source' | 'open' | 'high' | 'low' | 'reference' | 'totalVolume'>;
     /** 採用的真實成交日期（量比比對快照日期） */
@@ -78,10 +83,15 @@ function LimitChipWithBook({ code, contract, price }: { code: string; contract: 
     return chip ? <Chip chip={chip} /> : null;
 }
 
-export function TradeInfoStrip({ code, contract, price, priceIsTrade, stats, tickDate, snapshot, punished, open, onOpen }: TradeInfoStripProps) {
+export function TradeInfoStrip({ code, contract, price, priceIsTrade, quoteRef, stats, tickDate, snapshot, punished, open, onOpen }: TradeInfoStripProps) {
     const st = contract.security_type;
-    const kind = limitKind(contract, price, priceIsTrade);
-    const range = rangeInfo(contract, { reference: stats.reference, open: stats.open, high: stats.high, low: stats.low, close: price });
+    const sameDay = sameTradingDay(contract, quoteRef);
+    const kind = limitKind(contract, price, priceIsTrade && sameDay);
+    const range = rangeInfo(
+        contract,
+        { reference: sameDay ? stats.reference : quoteRef ?? null, open: stats.open, high: stats.high, low: stats.low, close: price },
+        sameDay,
+    );
     const ratio = volumeRatio({ secType: st, totalVolume: stats.totalVolume, source: stats.source, tickDate, snapshot });
     const dayTrade = dayTradeChip(st, contract.day_trade);
     const limit = limitChip(kind);

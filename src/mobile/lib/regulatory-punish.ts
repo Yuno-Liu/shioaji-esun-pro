@@ -26,9 +26,10 @@ export function refreshPunishedCodes(now: number = Date.now()): void {
     lastAttempt = now;
     apiGet<{ code?: unknown }>(PUNISH_PATH)
         .then(res => {
-            const list = Array.isArray(res?.code) ? res.code.filter((c): c is string => typeof c === 'string') : [];
-            codes = new Set(list);
-            if (Array.isArray(res?.code)) loaded = true;
+            // 格式不符（沒有 code 陣列）：保留上次結果、不算取得，同失敗（不把已知的處置股清掉）
+            if (!Array.isArray(res?.code)) return;
+            codes = new Set(res.code.filter((c): c is string => typeof c === 'string'));
+            loaded = true;
             listeners.forEach(l => l());
         }, () => undefined)
         .finally(() => { inflight = false; });

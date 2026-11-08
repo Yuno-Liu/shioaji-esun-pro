@@ -311,7 +311,11 @@ function WatchStar({ contract }: { contract: ContractInfo | undefined }) {
     const wl = useOptionalMobileWatchlist();
     const [busy, setBusy] = useState(false);
     const mounted = useRef(true);
-    useEffect(() => () => { mounted.current = false; }, []);
+    // StrictMode 會模擬卸載再掛載：掛載時要設回 true，否則之後 setBusy(false) 永遠不執行（☆ 一直停用）
+    useEffect(() => {
+        mounted.current = true;
+        return () => { mounted.current = false; };
+    }, []);
     if (!wl) return null;
     const code = contract?.code;
     const watched = !!code && wl.items.some(i => i.contract.code === code);
@@ -341,7 +345,9 @@ function WatchStar({ contract }: { contract: ContractInfo | undefined }) {
                 ariaLabel={`自選（${listName}）${blocked ? `，${blocked}` : ''}`}
                 icon={Star}
                 pressed={watched}
-                disabled={blocked !== null}
+                // 處理中只標 aria-disabled（不設 disabled，按的人焦點不會掉）；點擊由 toggle 開頭的 blocked 檢查忽略
+                disabled={blocked !== null && !busy}
+                ariaDisabled={busy}
                 onClick={() => { void toggle(); }}
                 testId='trade-watch-star'
             />
@@ -482,6 +488,7 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef, i
                     contract={contract}
                     price={price}
                     priceIsTrade={q.source === 'tick' || q.source === 'snapshot'}
+                    quoteRef={(q.source === 'tick' || q.source === 'snapshot') && q.price !== null && q.change !== null && q.price - q.change > 0 ? q.price - q.change : undefined}
                     stats={stats}
                     tickDate={stats.source === 'tick' ? (tick && !tick.simtrade ? tick : lastReal.current)?.date : undefined}
                     snapshot={snapshot}

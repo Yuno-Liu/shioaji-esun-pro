@@ -1,6 +1,6 @@
 // 交易頁（規格 §6.2）：標頭文字、持倉摘要（遮金額）、未成交筆數、買進／賣出只開下單面板
 import { readFileSync } from 'node:fs';
-import { createElement, useSyncExternalStore, type ReactElement } from 'react';
+import { StrictMode, createElement, useSyncExternalStore, type ReactElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractInfo } from '../../lib/types/contract';
@@ -1089,6 +1089,33 @@ describe('交易狀態只重繪需要它的葉節點（稽核 P2）', () => {
 
 // ---- 當沖資訊列與「籌碼與當沖」面板（設計規格 §7.3、§10 S1、§13） ----
 
+describe('TradePage 當沖資訊列：報價與合約不是同一交易日', () => {
+    const chipIds = () => view!.root.findAll(n => typeof n.type === 'string' && /^trade-info-(daytrade|limit|range|ratio|punish)$/.test(String(n.props['data-testid'] ?? '')))
+        .map(n => String(n.props['data-testid']));
+
+    it('盤前快照仍是分割前的價格（快照推出的參考價與合約差很多）：不顯示停板膠囊，小條改畫最低到最高', async () => {
+        // 合約已換成今天的參考價 1,070 與漲跌停；快照是昨天的 188.65（漲 2.00 → 快照的參考 186.65）
+        m.useQuote.mockReturnValue(undefined); // 還沒有成交：主價用快照
+        m.snapshot = { code: '2330', datetime: '2026-11-05 13:30:00', close: 188.65, change_price: 2, change_rate: 1.07, total_volume: 23456, open: 187, high: 190, low: 186.5 };
+        await render();
+        // 沒有同一天檢查時 188.65 ≤ 跌停 963 會被當成「跌停」
+        expect(chipIds()).not.toContain('trade-info-limit');
+        expect(chipIds()).toContain('trade-info-range');
+        expect(byId('trade-info-bar').props['data-mode']).toBe('span');
+        // 振幅以快照自身的參考價（186.65）計：(190 − 186.5) ÷ 186.65
+        expect(text(byId('trade-info-range'))).toContain(`振幅 ${((3.5 / 186.65) * 100).toFixed(2)}%`);
+    });
+
+    it('同一交易日（快照推出的參考價＝合約參考價）：照常判停板', async () => {
+        m.useQuote.mockReturnValue(undefined);
+        m.snapshot = { code: '2330', datetime: '2026-11-06 10:00:00', close: 1175, change_price: 105, change_rate: 9.81, total_volume: 23456, open: 1080, high: 1175, low: 1075 };
+        await render();
+        expect(chipIds()).toContain('trade-info-limit');
+        expect(text(byId('trade-info-limit'))).toBe('漲停');
+        expect(byId('trade-info-bar').props['data-mode']).toBe('rail');
+    });
+});
+
 describe('TradePage 當沖資訊列', () => {
     const CHIP_ID = /^trade-info-(daytrade|limit|range|ratio|punish)$/;
     const chipKeys = () => byId('trade-info-strip')
@@ -1322,19 +1349,36 @@ describe('TradePage 自選 ☆', () => {
         expect(star().props['aria-pressed']).toBe(true);
     });
 
-    it('加入：以已載入的合約呼叫 addSymbol（不重新解析）並以通知回報；完成前停用', async () => {
+    it('加入：以已載入的合約呼叫 addSymbol（不重新解析）並以通知回報；完成前不能再按（aria-disabled，焦點不掉）', async () => {
         let release!: () => void;
         const wl = makeWl({ addSymbol: vi.fn(() => new Promise(r => { release = () => r(stock); })) });
         m.wl = wl;
         await render();
         await act(async () => { star().props.onClick(); });
         expect(wl.addSymbol).toHaveBeenCalledWith('2330', 'STK', stock);
-        expect(star().props.disabled).toBe(true);
+        // 處理中：只標 aria-disabled（disabled 會讓聚焦中的按鈕失去焦點），再按一次被忽略
+        expect(star().props.disabled).toBe(false);
+        expect(star().props['aria-disabled']).toBe(true);
         expect(star().props['aria-label']).toBe('自選（短線），自選清單更新中');
+        await act(async () => { star().props.onClick(); });
+        expect(wl.addSymbol).toHaveBeenCalledTimes(1);
         await act(async () => { release(); });
         expect(m.notify).toHaveBeenCalledWith({ kind: 'ok', title: '已加入自選', body: '2330 台積電 已加入「短線」' });
         expect(star().props.disabled).toBe(false);
+        expect(star().props['aria-disabled']).toBeUndefined();
         expect(wl.removeSymbol).not.toHaveBeenCalled();
+    });
+
+    it('StrictMode（開發版）：模擬卸載再掛載後，加入完成仍會恢復可按（mounted 旗標掛載時設回 true）', async () => {
+        let release!: () => void;
+        const wl = makeWl({ addSymbol: vi.fn(() => new Promise(r => { release = () => r(stock); })) });
+        m.wl = wl;
+        await act(async () => { view = create(createElement(StrictMode, null, createElement(TradePage, { code: '2330' }))); });
+        await act(async () => { star().props.onClick(); });
+        expect(star().props['aria-disabled']).toBe(true);
+        await act(async () => { release(); });
+        expect(star().props['aria-disabled']).toBeUndefined();
+        expect(star().props.disabled).toBe(false);
     });
 
     it('移出：已在清單時呼叫 removeSymbol 並通知；失敗時以錯誤通知顯示原因', async () => {

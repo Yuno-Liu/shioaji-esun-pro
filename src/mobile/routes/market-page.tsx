@@ -7,8 +7,10 @@
 // 切換分段只呼叫 navigate(replace)，不新增歷史紀錄；上次的分段記在 sessionStorage（底部「市場」分頁帶回該分段）。
 // 盤中異動的 chunk 不在殼層的閒置預載清單（首屏 0 位元組）：市場頁掛載後閒置時預載一次（省流量／慢速網路時不預載）。
 // 本頁沒有任何下單入口（§10 S1）。
+// 兩個分段的根元素不同（產業流向的根在 SectorPage 內），切換時頁首會重新掛載：切換前焦點在分段上時，
+// 掛載後把焦點移到新選取的分段（鍵盤、輔助技術不會掉到 body）。
 
-import { Suspense, useEffect } from 'react';
+import { Suspense, useEffect, useRef } from 'react';
 import { ModuleErrorBoundary, ModuleLoadError, retryableLazy } from '../components/route-error-boundary';
 import { MARKET_SEGMENT_KEY, navigate, type MarketSegment } from '../lib/hash-router';
 import { constrainedNetwork, currentConnection, schedulePrefetchSequence } from '../lib/idle-prefetch';
@@ -37,16 +39,28 @@ function rememberSegment(segment: MarketSegment): void {
     }
 }
 
+/** 切換分段時焦點在分段上：新頁首掛載後把焦點還給選取的分段 */
+let focusSegmentAfterSwitch = false;
+
 function MarketHeader({ segment }: { segment: MarketSegment }) {
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+    useEffect(() => {
+        if (!focusSegmentAfterSwitch) return;
+        focusSegmentAfterSwitch = false;
+        wrapRef.current?.querySelector<HTMLElement>(`[data-testid="market-seg-${segment}"]`)?.focus();
+    }, [segment]);
     return (
         <>
             <PageHeader title='市場' />
-            <div className={s.inset}>
+            <div className={s.inset} ref={wrapRef}>
                 <Segmented<MarketSegment>
                     items={SEGMENTS}
                     value={segment}
                     onChange={v => {
-                        if (v !== segment) navigate({ name: 'market', segment: v }, { replace: true });
+                        if (v === segment) return;
+                        const active = typeof document === 'undefined' ? null : document.activeElement;
+                        focusSegmentAfterSwitch = !!active && !!wrapRef.current?.contains(active);
+                        navigate({ name: 'market', segment: v }, { replace: true });
                     }}
                     semantics='tabs'
                     ariaLabel='市場資訊'

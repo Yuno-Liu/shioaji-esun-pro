@@ -13,6 +13,7 @@ import {
     rangeInfo,
     rangePositionText,
     ratioChip,
+    sameTradingDay,
     showsCredit,
     volumeRatio,
 } from './trade-info';
@@ -69,6 +70,35 @@ describe('漲跌停狀態', () => {
         // 期貨照樣判斷
         expect(limitKind(fut, 24640, true)).toBe('up');
         expect(limitKind(fut, 24500, true)).toBe('nearUp');
+    });
+});
+
+describe('同一交易日（報價推出的參考價 vs 合約參考價）', () => {
+    it('相差不到半個跳動才算同一天；沒有報價參考或合約參考時視為同一天', () => {
+        expect(sameTradingDay(stock, 1070)).toBe(true);
+        expect(sameTradingDay(stock, 1072)).toBe(true); // 1,070 的跳動 5，差 2 < 2.5
+        expect(sameTradingDay(stock, 1075)).toBe(false);
+        expect(sameTradingDay(stock, 186.65)).toBe(false); // 分割日盤前：快照仍是舊價
+        expect(sameTradingDay(stock, undefined)).toBe(true);
+        expect(sameTradingDay(stock, null)).toBe(true);
+        expect(sameTradingDay({ ...stock, reference: 0 }, 900)).toBe(true);
+        expect(sameTradingDay(fut, 23800)).toBe(false); // 夜盤：結算價已是新的參考
+        expect(sameTradingDay(fut, 22400)).toBe(true);
+    });
+
+    it('選擇權不判停板（跌停只是最小跳動的地板），也不讀五檔', () => {
+        expect(limitKind(opt, 0.1, true, { bid_price: [], ask_price: ['0.1'], ask_volume: [30] })).toBeNull();
+        expect(limitKind(opt, 2500, true)).toBeNull();
+        expect(limitKind(opt, 2490, true)).toBeNull();
+    });
+
+    it('rangeInfo 的 rail=false：有漲跌停的股票也改畫最低到最高', () => {
+        const v = { reference: 1070, open: 1065, high: 1090, low: 1060, close: 1085 };
+        expect(rangeInfo(stock, v)!.bar.mode).toBe('rail');
+        const span = rangeInfo(stock, v, false)!;
+        expect(span.bar.mode).toBe('span');
+        expect(span.bar.reference).toBeNull();
+        expect(span.amplitudePct).toBeCloseTo((30 / 1070) * 100, 6);
     });
 });
 

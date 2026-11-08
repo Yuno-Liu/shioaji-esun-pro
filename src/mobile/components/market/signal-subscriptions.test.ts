@@ -3,9 +3,11 @@
 // - 失敗不自動重試；retry() 只對失敗的鍵各再送 1 次；失敗的鍵移除時不退訂（lib 沒有為它加 ref-count）。
 // - 訂閱中被移除：等結果，成功才退訂 1 次。
 // - 全部移除（離開或退到背景）＝成功的鍵各退訂 1 次。
-import { describe, expect, it, vi } from 'vitest';
+// - 釋放寬限（RELEASE_GRACE_MS）：寬限內再要同一個鍵就沿用（跨實例），寬限結束才退訂；失敗的鍵不寄放。
+//   既有案例以 graceMs 0 驗證不含寬限的行為。
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SignalKey } from './signal-model';
-import { SignalSubscriptions, type SignalSubscriptionApi } from './signal-subscriptions';
+import { RELEASE_GRACE_MS, resetParkedSignalsForTest, SignalSubscriptions, type SignalSubscriptionApi } from './signal-subscriptions';
 
 function deferred() {
     let resolve!: () => void;
@@ -20,7 +22,7 @@ function setup(fail: (key: SignalKey) => boolean = () => false) {
         unsubscribe: vi.fn(() => Promise.resolve()),
     } satisfies SignalSubscriptionApi;
     const onChange = vi.fn();
-    return { api, onChange, subs: new SignalSubscriptions(api, onChange) };
+    return { api, onChange, subs: new SignalSubscriptions(api, onChange, 0) };
 }
 
 const flush = () => new Promise(r => setTimeout(r, 0));
@@ -99,7 +101,7 @@ describe('SignalSubscriptions', () => {
             subscribe: vi.fn((key: SignalKey) => (key === 'TSE:suspend' ? ok.promise : bad.promise)),
             unsubscribe: vi.fn(() => Promise.resolve()),
         };
-        const subs = new SignalSubscriptions(api, () => undefined);
+        const subs = new SignalSubscriptions(api, () => undefined, 0);
         subs.sync(['TSE:suspend', 'OTC:suspend']);
         subs.sync([]);
         await flush();
@@ -113,6 +115,63 @@ describe('SignalSubscriptions', () => {
         expect(subs.coverage()).toEqual({ total: 0, ok: 0, pending: 0, failed: 0 });
     });
 
+    it('釋放寬限：寬限內再要（同一或另一個實例）沿用、不送請求；寬限結束才退訂 1 次', async () => {
+        vi.useFakeTimers();
+        const api = { subscribe: vi.fn(() => Promise.resolve()), unsubscribe: vi.fn(() => Promise.resolve()) };
+        const a = new SignalSubscriptions(api, () => undefined);
+        a.sync(['TSE:suspend', 'OTC:suspend']);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(api.subscribe).toHaveBeenCalledTimes(2);
+
+        // 篩選來回：移除後 1 秒內加回，0 個請求
+        a.sync(['TSE:suspend']);
+        await vi.advanceTimersByTimeAsync(RELEASE_GRACE_MS - 500);
+        a.sync(['TSE:suspend', 'OTC:suspend']);
+        await vi.advanceTimersByTimeAsync(RELEASE_GRACE_MS * 2);
+        expect(api.subscribe).toHaveBeenCalledTimes(2);
+        expect(api.unsubscribe).not.toHaveBeenCalled();
+        expect(a.coverage()).toEqual({ total: 2, ok: 2, pending: 0, failed: 0 });
+
+        // 切換分段（卸載）再回來：另一個實例在寬限內沿用
+        a.sync([]);
+        const b = new SignalSubscriptions(api, () => undefined);
+        await vi.advanceTimersByTimeAsync(RELEASE_GRACE_MS - 1);
+        b.sync(['TSE:suspend']);
+        await vi.advanceTimersByTimeAsync(RELEASE_GRACE_MS * 2);
+        expect(api.subscribe).toHaveBeenCalledTimes(2);
+        expect(b.coverage()).toEqual({ total: 1, ok: 1, pending: 0, failed: 0 });
+        // OTC 沒人再要：寬限結束退訂 1 次
+        expect(api.unsubscribe.mock.calls.map(c => (c as unknown[])[0])).toEqual(['OTC:suspend']);
+
+        // 超過寬限才回來：照常退訂再訂閱
+        b.sync([]);
+        await vi.advanceTimersByTimeAsync(RELEASE_GRACE_MS);
+        expect(api.unsubscribe).toHaveBeenCalledTimes(2);
+        b.sync(['TSE:suspend']);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(api.subscribe).toHaveBeenCalledTimes(3);
+    });
+
+    it('釋放寬限：失敗的鍵不寄放（再要時重新訂閱、移除時不退訂）', async () => {
+        vi.useFakeTimers();
+        let failing = true;
+        const api = {
+            subscribe: vi.fn(() => (failing ? Promise.reject(new Error('x')) : Promise.resolve())),
+            unsubscribe: vi.fn(() => Promise.resolve()),
+        };
+        const subs = new SignalSubscriptions(api, () => undefined);
+        subs.sync(['TSE:suspend']);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(subs.coverage().failed).toBe(1);
+        subs.sync([]);
+        failing = false;
+        subs.sync(['TSE:suspend']);
+        await vi.advanceTimersByTimeAsync(RELEASE_GRACE_MS * 2);
+        expect(api.subscribe).toHaveBeenCalledTimes(2);
+        expect(api.unsubscribe).not.toHaveBeenCalled();
+        expect(subs.coverage()).toEqual({ total: 1, ok: 1, pending: 0, failed: 0 });
+    });
+
     it('退訂失敗只吞掉', async () => {
         const { api, subs } = setup();
         api.unsubscribe.mockImplementation(() => Promise.reject(new Error('offline')));
@@ -122,4 +181,9 @@ describe('SignalSubscriptions', () => {
         await flush();
         expect(api.unsubscribe).toHaveBeenCalledTimes(1);
     });
+});
+
+afterEach(() => {
+    resetParkedSignalsForTest();
+    vi.useRealTimers();
 });

@@ -75,6 +75,23 @@ describe('refreshPunishedCodes', () => {
         refreshPunishedCodes(t0 + 2 * PUNISH_REFRESH_MS);
         await act(async () => { await flush(); });
         expect(loaded).toBe(true);
+        // 之後格式不符：保留上次的名單（不清空）
+        m.apiGet.mockResolvedValueOnce({ code: ['2330'] });
+        refreshPunishedCodes(t0 + 2.5 * PUNISH_REFRESH_MS);
+        await act(async () => { await flush(); });
+        m.apiGet.mockResolvedValueOnce({ unexpected: true });
+        refreshPunishedCodes(t0 + 3.5 * PUNISH_REFRESH_MS);
+        await act(async () => { await flush(); });
+        expect(loaded).toBe(true);
+        let seen: ReadonlySet<string> = new Set();
+        function Codes() {
+            seen = usePunishedCodes(false);
+            return null;
+        }
+        let codesView: ReturnType<typeof create> | undefined;
+        await act(async () => { codesView = create(createElement(Codes)); });
+        expect([...seen]).toEqual(['2330']);
+        await act(async () => codesView?.unmount());
         // 之後失敗：保留已取得（舊名單仍有效）
         m.apiGet.mockRejectedValueOnce(new Error('503'));
         refreshPunishedCodes(t0 + 3 * PUNISH_REFRESH_MS);

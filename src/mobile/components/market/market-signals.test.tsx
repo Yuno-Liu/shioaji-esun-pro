@@ -97,6 +97,9 @@ async function unmount() {
 
 const press = async (id: string) => act(async () => one(id).props.onClick());
 
+/** 退訂在釋放寬限之後才送（signal-subscriptions RELEASE_GRACE_MS 1.5 秒） */
+const GRACE = 1_500;
+
 async function setVisibility(state: 'visible' | 'hidden') {
     doc.visibilityState = state;
     await act(async () => { doc.dispatchEvent(new Event('visibilitychange')); });
@@ -146,6 +149,8 @@ beforeEach(() => {
 
 afterEach(async () => {
     await unmount();
+    // 釋放寬限結束才真的退訂：lib/shioaji 的 capability ref-count 是跨測試共用的模組狀態，不放掉會讓下一個測試的 subscribe 被當成「沿用」而不送出
+    await settle(GRACE);
     vi.useRealTimers();
     vi.unstubAllGlobals();
 });
@@ -163,6 +168,8 @@ describe('訂閱生命週期', () => {
         expect(m.handlers.has('scanner')).toBe(true);
         expect(m.ensureNames).toHaveBeenCalledTimes(1);
         await unmount();
+        expect(unsubscribes()).toHaveLength(0); // 釋放寬限內
+        await settle(GRACE);
         expect(unsubscribes().map(keyOf).sort()).toEqual(subscribes().map(keyOf).sort());
         expect(m.handlers.has('scanner')).toBe(false);
         expect(m.post).toHaveBeenCalledTimes(16);
@@ -171,6 +178,7 @@ describe('訂閱生命週期', () => {
     it('退到背景：全部退訂並停止監聽；回前景：重新訂閱 8 筆、名稱目錄再確認 1 次', async () => {
         await mount();
         await setVisibility('hidden');
+        await settle(GRACE);
         expect(unsubscribes()).toHaveLength(8);
         expect(m.handlers.has('scanner')).toBe(false);
         await setVisibility('visible');
@@ -189,7 +197,7 @@ describe('訂閱生命週期', () => {
         expect(one('signal-family-volume').props['aria-pressed']).toBe(true);
 
         await press('signal-exchange-OTC');
-        await settle();
+        await settle(GRACE);
         expect(subscribes()).toHaveLength(10);
         expect(unsubscribes().map(keyOf).sort()).toEqual([
             'OTC:ask_price_drop', 'OTC:bid_price_surge', 'OTC:trade_price_drop', 'OTC:trade_price_surge', 'OTC:volume_burst',
@@ -197,8 +205,9 @@ describe('訂閱生命週期', () => {
         expect(textOf(one('signal-coverage'))).toBe('已訂閱 5/5');
         expect(JSON.parse(storage.get('sj-mobile-signal-filters-v1')!)).toEqual({ families: ['move', 'volume'], exchanges: ['TSE'] });
 
-        // 重新進入：沿用存下的篩選
+        // 重新進入（寬限之後）：沿用存下的篩選
         await unmount();
+        await settle(GRACE);
         const before = subscribes().length;
         await mount();
         expect(subscribes().slice(before).map(keyOf).sort()).toEqual([
@@ -209,7 +218,7 @@ describe('訂閱生命週期', () => {
     it('取消全部篩選：退訂全部、說明需選擇', async () => {
         await mount();
         await press('signal-family-move');
-        await settle();
+        await settle(GRACE);
         expect(unsubscribes()).toHaveLength(8);
         expect(byTestId('signal-no-filter')).toHaveLength(1);
         expect(textOf(one('signal-coverage'))).toBe('目前沒有訂閱任何訊號。');
@@ -237,7 +246,24 @@ describe('訂閱生命週期', () => {
 
         // 失敗過的鍵在重試成功後才會被退訂：卸載退訂 8 筆
         await unmount();
+        await settle(GRACE);
         expect(unsubscribes()).toHaveLength(8);
+    });
+});
+
+describe('釋放寬限', () => {
+    it('短暫切到背景、篩選來回切換：寬限內不送退訂與重新訂閱', async () => {
+        await mount();
+        expect(subscribes()).toHaveLength(8);
+        await setVisibility('hidden');
+        await setVisibility('visible');
+        await press('signal-family-move');
+        await settle();
+        await press('signal-family-move');
+        await settle(GRACE * 2);
+        expect(subscribes()).toHaveLength(8);
+        expect(unsubscribes()).toHaveLength(0);
+        expect(textOf(one('signal-coverage'))).toBe('已訂閱 8/8');
     });
 });
 

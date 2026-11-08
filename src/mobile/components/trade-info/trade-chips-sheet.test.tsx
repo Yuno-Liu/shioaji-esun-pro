@@ -261,6 +261,28 @@ describe('內容', () => {
     });
 });
 
+describe('資料時間與焦點', () => {
+    it('融資融券與券源顯示資料時間，並註明下單時券商會重新查詢', async () => {
+        okResponses();
+        await render(stock);
+        expect(text(one('trade-chips-credit-time'))).toBe('資料時間 11/06 08:00；下單時券商會重新查詢，以下單當下為準。');
+        expect(text(one('trade-chips-source-note'))).toContain('資料時間 11/06 08:00');
+    });
+
+    it('按［重新查詢］：按鍵消失前把焦點移到「融資融券」標題（不掉到面板外）', async () => {
+        m.apiPost.mockRejectedValue(new Error('503'));
+        const focus = vi.fn();
+        await act(async () => {
+            view = create(el(stock), { createNodeMock: n => ((n.props as Record<string, unknown>)['data-testid'] === 'trade-chips-credit-title' ? { focus } : {}) });
+        });
+        await settle();
+        okResponses();
+        await act(async () => { one('trade-chips-retry').props.onClick(); });
+        expect(focus).toHaveBeenCalledTimes(1);
+        expect(one('trade-chips-credit-title').props.tabIndex).toBe(-1);
+    });
+});
+
 describe('S1：面板唯讀', () => {
     it('按遍面板內所有按鈕：openTicket／openOrderAction 與 lib 送單、改單、刪單 0 次', async () => {
         okResponses();

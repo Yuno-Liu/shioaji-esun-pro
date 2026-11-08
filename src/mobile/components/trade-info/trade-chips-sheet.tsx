@@ -8,8 +8,10 @@
 // - 資訊列各膠囊的定義。
 // 交易安全 S1：面板內沒有任何下單入口（沒有按鈕會呼叫 openTicket／openOrderAction 或 lib 送單函式），只有關閉。
 // 請求：融資融券與券源只在面板開啟且是股票時讀，每檔每交易日各最多 1 次（mobile/lib/trade-chips）；
-// 失敗時顯示［重新查詢］，按下才重讀失敗的那一項（不自動重試）。
+// 失敗時顯示［重新查詢］，按下才重讀失敗的那一項（不自動重試）；按下後焦點移到「融資融券」標題（按鍵會消失）。
+// 融資融券與券源顯示資料時間（每檔每天只讀一次，早上的數字整天沿用）；下單時券商端會重新查詢，以下單當下為準。
 
+import { useRef, type RefObject } from 'react';
 import { creditStatus, type CreditCond, type CreditEnquire } from '../../../lib/credit-eligibility';
 import type { ContractInfo } from '../../../lib/types/contract';
 import {
@@ -68,18 +70,26 @@ export function creditAbilityText(row: CreditEnquire | undefined, cond: CreditCo
     return { text: `${margin ? '停資' : '停券'}（${reasons}）`, tone: 'warn' };
 }
 
+/** 'YYYY-MM-DD HH:MM:SS' → 'MM/DD HH:MM'；無法辨識時原樣，沒有時 null */
+export function dataTimeText(v: unknown): string | null {
+    if (typeof v !== 'string' || !v.trim()) return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(v.trim());
+    return m ? `${m[2]}/${m[3]} ${m[4]}:${m[5]}` : v.trim();
+}
+
 const ratioText = (v: unknown) => (num(v) === null ? '—' : `${num(v)}%`);
 const unitText = (v: unknown) => (num(v) === null ? '—' : fmtInt(num(v)!));
 const ratePct = (rate: number) => `${Number((rate * 100).toFixed(3))}%`;
 
-function CreditSection({ credit }: { credit: ChipEntry<CreditEnquire> }) {
+function CreditSection({ credit, headingRef }: { credit: ChipEntry<CreditEnquire>; headingRef: RefObject<HTMLHeadingElement | null> }) {
     const pending = entryText(credit);
     const row = credit.status === 'ok' ? credit.value : undefined;
     const margin = creditAbilityText(row, 'MarginTrading');
     const short = creditAbilityText(row, 'ShortSelling');
+    const time = dataTimeText((row as { update_time?: unknown } | undefined)?.update_time);
     return (
         <>
-            <h3 className={styles.sectionTitle}>融資融券</h3>
+            <h3 className={styles.sectionTitle} ref={headingRef} tabIndex={-1} data-testid='trade-chips-credit-title'>融資融券</h3>
             {pending !== null
                 ? <p className={styles.status} role='status' data-testid='trade-chips-credit-status'>融資融券：{pending}</p>
                 : (
@@ -92,6 +102,11 @@ function CreditSection({ credit }: { credit: ChipEntry<CreditEnquire> }) {
                         <Item label='融券單位' value={unitText(row?.short_unit)} />
                     </dl>
                 )}
+            {pending === null && (
+                <p className={styles.note} data-testid='trade-chips-credit-time'>
+                    {time ? `資料時間 ${time}；` : ''}下單時券商會重新查詢，以下單當下為準。
+                </p>
+            )}
         </>
     );
 }
@@ -111,7 +126,9 @@ function SourceSection({ short, contract }: { short: ChipEntry<ShortSource>; con
                 <Item label='融資餘額' value={unitText(contract.margin_trading_balance)} testId='trade-chips-margin-balance' />
                 <Item label='融券餘額' value={unitText(contract.short_selling_balance)} testId='trade-chips-short-balance' />
             </dl>
-            <p className={styles.note}>券源為券商可借券數量（借券賣出用）；資券餘額取自合約資料。</p>
+            <p className={styles.note} data-testid='trade-chips-source-note'>
+                券源為券商可借券數量（借券賣出用）{src && dataTimeText(src.datetime) ? `，資料時間 ${dataTimeText(src.datetime)}` : ''}；資券餘額取自合約資料。
+            </p>
         </>
     );
 }
@@ -155,19 +172,24 @@ export function TradeChipsSheet({ open, onClose, contract, punished }: TradeChip
     const stock = showsCredit(st);
     const chips = useTradeChips(contract, open && stock);
     const punish = punishText(punished);
+    const creditHeadingRef = useRef<HTMLHeadingElement | null>(null);
     return (
         <BottomSheet open={open} onClose={onClose} title='籌碼與當沖' testId='trade-chips-sheet' detent='large'>
             <div className={styles.sheetBody}>
                 <p className={styles.note}>{`${contract.code} ${contract.name}`}・只供查看，下單請用頁面底部的買進、賣出。</p>
                 {stock && (
                     <>
-                        <CreditSection credit={chips.credit} />
+                        <CreditSection credit={chips.credit} headingRef={creditHeadingRef} />
                         <SourceSection short={chips.short} contract={contract} />
                         {(chips.credit.status === 'failed' || chips.short.status === 'failed') && (
                             <button
                                 type='button'
                                 className={`${controls.button.neutral} ${focusRing}`}
-                                onClick={() => retryTradeChips(contract)}
+                                onClick={() => {
+                                    retryTradeChips(contract);
+                                    // 按鍵會隨重新查詢消失：焦點移到「融資融券」標題，不掉到面板外
+                                    creditHeadingRef.current?.focus();
+                                }}
                                 data-testid='trade-chips-retry'
                             >
                                 重新查詢融資融券與券源

@@ -2,7 +2,8 @@
 //
 // 資訊列只用交易頁已有的資料（合約、標頭的報價與快照、處置名單），不發新請求。內容依序：
 //   1. 可當沖／先賣（只有股票 STK：合約 day_trade）
-//   2. 漲跌停狀態（lib/limit-state：hasPriceLimits、limitStateOf；指數、興櫃、權證沒有漲跌停 → 不顯示）
+//   2. 漲跌停狀態（lib/limit-state：hasPriceLimits、limitStateOf；指數、興櫃、權證沒有漲跌停 → 不顯示；選擇權不判：
+//      跌停只是最小跳動的地板，同桌面 quote-board）
 //      - 鎖漲停：價位在漲停、最佳委買在漲停且委賣已空；鎖跌停反之。沒有五檔資料時只寫「漲停」「跌停」。
 //      - 接近漲停／跌停：距停板 ≤ NEAR_LIMIT_PCT（以參考價計）。
 //      - 只用成交或快照的價格（參考價、指數不算），同標頭的「漲停」「跌停」徽章。
@@ -11,10 +12,14 @@
 //   4. 量比（只有股票，同桌面看板：期權夜盤量會失真）：今日累計量 ÷ 快照的前一交易日量；快照日期與成交對不上時不算。
 //   5. 處置（只有股票；mobile/lib/regulatory-punish）。
 // 每一項都有文字，不只靠顏色（設計規格 §11）。
+// 同一交易日（同桌面 quote-board 的 sameDay）：報價推出的參考價（現價 − 漲跌）與合約參考價相差半個跳動以上時，
+// 兩者不是同一個交易日（盤前開 App 的除權息、分割日；期貨夜盤時合約仍是日盤的參考價與漲跌停）：
+// 不判停板、不畫以參考價為中心的尺，振幅改以報價自身的參考價計。
 
 import { dayRangeOf, dirVsOpen, INDEX_FUTURE_SCALES, railEndPcts, railPos, railScale, STOCK_SCALES } from '../../lib/day-range';
 import { hasPriceLimits, limitStateOf } from '../../lib/limit-state';
 import type { ContractInfo, DayTrade, SecurityType } from '../../lib/types/contract';
+import { tickSizeFor } from '../../lib/utils/ticksize';
 import { fmtVolumeRatio, ratioSnapshotStale, volumeRatioOf } from '../../lib/volume-ratio';
 
 export type InfoTone = 'neutral' | 'warn' | 'danger' | 'up' | 'down';
@@ -64,6 +69,17 @@ export interface BookSide {
 
 type LimitContract = Parameters<typeof limitStateOf>[0];
 
+/**
+ * 報價與合約是否同一交易日：quoteRef（報價自身的參考價＝現價 − 漲跌）與合約參考價相差不到半個跳動。
+ * 沒有 quoteRef（只有合約推得出的漲跌）或合約沒有參考價時視為同一天（沒有反證）。
+ */
+export function sameTradingDay(contract: Parameters<typeof tickSizeFor>[0] & { reference?: number }, quoteRef: number | null | undefined): boolean {
+    const ref = Number(contract.reference);
+    if (quoteRef === null || quoteRef === undefined || !Number.isFinite(quoteRef) || quoteRef <= 0) return true;
+    if (!Number.isFinite(ref) || ref <= 0) return true;
+    return Math.abs(quoteRef - ref) < tickSizeFor(contract, ref) / 2;
+}
+
 const numOf = (v: unknown): number => (v === undefined || v === null || v === '' ? NaN : Number(v));
 
 /** 一側是否已空（沒有任何價格 > 0 且量 > 0 的檔位） */
@@ -95,12 +111,12 @@ export function limitLocked(contract: LimitContract, state: 'up' | 'down', book:
  * priceIsTrade：價格是成交或快照（參考價、指數不判斷）。
  */
 export function limitKind(
-    contract: LimitContract & { reference?: number },
+    contract: LimitContract & { reference?: number; security_type?: SecurityType },
     price: number | null | undefined,
     priceIsTrade: boolean,
     book?: BookSide,
 ): LimitKind | null {
-    if (!priceIsTrade || price === null || price === undefined || !hasPriceLimits(contract)) return null;
+    if (!priceIsTrade || price === null || price === undefined || contract.security_type === 'OPT' || !hasPriceLimits(contract)) return null;
     const state = limitStateOf(contract, price);
     if (state) {
         const locked = limitLocked(contract, state, book);
@@ -161,9 +177,11 @@ export interface RangeInfo {
 const pos = (v: number | null): v is number => v !== null && Number.isFinite(v) && v > 0;
 const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
 
+/** rail＝false（報價與合約不是同一交易日）時不畫以參考價為中心的尺，一律畫最低到最高 */
 export function rangeInfo(
     contract: Pick<ContractInfo, 'security_type' | 'exchange' | 'limit_up' | 'limit_down'> & { underlying_kind?: string },
     v: RangeInput,
+    rail = true,
 ): RangeInfo | null {
     const { reference, open, high, low, close } = v;
     if (!pos(reference) || !pos(high) || !pos(low) || !pos(close) || low > high) return null;
@@ -171,7 +189,7 @@ export function rangeInfo(
     const position = high > low ? clamp01((close - low) / (high - low)) : null;
     const dir = pos(open) ? dirVsOpen(close, open) : null;
     const st = contract.security_type;
-    if ((st === 'STK' || st === 'FUT') && hasPriceLimits(contract) && pos(open)) {
+    if (rail && (st === 'STK' || st === 'FUT') && hasPriceLimits(contract) && pos(open)) {
         const r = dayRangeOf({ reference, limitUp: contract.limit_up, limitDown: contract.limit_down, open, high, low, close });
         if (r) {
             const scales = st === 'FUT' && contract.underlying_kind === 'I' ? INDEX_FUTURE_SCALES : STOCK_SCALES;

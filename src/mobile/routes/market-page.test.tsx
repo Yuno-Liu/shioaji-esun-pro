@@ -151,3 +151,42 @@ describe('市場頁', () => {
         expect(m.navigate.mock.calls).toEqual([[{ name: 'market', segment: 'flow' }, { replace: true }]]);
     });
 });
+
+describe('切換分段的焦點', () => {
+    async function mountWithNodes(segment: 'flow' | 'signals', focus: () => void, query: (sel: string) => unknown) {
+        const { MarketPage } = await import('./market-page');
+        const wrap = { contains: (node: unknown) => node === active, querySelector: (sel: string) => { query(sel); return { focus }; } };
+        await act(async () => {
+            view = create(createElement(MarketPage, { segment }), {
+                createNodeMock: el => ((el.props as { children?: { props?: { testId?: string } } })?.children?.props?.testId === 'market-segment' ? wrap : {}),
+            });
+        });
+        await flush();
+    }
+    const active = { tag: 'focused-segment' };
+
+    it('焦點在分段上時切換：新頁首掛載後焦點移到新選取的分段', async () => {
+        vi.stubGlobal('document', { activeElement: active });
+        const focus = vi.fn();
+        const query = vi.fn();
+        await mountWithNodes('flow', focus, query);
+        await act(async () => { one('market-seg-signals').props.onClick(); });
+        expect(m.navigate).toHaveBeenCalledWith({ name: 'market', segment: 'signals' }, { replace: true });
+        const { MarketPage } = await import('./market-page');
+        await act(async () => { view!.update(createElement(MarketPage, { segment: 'signals' })); });
+        await flush();
+        expect(query).toHaveBeenCalledWith('[data-testid="market-seg-signals"]');
+        expect(focus).toHaveBeenCalledTimes(1);
+    });
+
+    it('焦點不在分段上（例如觸控點擊沒有聚焦）：不搶焦點', async () => {
+        vi.stubGlobal('document', { activeElement: { tag: 'body' } });
+        const focus = vi.fn();
+        await mountWithNodes('flow', focus, () => undefined);
+        await act(async () => { one('market-seg-signals').props.onClick(); });
+        const { MarketPage } = await import('./market-page');
+        await act(async () => { view!.update(createElement(MarketPage, { segment: 'signals' })); });
+        await flush();
+        expect(focus).not.toHaveBeenCalled();
+    });
+});
