@@ -5,6 +5,11 @@
 //   取回後再依各排行的指標在前端排序一次（穩定排序，同值保留伺服器順序），名次以此為準。
 //   例外：「高低價差」（DayRangeRank）依伺服器的排序依據（最高 − 最低的絕對價差），前端無法重現，
 //   一律保留伺服器名次；振幅%只當附加資訊顯示（不是振幅排行：低價大振幅的股票可能不在名單內）。
+//   「成交筆數」（TickCountRank）的筆數欄位未經確認（rank_value 語意不明），同樣保留伺服器名次，第二行仍顯示量。
+//   「漲價差／跌價差」（ChangePriceRank）依漲跌（元）排序，ascending 旗標與漲跌幅相同處理。
+// - 篩選（只在前端過濾已取回的名單，不發新請求；名次維持過濾前的名次）：
+//   排除處置（沿用本頁已讀的處置清單；名單尚未取得時不排除並說明）、排除 ETF（代碼 00 開頭，與 lib 的證交稅、
+//   升降單位判斷相同）、排除權證（6 碼、03–08 或 7 開頭）。上市／上櫃無法由排行資料判斷（沒有交易所），不提供。
 // - 只在自選頁的「排行」分段掛載本元件時才讀取；頁面在背景（document.hidden）時不讀，回前景時若快取過期才讀。
 // - 每種排行有模組層快取 RANKING_CACHE_MS（30 秒）：切換種類、切換分頁再回來都先用快取；
 //   任何讀取（含自動、手動、錯誤後重試）距上次讀取未滿 RANKING_COOLDOWN_MS（15 秒）都不發出。
@@ -30,10 +35,10 @@ import { fmtPrice } from '../../lib/utils/format';
 import { fmtCompactInt } from '../lib/num-format';
 import { openTicket } from '../lib/mobile-store';
 import { requestSparkContract } from '../lib/ranking-spark-contracts';
-import { usePunishedCodes } from '../lib/regulatory-punish';
+import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
 import { focusRing, pressable } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
-import { expandHit } from '../ui/chip.css';
+import { chip, expandHit } from '../ui/chip.css';
 import { EmptyState } from '../ui/empty-state';
 import { IconButton } from '../ui/icon-button';
 import { InlineNote } from '../ui/inline-note';
@@ -41,7 +46,7 @@ import { Segmented } from '../ui/segmented';
 import { Skeleton } from '../ui/skeleton';
 import { marketTag, QuoteRow, TicketButton, useSparkColumn, useVisibilityTracker, type RowQuoteView, type VisibilityTracker } from './quote-row';
 
-export type RankingKind = 'gainers' | 'losers' | 'volume' | 'amount' | 'range';
+export type RankingKind = 'gainers' | 'losers' | 'priceUp' | 'priceDown' | 'volume' | 'amount' | 'ticks' | 'range';
 
 export interface RankingDef {
     kind: RankingKind;
@@ -54,10 +59,16 @@ export interface RankingDef {
 export const RANKING_DEFS: readonly RankingDef[] = [
     { kind: 'gainers', label: '漲幅', type: 'ChangePercentRank', serverAscending: true },
     { kind: 'losers', label: '跌幅', type: 'ChangePercentRank', serverAscending: false },
+    { kind: 'priceUp', label: '漲價差', type: 'ChangePriceRank', serverAscending: true },
+    { kind: 'priceDown', label: '跌價差', type: 'ChangePriceRank', serverAscending: false },
     { kind: 'volume', label: '成交量', type: 'VolumeRank', serverAscending: true },
     { kind: 'amount', label: '成交值', type: 'AmountRank', serverAscending: true },
+    { kind: 'ticks', label: '成交筆數', type: 'TickCountRank', serverAscending: true },
     { kind: 'range', label: '高低價差', type: 'DayRangeRank', serverAscending: true },
 ];
+
+/** 保留伺服器名次（前端無法重現排序依據）的排行 */
+const SERVER_ORDER: ReadonlySet<RankingKind> = new Set<RankingKind>(['range', 'ticks']);
 
 export const RANKING_COUNT = 30;
 export const RANKING_CACHE_MS = 30_000;
@@ -94,10 +105,14 @@ function metricOf(kind: RankingKind, item: ScannerItem): number | undefined {
         case 'gainers':
         case 'losers':
             return rankingChangePct(item);
+        case 'priceUp':
+        case 'priceDown':
+            return Number(item.change_price);
         case 'volume':
             return Number(item.total_volume);
         case 'amount':
             return Number(item.total_amount);
+        case 'ticks':
         case 'range':
             return undefined; // 不在前端排序（見 sortRanking）
     }
@@ -113,12 +128,12 @@ export function rankingPriceRange(item: ScannerItem): number | undefined {
 }
 
 /**
- * 依排行指標排序（跌幅由小到大，其餘由大到小；無法計算的排最後；同值保留伺服器順序）。
- * 高低價差排行保留伺服器名次（伺服器依絕對價差排序，前端不重排）。
+ * 依排行指標排序（跌幅、跌價差由小到大，其餘由大到小；無法計算的排最後；同值保留伺服器順序）。
+ * 高低價差、成交筆數排行保留伺服器名次（前端無法重現排序依據，不重排）。
  */
 export function sortRanking(kind: RankingKind, items: readonly ScannerItem[]): ScannerItem[] {
-    if (kind === 'range') return [...items];
-    const sign = kind === 'losers' ? 1 : -1;
+    if (SERVER_ORDER.has(kind)) return [...items];
+    const sign = kind === 'losers' || kind === 'priceDown' ? 1 : -1;
     return items
         .map((item, index) => ({ item, index, v: metricOf(kind, item) }))
         .sort((a, b) => {
@@ -128,6 +143,56 @@ export function sortRanking(kind: RankingKind, items: readonly ScannerItem[]): S
             return av === bv ? a.index - b.index : sign * (av - bv);
         })
         .map(x => x.item);
+}
+
+// ---------------------------------------------------------------------------
+// 篩選（前端過濾已取回的名單，不發新請求）
+
+export interface RankingFilters {
+    noPunished: boolean;
+    noEtf: boolean;
+    noWarrant: boolean;
+}
+
+export const RANKING_FILTER_DEFS: readonly { key: keyof RankingFilters; label: string }[] = [
+    { key: 'noPunished', label: '排除處置' },
+    { key: 'noEtf', label: '排除 ETF' },
+    { key: 'noWarrant', label: '排除權證' },
+];
+
+const NO_FILTERS: RankingFilters = { noPunished: false, noEtf: false, noWarrant: false };
+
+/**
+ * 篩選晶片列：放不下時換行，列距 8px（擴張的點擊區不互相重疊）。
+ * 用 inline style 而不是新的 .css.ts：本 chunk 原本沒有自己的 CSS，多一個 CSS 檔會讓首屏 chunk 的預載清單多一筆；
+ * 間距寫死 0.5rem（＝tokens SPACE.s2）而不 import tokens：tokens 被打包在另一個 chunk，import 會讓預載清單變長。
+ */
+const FILTER_ROW = { display: 'flex', flexWrap: 'wrap', gap: '0.5rem', minWidth: 0 } as const;
+
+/** ETF：代碼 00 開頭（與 lib 的證交稅、升降單位判斷相同；含債券、槓桿反向 ETF） */
+export function isEtfCode(code: string): boolean {
+    return code.startsWith('00');
+}
+
+/** 權證：6 碼，上市 03–08 開頭、上櫃 7 開頭（末碼可為英文字母，例如認售 P） */
+export function isWarrantCode(code: string): boolean {
+    return /^(?:0[3-8]|7\d)\d{3}[\dA-Z]$/.test(code);
+}
+
+/**
+ * 依篩選條件過濾；rank 維持過濾前的名次。
+ * punished 為 null（處置名單尚未取得）時不排除處置股（「不在集合裡」不能當成「未處置」，也不能整份藏起來）。
+ */
+export function filterRanking(items: readonly ScannerItem[], f: RankingFilters, punished: ReadonlySet<string> | null): { item: ScannerItem; rank: number }[] {
+    const out: { item: ScannerItem; rank: number }[] = [];
+    items.forEach((item, i) => {
+        const c = item.code;
+        if (f.noPunished && punished?.has(c)) return;
+        if (f.noEtf && isEtfCode(c)) return;
+        if (f.noWarrant && isWarrantCode(c)) return;
+        out.push({ item, rank: i + 1 });
+    });
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +210,8 @@ export interface RankingState {
 
 /** 上次選的排行種類（切換分頁再回來保留） */
 let lastKind: RankingKind = 'gainers';
+/** 上次的篩選（同上；不寫入儲存，重新開啟 App 時全部關閉） */
+let lastFilters: RankingFilters = NO_FILTERS;
 
 const EMPTY_STATE: RankingState = { items: null, fetchedAt: null, attemptedAt: null, loading: false, error: null };
 const states = new Map<RankingKind, RankingState>();
@@ -206,6 +273,7 @@ export function requestRanking(kind: RankingKind, opts: { force?: boolean } = {}
 export function resetRankingForTest(): void {
     states.clear();
     lastKind = 'gainers';
+    lastFilters = NO_FILTERS;
     listeners.forEach(l => l());
 }
 
@@ -269,6 +337,12 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
         lastKind = k;
         setKindState(k);
     }, []);
+    const [filters, setFiltersState] = useState<RankingFilters>(lastFilters);
+    const toggleFilter = (key: keyof RankingFilters) => {
+        const next = { ...filters, [key]: !filters[key] };
+        lastFilters = next;
+        setFiltersState(next);
+    };
 
     // 掛載（＝排行分段可見）與切換種類時：前景才讀；快取未過期不讀
     useEffect(() => {
@@ -302,6 +376,12 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
     const items = state.items;
     // 處置清單：有排行資料時才讀（與自選共用快取，30 分鐘最多 1 次）
     const punished = usePunishedCodes(items !== null && items.length > 0);
+    const punishLoaded = usePunishedListLoaded();
+    const shown = useMemo(
+        () => (items ? filterRanking(items, filters, punishLoaded ? punished : null) : []),
+        [items, filters, punished, punishLoaded],
+    );
+    const hidden = items ? items.length - shown.length : 0;
 
     return (
         <div data-testid='ranking'>
@@ -315,12 +395,27 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
                     ariaLabel='排行種類'
                 />
 
+                <div style={FILTER_ROW} role='group' aria-label='排行篩選' data-testid='ranking-filters'>
+                    {RANKING_FILTER_DEFS.map(f => (
+                        <button
+                            key={f.key}
+                            type='button'
+                            className={`${chip} ${pressable} ${focusRing}`}
+                            aria-pressed={filters[f.key]}
+                            onClick={() => toggleFilter(f.key)}
+                            data-testid={`ranking-filter-${f.key}`}
+                        >
+                            {f.label}
+                        </button>
+                    ))}
+                </div>
+
                 <div className={styles.rankMeta}>
                     <span className={styles.rankMetaText} role='status' data-testid='ranking-updated'>
                         {state.loading
                             ? `${def.label}排行讀取中…`
                             : state.fetchedAt !== null
-                                ? `${def.label}前 ${RANKING_COUNT} 名・更新於 ${fmtTime(state.fetchedAt)}`
+                                ? `${def.label}前 ${RANKING_COUNT} 名${hidden > 0 ? `・已排除 ${hidden} 檔` : ''}・更新於 ${fmtTime(state.fetchedAt)}`
                                 : ''}
                     </span>
                     <button
@@ -351,6 +446,11 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
                     </InlineNote>
                 )}
                 {addError && <InlineNote tone='danger' role='alert' testId='ranking-add-error'>{addError}</InlineNote>}
+                {filters.noPunished && !punishLoaded && items !== null && items.length > 0 && (
+                    <InlineNote tone='info' role='status' testId='ranking-filter-punish-pending'>
+                        處置名單尚未取得，暫時無法排除處置股。
+                    </InlineNote>
+                )}
             </div>
 
             {!items && state.loading && <Skeleton label='排行讀取中…' rows={6} testId='ranking-loading' />}
@@ -363,12 +463,21 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
                 />
             )}
 
-            {items && items.length > 0 && (
+            {items && items.length > 0 && shown.length === 0 && (
+                <EmptyState
+                    icon={TrendingUp}
+                    title='沒有符合篩選條件的股票'
+                    description={`前 ${RANKING_COUNT} 名都被排除了，可關閉上方的排除條件。`}
+                    testId='ranking-filtered-empty'
+                />
+            )}
+
+            {shown.length > 0 && (
                 <ol className={styles.list} aria-label={`${def.label}排行`} data-testid='ranking-list'>
-                    {items.map((item, index) => (
+                    {shown.map(({ item, rank }, index) => (
                         <RankingRow
                             key={item.code}
-                            rank={index + 1}
+                            rank={rank}
                             kind={kind}
                             item={item}
                             index={index}
