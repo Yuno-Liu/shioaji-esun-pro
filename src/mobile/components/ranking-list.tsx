@@ -527,6 +527,9 @@ export function rankingView(item: ScannerItem): RowQuoteView {
         dir: !Number.isFinite(chg) || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down',
         simtrade: false,
         vol: Number.isFinite(vol) && vol >= 0 ? vol : undefined,
+        // 日內區間小條（與自選相同）：scanner 已帶今日最高、最低
+        high: Number(item.high) > 0 ? Number(item.high) : undefined,
+        low: Number(item.low) > 0 ? Number(item.low) : undefined,
     };
 }
 

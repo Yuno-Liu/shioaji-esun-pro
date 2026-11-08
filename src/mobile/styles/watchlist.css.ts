@@ -500,13 +500,43 @@ export const simBadge = style({
     color: vars.color.foreground,
 });
 
-/** 價格欄：價格（＋閃爍覆蓋層）與第二行 */
+/** 價格欄：價格（＋閃爍覆蓋層）與第二行；日內區間小條（dayRange）的定位基準 */
 export const priceCell = style({
+    position: 'relative',
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'flex-end',
     gap: '0.0625rem',
     minWidth: 0,
+});
+
+/**
+ * 日內區間小條（價格欄正下方）：今日最低（左）→ 最高（右）的 2px 細軌，2×6px 標記現價位置（--p，由列以 inline style 給）。
+ * 絕對定位在價格欄外緣下方 2–4px（列的上下內距之內）：不改列高、不佔名稱欄寬度、不蓋到文字。
+ * 純裝飾（aria-hidden）：位置與高低價寫在列按鈕的無障礙名稱裡。沒有動畫（不需處理減少動態）。
+ */
+export const dayRange = style({
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: '-4px',
+    height: '2px',
+    borderRadius: '1px',
+    background: vars.color.borderBright,
+    pointerEvents: 'none',
+    selectors: {
+        '&::after': {
+            content: '""',
+            position: 'absolute',
+            top: '-2px',
+            left: 'var(--p)',
+            width: '2px',
+            height: '6px',
+            marginLeft: '-1px',
+            borderRadius: '1px',
+            background: vars.color.foreground,
+        },
+    },
 });
 
 /** 價格：numMd、漲跌色；閃爍覆蓋層的定位基準（ui/price-flash.css 的 host 另行套用） */

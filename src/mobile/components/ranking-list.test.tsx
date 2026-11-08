@@ -861,3 +861,22 @@ describe('RankingList — 篩選晶片', () => {
         for (const k of ORDER_FNS) expect(m[k], k).not.toHaveBeenCalled();
     });
 });
+
+describe('排行列的日內區間小條（與自選相同）', () => {
+    it('scanner 的今日最高、最低進入列（位置寫進無障礙名稱）；最高＝最低時不顯示', async () => {
+        m.fetchScanner.mockResolvedValue([
+            item('2330', 1100, 100, { high: 1110, low: 1060 }),
+            item('2317', 210, 10),
+        ]);
+        await render();
+        const rowOf = (code: string) => view!.root.find(n => n.props['data-testid'] === 'ranking-row' && n.props['data-code'] === code && typeof n.type === 'string');
+        const bar = rowOf('2330').findAll(n => n.props['data-testid'] === 'ranking-range' && typeof n.type === 'string');
+        expect(bar).toHaveLength(1);
+        expect(bar[0]!.props.style).toEqual({ '--p': '80%' });
+        expect(byTestId('ranking-row-button')[0]!.props['aria-label']).toContain('今日最低 1,060 最高 1,110，現價位於區間 80%');
+        // item() 的高低都等於成交價
+        expect(rowOf('2317').findAll(n => n.props['data-testid'] === 'ranking-range')).toHaveLength(0);
+        // 不多發請求
+        expect(m.fetchScanner).toHaveBeenCalledTimes(1);
+    });
+});
