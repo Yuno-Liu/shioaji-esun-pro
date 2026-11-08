@@ -13,7 +13,8 @@
 // - 搜尋：search-sheet.tsx（searchProducts(query, 10)）。延遲載入（lib/deferred-modules.ts loadSearchSheet，閒置預載），
 //   第一次要求開啟時才掛載；載入失敗以底部面板「載入失敗」＋［重試］顯示。
 // - 試撮（tick.simtrade）：比照桌面，代碼旁加「試撮」徽章，不當成真實成交顯示。
-// - 分段「自選｜排行」（§13 Phase 3）：排行見 components/ranking-list.tsx（延遲載入），只在「排行」分段掛載時讀取；
+// - 分段「自選｜排行｜持倉」（§13 Phase 3）：排行見 components/ranking-list.tsx（延遲載入），只在「排行」分段掛載時讀取；
+//   「持倉」見 components/holdings-list.tsx（延遲載入；依 useTradingState().positions 自動列出，沒有任何編輯入口，不另外讀取）；
 //   「排行」分段不掛載自選列，自選列的行情訂閱隨之釋放。分段選擇在模組層保留（切換分頁再回來不變）。
 // - 版面（設計規格 §7.2，依使用者參考圖改版）：PageHeader（搜尋）；Segmented tabs（自選｜排行）；
 //   清單列：多個清單時清單分頁（Segmented scroll 變體，選中的自動捲進可見範圍；順序依這台裝置的群組順序，
@@ -84,7 +85,7 @@ import {
 } from '../components/quote-row';
 import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from '../components/route-error-boundary';
 import { WatchIndexStrip } from '../components/watch-index-strip';
-import { loadRankingList, loadSearchSheet, loadWatchEditControls, loadWatchListSheet } from '../lib/deferred-modules';
+import { loadHoldingsList, loadRankingList, loadSearchSheet, loadWatchEditControls, loadWatchListSheet } from '../lib/deferred-modules';
 import { navigate } from '../lib/hash-router';
 import { openTicket } from '../lib/mobile-store';
 import { usePunishedCodes } from '../lib/regulatory-punish';
@@ -393,12 +394,16 @@ function RowActionsSheet({ code, mode, items, onClose, onOpen, onRemove, onMove 
 // ---------------------------------------------------------------------------
 // 頁面
 
-export type WatchSegment = 'watchlist' | 'ranking';
+export type WatchSegment = 'watchlist' | 'ranking' | 'holdings';
 
 // 排行只在「排行」分段才用到：延遲載入（規格 §13 首次載入體積），閒置時由 app.tsx 預載。
 // 載入失敗只在分段內容區顯示「載入失敗」＋［重試］（retryableLazy 換新的 lazy 重新 import）。
 const RankingList = retryableLazy(() => loadRankingList().then(m => m.RankingList), 'RankingList');
 const resetRankingList = () => { RankingList.reset(); };
+
+// 「持倉」分段（依持倉自動列出，不能手動新增或移除）：同排行，延遲載入、閒置時由 app.tsx 預載；載入失敗只在分段內容區顯示「載入失敗」＋［重試］。
+const HoldingsList = retryableLazy(() => loadHoldingsList().then(m => m.HoldingsList), 'HoldingsList');
+const resetHoldingsList = () => { HoldingsList.reset(); };
 
 // 搜尋面板只在按「搜尋」（或空清單的「搜尋並加入」、編輯模式的「加入股票」）後才用到：延遲載入（連同 lib/product-search
 // 面板約 1.4 KiB gzip，另需上游搜尋本體 product-search chunk 約 18.7 KiB），閒置時由 app.tsx 預載。第一次要求開啟時才掛載、之後保持掛載（面板開關動畫正常；同 app.tsx 的下單面板）。
@@ -414,6 +419,7 @@ const resetWatchListSheet = () => { WatchListSheet.reset(); };
 const SEGMENTS = [
     { value: 'watchlist', label: '自選', testId: 'watch-segment-watchlist' },
     { value: 'ranking', label: '排行', testId: 'watch-segment-ranking' },
+    { value: 'holdings', label: '持倉', testId: 'watch-segment-holdings' },
 ] as const satisfies readonly { value: WatchSegment; label: string; testId: string }[];
 
 /** 上次選的分段（切換分頁再回來保留） */
@@ -465,7 +471,7 @@ export function WatchlistPage() {
     const setSegment = useCallback((next: WatchSegment) => {
         lastSegment = next;
         setSegmentState(next);
-        if (next === 'ranking') setEditing(false);
+        if (next !== 'watchlist') setEditing(false);
     }, []);
     const cycleMetric = useCallback(() => {
         setMetricState(m => {
@@ -529,19 +535,20 @@ export function WatchlistPage() {
     const activeList = wl.serverLists.find(l => l.id === wl.activeListId);
     // 群組（清單）分頁的順序只存在這台裝置（lib/watch-list-order.ts，每次渲染讀取）；編輯模式「排序群組」存檔後以 bumpOrder 重繪
     const [orderKey, bumpOrder] = useReducer((n: number) => n + 1, 0);
-    const ranking = segment === 'ranking';
-    const showList = !ranking && wl.items.length > 0;
+    // 不在「自選」分段（排行、持倉）：不顯示清單分頁、編輯入口與自選列
+    const otherSegment = segment !== 'watchlist';
+    const showList = !otherSegment && wl.items.length > 0;
     const metricLabel = WATCH_METRIC_LABEL[metric];
     // 走勢欄：設定開啟且放得下才掛載（窄螢幕＋字級「大」時與設定關閉相同：不掛載、不請求、不留佔位）
     const spark = useSparkColumn();
     // 處置清單：只在顯示自選列且清單含股票時讀取（受 30 分鐘間隔限制）
     const hasStocks = useMemo(() => wl.items.some(i => i.contract.security_type === 'STK'), [wl.items]);
     const punished = usePunishedCodes(showList && hasStocks);
-    const showListTabs = !ranking && wl.serverLists.length > 1;
+    const showListTabs = !otherSegment && wl.serverLists.length > 1;
     // 清單本身載入中（hook 的 loading 在清單結構更新時也為 true；結構更新中不算，避免編輯模式中途被收起）
     const listLoading = wl.loading && !wl.structureBusy;
     // 空清單（已載入）也顯示表頭的編輯鍵：才能重新命名或刪除空的清單
-    const emptyList = !ranking && !wl.items.length && !listLoading && !wl.loadError;
+    const emptyList = !otherSegment && !wl.items.length && !listLoading && !wl.loadError;
     const showHeader = showList || (emptyList && activeList !== undefined);
     const listNames = useMemo(() => wl.serverLists.map(l => l.name), [wl.serverLists]);
     const canDeleteList = wl.serverLists.length > 1;
@@ -607,7 +614,7 @@ export function WatchlistPage() {
                     semantics='tabs'
                     ariaLabel='自選或排行'
                 />
-                {!ranking && wl.serverLists.length > 0 && (
+                {!otherSegment && wl.serverLists.length > 0 && (
                     <div className={styles.listBar}>
                         {showListTabs ? (
                             <div ref={listTabsRef} className={styles.listTabs}>
@@ -628,7 +635,7 @@ export function WatchlistPage() {
                         <IconButton ariaLabel='新增自選清單' icon={Plus} onClick={() => setListSheet('create')} disabled={structureBusy} testId='watch-list-add' />
                     </div>
                 )}
-                {!ranking && editing && activeList && (
+                {!otherSegment && editing && activeList && (
                     <div className={styles.listTools} data-testid='watch-list-tools'>
                         <button
                             type='button'
@@ -654,25 +661,32 @@ export function WatchlistPage() {
                         </EditSlot>
                     </div>
                 )}
-                {!ranking && listError && <InlineNote tone='danger' role='alert' testId='watch-list-error'>{listError}</InlineNote>}
+                {!otherSegment && listError && <InlineNote tone='danger' role='alert' testId='watch-list-error'>{listError}</InlineNote>}
             </div>
 
-            {ranking && (
+            {segment === 'ranking' && (
                 <ModuleErrorBoundary onRetry={resetRankingList} fallback={props => <ModuleLoadError {...props} testId='ranking-load-error' />}>
                     <Suspense fallback={<Skeleton label='排行讀取中…' rows={6} testId='ranking-module-loading' />}>
                         <RankingList watchedCodes={watchedCodes} canAdd={canAdd} onAdd={onAddRanked} onOpen={openTrade} />
                     </Suspense>
                 </ModuleErrorBoundary>
             )}
+            {segment === 'holdings' && (
+                <ModuleErrorBoundary onRetry={resetHoldingsList} fallback={props => <ModuleLoadError {...props} testId='holdings-load-error' />}>
+                    <Suspense fallback={<Skeleton label='持倉讀取中…' rows={6} testId='holdings-module-loading' />}>
+                        <HoldingsList metric={metric} onOpen={openTrade} />
+                    </Suspense>
+                </ModuleErrorBoundary>
+            )}
 
-            {!ranking && wl.loadError && (
+            {!otherSegment && wl.loadError && (
                 <div className={styles.stateBlock}>
                     <InlineNote tone='danger' role='alert' action={{ label: '重試', onClick: () => wl.retryLoad(), testId: 'watch-retry' }}>
                         自選清單載入失敗。
                     </InlineNote>
                 </div>
             )}
-            {!ranking && !showList && listLoading && !wl.loadError && <Skeleton label='自選清單載入中…' rows={6} testId='watch-loading' />}
+            {!otherSegment && !showList && listLoading && !wl.loadError && <Skeleton label='自選清單載入中…' rows={6} testId='watch-loading' />}
 
             {showHeader && (
                 <div className={styles.listHeader} data-testid='watch-list-header'>
@@ -749,7 +763,7 @@ export function WatchlistPage() {
                     ))}
                 </ul>
             )}
-            {!ranking && editing && (
+            {!otherSegment && editing && (
                 <button
                     type='button'
                     className={`${styles.addSymbolRow} ${pressableRow} ${focusRing}`}
@@ -793,12 +807,12 @@ export function WatchlistPage() {
             />
             <ModuleErrorBoundary
                 onRetry={resetWatchListSheet}
-                fallback={props => <SheetLoadError {...props} open={!ranking && listSheet !== null} onClose={() => setListSheet(null)} testId='watch-list-sheet-load-error' />}
+                fallback={props => <SheetLoadError {...props} open={!otherSegment && listSheet !== null} onClose={() => setListSheet(null)} testId='watch-list-sheet-load-error' />}
             >
                 <Suspense fallback={null}>
                     {listSheetMounted && (
                         <WatchListSheet
-                            mode={ranking ? null : listSheet}
+                            mode={otherSegment ? null : listSheet}
                             currentName={activeList?.name ?? ''}
                             names={listNames}
                             busy={wl.structureBusy}
