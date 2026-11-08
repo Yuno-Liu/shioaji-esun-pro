@@ -80,6 +80,19 @@ describe('loadOnDemand', () => {
         expect(gateLeftSec(gate, now)).toBe(0);
     });
 
+    it('a fetcher that throws synchronously sends nothing and uses no gate quota', async () => {
+        resetOnDemandForTest(() => now);
+        const gate = { name: 'g', max: 1, windowMs: 60_000 };
+        const boom = vi.fn((): Promise<number> => { throw new Error('bad request'); });
+        expect(await loadOnDemand('a', boom, 30_000, gate)).toBe(true);
+        expect(getOnDemandState('a')).toMatchObject({ loading: false, error: 'bad request' });
+        expect(gateLeftSec(gate, now)).toBe(0);
+        const ok = vi.fn(async () => 1);
+        expect(await loadOnDemand('b', ok, 30_000, gate)).toBe(true);
+        expect(ok).toHaveBeenCalledTimes(1);
+        expect(gateLeftSec(gate, now)).toBe(60);
+    });
+
     it('a gate ignores passes stamped in the future (device clock moved back) instead of locking for the jump', async () => {
         resetOnDemandForTest(() => now);
         const gate = { name: 'g', max: 2, windowMs: 60_000 };

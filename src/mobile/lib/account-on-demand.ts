@@ -100,15 +100,18 @@ export function loadOnDemand<T>(key: string, fetcher: () => Promise<T>, cooldown
     if (gate && gateLeftSec(gate) > 0) return Promise.resolve(false);
     const target = entry;
     const at = clock();
-    if (gate) gates.set(gate.name, [...gateHits(gate, at), at]);
     target.state = { ...target.state, loading: true, error: null, attemptedAt: at };
     emit();
     let request: Promise<T>;
+    let issued = true;
     try {
         request = fetcher();
     } catch (err) {
+        // 同步丟錯＝請求沒有發出：不占 gate 額度（冷卻照常，與失敗時不自動重送一致）
+        issued = false;
         request = Promise.reject(err);
     }
+    if (gate && issued) gates.set(gate.name, [...gateHits(gate, at), at]);
     const done = request
         .then(data => {
             target.state = { ...target.state, data, error: null, loading: false, updatedAt: clock() };
