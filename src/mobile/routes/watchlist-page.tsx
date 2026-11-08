@@ -26,6 +26,10 @@
 //     「刪除清單」（兩段式確認；只剩一個清單時停用）→ deleteCurrentList（失敗顯示原因、保持編輯模式）。
 //   - 編輯模式每列列首「−」→ 移除確認面板（沿用操作面板的移除流程與文字）；清單底部「加入股票」開既有搜尋面板。
 //     非編輯模式沿用長按操作面板。
+//   - 多選刪除：編輯模式清單工具列的「多選」（延遲載入的 WatchEditTools，components/watch-edit-controls.tsx）→ 列首勾選圈、
+//     全選、底部「刪除 N 檔」→ 確認面板 → 逐檔 await removeSymbol（每檔 DELETE＋GET 清單）。多選狀態在編輯 chunk 內，
+//     本頁只把列點擊的代碼交給 blocked(code)（多選中切換勾選、不開交易頁）；多選中握把停用。
+//     編輯模式的說明文字（watch-edit-hint）也在 WatchEditTools（首屏體積；多選中改為多選的說明）。
 // - 手指拖曳排序（使用者要求；lib/watch-reorder.ts）：編輯模式每列列尾有握把（touch-action none，只有握把能拖，
 //   列的其他區域照常捲動，§8）；列以 transform 跟手指、其他列以 transform 讓位（減少動態時不做讓位動畫）、靠近
 //   main 上下緣自動捲動；放手時位置有變才呼叫一次 reorderSymbol（hook 每次是 GET＋PUT＋GET）；pointercancel 還原；
@@ -171,19 +175,21 @@ export function nextWatchMetric(m: WatchMetric): WatchMetric {
 const WatchEditReorder = retryableLazy(() => loadWatchEditControls().then(m => m.WatchEditReorder), 'WatchEditReorder');
 const WatchEditLeading = retryableLazy(() => loadWatchEditControls().then(m => m.WatchEditLeading), 'WatchEditLeading');
 const WatchEditTrailing = retryableLazy(() => loadWatchEditControls().then(m => m.WatchEditTrailing), 'WatchEditTrailing');
-/** 上次載入失敗時換新的 lazy（三個都要呼叫，不可短路）；未失敗時不動 */
+const WatchEditTools = retryableLazy(() => loadWatchEditControls().then(m => m.WatchEditTools), 'WatchEditTools');
+/** 上次載入失敗時換新的 lazy（四個都要呼叫，不可短路）；未失敗時不動 */
 const resetWatchEditControls = () => {
     WatchEditReorder.reset();
     WatchEditLeading.reset();
     WatchEditTrailing.reset();
+    WatchEditTools.reset();
 };
 /**
- * 閒置預載（app.tsx）：三個 lazy 都先記住元件（retryableLazy.preload），第一次進入編輯模式直接渲染、不 suspend
+ * 閒置預載（app.tsx）：四個 lazy 都先記住元件（retryableLazy.preload），第一次進入編輯模式直接渲染、不 suspend
  * （只 import chunk 的話 lazy 仍會 suspend 一次，React 的 Suspense 節流會讓佔位多停留最多約 300ms）。
- * 三個共用同一個 chunk，瀏覽器只抓一次；失敗時 preload 靜默，進入編輯模式再重新 import。
+ * 四個共用同一個 chunk，瀏覽器只抓一次；失敗時 preload 靜默，進入編輯模式再重新 import。
  */
 export const preloadWatchEditControls = (): Promise<void> =>
-    Promise.all([WatchEditReorder.preload(), WatchEditLeading.preload(), WatchEditTrailing.preload()]).then(() => undefined);
+    Promise.all([WatchEditReorder.preload(), WatchEditLeading.preload(), WatchEditTrailing.preload(), WatchEditTools.preload()]).then(() => undefined);
 const noop = () => undefined;
 const NOOP_GRIP: ListReorder['grip'] = {
     onPointerDown: noop,
@@ -496,7 +502,7 @@ export function WatchlistPage() {
         reorderRef.current = next;
         setReorder(next);
     }, []);
-    const blocked = useCallback(() => reorderRef.current?.blocked() ?? false, []);
+    const blocked = useCallback((code?: string) => reorderRef.current?.blocked(code) ?? false, []);
     /** 編輯鍵載入失敗後按［重試］的次數：改變時清除列內編輯槽的錯誤狀態 */
     const [editKey, setEditKey] = useState(0);
     const retryEditControls = useCallback(() => {
@@ -504,7 +510,7 @@ export function WatchlistPage() {
         setEditKey(k => k + 1);
     }, []);
     // 拖曳中與剛放手時不開交易頁、不開操作面板
-    const openRow = useCallback((code: string) => { if (!blocked()) openTrade(code); }, [blocked, openTrade]);
+    const openRow = useCallback((code: string) => { if (!blocked(code)) openTrade(code); }, [blocked, openTrade]);
     const openActions = useCallback((code: string) => {
         if (blocked()) return;
         setActionMode('actions');
@@ -637,16 +643,10 @@ export function WatchlistPage() {
                         >
                             {listBusy ? '刪除中…' : confirmDelete ? `確定刪除「${activeList.name}」` : '刪除清單'}
                         </button>
+                        <EditSlot editKey={editKey} placeholder={null}>
+                            <WatchEditTools confirmDelete={confirmDelete} />
+                        </EditSlot>
                     </div>
-                )}
-                {!ranking && editing && (
-                    <p className={styles.listName} data-testid='watch-edit-hint'>
-                        {!canDeleteList
-                            ? '只剩一個清單時不能刪除。按住右側握把拖曳可調整順序，按「−」移除。'
-                            : confirmDelete
-                                ? '自選清單與桌面共用，刪除後桌面也會看不到。'
-                                : '按住右側握把拖曳可調整順序，按「−」移除；也可按「⋯」或長按一列。'}
-                    </p>
                 )}
                 {!ranking && listError && <InlineNote tone='danger' role='alert' testId='watch-list-error'>{listError}</InlineNote>}
             </div>

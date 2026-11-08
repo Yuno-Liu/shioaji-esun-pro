@@ -89,8 +89,10 @@ interface DragState {
 export interface ListReorder {
     /** 拖曳中的代碼（開始與結束各更新一次） */
     dragging: string | null;
-    /** 拖曳中或剛放手：呼叫端擋下列點擊、長按 */
-    blocked(): boolean;
+    /**
+     * 拖曳中或剛放手：呼叫端擋下列點擊、長按。code＝被點的列（列點擊時傳入；自選多選中 WatchEditReorder 以此切換勾選並擋下）
+     */
+    blocked(code?: string): boolean;
     /** 握把事件（穩定的參照，列可 memo） */
     grip: {
         onPointerDown(code: string, e: ReactPointerEvent<HTMLElement>): void;

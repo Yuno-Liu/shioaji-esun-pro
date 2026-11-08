@@ -35,6 +35,8 @@ vi.mock('../../lib/shioaji', () => ({
     placeFuturesOrder: m.placeFuturesOrder,
 }));
 vi.mock('../../lib/api', () => ({ apiGet: async () => ({ code: [] }) }));
+// 編輯模式 chunk 以 lib/trade 的 notify 回報多選刪除結果（lib/trade 載入時會碰 window，node 測試環境以假的取代）
+vi.mock('../../lib/trade', () => ({ notify: vi.fn() }));
 vi.mock('../lib/hash-router', () => ({ navigate: vi.fn() }));
 vi.mock('../motion/haptics', () => ({ haptic: vi.fn(() => false) }));
 
