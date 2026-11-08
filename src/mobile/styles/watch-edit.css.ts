@@ -144,3 +144,16 @@ export const actions = style({
 });
 
 globalStyle(`${actions} > button`, { flex: '1 1 8rem' });
+
+/** 刪除群組確認畫面的標題（進入時焦點移到這裡；tabIndex -1，不顯示焦點外框以外的樣式） */
+export const confirmTitle = style({
+    margin: 0,
+    ...TEXT.headline,
+    color: vars.color.foreground,
+    outline: 'none',
+});
+
+/** 群組列首的勾選鍵：列的左內距已有 16，往左讓出一點，讓 44px 點擊區不把名稱擠窄 */
+export const groupCheck = style({
+    marginLeft: `calc(-1 * ${SPACE.s3})`,
+});

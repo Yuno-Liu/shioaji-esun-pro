@@ -22,10 +22,17 @@
 //   面板直列每個群組（清單），握把拖曳（useListReorder，與自選列相同的手勢規則與減少動態）、握把上 ↑／↓ 鍵與每列的 ↑／↓ 鍵
 //   一次移一格；放手或移動即存（saveListOrder → localStorage，再以 onOrder 通知自選頁重繪），「完成」關閉。伺服器的自選清單沒有順序欄位與排序 API，
 //   順序只存在這台裝置（localStorage），桌面不受影響；不發任何網路請求。自選頁清單分頁與交易頁 ☆ 面板都依這個順序顯示。
+// - 多選刪除群組（使用者要求「排序群組的時候也支援多選刪除，刪除時須使用者確認」）：排序群組面板的「選取」（aria-pressed）→
+//   每列勾選鍵（role=checkbox、「選取群組「主要」（7 檔）」、點列也可切換；握把與 ↑／↓ 隱藏；不提供全選——不能全部刪除）→
+//   底部「已選 N 個｜取消｜刪除 N 個群組」（N＝0、全選、清單忙碌或載入失敗時停用並寫原因）→ 同一面板切到確認畫面
+//   （「刪除 N 個群組？」、各群組檔數與合計、無法復原的警語、含目前群組時說明會切換）→「確定刪除」才發請求（deleteGroups）。
+//   進行中顯示進度、面板不可關閉；結束後一則摘要通知、回到排序、把刪掉的 id 從這台裝置的順序移除。只改自選，不下單（S1）。
 
 import { ChevronDown, ChevronUp, Circle, CircleCheck, CircleMinus, GripVertical, MoreHorizontal, Square, SquareCheck, SquareMinus } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from 'react';
+import { deleteWatchlist } from '../../lib/shioaji';
 import { notify } from '../../lib/trade';
+import { emitWatchlistChanged } from '../../lib/watchlist-sync';
 import { LIST_ORDER_KEY, orderLists, readListOrder } from '../lib/watch-list-order';
 import { useListReorder, type ListReorder } from '../lib/watch-reorder';
 import { useMobileWatchlist, type MobileWatchlist } from '../lib/watchlist-context';
@@ -283,14 +290,138 @@ export function moveId(ids: readonly string[], from: string, to: string): readon
     return next;
 }
 
-/** 排序群組面板：拖曳握把（或握把上 ↑／↓）、每列 ↑／↓ 鍵；移動即存在這台裝置，不發請求 */
+// ---------------------------------------------------------------------------
+// 多選刪除群組（排序群組面板的「選取」模式）
+
+export interface GroupDeleteResult {
+    /** 已刪除的群組名稱（依刪除順序；目前群組在最後） */
+    deleted: string[];
+    /** 已刪除的群組 id */
+    ids: string[];
+    /** 執行前已不存在而略過的群組名稱 */
+    skipped: string[];
+    /** 停止的原因；全部完成時 null */
+    reason: string | null;
+    /** 有刪到目前群組時，刪除後切換到的群組名稱 */
+    switchedTo: string | null;
+}
+
+/**
+ * 依序刪除群組（遇到第一個失敗就停止）。get() 回傳最新一次渲染的 hook 狀態。
+ * - 執行前再驗一次：hook 不在載入中／結構更新中／載入失敗、選取的群組仍存在（不存在的略過）、刪除後至少還剩一個。
+ * - 非目前的群組：lib 的 deleteWatchlist(id)，每個 1 次 DELETE（hook 只能刪目前清單，其他清單走 AI Agent 工具同一條外部變更路徑）。
+ * - 目前的群組（有選才做）：最後以 hook 的 deleteCurrentList()（排進該清單的寫入佇列，DELETE＋GET 清單，再切到伺服器順序的第一個清單）；
+ *   hook 在結構更新中會直接返回、不丟錯，所以等到該群組從 serverLists 消失才算刪除。
+ * - 刪過（或試過）非目前的群組、而 hook 的 serverLists 仍有它們時，最後 emitWatchlistChanged({ source: 'user' }) 一次讓 hook 重新讀取；
+ *   有刪到目前群組時，deleteCurrentList 的 GET 已經是伺服器的最新清單（也不含其他被刪的群組），就不再重新讀取（省一次整份重讀）。
+ *   事件放在最後：若在 deleteCurrentList 之前發，hook 的重新讀取會把結構鎖住，deleteCurrentList 會直接返回。
+ */
+export async function deleteGroups(get: () => MobileWatchlist, picked: readonly { id: string; name: string }[], onProgress: (deleted: number) => void): Promise<GroupDeleteResult> {
+    const result: GroupDeleteResult = { deleted: [], ids: [], skipped: [], reason: null, switchedTo: null };
+    const exists = (id: string) => get().serverLists.some(l => l.id === id);
+    const busyReason = (wl: MobileWatchlist) => (wl.loadError ? '自選清單載入失敗' : wl.loading || wl.structureBusy ? '自選清單更新中' : null);
+    const wl = get();
+    result.reason = busyReason(wl);
+    if (result.reason) return result;
+    const live = picked.filter(p => exists(p.id));
+    result.skipped = picked.filter(p => !exists(p.id)).map(p => p.name);
+    if (live.length && live.length >= wl.serverLists.length) {
+        result.reason = '至少要保留一個群組';
+        return result;
+    }
+    const active = live.find(p => p.id === wl.activeListId);
+    const others = live.filter(p => p !== active);
+    let tried = 0;
+    for (const p of others) {
+        tried++;
+        try {
+            await deleteWatchlist(p.id);
+        } catch (e) {
+            result.reason = `「${p.name}」${errText(e)}`;
+            break;
+        }
+        result.deleted.push(p.name);
+        result.ids.push(p.id);
+        onProgress(result.deleted.length);
+    }
+    if (active && !result.reason) {
+        const now = get();
+        result.reason = now.activeListId !== active.id ? '自選清單已切換' : busyReason(now);
+        if (!result.reason) {
+            try {
+                await now.deleteCurrentList();
+            } catch (e) {
+                result.reason = `「${active.name}」${errText(e)}`;
+            }
+            if (!result.reason && !(await settle(() => !exists(active.id)))) result.reason = '自選清單更新中';
+            if (!result.reason) {
+                result.deleted.push(active.name);
+                result.ids.push(active.id);
+                onProgress(result.deleted.length);
+                const after = get();
+                result.switchedTo = after.serverLists.find(l => l.id === after.activeListId)?.name ?? null;
+            }
+        }
+    }
+    if (others.slice(0, tried).some(p => exists(p.id))) emitWatchlistChanged({ source: 'user' });
+    return result;
+}
+
+/**
+ * 結果通知（一則）。只刪了目前群組且成功時回傳 null：hook 的 deleteCurrentList 已發「已刪除清單」，不再重複；
+ * 其他情況發摘要（含目前群組時，hook 那則會在摘要之前，摘要寫明切換到哪個群組）。
+ */
+export function groupDeleteSummary(r: GroupDeleteResult, total: number, activeName: string | null): { kind: 'ok' | 'err' | 'info'; title: string; body: string } | null {
+    const skipped = r.skipped.length ? `「${r.skipped.join('」「')}」已不存在，略過。` : '';
+    const switched = r.switchedTo ? `已切換到「${r.switchedTo}」。` : '';
+    if (r.reason) {
+        return { kind: 'err', title: '群組刪除未完成', body: `已刪除 ${r.deleted.length} 個，${total - r.skipped.length - r.deleted.length} 個未刪除：${r.reason}。${skipped}` };
+    }
+    if (!r.deleted.length) return { kind: 'info', title: '沒有刪除群組', body: skipped };
+    if (r.deleted.length === 1 && r.deleted[0] === activeName && !skipped) return null;
+    return { kind: 'ok', title: `已刪除 ${r.deleted.length} 個群組`, body: `${r.deleted.join('、')}。${switched}${skipped}` };
+}
+
+/** 選取模式「刪除 N 個群組」停用的原因；可刪時 null */
+export function groupDeleteBlocked(n: number, lists: number, wl: Pick<MobileWatchlist, 'loading' | 'structureBusy' | 'loadError'>): string | null {
+    if (!n) return '請選取要刪除的群組';
+    if (n >= lists) return '至少要保留一個群組';
+    if (wl.loadError) return '自選清單載入失敗';
+    return wl.loading || wl.structureBusy ? '自選清單更新中' : null;
+}
+
+/**
+ * 排序群組面板：拖曳握把（或握把上 ↑／↓）、每列 ↑／↓ 鍵；移動即存在這台裝置，不發請求。
+ * 「選取」模式：每列勾選鍵（點列也可切換）、底部「已選 N 個｜取消｜刪除 N 個群組」；刪除先在同一面板切到確認畫面
+ * （列出群組、檔數與合計、警語；焦點移到確認標題，返回時回到刪除鍵），按「確定刪除」才發請求（deleteGroups）。
+ */
 function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boolean; onClose: () => void; reducedMotion: () => boolean; onOrder: () => void }) {
-    const { serverLists } = useMobileWatchlist();
+    const wl = useMobileWatchlist();
+    const latest = useRef(wl);
+    latest.current = wl;
+    const { serverLists, activeListId } = wl;
     /** 存在這台裝置的順序（開啟時重新讀取；移動時更新並存檔） */
     const [saved, setSaved] = useState<readonly string[]>(readListOrder);
-    useEffect(() => { if (open) setSaved(readListOrder()); }, [open]);
-    const lists = useMemo(() => orderLists(serverLists, saved), [serverLists, saved]);
+    /** sort：排序；select：選取要刪除的群組；confirm：刪除確認（同一面板） */
+    const [mode, setMode] = useState<'sort' | 'select' | 'confirm'>('sort');
+    const [sel, setSel] = useState<ReadonlySet<string>>(() => new Set());
+    /** 刪除進行中：已刪除幾個／共幾個 */
+    const [run, setRun] = useState<{ done: number; total: number } | null>(null);
+    /** 這次刪掉的群組：hook 重新讀取完成前 serverLists 可能還有它們，先不顯示（伺服器上已刪除） */
+    const [dropped, setDropped] = useState<readonly string[]>([]);
+    useEffect(() => {
+        if (!open) return;
+        setSaved(readListOrder());
+        setMode('sort');
+        setSel(new Set());
+        setDropped([]);
+    }, [open]);
+    const lists = useMemo(() => orderLists(serverLists.filter(l => !dropped.includes(l.id)), saved), [serverLists, saved, dropped]);
     const ids = useMemo(() => lists.map(l => l.id), [lists]);
+    // 清單裡消失的群組移出選取（刪除進行中除外：確認畫面要列出全部）
+    useEffect(() => {
+        if (!run && [...sel].some(id => !ids.includes(id))) setSel(new Set([...sel].filter(id => ids.includes(id))));
+    }, [ids, sel, run]);
     const listRef = useRef<HTMLUListElement | null>(null);
     const move = useCallback((from: string, to: string) => {
         const next = moveId(ids, from, to);
@@ -298,7 +429,8 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
         saveListOrder(next);
         onOrder();
     }, [ids, onOrder]);
-    const { dragging, grip } = useListReorder({ listRef, codes: ids, disabled: !open, onMove: move, reducedMotion });
+    const sorting = mode === 'sort';
+    const { dragging, grip } = useListReorder({ listRef, codes: ids, disabled: !open || !sorting, onMove: move, reducedMotion });
     /** ↑／↓ 鍵移動後把焦點放回同一列的同方向鍵（到頂／底而停用時改放另一個方向）；列以 id 為 key，DOM 搬移時可能失焦 */
     const refocus = useRef<{ id: string; dir: 'up' | 'down' } | null>(null);
     useLayoutEffect(() => {
@@ -316,71 +448,214 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
         move(id, to);
     };
 
+    // 選取與確認
+    const toggle = (id: string) => {
+        if (mode !== 'select') return;
+        const next = new Set(sel);
+        if (!next.delete(id)) next.add(id);
+        setSel(next);
+    };
+    const picked = lists.filter(l => sel.has(l.id));
+    const n = picked.length;
+    const blocked = groupDeleteBlocked(n, lists.length, wl);
+    const activeName = serverLists.find(l => l.id === activeListId)?.name ?? null;
+    /** 確認畫面的標題（進入時焦點移到這裡）與選取模式的刪除鍵（返回時焦點回到這裡） */
+    const confirmTitle = useRef<HTMLHeadingElement | null>(null);
+    const deleteBtn = useRef<HTMLButtonElement | null>(null);
+    const focusAfter = useRef<'title' | 'delete' | null>(null);
+    useLayoutEffect(() => {
+        const f = focusAfter.current;
+        focusAfter.current = null;
+        const el = f === 'title' ? confirmTitle.current : f === 'delete' ? deleteBtn.current : null;
+        if (el && typeof el.focus === 'function') el.focus();
+    }, [mode]);
+    const exitSelect = () => {
+        setSel(new Set());
+        setMode('sort');
+    };
+    const confirm = async () => {
+        if (run || groupDeleteBlocked(n, lists.length, latest.current)) return;
+        const targets = picked.map(l => ({ id: l.id, name: l.name }));
+        setRun({ done: 0, total: targets.length });
+        const result = await deleteGroups(() => latest.current, targets, done => setRun({ done, total: targets.length }));
+        // 刪掉的群組從這台裝置的順序移除（只留仍存在的清單）
+        const left = orderLists(latest.current.serverLists, saved).map(l => l.id).filter(id => !result.ids.includes(id));
+        setDropped(result.ids);
+        setSaved(left);
+        saveListOrder(left);
+        onOrder();
+        setRun(null);
+        setSel(new Set());
+        setMode('sort');
+        const summary = groupDeleteSummary(result, targets.length, activeName);
+        if (summary) notify(summary);
+    };
+
+    const total = picked.reduce((s, l) => s + l.contracts.length, 0);
+    const footer = mode === 'confirm' ? (
+        <div className={edit.actions}>
+            <button
+                type='button'
+                className={button.neutral}
+                disabled={run !== null}
+                onClick={() => {
+                    focusAfter.current = 'delete';
+                    setMode('select');
+                }}
+                data-testid='watch-group-del-back'
+            >
+                返回
+            </button>
+            <button type='button' className={button.danger} disabled={run !== null || blocked !== null} onClick={() => void confirm()} data-testid='watch-group-del-ok'>
+                {run ? '刪除中…' : `確定刪除 ${n} 個群組`}
+            </button>
+        </div>
+    ) : mode === 'select' ? (
+        <div className={edit.sheetBody}>
+            <p className={edit.barCount} role='status' data-testid='watch-group-sel-count'>{`已選 ${n} 個`}</p>
+            {blocked && <p className={edit.note} data-testid='watch-group-del-reason'>{blocked}</p>}
+            <div className={edit.actions}>
+                <button type='button' className={button.neutral} onClick={exitSelect} data-testid='watch-group-sel-cancel'>取消</button>
+                <button
+                    ref={deleteBtn}
+                    type='button'
+                    className={`${edit.dangerOutline} ${pressable} ${focusRing}`}
+                    disabled={blocked !== null}
+                    onClick={() => {
+                        focusAfter.current = 'title';
+                        setMode('confirm');
+                    }}
+                    data-testid='watch-group-del'
+                >
+                    {`刪除 ${n} 個群組`}
+                </button>
+            </div>
+        </div>
+    ) : (
+        // 與其他面板一致：鍵填滿底部寬度（edit.actions 的子鍵 flex 1）
+        <div className={edit.actions}>
+            <button type='button' className={button.primary} onClick={onClose} data-testid='watch-group-sort-done'>完成</button>
+        </div>
+    );
+
     return (
-        <BottomSheet
-            open={open}
-            onClose={onClose}
-            title='排序群組'
-            testId='watch-group-sort'
-            footer={(
-                // 與其他面板一致：鍵填滿底部寬度（edit.actions 的子鍵 flex 1）
-                <div className={edit.actions}>
-                    <button type='button' className={button.primary} onClick={onClose} data-testid='watch-group-sort-done'>完成</button>
+        <BottomSheet open={open} onClose={onClose} dismissible={run === null} title='排序群組' testId='watch-group-sort' footer={footer}>
+            {mode === 'confirm' ? (
+                <div className={edit.sheetBody} data-testid='watch-group-del-confirm'>
+                    <h3 ref={confirmTitle} tabIndex={-1} className={edit.confirmTitle} data-testid='watch-group-del-title'>{`刪除 ${n} 個群組？`}</h3>
+                    <ul className={`${edit.sheetList} ${edit.sheetListScroll}`} aria-label='要刪除的群組' data-testid='watch-group-del-list'>
+                        {picked.map(l => (
+                            <li key={l.id} className={edit.sheetItem}>
+                                <span className={edit.itemName}>{l.name}{l.id === activeListId ? '（目前）' : ''}</span>
+                                <span className={edit.itemMeta}>{`${l.contracts.length} 檔`}</span>
+                            </li>
+                        ))}
+                    </ul>
+                    <p className={edit.note} data-testid='watch-group-del-total'>{`合計 ${total} 檔。自選清單與桌面共用，刪除後桌面也會看不到，無法復原。`}</p>
+                    {picked.some(l => l.id === activeListId) && (
+                        <p className={edit.note} data-testid='watch-group-del-active'>包含目前的群組，刪除後會切換到其他群組。</p>
+                    )}
+                    <p className={edit.note} role='status' data-testid='watch-group-del-progress'>{run ? `刪除中 ${run.done}／${run.total}…` : ''}</p>
+                </div>
+            ) : (
+                <div className={edit.sheetBody}>
+                    <p className={edit.note}>
+                        {sorting
+                            ? '拖曳右側握把，或按 ↑／↓ 調整自選頁群組分頁的順序。群組順序只存在這台裝置，桌面不受影響。'
+                            : '勾選要刪除的群組（點一列也可以勾選），至少要保留一個群組。'}
+                    </p>
+                    <div className={styles.listTools}>
+                        <button
+                            type='button'
+                            className={`${styles.listTool} ${edit.toolOn} ${pressable} ${focusRing}`}
+                            aria-pressed={!sorting}
+                            disabled={lists.length < 2}
+                            onClick={() => (sorting ? setMode('select') : exitSelect())}
+                            data-testid='watch-group-select'
+                        >
+                            {!sorting && <CircleCheck size={18} aria-hidden='true' focusable='false' />}
+                            選取
+                        </button>
+                    </div>
+                    <ul ref={listRef} className={edit.sheetList} aria-label={sorting ? '群組順序' : '選取要刪除的群組'} data-testid='watch-group-sort-list'>
+                        {lists.map((l, i) => {
+                            const checked = sel.has(l.id);
+                            const Check = checked ? CircleCheck : Circle;
+                            return (
+                                <li
+                                    key={l.id}
+                                    data-code={l.id}
+                                    className={`${edit.sheetItem}${dragging === l.id ? ` ${styles.rowDragging}` : ''}`}
+                                    onClick={sorting ? undefined : () => toggle(l.id)}
+                                    data-testid='watch-group-row'
+                                >
+                                    {!sorting && (
+                                        <button
+                                            type='button'
+                                            role='checkbox'
+                                            aria-checked={checked}
+                                            aria-label={`選取群組「${l.name}」（${l.contracts.length} 檔）`}
+                                            className={`${iconStyles.button.regular} ${edit.check} ${edit.groupCheck} ${pressable} ${focusRing}`}
+                                            onClick={e => {
+                                                e.stopPropagation();
+                                                toggle(l.id);
+                                            }}
+                                            data-testid='watch-group-check'
+                                        >
+                                            <Check size={22} aria-hidden='true' focusable='false' />
+                                        </button>
+                                    )}
+                                    <span className={edit.itemName}>{l.name}{l.id === activeListId ? '（目前）' : ''}</span>
+                                    <span className={edit.itemMeta}>{`${l.contracts.length} 檔`}</span>
+                                    {sorting && (
+                                        <span className={styles.trailingPair}>
+                                            <button
+                                                type='button'
+                                                className={`${iconStyles.button.regular} ${pressable} ${focusRing}`}
+                                                aria-label={`上移「${l.name}」`}
+                                                disabled={i === 0}
+                                                onClick={() => step(l.id, 'up')}
+                                                data-dir='up'
+                                                data-testid='watch-group-up'
+                                            >
+                                                <ChevronUp size={20} aria-hidden='true' focusable='false' />
+                                            </button>
+                                            <button
+                                                type='button'
+                                                className={`${iconStyles.button.regular} ${pressable} ${focusRing}`}
+                                                aria-label={`下移「${l.name}」`}
+                                                disabled={i === lists.length - 1}
+                                                onClick={() => step(l.id, 'down')}
+                                                data-dir='down'
+                                                data-testid='watch-group-down'
+                                            >
+                                                <ChevronDown size={20} aria-hidden='true' focusable='false' />
+                                            </button>
+                                            <button
+                                                type='button'
+                                                className={`${styles.grip} ${focusRing}`}
+                                                aria-label={`拖曳以調整「${l.name}」的位置`}
+                                                aria-keyshortcuts='ArrowUp ArrowDown'
+                                                onPointerDown={e => grip.onPointerDown(l.id, e)}
+                                                onPointerMove={grip.onPointerMove}
+                                                onPointerUp={grip.onPointerUp}
+                                                onPointerCancel={grip.onPointerCancel}
+                                                onLostPointerCapture={grip.onPointerCancel}
+                                                onKeyDown={e => grip.onKeyDown(l.id, e)}
+                                                onClick={grip.onClick}
+                                                onContextMenu={e => e.preventDefault()}
+                                                data-testid='watch-group-grip'
+                                            >
+                                                <GripVertical size={20} aria-hidden='true' focusable='false' />
+                                            </button>
+                                        </span>
+                                    )}
+                                </li>
+                            );
+                        })}
+                    </ul>
                 </div>
             )}
-        >
-            <div className={edit.sheetBody}>
-                <p className={edit.note}>拖曳右側握把，或按 ↑／↓ 調整自選頁群組分頁的順序。群組順序只存在這台裝置，桌面不受影響。</p>
-                <ul ref={listRef} className={edit.sheetList} aria-label='群組順序' data-testid='watch-group-sort-list'>
-                    {lists.map((l, i) => (
-                        <li key={l.id} data-code={l.id} className={`${edit.sheetItem}${dragging === l.id ? ` ${styles.rowDragging}` : ''}`} data-testid='watch-group-row'>
-                            <span className={edit.itemName}>{l.name}</span>
-                            <span className={edit.itemMeta}>{`${l.contracts.length} 檔`}</span>
-                            <span className={styles.trailingPair}>
-                                <button
-                                    type='button'
-                                    className={`${iconStyles.button.regular} ${pressable} ${focusRing}`}
-                                    aria-label={`上移「${l.name}」`}
-                                    disabled={i === 0}
-                                    onClick={() => step(l.id, 'up')}
-                                    data-dir='up'
-                                    data-testid='watch-group-up'
-                                >
-                                    <ChevronUp size={20} aria-hidden='true' focusable='false' />
-                                </button>
-                                <button
-                                    type='button'
-                                    className={`${iconStyles.button.regular} ${pressable} ${focusRing}`}
-                                    aria-label={`下移「${l.name}」`}
-                                    disabled={i === lists.length - 1}
-                                    onClick={() => step(l.id, 'down')}
-                                    data-dir='down'
-                                    data-testid='watch-group-down'
-                                >
-                                    <ChevronDown size={20} aria-hidden='true' focusable='false' />
-                                </button>
-                                <button
-                                    type='button'
-                                    className={`${styles.grip} ${focusRing}`}
-                                    aria-label={`拖曳以調整「${l.name}」的位置`}
-                                    aria-keyshortcuts='ArrowUp ArrowDown'
-                                    onPointerDown={e => grip.onPointerDown(l.id, e)}
-                                    onPointerMove={grip.onPointerMove}
-                                    onPointerUp={grip.onPointerUp}
-                                    onPointerCancel={grip.onPointerCancel}
-                                    onLostPointerCapture={grip.onPointerCancel}
-                                    onKeyDown={e => grip.onKeyDown(l.id, e)}
-                                    onClick={grip.onClick}
-                                    onContextMenu={e => e.preventDefault()}
-                                    data-testid='watch-group-grip'
-                                >
-                                    <GripVertical size={20} aria-hidden='true' focusable='false' />
-                                </button>
-                            </span>
-                        </li>
-                    ))}
-                </ul>
-            </div>
         </BottomSheet>
     );
 }

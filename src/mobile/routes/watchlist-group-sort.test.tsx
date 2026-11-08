@@ -250,7 +250,7 @@ describe('排序群組面板', () => {
         expect(sheet()!.props.open).toBe(true);
         expect(sheet()!.props.title).toBe('排序群組');
         expect(sheetOrder()).toEqual(['b', 'a', 'c']);
-        expect(sheetRows().map(r => textOf(r))).toEqual(['觀察1 檔', '主要2 檔', '短線0 檔']);
+        expect(sheetRows().map(r => textOf(r))).toEqual(['觀察1 檔', '主要（目前）2 檔', '短線0 檔']);
         expect(textOf(sheet()!.findAll(n => n.type === 'p')[0]!)).toContain('群組順序只存在這台裝置');
         expect(inRow('b', 'watch-group-up').props.disabled).toBe(true);
         expect(inRow('b', 'watch-group-down').props.disabled).toBe(false);
