@@ -4,24 +4,31 @@
 //   達上限（主圖 4、副圖 2）時停用「加入」並說明原因。
 // - 點已啟用的指標 → 編輯參數：數字輸入（inputmode）、−／＋ 依步進、夾在定義的範圍內、恢復預設、顏色。
 // - 設定由 lib/mobile-indicators.ts 保存（localStorage），圖表即時套用。
+// - 快速範本（當沖、波段、長線）：一鍵取代目前設定，不跳確認；之後就地顯示「已套用」＋［復原］（一步，還原套用前的設定）。
+//   設定再被改動（加入、移除、改參數…）後復原失效、說明消失；復原後焦點回到該範本的套用鍵。
 // - 外觀沿用設計規格的元件語彙（elevatedBg 鍵、中性島輸入框、InlineNote 說明）；只改樣式，不改行為與 testid。
 
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { DEF_BY_TYPE, type IndicatorDef, type ParamDef } from '../../lib/indicator-defs';
 import {
     MOBILE_INDICATOR_DEFS,
     INDICATOR_PALETTE,
+    INDICATOR_TEMPLATES,
     categoryCount,
     categoryLimit,
     clampParam,
+    getIndicatorSettings,
     indicatorLabel,
     indicatorName,
     limitReason,
     paletteColor,
+    templateSummary,
     useMobileIndicators,
     usesPaletteColor,
     type IndicatorCategory,
+    type IndicatorTemplate,
     type MobileIndicator,
+    type MobileIndicatorSettings,
 } from '../lib/mobile-indicators';
 import * as styles from '../styles/chart.css';
 import { InlineNote } from '../ui/inline-note';
@@ -67,6 +74,72 @@ export function IndicatorSheet({ open, onClose, lineMode = false }: IndicatorShe
     );
 }
 
+/** 套用範本後的復原資訊：applied 仍是目前設定（同一物件）時才能復原 */
+interface TemplateUndo {
+    template: IndicatorTemplate;
+    prev: MobileIndicatorSettings;
+    applied: MobileIndicatorSettings;
+}
+
+function TemplateSection() {
+    const ind = useMobileIndicators();
+    const [undo, setUndo] = useState<TemplateUndo | null>(null);
+    const buttons = useRef(new Map<string, HTMLButtonElement>());
+    const canUndo = undo !== null && undo.applied === ind.settings;
+    const apply = (t: IndicatorTemplate) => {
+        const prev = ind.applyTemplate(t);
+        // applyTemplate 已同步寫入 store：此時的 getter 就是套用後的設定
+        setUndo({ template: t, prev, applied: getIndicatorSettings() });
+    };
+    const revert = () => {
+        if (!undo) return;
+        ind.replace(undo.prev);
+        setUndo(null);
+        buttons.current.get(undo.template.id)?.focus();
+    };
+    return (
+        <section className={styles.section} aria-label='快速範本' data-testid='indicator-templates'>
+            <h3 className={styles.sectionHead}>
+                <span>快速範本</span>
+                <span className={styles.sectionCount}>取代目前設定</span>
+            </h3>
+            {canUndo && (
+                <div className={styles.sheetNote}>
+                    <InlineNote
+                        tone='info'
+                        role='status'
+                        testId='indicator-template-applied'
+                        action={{ label: '復原', onClick: revert, testId: 'indicator-template-undo' }}
+                    >
+                        已套用「{undo.template.label}」範本，原本的設定已取代。
+                    </InlineNote>
+                </div>
+            )}
+            {INDICATOR_TEMPLATES.map(t => {
+                const summary = `${templateSummary(t)}＋成交量`;
+                return (
+                    <div key={t.id} className={styles.defRow}>
+                        <span className={styles.defText}>
+                            <span className={styles.defName}>{t.label}</span>
+                            <span className={styles.defDesc}>{summary}</span>
+                        </span>
+                        <button
+                            ref={el => { if (el) buttons.current.set(t.id, el); else buttons.current.delete(t.id); }}
+                            type='button'
+                            className={styles.smallButton}
+                            aria-label={`套用「${t.label}」範本：${summary}（取代目前設定）`}
+                            onClick={() => apply(t)}
+                            data-testid={`indicator-template-${t.id}`}
+                        >
+                            套用
+                        </button>
+                    </div>
+                );
+            })}
+        </section>
+    );
+}
+
 function IndicatorList({ lineMode, onEdit }: { lineMode: boolean; onEdit: (id: string) => void }) {
     const ind = useMobileIndicators();
     const s = ind.settings;
@@ -78,6 +151,7 @@ function IndicatorList({ lineMode, onEdit }: { lineMode: boolean; onEdit: (id: s
                     <InlineNote tone='info'>走勢圖只顯示均價線、當日最高最低與成交量；以下指標套用在 K 線（1 分以上）。</InlineNote>
                 </div>
             )}
+            <TemplateSection />
             <div className={styles.toggleRow}>
                 <span>成交量（K 線）</span>
                 <button
