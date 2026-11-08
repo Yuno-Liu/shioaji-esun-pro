@@ -1239,6 +1239,8 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
   - 加入排行新種類與篩選、指標範本、日內區間小條、交易頁 ☆ 後：222,909 bytes（+228，全部來自自選列的日內區間小條；其餘都在延遲載入的 chunk）。
   - 加入通知中心與憑證提醒後：223,299 bytes（+390：精簡鈴路徑、未讀數訂閱、延遲面板外殼與載入入口），超出 218 KiB 目標 67 bytes。
   - 「需要 HTTPS」說明頁改為只在非 secure context 才載入（§7.8）：**222,187 bytes（217.0 KiB，15 個 JS）**，第 1 期全部功能加入後仍在目標內，剩約 1.0 KiB。
+  - 深度審查修正後最終：222,197 bytes（217.0 KiB，15 個 JS）。
+  - 桌面 `index.html` 802.9 → 805.2 KiB（38 → 43 個 JS）、`approval.html` 79.3 KiB 不變：桌面程式碼沒有改，但手機延遲載入的 chunk 與桌面共用了 lib 模組（`contract-cost`、`credit-eligibility`、`market-pulse`、`stock-runtime-catalog`、`volume-ratio`），rolldown 把它們拆成共用檔，桌面多 5 個請求，gzip 多約 2.3 KiB（raw 只多 1.4 KiB）。
   - 注意：在延遲載入的 chunk 新增 `.css.ts`，或匯入被打包在別的 chunk 的 tokens，會讓首屏 mobile.js 的預載對照表變長（約 +20 bytes）。
 - 未處理（需要修改 `src/lib`，R2 不允許，列入 §16）：trading-state 每筆 tick 重算全部持倉並發布、每秒以 BroadcastChannel 傳出整份 state（P2 根因、P14）；SSE 第一次連線就發 RECONNECT 合約刷新，冷啟動同一份合約抓 3 次（P4）；自選快照等全部合約 info 才讀，LCP 被最慢的一筆卡住（P5）；首屏帶入 Tauri 橋接、閃電下單模組、MockEsunDriver 與玉山整合（P6、P7、P8、P15，稽核估計合計約 50 KiB gzip）。
 
