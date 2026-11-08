@@ -1477,7 +1477,8 @@ describe('TradePage 自選 ☆', () => {
     });
 
     it('只改目前清單：hook 的 removeSymbol，不發重新讀取事件', async () => {
-        const wl = makeWl({ activeListId: 'L3' });
+        // 目前清單是 L3（含 2330）：hook 的本機列表也有這檔（與伺服器一致）
+        const wl = makeWl({ activeListId: 'L3', items: [{ contract: { code: '2330' } }, { contract: { code: '2454' } }] });
         m.wl = wl;
         await render();
         await openPicker();
