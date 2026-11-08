@@ -22,7 +22,7 @@ import { useFillSound } from './hooks/use-fill-sound';
 import { useHtmlAttributes } from './hooks/use-html-attributes';
 import { useRiskPnlFeed } from './hooks/use-risk-pnl-feed';
 import { useWakeLock } from './hooks/use-wake-lock';
-import { loadRankingList, loadSearchSheet, loadWatchListSheet, loadWatchSparkline } from './lib/deferred-modules';
+import { loadNoticeCenterSheet, loadRankingList, loadSearchSheet, loadWatchListSheet, loadWatchSparkline } from './lib/deferred-modules';
 import { formatRoute, isCanonicalHash, lastMarketSegment, navigate, parseHash, useHashRoute, type MobileRoute, type MobileTab } from './lib/hash-router';
 import { constrainedNetwork, currentConnection, schedulePrefetchSequence } from './lib/idle-prefetch';
 import { closeOrderAction, closeTicket, setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
@@ -72,6 +72,7 @@ const PREFETCH_DELAY_MS = 1_500;
  * 分頁與面板呼叫 retryableLazy 的 preload()：resolve 後第一次進入直接渲染、不 suspend（稽核 P3）；自選頁內的模組呼叫載入入口，
  * 自選編輯鍵例外：呼叫自選頁匯出的 preloadWatchEditControls（三個 lazy 的 preload），第一次進入編輯模式不閃空白佔位。
  * essential：省流量或 2g／3g 時仍預載的（迷你走勢、下單面板、交易頁；稽核 P10），其餘等真正用到才載入。
+ * 最後是通知中心面板（同一個 chunk 帶憑證到期提醒，載入後執行；essential：省流量時也提醒，本身很小）。
  */
 const DEFERRED_MODULES: readonly { load: () => Promise<unknown>; essential?: true }[] = [
     { load: loadWatchSparkline, essential: true },
@@ -86,6 +87,9 @@ const DEFERRED_MODULES: readonly { load: () => Promise<unknown>; essential?: tru
     { load: preloadWatchEditControls },
     { load: MarketPage.preload },
     { load: loadRankingList },
+    // 最後一項：通知中心面板的 chunk，載入後執行前景憑證到期提醒（每個台北日最多一次，見 lib/ca-expiry-check.ts）。
+    // essential：省流量時也提醒；promise 在檢查結束（或放棄）時才 resolve，它是最後一項，不擋其他預載。
+    { load: () => loadNoticeCenterSheet().then(m => m.runCaExpiryCheck()), essential: true },
 ];
 
 /**

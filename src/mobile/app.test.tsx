@@ -14,6 +14,8 @@ const m = vi.hoisted(() => ({
     deferredFail: false,
     /** 產業分頁模組已被 import（app.tsx 直接延遲載入，列入閒置預載；mock factory 在第一次 import 時執行） */
     sectorImported: false,
+    /** 前景憑證到期提醒（閒置預載序列最後一項）被執行的次數 */
+    caRuns: 0,
 }));
 
 vi.mock('../lib/stream', () => ({ ensureStream: () => undefined }));
@@ -82,6 +84,12 @@ vi.mock('./lib/deferred-modules', () => ({
         if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: watch-list-sheet.js');
         return {};
     },
+    // 通知中心面板的 chunk 同時帶前景憑證到期提醒：閒置預載最後一項載入後執行 runCaExpiryCheck
+    loadNoticeCenterSheet: async () => {
+        m.deferredLoads.push('notice-center-sheet');
+        if (m.deferredFail) throw new TypeError('Failed to fetch dynamically imported module: notice-center-sheet.js');
+        return { runCaExpiryCheck: async () => { m.caRuns++; } };
+    },
 }));
 
 import { MobileShell } from './app';
@@ -115,6 +123,7 @@ beforeEach(() => {
     m.ticketLoads = 0;
     m.deferredLoads = [];
     m.deferredFail = false;
+    m.caRuns = 0;
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
@@ -167,8 +176,8 @@ describe('MobileShell lazy module failures', () => {
 });
 
 /** 閒置預載全部完成所需時間：1.5 秒延遲＋其後每個間隔 100ms（12 個模組）再多留一點 */
-const PREFETCH_ALL_MS = 1_500 + 12 * 100 + 200;
-const ALL_DEFERRED = ['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'watch-edit-controls', 'ranking-list'];
+const PREFETCH_ALL_MS = 1_500 + 14 * 100 + 200;
+const ALL_DEFERRED = ['watch-sparkline', 'search-sheet', 'watch-list-sheet', 'watch-edit-controls', 'ranking-list', 'notice-center-sheet'];
 
 /**
  * 推進假時鐘；每 100ms（預載間隔）等一次動態 import 完成（分頁與面板的 preload() 是真的 import()，會在真實時間 resolve，
@@ -194,7 +203,7 @@ describe('MobileShell idle prefetch', () => {
         store.resetMobileUiForTest();
         openTicketFresh = store.openTicket;
     });
-    it('首屏完成 1.5 秒後逐一預載（稽核 P10）：迷你走勢第一個，之後每 100ms 一個、同一時間只發一個；含搜尋面板、清單名稱面板、自選編輯鍵與排行', async () => {
+    it('首屏完成 1.5 秒後逐一預載（稽核 P10）：迷你走勢第一個，之後每 100ms 一個、同一時間只發一個；含搜尋面板、清單名稱面板、自選編輯鍵、排行與通知中心（最後，載入後執行一次憑證到期提醒）', async () => {
         m.failOrders = false;
         await mount(Shell);
         const ticket0 = m.ticketLoads;
@@ -211,9 +220,14 @@ describe('MobileShell idle prefetch', () => {
         expect(m.deferredLoads).toEqual(['watch-sparkline']);
         await advance(100);
         expect(m.deferredLoads).toEqual(['watch-sparkline', 'search-sheet']);
+        expect(m.caRuns).toBe(0);
         await advance(PREFETCH_ALL_MS);
         expect(m.deferredLoads).toEqual(ALL_DEFERRED);
         expect(m.ticketLoads).toBe(ticket0 + 1);
+        // 最後一項：通知中心 chunk 載入後執行一次前景憑證到期提醒；之後不再執行
+        expect(m.caRuns).toBe(1);
+        await advance(1_000);
+        expect(m.caRuns).toBe(1);
         expectPersistentChromeMounted();
     });
 
@@ -248,7 +262,9 @@ describe('MobileShell idle prefetch', () => {
         await mount(Shell);
         const ticket0 = m.ticketLoads;
         await advance(PREFETCH_ALL_MS);
-        expect(m.deferredLoads).toEqual(['watch-sparkline']);
+        // 通知中心 chunk（帶憑證到期提醒）也是 essential
+        expect(m.deferredLoads).toEqual(['watch-sparkline', 'notice-center-sheet']);
+        expect(m.caRuns).toBe(1);
         expect(m.ticketLoads).toBe(ticket0 + 1);
         expectPersistentChromeMounted();
     });

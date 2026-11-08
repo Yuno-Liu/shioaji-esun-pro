@@ -17,6 +17,7 @@ const m = vi.hoisted(() => {
         route: { simulation: false } as { simulation: boolean | undefined },
         fetchSettlements: vi.fn(),
         fetchHealth: vi.fn(),
+        shareHealth: vi.fn(<T,>(p: T) => p),
         fetchInfo: vi.fn(),
         fetchProfitLoss: vi.fn(),
         fetchProfitLossSummary: vi.fn(),
@@ -84,6 +85,8 @@ vi.mock('../../lib/stream', () => ({ getLastHeartbeat: () => 0, streamConnection
 vi.mock('../../hooks/use-stream', () => ({ useStreamStatus: () => 'live' }));
 vi.mock('../../hooks/use-monitor-resource', () => ({ useMonitorResource: () => ({ data: m.usage, error: '', updated: null, base: '' }) }));
 vi.mock('../../lib/server-info-store', () => ({ useServerInfo: () => m.info }));
+// 伺服器卡把 health 讀取登記給前景憑證提醒（lib/ca-expiry-check.ts）；這裡只需原樣傳回，不載入提醒模組的相依
+vi.mock('../lib/ca-expiry-check', () => ({ shareHealth: m.shareHealth }));
 vi.mock('../../lib/shioaji', () => ({
     fetchSettlements: m.fetchSettlements,
     fetchHealth: m.fetchHealth,
@@ -188,6 +191,7 @@ beforeEach(() => {
         { date: twDate(2), amount: 12000, T: 2 },
     ]);
     m.fetchHealth.mockReset().mockResolvedValue({ status: 'ok', version: '1.7.10', ca_expires_in_days: 120 });
+    m.shareHealth.mockClear();
     m.fetchInfo.mockReset().mockResolvedValue({ version: '1.7.10', simulation: true });
     m.fetchProfitLoss.mockReset().mockImplementation(async (market: string) => (market === 'S'
         ? [stockPnl(1, '2330', 300), stockPnl(2, '2317', -900)]
@@ -644,6 +648,9 @@ describe('AccountPage status', () => {
         expect(allByTestId('diag-build')).toHaveLength(1);
         expect(m.refreshHealth).toHaveBeenCalledTimes(1);
         expect(m.fetchHealth).toHaveBeenCalledTimes(1);
+        // 伺服器卡的 health 讀取登記給前景憑證提醒沿用（同一個 promise，不另發）
+        expect(m.shareHealth).toHaveBeenCalledTimes(1);
+        expect(m.shareHealth.mock.calls[0]![0]).toBe(m.fetchHealth.mock.results[0]!.value);
     });
 
     it('shows E.SUN bridge session state from the service health', async () => {

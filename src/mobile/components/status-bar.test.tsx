@@ -24,7 +24,12 @@ vi.mock('../../lib/esun/stream', () => ({ getEsunStreamStatus: () => 'idle' }));
 vi.mock('../../lib/order-route', () => ({ routeEnvText: (s: boolean | undefined) => (s === true ? '模擬' : s === false ? '正式' : '環境未確認') }));
 vi.mock('../../lib/risk', () => ({ setRiskSettings: vi.fn(), useRiskSettings: () => ({ locked: false }) }));
 vi.mock('../../lib/stream', () => ({ getLastHeartbeat: () => 0, streamConnectionEpoch: () => 3 }));
-vi.mock('../../lib/trade', () => ({ isFuturesContract: (c: { security_type: string }) => c.security_type === 'FUT' || c.security_type === 'OPT' }));
+const NO_NOTICES: never[] = [];
+vi.mock('../../lib/trade', () => ({
+    isFuturesContract: (c: { security_type: string }) => c.security_type === 'FUT' || c.security_type === 'OPT',
+    getNoticeLog: () => NO_NOTICES,
+    subscribeNoticeLog: () => () => undefined,
+}));
 vi.mock('../../lib/privacy', () => ({ usePrivacyMode: () => false }));
 vi.mock('../../hooks/use-stream', () => ({ useStreamStatus: () => 'live' }));
 vi.mock('../hooks/use-resume-gate', () => ({ useResumeGate: () => m.gate }));

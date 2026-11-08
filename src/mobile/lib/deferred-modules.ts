@@ -23,3 +23,10 @@ export const loadWatchListSheet = () => import('../components/watch-list-sheet')
  * 載入前與載入失敗時列首、列尾是同尺寸空白佔位，失敗在清單上方顯示「載入失敗」＋［重試］；非編輯模式的列不受影響。
  */
 export const loadWatchEditControls = () => import('../components/watch-edit-controls');
+/**
+ * 通知中心面板（狀態列的鈴）：首屏只有鈴與未讀數（status-bar.tsx），面板第一次開啟才掛載。
+ * 這個 chunk 也帶前景憑證到期提醒（notice-center-sheet 轉出 lib/ca-expiry-check 的 runCaExpiryCheck）：
+ * 閒置預載序列的最後一項 import 它並執行一次檢查（app.tsx），面板因此第一次開啟時通常已在快取
+ * （狀態列面板延遲載入的「點了沒有回饋」風險見上方說明）。兩者共用一個載入入口：首屏少一個載入函式與預載清單項目。
+ */
+export const loadNoticeCenterSheet = () => import('../components/notice-center-sheet');

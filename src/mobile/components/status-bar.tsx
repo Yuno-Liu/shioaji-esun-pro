@@ -12,31 +12,52 @@
 //   環境實心小膠囊：「正式」danger、「模擬」accent、「環境未確認」amber。點擊開啟帳戶切換面板。
 // - 風控鎖：鎖定時 danger 實心「已鎖單」（lucide 鎖頭）；未鎖定時點擊立即鎖定，解鎖需滑動確認。此鎖只對本裝置有效。
 //   鎖單改變與連線狀態（維持 2 秒以上）以視覺隱藏的 aria-live 宣告。
+// - 通知鈴（風控左側）：IconButton＋未讀數徽章（無障礙名稱「通知，N 則未讀」，徽章只是視覺）。來源是 src/lib/trade.ts 的
+//   記憶體通知紀錄；未讀＝ts 晚於上次開啟（或關閉）通知中心的時間，這個時間只放記憶體（紀錄本身也只在記憶體，重新整理後
+//   一起歸零），通知內容不寫入任何儲存。點擊開啟通知中心（components/notice-center-sheet.tsx，第一次開啟才掛載、延遲載入：
+//   retryableLazy＋ModuleErrorBoundary＋SheetLoadError）。首屏只有鈴與未讀數的訂閱。
 
-import { ChevronDown, Lock, LockOpen } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { ChevronDown, createLucideIcon, Lock, LockOpen } from 'lucide-react';
+import { Suspense, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useAccounts } from '../../lib/account-store';
 import { useContract } from '../../lib/contracts-cache';
 import { getEsunStreamStatus } from '../../lib/esun/stream';
 import { routeEnvText } from '../../lib/order-route';
 import { setRiskSettings, useRiskSettings } from '../../lib/risk';
 import { getLastHeartbeat, streamConnectionEpoch, type StreamStatus } from '../../lib/stream';
-import { isFuturesContract } from '../../lib/trade';
+import { getNoticeLog, isFuturesContract, subscribeNoticeLog } from '../../lib/trade';
 import { usePrivacyMode } from '../../lib/privacy';
 import { useStreamStatus } from '../../hooks/use-stream';
 import { useResumeGate } from '../hooks/use-resume-gate';
 import type { ResumeGateState } from '../lib/resume-gate';
 import type { ResumeGateSnapshot } from '../lib/resume-gate-runtime';
+import { loadNoticeCenterSheet } from '../lib/deferred-modules';
 import { useMobileUi } from '../lib/mobile-store';
 import * as controls from '../styles/controls.css';
 import { fill, srOnly } from '../styles/primitives.css';
 import * as routeStyles from '../styles/route-badge.css';
 import * as styles from '../styles/status-bar.css';
+import { IconButton } from '../ui/icon-button';
 import { AccountSwitchSheet, mobileAccountLabel } from './account-switch-sheet';
 import { BottomSheet } from './bottom-sheet';
 import { ResumeGateNote } from './resume-gate-note';
+import { ModuleErrorBoundary, retryableLazy, SheetLoadError } from './route-error-boundary';
 import { routeTone, useOrderRoute } from './route-badge';
 import { SlideToConfirm } from './slide-to-confirm';
+
+/**
+ * 鈴圖示：lucide 早期版本 bell 的路徑（合併成一段），以 lucide-react 的 createLucideIcon 建立（與其他圖示同一套渲染）。
+ * 不用 lucide-react 目前的 Bell：路徑較長，首屏多約 200 bytes gzip，而首屏預算只剩數百 bytes（設計規格 §13）。
+ */
+const BellIcon = createLucideIcon('bell', [['path', { d: 'M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9m4.3 13a1.94 1.94 0 0 0 3.4 0', key: 'b' }]]);
+
+const NoticeCenterSheet = retryableLazy(() => loadNoticeCenterSheet().then(m => m.NoticeCenterSheet));
+const resetNoticeSheet = () => { NoticeCenterSheet.reset(); };
+
+/** 通知鈴的無障礙名稱：「通知，3 則未讀」；沒有未讀時「通知」 */
+export function noticeBellLabel(unread: number): string {
+    return unread > 0 ? `通知，${unread} 則未讀` : '通知';
+}
 
 export type LightTone = 'live' | 'connecting' | 'down' | 'syncing';
 
@@ -174,14 +195,25 @@ export function StatusBar() {
     const ui = useMobileUi();
     const priv = usePrivacyMode();
     const contract = useContract(ui.currentCode);
-    const [sheet, setSheet] = useState<'connection' | 'account' | 'unlock' | null>(null);
+    const [sheet, setSheet] = useState<'connection' | 'account' | 'unlock' | 'notice' | null>(null);
+    // 未讀通知：ts 晚於上次開啟／關閉通知中心（seenAt > 0 也表示開啟過：之後保持掛載，開關動畫正常）
+    const notices = useSyncExternalStore(subscribeNoticeLog, getNoticeLog);
+    const [seenAt, setSeenAt] = useState(0);
+    const unread = notices.filter(n => n.ts > seenAt).length;
 
     const { account, emptyText } = statusBarAccount(contract ? (isFuturesContract(contract) ? 'futures' : 'stock') : null, accounts);
     const route = useOrderRoute(account);
     const tone = routeTone(route);
     const light = connectionLight(stream, resume.state);
     const announce = useStatusAnnouncements(risk.locked, light.label);
-    const close = () => setSheet(null);
+    const close = () => {
+        if (sheet === 'notice') setSeenAt(Date.now());
+        setSheet(null);
+    };
+    const openNotices = () => {
+        setSeenAt(Date.now());
+        setSheet('notice');
+    };
     // 正式環境：狀態列下緣 2px danger（目前路由 simulation === false；沒有帳戶或環境未知不標示）
     const env = account && route ? tone : undefined;
 
@@ -230,6 +262,9 @@ export function StatusBar() {
                             )
                             : <span className={styles.routeLoading} data-testid='status-route-empty'>帳戶載入中…</span>}
                 </button>
+                <IconButton ariaLabel={noticeBellLabel(unread)} icon={BellIcon} onClick={openNotices} testId='status-notices'>
+                    {unread > 0 && <span className={styles.badge} aria-hidden='true'>{unread > 99 ? '99+' : unread}</span>}
+                </IconButton>
                 <button
                     type='button'
                     className={styles.risk}
@@ -258,6 +293,16 @@ export function StatusBar() {
             <ConnectionDetails open={sheet === 'connection'} onClose={close} stream={stream} gate={resume} />
             <AccountSwitchSheet open={sheet === 'account'} onClose={close} />
             <RiskUnlockSheet open={sheet === 'unlock'} onClose={close} />
+            {seenAt > 0 && (
+                <ModuleErrorBoundary
+                    onRetry={resetNoticeSheet}
+                    fallback={props => <SheetLoadError {...props} open={sheet === 'notice'} onClose={close} testId='notice-load-error' />}
+                >
+                    <Suspense fallback={null}>
+                        <NoticeCenterSheet open={sheet === 'notice'} onClose={close} />
+                    </Suspense>
+                </ModuleErrorBoundary>
+            )}
         </>
     );
 }

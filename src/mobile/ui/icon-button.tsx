@@ -2,8 +2,10 @@
 //
 // aria-label 必填（純圖示沒有可見文字）；pressed 有給時輸出 aria-pressed（切換型，例如編輯模式）。
 // variant 'close'：面板關閉鈕（30px 圓內 X 18px）；icon 未給時預設 X。
+// children：圖示之後的附加內容（例如狀態列通知鈴的未讀徽章；以按鈕為定位基準，aria-label 仍是無障礙名稱）。
 
 import { X, type LucideIcon } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { focusRing, pressable } from '../styles/primitives.css';
 import * as styles from './icon-button.css';
 
@@ -20,9 +22,10 @@ export interface IconButtonProps {
     disabled?: boolean;
     testId?: string;
     className?: string;
+    children?: ReactNode;
 }
 
-export function IconButton({ ariaLabel, onClick, icon, iconSize, variant = 'regular', pressed, disabled = false, testId, className }: IconButtonProps) {
+export function IconButton({ ariaLabel, onClick, icon, iconSize, variant = 'regular', pressed, disabled = false, testId, className, children }: IconButtonProps) {
     const Icon = icon ?? X;
     const size = variant === 'close' ? 18 : Math.min(24, Math.max(18, iconSize ?? 20));
     return (
@@ -36,6 +39,7 @@ export function IconButton({ ariaLabel, onClick, icon, iconSize, variant = 'regu
             onClick={() => onClick()}
         >
             <Icon className={styles.icon} size={size} aria-hidden='true' focusable='false' />
+            {children}
         </button>
     );
 }
