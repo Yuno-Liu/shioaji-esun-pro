@@ -322,7 +322,12 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
             onClose={onClose}
             title='排序群組'
             testId='watch-group-sort'
-            footer={<button type='button' className={button.primary} onClick={onClose} data-testid='watch-group-sort-done'>完成</button>}
+            footer={(
+                // 與其他面板一致：鍵填滿底部寬度（edit.actions 的子鍵 flex 1）
+                <div className={edit.actions}>
+                    <button type='button' className={button.primary} onClick={onClose} data-testid='watch-group-sort-done'>完成</button>
+                </div>
+            )}
         >
             <div className={edit.sheetBody}>
                 <p className={edit.note}>拖曳右側握把，或按 ↑／↓ 調整自選頁群組分頁的順序。群組順序只存在這台裝置，桌面不受影響。</p>
