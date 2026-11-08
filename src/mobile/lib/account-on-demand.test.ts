@@ -1,6 +1,6 @@
 // 按需查詢快取：同時只發一次、冷卻內不重查、失敗保留舊資料且不自動重送
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { canLoadOnDemand, cooldownLeftSec, getOnDemandState, loadOnDemand, resetOnDemandForTest } from './account-on-demand';
+import { canLoadOnDemand, cooldownLeftSec, gateLeftSec, getOnDemandState, loadOnDemand, resetOnDemandForTest } from './account-on-demand';
 
 let now = 1_000_000;
 afterEach(() => resetOnDemandForTest());
@@ -48,5 +48,26 @@ describe('loadOnDemand', () => {
         expect(await loadOnDemand('b', async () => 2, 30_000)).toBe(true);
         expect(getOnDemandState('b').data).toBe(2);
         expect(getOnDemandState(null).data).toBeNull();
+    });
+
+    it('a shared gate spaces requests across keys; skipped loads do not restart it', async () => {
+        resetOnDemandForTest(() => now);
+        const gate = { name: 'g', intervalMs: 15_000 };
+        const fetcher = vi.fn(async () => 1);
+        expect(gateLeftSec(gate, now)).toBe(0);
+        expect(await loadOnDemand('a', fetcher, 30_000, gate)).toBe(true);
+        now += 4_000;
+        expect(gateLeftSec(gate, now)).toBe(11);
+        expect(await loadOnDemand('b', fetcher, 30_000, gate)).toBe(false);
+        expect(getOnDemandState('b')).toMatchObject({ loading: false, attemptedAt: null });
+        // 被擋下的嘗試不重新起算
+        now += 11_000;
+        expect(gateLeftSec(gate, now)).toBe(0);
+        expect(await loadOnDemand('b', fetcher, 30_000, gate)).toBe(true);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        // 沒帶 gate 的 key 不受影響；reset 清空閘門
+        expect(await loadOnDemand('c', fetcher, 30_000)).toBe(true);
+        resetOnDemandForTest(() => now);
+        expect(gateLeftSec(gate, now)).toBe(0);
     });
 });

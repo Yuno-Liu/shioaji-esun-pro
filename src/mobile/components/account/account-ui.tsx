@@ -101,10 +101,19 @@ export function Switch({ checked, onChange, label, disabled = false, testId }: {
 }
 
 /** 分段選擇：沿用全站唯一的 ui/segmented（toggle 語意：role=group＋aria-pressed、按鈕文字恰為選項文字） */
-export function Segmented<T extends string | number>({ label, value, options, onChange, testId }: { label: string; value: T; options: readonly { value: T; text: string }[]; onChange: (v: T) => void; testId?: string }) {
+export function Segmented<T extends string | number>({ label, value, options, onChange, testId, variant }: {
+    label: string;
+    value: T;
+    options: readonly { value: T; text: string }[];
+    onChange: (v: T) => void;
+    testId?: string;
+    /** 預設等寬分段（thumb）；選項多時用 wrap（換行膠囊） */
+    variant?: 'thumb' | 'wrap';
+}) {
     return (
         <UiSegmented<T>
             semantics='toggle'
+            variant={variant}
             ariaLabel={label}
             value={value}
             items={options.map(o => ({ value: o.value, label: o.text }))}

@@ -25,7 +25,8 @@ export interface SegmentedProps<T extends string | number> {
     semantics: 'tabs' | 'toggle';
     ariaLabel: string;
     size?: 'regular' | 'compact';
-    variant?: 'thumb' | 'scroll';
+    /** thumb：等寬分段；scroll：可橫向捲動的膠囊；wrap：膠囊放不下時換行 */
+    variant?: 'thumb' | 'scroll' | 'wrap';
     /** 整組停用（例如送出中） */
     disabled?: boolean;
     /** 停用原因元素 id（呼叫端自行渲染） */
@@ -64,7 +65,7 @@ export function Segmented<T extends string | number>({
                 aria-selected={tabs ? selected : undefined}
                 aria-pressed={tabs ? undefined : selected}
                 aria-label={item.ariaLabel}
-                className={`${variant === 'scroll' ? styles.pill : styles.segment} ${focusRing}`}
+                className={`${variant === 'thumb' ? styles.segment : styles.pill} ${focusRing}`}
                 disabled={disabled || !!item.disabled}
                 data-testid={item.testId}
                 // 點已選段也回報（與既有分段按鈕行為一致，由呼叫端決定是否忽略）
@@ -75,8 +76,8 @@ export function Segmented<T extends string | number>({
         );
     });
 
-    const group = variant === 'scroll' ? (
-        <div className={styles.scroller} role={tabs ? 'tablist' : 'group'} aria-label={ariaLabel} aria-describedby={describedByIds} data-testid={testId}>
+    const group = variant !== 'thumb' ? (
+        <div className={variant === 'wrap' ? styles.wrapper : styles.scroller} role={tabs ? 'tablist' : 'group'} aria-label={ariaLabel} aria-describedby={describedByIds} data-testid={testId}>
             {buttons}
         </div>
     ) : (
