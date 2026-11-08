@@ -3,6 +3,7 @@
 import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getLineIndicatorSettings, LINE_INDICATORS_KEY, resetLineIndicatorSettingsForTest } from '../lib/line-indicators';
 import { getIndicatorSettings, MOBILE_INDICATORS_KEY, resetIndicatorSettingsForTest, setIndicatorSettings } from '../lib/mobile-indicators';
 import { getMobileUi, resetMobileUiForTest } from '../lib/mobile-store';
 import { IndicatorSheet } from './indicator-sheet';
@@ -28,16 +29,18 @@ beforeEach(() => {
     storage.clear();
     vi.stubGlobal('localStorage', fakeStorage);
     resetIndicatorSettingsForTest();
+    resetLineIndicatorSettingsForTest();
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
     view = undefined;
     vi.unstubAllGlobals();
     resetIndicatorSettingsForTest();
+    resetLineIndicatorSettingsForTest();
 });
 
-async function render(lineMode = false) {
-    await act(async () => { view = create(createElement(IndicatorSheet, { open: true, onClose: () => undefined, lineMode })); });
+async function render(lineMode = false, lineFlowSupported = true) {
+    await act(async () => { view = create(createElement(IndicatorSheet, { open: true, onClose: () => undefined, lineMode, lineFlowSupported })); });
 }
 
 describe('IndicatorSheet', () => {
@@ -137,9 +140,59 @@ describe('IndicatorSheet', () => {
         expect(labels()).toEqual(['sma:{"period":5}', 'sma:{"period":20}']);
     });
 
-    it('走勢模式顯示說明（指標只套用在 K 線）', async () => {
+    it('走勢模式顯示說明（其餘指標只套用在 K 線）', async () => {
         await render(true);
-        expect(textOf(one('indicator-list'))).toContain('走勢圖只顯示均價線');
+        // 走勢多了「走勢副圖」：說明改為其餘指標套用在 K 線
+        expect(textOf(one('indicator-list'))).toContain('其餘指標套用在 K 線');
+    });
+});
+
+describe('IndicatorSheet — 走勢副圖（買賣力）', () => {
+    it('只在走勢模式出現；預設兩個都關閉，門檻選擇只在開啟大單／小單時出現', async () => {
+        await render(false);
+        expect(byId('indicator-section-line')).toHaveLength(0);
+        await act(async () => view!.unmount());
+        await render(true);
+        expect(byId('indicator-section-line')).toHaveLength(1);
+        expect(one('line-flow-flow').props['aria-pressed']).toBe(false);
+        expect(one('line-flow-bigSmall').props['aria-pressed']).toBe(false);
+        expect(byId('line-flow-threshold-500')).toHaveLength(0);
+    });
+
+    it('開關與門檻寫入新的儲存鍵，不動既有指標設定的格式', async () => {
+        await render(true);
+        const before = storage.get(MOBILE_INDICATORS_KEY);
+        await act(async () => { one('line-flow-flow').props.onClick(); });
+        await act(async () => { one('line-flow-bigSmall').props.onClick(); });
+        expect(one('line-flow-flow').props['aria-pressed']).toBe(true);
+        expect(textOf(one('line-flow-flow'))).toBe('顯示中');
+        // 門檻：100、300、500（預設、已選）、1千萬、2千萬
+        expect(one('line-flow-threshold-500').props['aria-pressed']).toBe(true);
+        expect(textOf(one('line-flow-threshold-1000'))).toBe('1千萬');
+        await act(async () => { one('line-flow-threshold-1000').props.onClick(); });
+        expect(getLineIndicatorSettings()).toEqual({ version: 1, flow: true, bigSmall: true, threshold: 1000 });
+        expect(JSON.parse(storage.get(LINE_INDICATORS_KEY)!)).toEqual({ version: 1, flow: true, bigSmall: true, threshold: 1000 });
+        expect(storage.get(MOBILE_INDICATORS_KEY)).toBe(before);
+    });
+
+    it('不支援的商品（指數、期權、權證）：開關停用並說明，不顯示門檻', async () => {
+        storage.set(LINE_INDICATORS_KEY, JSON.stringify({ version: 1, flow: true, bigSmall: true, threshold: 500 }));
+        resetLineIndicatorSettingsForTest();
+        await render(true, false);
+        const flow = one('line-flow-flow');
+        expect(flow.props.disabled).toBe(true);
+        expect(flow.props['aria-pressed']).toBe(false);
+        expect(flow.props['aria-describedby']).toBe(one('line-flow-unsupported').props.id);
+        expect(textOf(one('line-flow-unsupported'))).toContain('只提供股票與 ETF');
+        expect(byId('line-flow-threshold-500')).toHaveLength(0);
+    });
+
+    it('S1：開關與門檻不開下單面板', async () => {
+        await render(true);
+        await act(async () => { one('line-flow-flow').props.onClick(); });
+        await act(async () => { one('line-flow-bigSmall').props.onClick(); });
+        await act(async () => { one('line-flow-threshold-2000').props.onClick(); });
+        expect(getMobileUi().ticket).toBeNull();
     });
 });
 

@@ -57,6 +57,8 @@ export const frame = styleVariants({
     0: [frameBase, { height: ['42vh', '42dvh'], minHeight: '220px', maxHeight: '520px' }],
     1: [frameBase, { height: [`calc(42vh + ${PANE_HEIGHT_PX}px)`, `calc(42dvh + ${PANE_HEIGHT_PX}px)`], minHeight: `${220 + PANE_HEIGHT_PX}px`, maxHeight: `${520 + PANE_HEIGHT_PX}px` }],
     2: [frameBase, { height: [`calc(42vh + ${PANE_HEIGHT_PX * 2}px)`, `calc(42dvh + ${PANE_HEIGHT_PX * 2}px)`], minHeight: `${220 + PANE_HEIGHT_PX * 2}px`, maxHeight: `${520 + PANE_HEIGHT_PX * 2}px` }],
+    // 走勢：量＋分時買賣力＋大單／小單買賣力
+    3: [frameBase, { height: [`calc(42vh + ${PANE_HEIGHT_PX * 3}px)`, `calc(42dvh + ${PANE_HEIGHT_PX * 3}px)`], minHeight: `${220 + PANE_HEIGHT_PX * 3}px`, maxHeight: `${520 + PANE_HEIGHT_PX * 3}px` }],
 });
 
 /** 全螢幕：填滿工具列與買賣列之間；所有觸控手勢交給圖表（不捲動底下的頁面） */

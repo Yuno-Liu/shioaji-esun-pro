@@ -48,7 +48,7 @@ const m = vi.hoisted(() => {
         logicalToCoordinate: vi.fn((l: number) => l * 20),
         width: vi.fn(() => 300),
     };
-    const paneObjs = [0, 1, 2, 3].map(i => ({ setHeight: vi.fn(), getHeight: vi.fn((): number => (i === 0 ? 200 : 96)), getHTMLElement: () => null }));
+    const paneObjs = [0, 1, 2, 3].map(i => ({ setHeight: vi.fn(), getHeight: vi.fn((): number => (i === 0 ? 200 : 96)), setStretchFactor: vi.fn(), getHTMLElement: () => null }));
     const chart = {
         addSeries: vi.fn((_type: unknown, _options?: unknown, pane?: number) => {
             if (pane && pane > state.paneMax) state.paneMax = pane;
@@ -72,6 +72,8 @@ const m = vi.hoisted(() => {
         allSeries,
         createChart: vi.fn(() => chart),
         fetchChartHistory: vi.fn(),
+        /** 走勢買賣力的當日逐筆（fetchHistoryTicks） */
+        fetchTicks: vi.fn(),
         openTicket: vi.fn(),
         openOrderAction: vi.fn(),
         rev: 100,
@@ -109,7 +111,7 @@ vi.mock('../../lib/theme-store', () => ({
 }));
 vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, openOrderAction: m.openOrderAction }));
 vi.mock('../motion/haptics', () => ({ haptic: m.haptic }));
-vi.mock('../../lib/shioaji', async importOriginal => ({ ...(await importOriginal<typeof import('../../lib/shioaji')>()), ...m.send }));
+vi.mock('../../lib/shioaji', async importOriginal => ({ ...(await importOriginal<typeof import('../../lib/shioaji')>()), ...m.send, fetchHistoryTicks: m.fetchTicks }));
 
 import { HISTORY_STALE_MS, resetHistoryEntriesForTest } from '../lib/chart-history-freshness';
 import {
@@ -120,6 +122,8 @@ import {
     updateIndicatorParams,
     type MobileIndicatorSettings,
 } from '../lib/mobile-indicators';
+import { resetLineFlowForTest } from '../lib/line-flow';
+import { resetLineIndicatorSettingsForTest, setLineIndicatorSettings } from '../lib/line-indicators';
 import * as cs from '../styles/chart.css';
 import * as tradeStyles from '../styles/trade.css';
 import * as segmentedStyles from '../ui/segmented.css';
@@ -132,6 +136,14 @@ const contract = {
 } as ContractInfo;
 
 const KBARS = { datetime: ['2026-11-05 09:01:00', '2026-11-05 09:02:00'], Open: [1070, 1075], High: [1076, 1080], Low: [1069, 1074], Close: [1075, 1078], Volume: [10, 20], Amount: [0, 0] };
+/** 走勢買賣力的假逐筆：09:01 外 6（645 萬，大單）內 4（430 萬，小單）；09:02 外 20（大單）；09:03 內 30（大單） */
+const FLOW_TICKS = {
+    datetime: ['2026-11-05 09:00:30.100000', '2026-11-05 09:00:40.000000', '2026-11-05 09:01:30.000000', '2026-11-05 09:02:10.000000', '2026-11-05 09:02:20.000000'],
+    close: [1075, 1075, 1080, 1065, 1065],
+    volume: [6, 4, 20, 30, 9],
+    tick_type: [1, 2, 1, 2, 0],
+    bid_price: [], bid_volume: [], ask_price: [], ask_volume: [],
+};
 const ORDER_LINE: PriceLineSpec = { key: 'order:o1', price: 1080, kind: 'order-buy', label: '買 2 @1,080', tradeId: 'o1' };
 
 const storage = new Map<string, string>();
@@ -183,11 +195,14 @@ beforeEach(() => {
     m.chart.remove.mockClear();
     m.chart.removeSeries.mockClear();
     m.chart.subscribeCrosshairMove.mockClear();
-    m.paneObjs.forEach(p => p.setHeight.mockClear());
+    m.paneObjs.forEach(p => { p.setHeight.mockClear(); p.setStretchFactor.mockClear(); });
     m.state.paneMax = 0;
     storage.clear();
     vi.stubGlobal('localStorage', fakeStorage);
     resetIndicatorSettingsForTest();
+    resetLineIndicatorSettingsForTest();
+    resetLineFlowForTest();
+    m.fetchTicks.mockReset().mockResolvedValue(FLOW_TICKS);
     m.timeScale.setVisibleLogicalRange.mockClear();
     m.timeScale.fitContent.mockClear();
     m.allSeries.length = 0;
@@ -1175,20 +1190,22 @@ describe('TradeChart 走勢成交量副圖', () => {
     it('退出全螢幕後程式庫依比例放大了副圖：一般模式把副圖拉回 PANE_HEIGHT_PX（價格區不縮小）；全螢幕不校正', async () => {
         await render([], 'line');
         await tick(20);
-        m.paneObjs[1]!.setHeight.mockClear();
+        m.paneObjs.forEach(p => p.setStretchFactor.mockClear());
         m.paneObjs[1]!.getHeight.mockImplementation(() => 127);
         try {
             await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
             await tick(20);
-            expect(m.paneObjs[1]!.setHeight).not.toHaveBeenCalled();
+            expect(m.paneObjs[1]!.setStretchFactor).not.toHaveBeenCalled();
             await act(async () => { byTestId('chart-fs-exit')[0]!.props.onClick(); });
             await tick(20);
-            expect(m.paneObjs[1]!.setHeight).toHaveBeenCalledTimes(1);
-            expect(m.paneObjs[1]!.setHeight).toHaveBeenCalledWith(cs.PANE_HEIGHT_PX);
+            // 以 stretch factor 一次設定：主圖＝總高 327 − 96，副圖＝96
+            expect(m.paneObjs[0]!.setStretchFactor).toHaveBeenCalledWith(200 + 127 - cs.PANE_HEIGHT_PX);
+            expect(m.paneObjs[1]!.setStretchFactor).toHaveBeenCalledTimes(1);
+            expect(m.paneObjs[1]!.setStretchFactor).toHaveBeenCalledWith(cs.PANE_HEIGHT_PX);
             // 同一外框高度不反覆校正
             await emit({ time: '09:02:30', close: '1060', volume: 4, total_volume: 64 });
             await tick(20);
-            expect(m.paneObjs[1]!.setHeight).toHaveBeenCalledTimes(1);
+            expect(m.paneObjs[1]!.setStretchFactor).toHaveBeenCalledTimes(1);
         } finally {
             m.paneObjs[1]!.getHeight.mockImplementation(() => 96);
         }
@@ -1201,5 +1218,163 @@ describe('TradeChart 走勢成交量副圖', () => {
         expect(textOf(byTestId('chart-readout-volume')[0]!)).toBe('量 30');
         const group = byTestId('chart-readout')[0]!.findAll(n => n.props.role === 'group')[0]!;
         expect(group.props['aria-label']).toContain('成交量 30');
+    });
+});
+
+describe('TradeChart 走勢副圖：分時買賣力、大單／小單買賣力', () => {
+    const flowCalls = () => m.chart.addSeries.mock.calls.map((c, i) => ({ type: c[0], pane: c[2], series: m.allSeries[i]! })).filter(c => (c.pane ?? 0) >= 2);
+    const paneLegend = (needle: string) => byTestId('chart-legend').find(n => textOf(n).includes(needle));
+    const press = async (x: number, y: number, ms: number) => {
+        await act(async () => { wrap().props.onPointerDown(ptr(x, y)); });
+        await tick(ms);
+    };
+    const release = async (x: number, y: number) => { await act(async () => { wrap().props.onPointerUp(ptr(x, y)); }); };
+    beforeEach(() => {
+        m.fetchChartHistory.mockReset().mockResolvedValue(LINE_KBARS);
+        Object.values(m.send).forEach(f => f.mockReset());
+    });
+
+    it('預設關閉：0 個逐筆請求、只有量副圖（外框 1 副圖）', async () => {
+        await render([], 'line');
+        expect(m.fetchTicks).not.toHaveBeenCalled();
+        expect(flowCalls()).toHaveLength(0);
+        expect(wrap().props.className).toBe(cs.frame[1]);
+    });
+
+    it('開啟兩個：下載一次當日逐筆；量在 pane 1、分時買賣力 pane 2（外盤正柱、內盤負柱、累積淨買線）、大單／小單 pane 3，外框 3 副圖', async () => {
+        setLineIndicatorSettings({ flow: true, bigSmall: true });
+        await render([], 'line');
+        await tick(INDICATOR_FLUSH_MS + 20);
+        expect(m.fetchTicks).toHaveBeenCalledTimes(1);
+        expect(m.fetchTicks.mock.calls[0]![1]).toBe('2026-11-05');
+        expect(m.chart.addSeries.mock.calls.find(c => c[0] === 'Histogram')![2]).toBe(1);
+        const calls = flowCalls();
+        expect(calls.map(c => `${c.type}@${c.pane}`)).toEqual(['Histogram@2', 'Histogram@2', 'Line@2', 'Line@3', 'Line@3']);
+        expect((m.chart.addSeries.mock.calls.find(c => c[2] === 2 && c[0] === 'Line')![1] as { priceScaleId?: string }).priceScaleId).toBe('flow-net');
+        expect(wrap().props.className).toBe(cs.frame[3]);
+        const [buy, sell, net, big, small] = calls.map(c => c.series.setData.mock.calls.at(-1)![0] as Array<{ value: number }>);
+        expect(buy!.map(p => p.value)).toEqual([6, 20, 0]);
+        expect(sell!.map(p => p.value)).toEqual([-4, -0, -30]);
+        expect(net!.map(p => p.value)).toEqual([2, 22, -8]);
+        expect(big!.map(p => p.value)).toEqual([6, 26, -4]);
+        expect(small!.map(p => p.value)).toEqual([-4, -4, -4]);
+        // 圖例：當日累計（tick_type 0 不計）
+        const flow = textOf(paneLegend('分時買賣力')!);
+        expect(flow).toContain('外 26');
+        expect(flow).toContain('內 34');
+        expect(flow).toContain('外盤比 43.3%');
+        expect(flow).toContain('累積淨 -8');
+        const bs = textOf(paneLegend('大單≥500萬')!);
+        expect(bs).toContain('淨 -4');
+        expect(bs).toContain('小單');
+        expect(paneLegend('分時買賣力')!.props.style).toEqual({ top: `${(200 + 1) + (96 + 1) + 4}px` });
+    });
+
+    it('輕點某一分鐘：分時買賣力顯示該分鐘、累積線為到該分鐘為止', async () => {
+        setLineIndicatorSettings({ flow: true, bigSmall: true });
+        await render([], 'line');
+        await tick(INDICATOR_FLUSH_MS + 20);
+        await press(20, 100, 100); // logical 1 → 09:02
+        await release(20, 100);
+        const flow = textOf(paneLegend('分時買賣力')!);
+        expect(flow).toContain('外 20');
+        expect(flow).toContain('內 0');
+        expect(flow).toContain('外盤比 100.0%');
+        expect(flow).toContain('累積淨 +22');
+        expect(textOf(paneLegend('大單≥500萬')!)).toContain('淨 +26');
+    });
+
+    it('改門檻只重算（不重抓）；關閉移除副圖、外框收回，0 個新請求；再開沿用快取；換週期再回走勢也沿用', async () => {
+        setLineIndicatorSettings({ bigSmall: true });
+        await render([], 'line');
+        await tick(INDICATOR_FLUSH_MS + 20);
+        expect(flowCalls().map(c => `${c.type}@${c.pane}`)).toEqual(['Line@2', 'Line@2']);
+        expect(wrap().props.className).toBe(cs.frame[2]);
+        await act(async () => { setLineIndicatorSettings({ threshold: 2000 }); });
+        const big = flowCalls()[0]!.series;
+        // 2 千萬：09:01 的 645 萬改算小單；09:02（2,160 萬）、09:03（3,195 萬）仍是大單
+        expect((big.setData.mock.calls.at(-1)![0] as Array<{ value: number }>).map(p => p.value)).toEqual([0, 20, -10]);
+        expect(textOf(paneLegend('大單≥2千萬')!)).toContain('淨 -10');
+        await act(async () => { setLineIndicatorSettings({ bigSmall: false }); });
+        await tick(20);
+        expect(m.chart.removeSeries).toHaveBeenCalledWith(big);
+        expect(wrap().props.className).toBe(cs.frame[1]);
+        await act(async () => { setLineIndicatorSettings({ bigSmall: true }); });
+        await act(async () => {
+            view!.update(createElement(TradeChart, { code: '2330', contract, period: '5m', lines: [] }));
+        });
+        await tick(50);
+        await act(async () => {
+            view!.update(createElement(TradeChart, { code: '2330', contract, period: 'line', lines: [] }));
+        });
+        await tick(INDICATOR_FLUSH_MS + 50);
+        expect(m.fetchTicks).toHaveBeenCalledTimes(1);
+    });
+
+    it('K 線、指數、權證、期貨不建買賣力副圖也不下載', async () => {
+        setLineIndicatorSettings({ flow: true, bigSmall: true });
+        await render([], '5m');
+        expect(m.fetchTicks).not.toHaveBeenCalled();
+        await unmount();
+        for (const security_type of ['IND', 'WRT', 'FUT']) {
+            m.chart.addSeries.mockClear();
+            await act(async () => {
+                view = create(createElement(TradeChart, { code: '2330', contract: { ...contract, security_type } as ContractInfo, period: 'line', lines: [] }), { createNodeMock: nodeMock });
+            });
+            await tick(INDICATOR_FLUSH_MS + 20);
+            expect(flowCalls(), security_type).toHaveLength(0);
+            await unmount();
+        }
+        expect(m.fetchTicks).not.toHaveBeenCalled();
+    });
+
+    it('讀取中、失敗就地寫在圖例；失敗不自動重試', async () => {
+        let reject!: (e: Error) => void;
+        m.fetchTicks.mockReset().mockReturnValue(new Promise((_, r) => { reject = r; }));
+        setLineIndicatorSettings({ flow: true });
+        await render([], 'line');
+        expect(textOf(paneLegend('分時買賣力')!)).toContain('讀取逐筆中…');
+        await act(async () => { reject(new Error('timeout')); });
+        await tick(INDICATOR_FLUSH_MS + 20);
+        expect(textOf(paneLegend('分時買賣力')!)).toContain('讀取失敗（重開指標重試）');
+        await tick(60_000);
+        expect(m.fetchTicks).toHaveBeenCalledTimes(1);
+    });
+
+    it('即時成交累加到最後一分鐘（不重複計入歷史已有的那筆）', async () => {
+        setLineIndicatorSettings({ flow: true });
+        await render([], 'line');
+        await tick(INDICATOR_FLUSH_MS + 20);
+        await emit({ time: '09:02:40.000000', close: '1066', volume: 5, total_volume: 74, tick_type: 1 });
+        await tick(INDICATOR_FLUSH_MS + 20);
+        const flow = textOf(paneLegend('分時買賣力')!);
+        expect(flow).toContain('外 31');
+        expect(flow).toContain('內 34');
+    });
+
+    it('在買賣力副圖內長按不選價、輕點不顯示資訊列', async () => {
+        setLineIndicatorSettings({ flow: true, bigSmall: true });
+        await render([], 'line');
+        await tick(INDICATOR_FLUSH_MS + 20);
+        await press(100, 350, LONG_PRESS_MS + 10);
+        await act(async () => { (m.chart.subscribeCrosshairMove.mock.calls.at(-1)![0] as (p: unknown) => void)({ time: 1, point: { x: 100, y: 350 }, paneIndex: 2, seriesData: new Map() }); });
+        await release(100, 350);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        await press(12, 400, 100);
+        await release(12, 400);
+        expect(byTestId('chart-readout')).toHaveLength(0);
+    });
+
+    it('S1：開關、門檻、副圖互動都不開下單面板，lib 送出函式 0 次', async () => {
+        await render([], 'line');
+        await act(async () => { setLineIndicatorSettings({ flow: true, bigSmall: true }); });
+        await act(async () => { setLineIndicatorSettings({ threshold: 100 }); });
+        await tick(INDICATOR_FLUSH_MS + 20);
+        await press(12, 350, 100);
+        await release(12, 350);
+        await act(async () => { setLineIndicatorSettings({ flow: false, bigSmall: false }); });
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.openOrderAction).not.toHaveBeenCalled();
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
     });
 });

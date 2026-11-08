@@ -7,6 +7,11 @@
 //   跟著使用者的漲跌配色（ChartColors upVol／downVol，比價格線淡）。指數、量全為 0 或沒有資料時不建副圖（外框維持 0 副圖）；
 //   之後有量（例如開盤第一筆成交）才建立。一般模式下外框改變（退出全螢幕、副圖晚建）後把副圖拉回 PANE_HEIGHT_PX
 //   （K 線指標副圖同樣適用）；全螢幕依比例分配。
+// - 走勢副圖指標（股票＋ETF，指標面板「走勢副圖」開啟；lib/line-indicators.ts 設定、lib/line-flow.ts 逐筆彙總）：
+//   排在量副圖之後（量固定在 pane 1）。分時買賣力＝每分鐘外盤（正柱，漲色）／內盤（負柱，跌色）＋累積淨買力線
+//   （另一個不顯示座標的疊加刻度，否則每分鐘的柱會被壓扁）；大單／小單買賣力＝依單筆成交金額門檻分類的兩條累積淨買線。
+//   單位皆為張。圖例平時顯示當日累計，輕點／追蹤時顯示該分鐘（累積線為到該分鐘為止）。開啟時才下載當日逐筆，
+//   讀取中、失敗、尚無成交就地寫在圖例。沒有量副圖（沒有成交）時不建這兩個副圖，狀態寫在主圖圖例。
 // - 指標：定義與計算重用 src/lib/indicator-defs.ts；主圖疊加用 LineSeries，副圖各自一個 pane，
 //   副圖畫參考線（levels）。左上角圖例顯示指標名稱與最新值；長按追蹤時顯示該根的值。
 //   即時更新：K 棒每 CHART_FLUSH_MS 合併重畫，指標另以 INDICATOR_FLUSH_MS 節流、只 update 變動的尾端點
@@ -84,6 +89,8 @@ import {
     type MobileIndicator,
     type MobileIndicatorSettings,
 } from '../lib/mobile-indicators';
+import { buyRatio, dateOfWallClock, flowView, lineFlowSupported, retainLineFlow, type FlowStatus, type FlowView, type LineFlowSnapshot } from '../lib/line-flow';
+import { thresholdIndex, thresholdLabel, useLineIndicatorSettings, type LineIndicatorSettings } from '../lib/line-indicators';
 import { openOrderAction, openTicket } from '../lib/mobile-store';
 import { haptic } from '../motion/haptics';
 import { prefersReducedMotion } from '../motion/prefs';
@@ -112,6 +119,11 @@ export const LINE_GAP_SECONDS = 180;
 const INITIAL_VISIBLE_BARS = 80;
 /** 走勢均價線顏色 */
 const AVG_COLOR = INDICATOR_PALETTE[0]!;
+/** 大單、小單累積淨買線顏色（避開漲跌色） */
+const BIG_COLOR = INDICATOR_PALETTE[1]!;
+const SMALL_COLOR = INDICATOR_PALETTE[2]!;
+/** 買賣力的價格格式：整數張 */
+const LOTS_FORMAT = { type: 'price' as const, precision: 0, minMove: 1 };
 
 type Status = 'loading' | 'ready' | 'empty' | 'error';
 
@@ -284,6 +296,12 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const settingsRef = useRef<MobileIndicatorSettings>(settings);
     settingsRef.current = settings;
     const settingsKey = indicatorSettingsKey(settings);
+    const lineSettings = useLineIndicatorSettings();
+    const lineSettingsRef = useRef<LineIndicatorSettings>(lineSettings);
+    lineSettingsRef.current = lineSettings;
+    const lineSettingsKey = `${lineSettings.flow}|${lineSettings.bigSmall}|${lineSettings.threshold}`;
+    /** 走勢副圖設定改變：在既有圖表上增減副圖、換門檻（不重建圖表） */
+    const flowRebuildRef = useRef<() => void>(() => undefined);
 
     const hostRef = useRef<HTMLDivElement | null>(null);
     const chartRef = useRef<IChartApi | null>(null);
@@ -461,6 +479,17 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         let indTimer: ReturnType<typeof setTimeout> | null = null;
         /** 目前追蹤中的十字線資料（null＝顯示最新值） */
         let crossData: Map<unknown, unknown> | null = null;
+        /** 追蹤或輕點的那一分鐘（買賣力圖例以時間對照）；null＝顯示當日累計 */
+        let crossTime: number | null = null;
+        // 走勢副圖：分時買賣力（flowS）、大單／小單買賣力（bsS）
+        const flowAllowed = isLine && lineFlowSupported(ct.security_type);
+        let flowS: { buy: ISeriesApi<SeriesType>; sell: ISeriesApi<SeriesType>; net: ISeriesApi<SeriesType> } | null = null;
+        let bsS: { big: ISeriesApi<SeriesType>; small: ISeriesApi<SeriesType> } | null = null;
+        let flowHandle: { get: () => LineFlowSnapshot; release: () => void } | null = null;
+        let flowDate: string | null = null;
+        let flowTimer: ReturnType<typeof setTimeout> | null = null;
+        let flowStatus: FlowStatus | null = null;
+        let flowV: FlowView | null = null;
         /** 輕點釘住的那一根（時間）；null＝沒有 */
         let tapTime: number | null = null;
         readout.set(null);
@@ -499,6 +528,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                     // 副圖小標：成交量＋最新一分鐘（追蹤、輕點時為該分鐘）的量
                     next.push({ id: 'vol', name: '成交量', color: c.text, pane: 1, values: [{ label: '', color: c.text, text: formatIndicatorValue(seriesValue(vol, bars[bars.length - 1]?.volume), 0) }] });
                 }
+                if (flowAllowed) next.push(...flowLegend());
             } else {
                 for (const r of inds) {
                     const single = r.outputs.length === 1;
@@ -518,6 +548,63 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             setLegend(prev => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
         };
 
+        // ---- 走勢副圖的圖例 ----
+        const lots = (v: number | undefined) => formatIndicatorValue(v, 0);
+        const signedLots = (v: number | undefined) => (v !== undefined && v > 0 ? `+${lots(v)}` : lots(v));
+        /** 到 time 為止最後一個有資料的分鐘（累積線用）；沒有回傳 -1 */
+        const flowIndexAtOrBefore = (v: FlowView, time: number): number => {
+            let lo = 0;
+            let hi = v.times.length - 1;
+            let ans = -1;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (v.times[mid]! <= time) {
+                    ans = mid;
+                    lo = mid + 1;
+                } else hi = mid - 1;
+            }
+            return ans;
+        };
+        const flowLegend = (): LegendEntry[] => {
+            const s = lineSettingsRef.current;
+            if (!s.flow && !s.bigSmall) return [];
+            const out: LegendEntry[] = [];
+            const empty = flowV !== null && flowV.times.length === 0;
+            const note = flowStatus === 'loading' || flowStatus === null
+                ? '讀取逐筆中…'
+                : flowStatus === 'error'
+                    ? '讀取失敗（重開指標重試）'
+                    : empty
+                        ? (flowDate === dateOfWallClock(nowWallClockUtc()) ? '今日尚無成交' : '此時段尚無成交')
+                        : null;
+            const v = note === null ? flowV : null;
+            // 輕點／追蹤：該分鐘的外盤、內盤（沒有那一分鐘＝0）；累積線取到該分鐘為止
+            const at = v && crossTime !== null ? v.index.get(crossTime) : undefined;
+            const upto = v ? (crossTime !== null ? flowIndexAtOrBefore(v, crossTime) : v.times.length - 1) : -1;
+            const flowPane = flowS ? 2 : 0;
+            const bsPane = bsS ? (flowS ? 3 : 2) : 0;
+            if (s.flow) {
+                if (!v) out.push({ id: 'flow', name: '分時買賣力', color: c.text, pane: flowPane, values: [], note: note ?? '' });
+                else {
+                    const buy = crossTime !== null ? (at !== undefined ? v.buy[at]! : 0) : v.totalBuy;
+                    const sell = crossTime !== null ? (at !== undefined ? v.sell[at]! : 0) : v.totalSell;
+                    const ratio = buyRatio(buy, sell);
+                    out.push({ id: 'flow', name: '分時買賣力', color: c.text, pane: flowPane, values: [{ label: '外', color: c.up, text: lots(buy) }, { label: '內', color: c.down, text: lots(sell) }] });
+                    out.push({ id: 'flow-ratio', name: '外盤比', color: c.text, pane: flowPane, values: [{ label: '', color: c.text, text: ratio === null ? '—' : `${ratio.toFixed(1)}%` }] });
+                    out.push({ id: 'flow-net', name: '累積淨', color: c.text, pane: flowPane, values: [{ label: '', color: c.text, text: upto < 0 ? '0' : signedLots(v.cumNet[upto]) }] });
+                }
+            }
+            if (s.bigSmall) {
+                const bigName = `大單≥${thresholdLabel(s.threshold)}`;
+                if (!v) out.push({ id: 'bs-big', name: bigName, color: BIG_COLOR, pane: bsPane, values: [], ...(s.flow && flowPane === bsPane ? {} : { note: note ?? '' }) });
+                else {
+                    out.push({ id: 'bs-big', name: bigName, color: BIG_COLOR, pane: bsPane, values: [{ label: '淨', color: c.text, text: upto < 0 ? '0' : signedLots(v.bigNet[upto]) }] });
+                    out.push({ id: 'bs-small', name: '小單', color: SMALL_COLOR, pane: bsPane, values: [{ label: '淨', color: c.text, text: upto < 0 ? '0' : signedLots(v.smallNet[upto]) }] });
+                }
+            }
+            return out;
+        };
+
         // 委託線標籤（HTML 按鈕）跟著價格座標走；副圖圖例跟著自己的 pane：資料或可見範圍變動後的下一個畫面重新定位
         const layoutLabels = () => {
             raf1 = raf2 = null;
@@ -529,20 +616,20 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             if (subPanes > 0) {
                 try {
                     const panes = chart.panes();
-                    // 一般模式的外框＝0 副圖高度＋每個副圖 PANE_HEIGHT_PX；外框改變（退出全螢幕、走勢副圖晚建）時
+                    // 一般模式的外框＝0 副圖高度＋每個副圖 PANE_HEIGHT_PX；外框改變（退出全螢幕、副圖晚建或增減）時
                     // 程式庫依比例重分配各 pane → 把副圖拉回 PANE_HEIGHT_PX，價格區才不縮小。
-                    // 每個外框高度只校正一次（避免放不下時反覆重排）；全螢幕沿用比例分配（橫向高度不夠固定高度）。
+                    // 以 stretch factor 一次設定全部 pane（逐一 setHeight 會互相把差額攤到別的副圖上）。
+                    // 每個外框高度（或副圖組成）只校正一次，避免放不下時反覆重排；全螢幕沿用比例分配（橫向高度不夠固定高度）。
                     if (!fullscreenRef.current && height !== paneFixHeight) {
                         paneFixHeight = height;
-                        let fixed = false;
-                        for (let i = 1; i < panes.length; i++) {
-                            const h = panes[i]!.getHeight();
-                            if (h > 0 && Math.abs(h - cs.PANE_HEIGHT_PX) > 1) {
-                                panes[i]!.setHeight(cs.PANE_HEIGHT_PX);
-                                fixed = true;
-                            }
+                        const hs = panes.map(p => p.getHeight() || 0);
+                        const total = hs.reduce((a, b) => a + b, 0);
+                        const n = panes.length - 1;
+                        if (total > 0 && hs.slice(1).some(h => Math.abs(h - cs.PANE_HEIGHT_PX) > 1)) {
+                            panes[0]!.setStretchFactor(Math.max(total - cs.PANE_HEIGHT_PX * n, 60));
+                            for (let i = 1; i < panes.length; i++) panes[i]!.setStretchFactor(cs.PANE_HEIGHT_PX);
+                            scheduleLayout(); // 新高度下一個畫面才生效：重新定位標籤
                         }
-                        if (fixed) scheduleLayout(); // 新高度下一個畫面才生效：重新定位標籤
                     }
                     let acc = 0;
                     for (let i = 0; i < panes.length; i++) {
@@ -697,6 +784,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 inds.push(r);
             }
             subPanes = paneIdx - 1;
+            paneFixHeight = -1;
             try {
                 const panes = chart.panes();
                 for (let i = 1; i < panes.length; i++) panes[i]!.setHeight(cs.PANE_HEIGHT_PX);
@@ -754,14 +842,122 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 try { vol.priceScale().applyOptions({ scaleMargins: { top: 0.12, bottom: 0 } }); } catch { /* 舊版選項 */ }
                 try { chart.panes()[1]?.setHeight(cs.PANE_HEIGHT_PX); } catch { /* pane API 差異不能讓圖表掛掉 */ }
                 subPanes = 1;
+                paneFixHeight = -1;
             } else {
+                // 買賣力副圖排在量之後：先移除，否則量的 pane 移除後它們會往上遞補
+                removeFlowSeries();
                 // 移除最後一個 series 時程式庫會一併移除空的 pane
                 try { chart.removeSeries(vol!); } catch { /* 已隨圖表移除 */ }
                 vol = null;
                 subPanes = 0;
+                paneFixHeight = -1;
             }
             setPaneCount(subPanes);
+            syncFlowPanes();
             return hasVolume;
+        };
+
+        // ---- 走勢副圖：分時買賣力、大單／小單買賣力 ----
+        const removeFlowSeries = () => {
+            const all = [...(flowS ? [flowS.buy, flowS.sell, flowS.net] : []), ...(bsS ? [bsS.big, bsS.small] : [])];
+            for (const sr of all) {
+                try { chart.removeSeries(sr); } catch { /* 已隨圖表移除 */ }
+            }
+            flowS = null;
+            bsS = null;
+        };
+        /** 依設定增減副圖（量副圖存在才建：量固定在 pane 1，買賣力依序在其後） */
+        const syncFlowPanes = () => {
+            if (!flowAllowed) return;
+            const s = lineSettingsRef.current;
+            const needFlow = s.flow && vol !== null;
+            const needBs = s.bigSmall && vol !== null;
+            if (needFlow === (flowS !== null) && needBs === (bsS !== null)) return;
+            removeFlowSeries();
+            const common = { priceLineVisible: false, lastValueVisible: false, priceFormat: LOTS_FORMAT };
+            let pane = 2;
+            if (needFlow) {
+                flowS = {
+                    buy: chart.addSeries(HistogramSeries, { ...common, color: c.upVol }, pane),
+                    sell: chart.addSeries(HistogramSeries, { ...common, color: c.downVol }, pane),
+                    // 累積淨買力：另一個疊加刻度（不顯示座標）；與每分鐘的柱共用右側刻度會把柱壓扁
+                    net: chart.addSeries(LineSeries, { ...common, color: c.text, lineWidth: 1, crosshairMarkerVisible: false, priceScaleId: 'flow-net' }, pane),
+                };
+                try {
+                    // 上方留給圖例（字級大時外內／外盤比／累積淨會排成兩列）
+                    flowS.buy.priceScale().applyOptions({ scaleMargins: { top: 0.45, bottom: 0.05 } });
+                    flowS.net.priceScale().applyOptions({ scaleMargins: { top: 0.45, bottom: 0.05 } });
+                } catch { /* 舊版選項 */ }
+                pane++;
+            }
+            if (needBs) {
+                bsS = {
+                    big: chart.addSeries(LineSeries, { ...common, color: BIG_COLOR, lineWidth: 2, crosshairMarkerVisible: false }, pane),
+                    small: chart.addSeries(LineSeries, { ...common, color: SMALL_COLOR, lineWidth: 2, crosshairMarkerVisible: false }, pane),
+                };
+                try { bsS.big.priceScale().applyOptions({ scaleMargins: { top: 0.3, bottom: 0.05 } }); } catch { /* 舊版選項 */ }
+                bsS.big.createPriceLine({ price: 0, color: c.grid, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: '' });
+                pane++;
+            }
+            try {
+                const panes = chart.panes();
+                for (let i = 2; i < panes.length; i++) panes[i]!.setHeight(cs.PANE_HEIGHT_PX);
+            } catch {
+                // pane API 差異不能讓圖表掛掉
+            }
+            subPanes = pane - 1;
+            paneFixHeight = -1;
+            setPaneCount(subPanes);
+            applyFlowData();
+            scheduleLayout();
+        };
+        /** 依彙總畫副圖並更新圖例（每筆成交以 INDICATOR_FLUSH_MS 節流；整段 setData，一天最多 271 點） */
+        const applyFlowData = () => {
+            if (flowTimer !== null) {
+                clearTimeout(flowTimer);
+                flowTimer = null;
+            }
+            if (cancelled) return;
+            const snap = flowHandle?.get() ?? null;
+            flowStatus = snap?.status ?? null;
+            flowV = snap && snap.status === 'ready' ? flowView(snap.agg, thresholdIndex(lineSettingsRef.current.threshold)) : null;
+            const v = flowV;
+            const pts = (vals: readonly number[] | undefined, sign = 1) => (v && vals ? v.times.map((tm, i) => ({ time: t(tm), value: sign * vals[i]! })) : []);
+            try {
+                if (flowS) {
+                    flowS.buy.setData(pts(v?.buy));
+                    flowS.sell.setData(pts(v?.sell, -1));
+                    flowS.net.setData(pts(v?.cumNet));
+                }
+                if (bsS) {
+                    bsS.big.setData(pts(v?.bigNet));
+                    bsS.small.setData(pts(v?.smallNet));
+                }
+            } catch {
+                // 資料格式問題不能讓圖表掛掉
+            }
+            publishLegend();
+        };
+        const scheduleFlow = () => {
+            if (flowTimer === null && !cancelled) flowTimer = setTimeout(applyFlowData, INDICATOR_FLUSH_MS);
+        };
+        /** 開啟任一買賣力指標且知道走勢的時段時，取用該檔該日的彙總（開啟才下載；關閉時釋放） */
+        const syncFlowHandle = () => {
+            if (!flowAllowed) return;
+            const s = lineSettingsRef.current;
+            const date = (s.flow || s.bigSmall) && win ? dateOfWallClock(win.start) : null;
+            if (date === flowDate) return;
+            flowHandle?.release();
+            flowHandle = null;
+            flowDate = date;
+            if (date) flowHandle = retainLineFlow(ct, date, scheduleFlow);
+            applyFlowData();
+        };
+        flowRebuildRef.current = () => {
+            if (cancelled) return;
+            syncFlowPanes();
+            syncFlowHandle();
+            applyFlowData();
         };
 
         const applyAll = () => {
@@ -844,6 +1040,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             dirtyFrom = -1;
             loaded = true;
             applyAll();
+            syncFlowHandle();
             if (range && live.length > 0) {
                 const shift = bars.length - prevLen;
                 ts.setVisibleLogicalRange({ from: range.from + shift, to: range.to + shift });
@@ -884,6 +1081,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                         if (cancelled || mode === 'refresh') return false;
                         // 走勢載入失敗時仍以目前時段接即時成交
                         if (isLine && !win) win = sessionWindowFor(ct.security_type, nowWallClockUtc());
+                        syncFlowHandle();
                         // 收回預留的成交量副圖高度（之後有量的成交才建立）
                         if (lineVolAllowed && vol === null) setPaneCount(0);
                         loaded = true;
@@ -1014,6 +1212,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             const bar = bars[i];
             if (!bar) return;
             tapTime = bar.time;
+            crossTime = bar.time;
             try {
                 // 程式設定的十字線不觸發 crosshairMove（skipEvent）
                 chart.setCrosshairPosition(bar.close, t(bar.time), main);
@@ -1030,8 +1229,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             readout.set(null);
             if (!clearChart) return;
             try { chart.clearCrosshairPosition(); } catch { /* 十字線 API 差異 */ }
-            if (crossData !== null) {
+            if (crossData !== null || crossTime !== null) {
                 crossData = null;
+                crossTime = null;
                 publishLegend();
             }
         };
@@ -1078,6 +1278,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             else if (tapTime === null) readout.set(null);
             if (next === null && crossData === null) return;
             crossData = next;
+            crossTime = next !== null && param.time !== undefined ? Number(param.time) : null;
             publishLegend();
         });
 
@@ -1094,7 +1295,10 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         setOrderLabels([]);
         setLegend([]);
         // 走勢（非指數）先預留成交量副圖的高度，載入後沒有量才收回（避免載入完成時版面往下跳）
-        setPaneCount(lineVolAllowed ? 1 : 0);
+        {
+            const ls = lineSettingsRef.current;
+            setPaneCount(lineVolAllowed ? 1 + (flowAllowed ? Number(ls.flow) + Number(ls.bigSmall) : 0) : 0);
+        }
         setChartGen(g => g + 1);
         const plan = planHistory(getHistoryEntry(code, period), Date.now(), resumeSeqRef.current);
         if (plan.kind === 'fetch') void load(nextChartHistoryRevision(), 'initial');
@@ -1118,6 +1322,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             resumeRefreshRef.current = () => undefined;
             if (flushTimer !== null) clearTimeout(flushTimer);
             if (indTimer !== null) clearTimeout(indTimer);
+            if (flowTimer !== null) clearTimeout(flowTimer);
+            flowHandle?.release();
+            flowRebuildRef.current = () => undefined;
             if (typeof cancelAnimationFrame === 'function') {
                 if (raf1 !== null) cancelAnimationFrame(raf1);
                 if (raf2 !== null) cancelAnimationFrame(raf2);
@@ -1133,6 +1340,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
 
     // 指標設定改變（或圖表重建後）：在既有圖表上重建指標 series
     useEffect(() => { rebuildRef.current(settingsKey); }, [settingsKey, chartGen]);
+    // 走勢副圖設定改變（或圖表重建後）：增減副圖、換門檻、開始或停止取用逐筆彙總
+    useEffect(() => { flowRebuildRef.current(); }, [lineSettingsKey, chartGen]);
 
     // 回前景（resumeSeq 改變）：背景重抓歷史，補上背景期間缺的一段
     useEffect(() => { resumeRefreshRef.current(resumeSeq); }, [resumeSeq]);
@@ -1355,8 +1564,12 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
 
     const tradable = secType !== 'IND' && !contract.combo;
     const mainLegend = legend.filter(l => l.pane === 0 || paneTops[l.pane] === undefined);
-    const paneLegends = legend.filter(l => l.pane > 0 && paneTops[l.pane] !== undefined);
-    const frameClass = fullscreen ? cs.frameFullscreen : cs.frame[(Math.min(paneCount, 2)) as 0 | 1 | 2];
+    // 同一個副圖可能有好幾組（買賣力：外內、外盤比、累積淨）：同一個副圖放在同一個圖例容器裡換行
+    const paneLegends = new Map<number, LegendEntry[]>();
+    for (const l of legend) {
+        if (l.pane > 0 && paneTops[l.pane] !== undefined) paneLegends.set(l.pane, [...(paneLegends.get(l.pane) ?? []), l]);
+    }
+    const frameClass = fullscreen ? cs.frameFullscreen : cs.frame[(Math.min(paneCount, 3)) as 0 | 1 | 2 | 3];
     const periodLabel = CHART_PERIODS.find(p => p.key === period)?.label ?? '';
 
     const renderLegend = (entries: LegendEntry[], top?: number, withReadout = false) => (
@@ -1411,7 +1624,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             >
                 <div ref={hostRef} className={styles.chartHost} />
                 {renderLegend(mainLegend, undefined, true)}
-                {paneLegends.map(l => <div key={l.id}>{renderLegend([l], paneTops[l.pane])}</div>)}
+                {[...paneLegends].map(([p, ls]) => <div key={p}>{renderLegend(ls, paneTops[p])}</div>)}
                 {orderLabels.map(l => (
                     <button
                         key={l.key}
@@ -1478,7 +1691,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                     <button type='button' className={cs.fsTradeButton.sell} onClick={() => openTicket({ code, action: 'Sell', source: 'button' })} data-testid='chart-fs-sell'>賣 出</button>
                 </div>
             )}
-            <IndicatorSheet open={sheetOpen} onClose={() => setSheetOpen(false)} lineMode={isLine} />
+            <IndicatorSheet open={sheetOpen} onClose={() => setSheetOpen(false)} lineMode={isLine} lineFlowSupported={lineFlowSupported(secType)} />
         </div>
     );
 }
