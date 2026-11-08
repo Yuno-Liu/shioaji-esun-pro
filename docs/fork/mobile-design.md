@@ -1093,7 +1093,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 ### 7.8 帳戶與 HTTPS 說明頁
 
 - 帳戶頁維持同一頁的區塊順序（`account-page.tsx:45-57`），不改讀取與刷新時機；`account-ui.tsx` 的 `Card`、`CollapsibleCard`、`Item`、`Switch`、`Segmented` 改為 GroupedSection 外觀（標題移到卡片外 footnote、資訊列 ≥44px、髮絲分隔），props 與 testId 不變；CollapsibleCard 展開立即、內容 150ms 淡入、chevron 旋轉；Switch 拇指改 `transform: translateX`（取代 `account.css.ts:189` 的 left 轉場）。
-- 顯示區（`display-card.tsx`）新增「降低透明度：跟隨系統／開／關」Segmented（寫 `ui-settings.transparency`，立即改寫 html 屬性）。本裝置區（`device-settings-section.tsx`）新增「介面觸覺回饋（Android）」Switch（`ui-settings.uiHaptics`）。風控區註腳「此鎖定只對本裝置有效」沿用。
+- 顯示區（`display-card.tsx`）新增「降低透明度：跟隨系統／開／關」Segmented（寫 `ui-settings.transparency`，立即改寫 html 屬性）。本裝置區（`device-settings-section.tsx`）新增「介面觸覺回饋（Android）」Switch（`ui-settings.uiHaptics`）。風控區註腳「此鎖定只對本裝置有效」沿用。2026-11-09 更正註腳：原本寫「不會同步到桌面」，但鎖定存在與桌面共用的 `sj-pro-risk`（同源 localStorage），同一瀏覽器開啟的桌面網頁版也會套用，改為「此鎖定只對本裝置有效（存在這個瀏覽器，同一瀏覽器開啟的桌面網頁版也會套用）；不會同步到其他裝置或其他瀏覽器，也沒有伺服器端總開關。」（`account-page.test.tsx` 鎖住這段文字）。
 - HTTPS 說明頁（`secure-context-gate.tsx`、`gate.css.ts`）：仍不建立任何連線；頁面 `overflow-x: hidden`、`overflow-wrap: anywhere`；診斷表 `grid-template-columns: auto minmax(0, 1fr)`；網址與診斷值保留 `SELECTABLE`（已用於 `secure-context-gate.tsx` 與 `diagnostics-card.tsx`）；步驟改編號卡；靜態、無材質、無動畫。裁切原因以 390 寬行動模擬 @2x 重拍確認。
 - 第 1 期起說明頁只在非 secure context 時才載入（`app.tsx` 的 MobileApp 以 retryableLazy 載入 `gate/secure-context-gate`）。載入中與載入失敗時顯示最小的靜態說明（`secure-context-gate-fallback`：「需要 HTTPS」「無法下單」）；兩者都不 bootstrap、不開串流、不掛載交易畫面（`secure-context-gate.test.tsx`、`secure-context-gate-lazy.test.tsx`）。
 

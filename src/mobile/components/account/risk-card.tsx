@@ -1,7 +1,9 @@
 // src/mobile/components/account/risk-card.tsx — 帳戶頁「風控」（規格 §6.7、§10）
 //
 // 一鍵鎖單、單筆上限、當日虧損上限。「手動下單確認」在手機版一律鎖定開啟、不可關閉（R4）；
-// 這裡**不寫入** confirmManualOrders（那是桌面的設定）。鎖定只對本裝置有效（§10.6）。
+// 這裡**不寫入** confirmManualOrders：它在與桌面共用的 sj-pro-risk 裡，由 src/mobile/start.ts 的 pinManualOrderConfirm()
+// 在手機啟動時設為開啟並維持（同一瀏覽器開啟的桌面網頁版也會因此開啟）。
+// 鎖定同樣存在這個瀏覽器的 sj-pro-risk：同一瀏覽器的桌面網頁版也會套用，不跨裝置、沒有伺服器端總開關（§10.6）。
 
 import { Lock, LockOpen } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -118,7 +120,7 @@ export function RiskCard() {
                 )}
             </div>
             <p className={styles.deviceOnly} data-testid='risk-device-only'>
-                此鎖定只對本裝置有效（這個瀏覽器）；不會同步到桌面或其他裝置，也沒有伺服器端總開關。
+                此鎖定只對本裝置有效（存在這個瀏覽器，同一瀏覽器開啟的桌面網頁版也會套用）；不會同步到其他裝置或其他瀏覽器，也沒有伺服器端總開關。
             </p>
 
             <div className={styles.settingRow}>
