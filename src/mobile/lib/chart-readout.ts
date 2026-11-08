@@ -5,6 +5,8 @@
 // - K 線：該根的收盤與「較前一根」收盤的漲跌；日 K 時間改 MM/DD；第一根沒有前一根，只顯示收盤。
 // - 漲跌差額不吸附到跳動價位（參考價與成交價可能落在不同級距，例如 99.9 → 100.5 差 0.6，
 //   吸附到 0.5 檔會錯）；小數位數取兩邊級距的較大者。
+// - 量：options.volume 時附該根的量（千分位整數，單位與圖表量的座標相同：股票張、期權口），不帶顏色
+//   （量本身沒有方向；量柱顏色只是輔助）。無障礙名稱另寫「成交量 N」。
 // - 顏色只輔助：方向以 ▲／▼ 與正負號標示（文字，不只靠顏色）；無障礙名稱另寫「上漲／下跌／平盤」。
 
 import { tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
@@ -34,6 +36,8 @@ export interface ChartReadout {
         /** +0.93%／-0.47%／0.00% */
         pct: string;
     } | null;
+    /** 該根的量（千分位整數）；null＝不顯示（指數、未要求） */
+    volume: string | null;
     ariaLabel: string;
 }
 
@@ -45,6 +49,8 @@ export interface ReadoutOptions {
     /** 走勢的基準（合約參考價）；K 線不使用 */
     reference: number;
     source: ChartReadout['source'];
+    /** 附該根的量（指數不附） */
+    volume?: boolean;
 }
 
 const pad = (n: number) => String(n).padStart(2, '0');
@@ -83,10 +89,14 @@ export function chartReadout(bars: readonly Candle[], i: number, o: ReadoutOptio
     const price = formatToTick(o.contract, bar.close);
     const label = line ? '' : '較前一根';
     const dirWord = ch ? (ch.dir === 'up' ? '上漲' : ch.dir === 'down' ? '下跌' : '平盤') : '';
+    const volume = o.volume && Number.isFinite(bar.volume) && bar.volume >= 0
+        ? cachedNumberFormat('en-US', { maximumFractionDigits: 0 }).format(bar.volume)
+        : null;
     const aria = [
         time,
         `${line ? '價格' : '收盤'} ${price}`,
         ch ? `${line ? '漲跌' : '較前一根'} ${dirWord} ${ch.abs}，${line ? '漲跌幅' : '幅度'} ${ch.pct}` : '',
+        volume !== null ? `成交量 ${volume}` : '',
     ].filter(Boolean).join('，');
     return {
         source: o.source,
@@ -96,6 +106,7 @@ export function chartReadout(bars: readonly Candle[], i: number, o: ReadoutOptio
         price,
         dir: ch?.dir ?? 'flat',
         change: ch ? { label, text: ch.text, pct: ch.pct } : null,
+        volume,
         ariaLabel: aria,
     };
 }

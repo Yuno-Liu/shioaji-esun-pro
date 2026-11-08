@@ -48,7 +48,7 @@ const m = vi.hoisted(() => {
         logicalToCoordinate: vi.fn((l: number) => l * 20),
         width: vi.fn(() => 300),
     };
-    const paneObjs = [0, 1, 2, 3].map(i => ({ setHeight: vi.fn(), getHeight: vi.fn(() => (i === 0 ? 200 : 96)), getHTMLElement: () => null }));
+    const paneObjs = [0, 1, 2, 3].map(i => ({ setHeight: vi.fn(), getHeight: vi.fn((): number => (i === 0 ? 200 : 96)), getHTMLElement: () => null }));
     const chart = {
         addSeries: vi.fn((_type: unknown, _options?: unknown, pane?: number) => {
             if (pane && pane > state.paneMax) state.paneMax = pane;
@@ -309,9 +309,11 @@ describe('TradeChart', () => {
         expect(hasText('歷史資料載入失敗')).toBe(false);
     });
 
-    it('走勢模式使用 BaselineSeries（參考價基準線）＋量＋均價線，不畫 MA 等指標', async () => {
+    it('走勢模式使用 BaselineSeries（參考價基準線）＋均價線＋成交量副圖，不畫 MA 等指標', async () => {
         await render([], 'line');
-        expect(m.chart.addSeries.mock.calls.map(c => c[0])).toEqual(['Baseline', 'Histogram', 'Line']);
+        // 成交量在有量的歷史載入後才建立（pane 1），所以排在均價線之後
+        expect(m.chart.addSeries.mock.calls.map(c => c[0])).toEqual(['Baseline', 'Line', 'Histogram']);
+        expect(m.chart.addSeries.mock.calls[2]![2]).toBe(1);
     });
 
     it('可互動的圖表容器帶 data-allow-pinch="true"（平台手勢防護略過這一區）', async () => {
@@ -567,7 +569,7 @@ describe('TradeChart 技術指標（W2）', () => {
 describe('TradeChart 走勢均價線與最高最低（W2）', () => {
     it('歷史畫均價線；即時成交帶 avg_price 時以交易所均價更新；最高最低以價格軸標示並跟著更新', async () => {
         await render([], 'line');
-        const avg = m.allSeries[2]!;
+        const avg = m.allSeries[1]!; // Baseline、均價線，之後才是有量時建立的成交量
         const hist = avg.setData.mock.calls.at(-1)![0] as Array<{ value?: number }>;
         expect(hist).toHaveLength(2);
         expect(hist.every(p => typeof p.value === 'number' && Number.isFinite(p.value))).toBe(true);
@@ -584,7 +586,7 @@ describe('TradeChart 走勢均價線與最高最低（W2）', () => {
 
     it('沒有 avg_price 時以累計成交金額／量估算', async () => {
         await render([], 'line');
-        const avg = m.allSeries[2]!;
+        const avg = m.allSeries[1]!; // Baseline、均價線，之後才是有量時建立的成交量
         await emit({ time: '09:03:00', close: '1100', volume: 30, total_volume: 60 });
         const v = (avg.update.mock.calls.at(-1)![0] as { value: number }).value;
         // 歷史估算：(1073.33×10 + 1077.33×20)／30 ≈ 1076；加上 1100×30 → 介於兩者之間
@@ -898,7 +900,8 @@ describe('TradeChart 點選價格資訊', () => {
         // 文字標示方向（▲＋正負號），顏色只輔助；無障礙名稱寫出「上漲」
         expect(byTestId('chart-readout-change')[0]!.props.className).toContain(tradeStyles.dirText.up);
         const group = readoutNodes()[0]!.findAll(n => n.props.role === 'group')[0]!;
-        expect(group.props['aria-label']).toBe('09:02，價格 1,080，漲跌 上漲 10，漲跌幅 +0.93%');
+        expect(group.props['aria-label']).toBe('09:02，價格 1,080，漲跌 上漲 10，漲跌幅 +0.93%，成交量 20');
+        expect(textOf(byTestId('chart-readout-volume')[0]!)).toBe('量 20');
         // 資訊列在圖例第一列（同一個容器，往下排，不另疊一層）
         expect(byTestId('chart-legend')[0]!.findAll(n => n.props['data-testid'] === 'chart-readout')).toHaveLength(1);
         expect(byTestId('chart-pick')).toHaveLength(0);
@@ -1025,6 +1028,8 @@ describe('TradeChart 點選價格資訊', () => {
         await tap(10, 100);
         expect(readoutText()).toContain('11/04');
         expect(textOf(byTestId('chart-readout-price')[0]!)).toBe('收 1,080');
+        // K 線也附該根的量（量仍疊在主圖，不另建副圖）
+        expect(textOf(byTestId('chart-readout-volume')[0]!)).toBe('量 20');
         expect(textOf(byTestId('chart-readout-change')[0]!)).toBe('較前一根 ▲30 (+2.86%)');
         await tap(40, 100);
         expect(textOf(byTestId('chart-readout-change')[0]!)).toBe('較前一根 0 (0.00%)');
@@ -1054,5 +1059,141 @@ describe('TradeChart 點選價格資訊', () => {
         expect(m.openOrderAction).not.toHaveBeenCalled();
         expect(byTestId('chart-pick')).toHaveLength(0);
         for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
+    });
+});
+
+describe('TradeChart 走勢成交量副圖', () => {
+    const volIndex = () => m.chart.addSeries.mock.calls.findIndex(c => c[0] === 'Histogram');
+    const volCall = () => m.chart.addSeries.mock.calls[volIndex()];
+    const volSeries = () => m.allSeries[volIndex()]!;
+    const press = async (x: number, y: number, ms: number) => {
+        await act(async () => { wrap().props.onPointerDown(ptr(x, y)); });
+        await tick(ms);
+    };
+    const release = async (x: number, y: number) => { await act(async () => { wrap().props.onPointerUp(ptr(x, y)); }); };
+    const crosshairHandler = () => m.chart.subscribeCrosshairMove.mock.calls.at(-1)![0] as (p: unknown) => void;
+
+    beforeEach(() => {
+        m.fetchChartHistory.mockReset().mockResolvedValue(LINE_KBARS);
+    });
+
+    it('走勢：成交量在 pane 1（量的座標、副圖高度、外框加高）；量柱以本分鐘對前一分鐘（第一根對參考價）漲紅跌綠；副圖圖例「成交量」', async () => {
+        await render([], 'line');
+        await tick(20);
+        const [, opts, pane] = volCall()!;
+        expect(pane).toBe(1);
+        expect(opts).toMatchObject({ priceFormat: { type: 'volume' }, lastValueVisible: false });
+        expect((opts as Record<string, unknown>).priceScaleId).toBeUndefined(); // 副圖自己的右側座標，不是主圖的疊加座標
+        expect(m.paneObjs[1]!.setHeight).toHaveBeenCalledWith(cs.PANE_HEIGHT_PX);
+        expect(wrap().props.className).toBe(cs.frame[1]);
+        const data = volSeries().setData.mock.calls.at(-1)![0] as Array<{ value: number; color: string }>;
+        // 1075 > 參考價 1070 → 漲；1080 > 1075 → 漲；1065 < 1080 → 跌（測試配色：upVol #f008、downVol #0f08）
+        expect(data.map(p => [p.value, p.color])).toEqual([[10, '#f008'], [20, '#f008'], [30, '#0f08']]);
+        // 圖例：在 pane 1 的頂端（主圖高 200＋分隔線 1），顯示最新一分鐘的量
+        const volLegend = byTestId('chart-legend').find(n => textOf(n).includes('成交量'))!;
+        expect(volLegend.props.style).toEqual({ top: '205px' });
+        expect(textOf(volLegend)).toContain('30');
+        // 主圖圖例不含成交量
+        expect(textOf(byTestId('chart-legend')[0]!)).not.toContain('成交量');
+    });
+
+    it('K 線：成交量維持疊加在主圖（priceScaleId vol、沒有 pane），外框不加高', async () => {
+        await render([], '5m');
+        const [, opts, pane] = volCall()!;
+        expect(pane).toBeUndefined();
+        expect(opts).toMatchObject({ priceScaleId: 'vol' });
+        expect(wrap().props.className).toBe(cs.frame[0]);
+        expect(legendText()).not.toContain('成交量');
+    });
+
+    it('指數走勢不建成交量副圖、外框維持 0 副圖；資訊列不附量', async () => {
+        await act(async () => {
+            view = create(createElement(TradeChart, { code: '001', contract: { ...contract, code: '001', security_type: 'IND' } as ContractInfo, period: 'line', lines: [] }), { createNodeMock: nodeMock });
+        });
+        await tick(50);
+        expect(seriesTypes()).toEqual(['Baseline']);
+        expect(wrap().props.className).toBe(cs.frame[0]);
+        await press(12, 100, 100);
+        await release(12, 100);
+        expect(byTestId('chart-readout')).toHaveLength(1);
+        expect(byTestId('chart-readout-volume')).toHaveLength(0);
+    });
+
+    it('量全為 0 時不建副圖（外框 0 副圖）；之後有量的成交才建立並整段 setData，同一分鐘的成交 update 最後一根', async () => {
+        m.fetchChartHistory.mockReset().mockResolvedValue({ ...LINE_KBARS, Volume: [0, 0, 0] });
+        await render([], 'line');
+        expect(seriesTypes()).toEqual(['Baseline', 'Line']);
+        expect(wrap().props.className).toBe(cs.frame[0]);
+        expect(legendText()).not.toContain('成交量');
+
+        await emit({ time: '09:03:30', close: '1065', volume: 5, total_volume: 5 });
+        expect(volCall()![2]).toBe(1);
+        expect(wrap().props.className).toBe(cs.frame[1]);
+        const vol = volSeries();
+        const set = vol.setData.mock.calls.at(-1)![0] as Array<{ value: number; color: string }>;
+        // 09:04 這一分鐘 1065 與前一分鐘收盤 1065 相同 → 平盤中性色
+        expect(set.map(p => p.value)).toEqual([0, 0, 0, 5]);
+        expect(set.at(-1)!.color).toBe('#888');
+
+        await emit({ time: '09:03:40', close: '1070', volume: 7, total_volume: 12 });
+        expect(vol.update).toHaveBeenLastCalledWith({ time: expect.any(Number), value: 12, color: '#f008' });
+    });
+
+    it('有量的走勢：即時成交更新最後一根的量柱（不重建副圖）', async () => {
+        await render([], 'line');
+        const vol = volSeries();
+        await emit({ time: '09:02:30', close: '1060', volume: 4, total_volume: 64 });
+        // 09:03 這一分鐘：30 + 4，收 1060 < 前一分鐘 1080 → 跌
+        expect(vol.update).toHaveBeenLastCalledWith({ time: expect.any(Number), value: 34, color: '#0f08' });
+        expect(m.chart.addSeries.mock.calls.filter(c => c[0] === 'Histogram')).toHaveLength(1);
+    });
+
+    it('在成交量副圖內長按不選價、輕點不顯示資訊列；主圖內長按仍可選價', async () => {
+        await render([], 'line');
+        await tick(20); // 版面定位：主圖高 200
+        await press(100, 250, LONG_PRESS_MS + 10);
+        await act(async () => { crosshairHandler()({ time: 1, point: { x: 100, y: 250 }, paneIndex: 1, seriesData: new Map() }); });
+        await release(100, 250);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+
+        await press(12, 250, 100);
+        await release(12, 250);
+        expect(byTestId('chart-readout')).toHaveLength(0);
+
+        await press(100, 150, LONG_PRESS_MS + 10);
+        await release(100, 150);
+        expect(byTestId('chart-pick')).toHaveLength(1);
+        expect(m.openTicket).not.toHaveBeenCalled();
+    });
+
+    it('退出全螢幕後程式庫依比例放大了副圖：一般模式把副圖拉回 PANE_HEIGHT_PX（價格區不縮小）；全螢幕不校正', async () => {
+        await render([], 'line');
+        await tick(20);
+        m.paneObjs[1]!.setHeight.mockClear();
+        m.paneObjs[1]!.getHeight.mockImplementation(() => 127);
+        try {
+            await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+            await tick(20);
+            expect(m.paneObjs[1]!.setHeight).not.toHaveBeenCalled();
+            await act(async () => { byTestId('chart-fs-exit')[0]!.props.onClick(); });
+            await tick(20);
+            expect(m.paneObjs[1]!.setHeight).toHaveBeenCalledTimes(1);
+            expect(m.paneObjs[1]!.setHeight).toHaveBeenCalledWith(cs.PANE_HEIGHT_PX);
+            // 同一外框高度不反覆校正
+            await emit({ time: '09:02:30', close: '1060', volume: 4, total_volume: 64 });
+            await tick(20);
+            expect(m.paneObjs[1]!.setHeight).toHaveBeenCalledTimes(1);
+        } finally {
+            m.paneObjs[1]!.getHeight.mockImplementation(() => 96);
+        }
+    });
+
+    it('輕點資訊列附該分鐘的量（無障礙名稱一併）', async () => {
+        await render([], 'line');
+        await press(250, 100, 100);
+        await release(250, 100);
+        expect(textOf(byTestId('chart-readout-volume')[0]!)).toBe('量 30');
+        const group = byTestId('chart-readout')[0]!.findAll(n => n.props.role === 'group')[0]!;
+        expect(group.props['aria-label']).toContain('成交量 30');
     });
 });
