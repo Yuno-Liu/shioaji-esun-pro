@@ -1,4 +1,4 @@
-// useWakeLock：依本裝置設定啟停；關閉開關即釋放；不支援時不呼叫
+// useWakeLock：依本裝置設定啟停；關閉開關即釋放；不支援時不呼叫；lib/wake-lock 只在開關開啟時才動態載入
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -43,8 +43,8 @@ describe('useWakeLock', () => {
     it('acquires when switched on and releases when switched off', async () => {
         await act(async () => { view = create(createElement(Probe)); });
         await act(async () => { setMobileDeviceSettings({ wakeLock: true }); await flush(); });
+        await vi.waitFor(() => expect(getWakeLockStatus().state).toBe('active'));
         expect(request).toHaveBeenCalledWith('screen');
-        expect(getWakeLockStatus().state).toBe('active');
         await act(async () => { setMobileDeviceSettings({ wakeLock: false }); });
         expect(release).toHaveBeenCalledOnce();
         expect(getWakeLockStatus().state).toBe('off');
@@ -53,16 +53,32 @@ describe('useWakeLock', () => {
     it('releases on unmount', async () => {
         setMobileDeviceSettings({ wakeLock: true });
         await act(async () => { view = create(createElement(Probe)); await flush(); });
+        await vi.waitFor(() => expect(getWakeLockStatus().state).toBe('active'));
         await act(async () => view?.unmount());
         view = undefined;
         expect(release).toHaveBeenCalledOnce();
     });
 
-    it('marks unsupported browsers and never requests', async () => {
+    it('unsupported browsers: never loads the module or requests (the settings UI uses wakeLockSupported())', async () => {
         vi.stubGlobal('navigator', {});
         setMobileDeviceSettings({ wakeLock: true });
-        await act(async () => { view = create(createElement(Probe)); });
-        expect(getWakeLockStatus().state).toBe('unsupported');
+        await act(async () => { view = create(createElement(Probe)); await flush(); });
+        // 先前的測試已載入模組時會設為 unsupported；沒載入時維持初始 off（設定區塊以 wakeLockSupported() 判斷）
+        expect(['off', 'unsupported']).toContain(getWakeLockStatus().state);
         expect(request).not.toHaveBeenCalled();
+    });
+
+    it('switched off (or unmounted) before the lazy module arrives: never acquires', async () => {
+        await act(async () => { view = create(createElement(Probe)); });
+        // 同步 act：effect 立即執行、動態 import 還沒 resolve 就關掉開關
+        act(() => { setMobileDeviceSettings({ wakeLock: true }); });
+        act(() => { setMobileDeviceSettings({ wakeLock: false }); });
+        // 再開一次、還沒 resolve 就卸載
+        act(() => { setMobileDeviceSettings({ wakeLock: true }); });
+        act(() => { view?.unmount(); });
+        view = undefined;
+        await act(async () => { await flush(); await flush(); });
+        expect(request).not.toHaveBeenCalled();
+        expect(getWakeLockStatus().state).not.toBe('active');
     });
 });
