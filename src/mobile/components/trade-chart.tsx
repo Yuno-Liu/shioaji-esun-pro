@@ -1365,7 +1365,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             {!fullscreen && (
                 <div className={cs.toolRow}>
                     <p className={cs.toolNote}>
-                        {isLine ? '長按圖表選價位，放開後可帶價開啟下單面板' : period === '1D' ? '日 K 由 1 分 K 聚合，未含除權息調整' : '長按圖表選價位'}
+                        {isLine ? '點一下看價格與漲跌；長按選價位，放開開啟下單面板' : period === '1D' ? '日 K 由 1 分 K 聚合，未含除權息調整' : '點一下看收盤與漲跌；長按選價位'}
                     </p>
                     <Chip label='指標' className={cs.toolButton} onClick={() => setSheetOpen(true)} testId='chart-indicators' />
                     <Chip label='全螢幕' className={cs.toolButton} onClick={enterFullscreen} testId='chart-fs-enter' />
