@@ -30,6 +30,11 @@ const m = vi.hoisted(() => ({
     // 自選 ☆：殼層 WatchlistProvider 的替身（null＝不在 Provider 內）與通知
     wl: null as unknown,
     notify: vi.fn(),
+    // ☆「加入自選」面板：其他清單的外部變更路徑（lib/shioaji）、重新讀取事件、面板的延遲載入
+    addWl: vi.fn(),
+    removeWl: vi.fn(),
+    emit: vi.fn(),
+    pickerLoad: vi.fn(),
     // S1：lib 的送單／改單／刪單函式（交易頁任何入口都不得呼叫）
     send: {
         placeStockOrder: vi.fn(),
@@ -85,7 +90,11 @@ vi.mock('../../lib/shioaji', () => ({
     cancelVerifiedOrder: m.send.cancelVerifiedOrder,
     updateOrderPrice: m.send.updateOrderPrice,
     updateOrderQty: m.send.updateOrderQty,
+    addWatchlistContracts: m.addWl,
+    removeWatchlistContracts: m.removeWl,
 }));
+vi.mock('../../lib/watchlist-sync', () => ({ emitWatchlistChanged: m.emit }));
+vi.mock('../components/load-watch-picker-sheet', () => ({ loadWatchPickerSheet: () => m.pickerLoad() }));
 vi.mock('../lib/mobile-order', () => ({ submitMobileOrder: m.send.submitMobileOrder }));
 vi.mock('../../lib/trade', () => ({ placeQuickOrder: m.send.placeQuickOrder, cancelAllOrders: m.send.cancelAllOrders, notify: m.notify }));
 vi.mock('../lib/watchlist-context', () => ({ useOptionalMobileWatchlist: () => m.wl }));
@@ -103,7 +112,7 @@ import * as tradeStyles from '../styles/trade.css';
 import * as tradeInfoStyles from '../styles/trade-info.css';
 import { card as groupedCard } from '../ui/grouped.css';
 import { ShellSlot, ShellSlotsContext } from '../ui/shell-slots';
-import { dayTradeText, deliveryMonthText, positionSummaries, watchStarBlocked, scrolledPast, sessionText, statKeys, summaryUsesStockUnits, TradePage, workingOrderCount } from './trade-page';
+import { dayTradeText, deliveryMonthText, listsWithContract, positionSummaries, watchStarBlocked, watchStarLabel, scrolledPast, sessionText, statKeys, summaryUsesStockUnits, TradePage, workingOrderCount } from './trade-page';
 
 const stock = {
     exchange: 'TSE', code: '2330', security_type: 'STK', target_code: null, name: '台積電', currency: 'TWD',
@@ -150,6 +159,10 @@ beforeEach(() => {
     m.chipsSheetProps.length = 0;
     m.wl = null;
     m.notify.mockReset();
+    m.addWl.mockReset().mockResolvedValue({});
+    m.removeWl.mockReset().mockResolvedValue({});
+    m.emit.mockReset();
+    m.pickerLoad.mockReset().mockImplementation(() => import('../components/watch-picker-sheet'));
     Object.values(m.send).forEach(f => f.mockReset());
 });
 afterEach(async () => {
@@ -1286,34 +1299,69 @@ describe('TradePage 當沖資訊列', () => {
     });
 });
 
-// ---- P1：標頭 ☆ 加入／移出目前的自選清單（殼層 WatchlistProvider；§10 S1） ----
+// ---- 標頭 ☆ → 「加入自選」清單選擇面板：一次加入／移出多個清單（殼層 WatchlistProvider；§10 S1） ----
 
 describe('TradePage 自選 ☆', () => {
+    type Base = { code: string; security_type: string; exchange: string };
     type Wl = {
         items: { contract: { code: string } }[];
         loading: boolean;
         structureBusy: boolean;
         loadError: boolean;
-        serverLists: { id: string; name: string }[];
+        serverLists: { id: string; name: string; contracts: Base[] }[];
         activeListId: string | null;
         addSymbol: ReturnType<typeof vi.fn>;
         removeSymbol: ReturnType<typeof vi.fn>;
     };
+    const STK_2330: Base = { code: '2330', security_type: 'STK', exchange: 'TSE' };
+    const other = (code: string): Base => ({ code, security_type: 'STK', exchange: 'TSE' });
     const makeWl = (over: Partial<Wl> = {}): Wl => ({
         items: [],
         loading: false,
         structureBusy: false,
         loadError: false,
-        serverLists: [{ id: 'L1', name: '我的自選' }, { id: 'L2', name: '短線' }],
+        serverLists: [
+            { id: 'L1', name: '我的自選', contracts: [other('2317')] },
+            { id: 'L2', name: '短線', contracts: [] },
+            { id: 'L3', name: '觀察', contracts: [STK_2330, other('2454')] },
+        ],
         activeListId: 'L2',
         addSymbol: vi.fn(async () => stock),
         removeSymbol: vi.fn(async () => undefined),
         ...over,
     });
     const star = () => byId('trade-watch-star');
-    const settleClick = async () => {
+    const all = (id: string) => view!.root.findAll(n => n.props['data-testid'] === id && typeof n.type === 'string');
+    const one = (id: string) => {
+        const found = all(id);
+        if (found.length !== 1) throw new Error(`${id}: ${found.length}`);
+        return found[0]!;
+    };
+    const picker = () => view!.root.findAll(n => n.props.testId === 'watch-picker' && typeof n.type !== 'string')[0];
+    const rowOf = (id: string) => all('watch-picker-list').find(r => r.props['data-list-id'] === id)!;
+    const checkOf = (id: string) => rowOf(id).findByProps({ 'data-testid': 'watch-picker-check' });
+    const toggle = async (id: string) => { await act(async () => { checkOf(id).props.onChange(); }); };
+    /** 按 ☆ 並等延遲載入的面板出現 */
+    const openPicker = async () => {
         await act(async () => { star().props.onClick(); });
-        await act(async () => { await Promise.resolve(); });
+        for (let i = 0; i < 50 && !picker(); i++) {
+            await act(async () => {
+                await vi.dynamicImportSettled();
+                await new Promise(r => setTimeout(r, 5));
+            });
+        }
+        expect(picker()?.props.open).toBe(true);
+    };
+    const done = async () => {
+        await act(async () => { one('watch-picker-done').props.onClick(); });
+        await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    };
+    const noWrites = (wl: Wl) => {
+        expect(wl.addSymbol).not.toHaveBeenCalled();
+        expect(wl.removeSymbol).not.toHaveBeenCalled();
+        expect(m.addWl).not.toHaveBeenCalled();
+        expect(m.removeWl).not.toHaveBeenCalled();
+        expect(m.emit).not.toHaveBeenCalled();
     };
 
     it('不在 WatchlistProvider 內時不顯示', async () => {
@@ -1321,13 +1369,23 @@ describe('TradePage 自選 ☆', () => {
         expect(view!.root.findAllByProps({ 'data-testid': 'trade-watch-star' })).toHaveLength(0);
     });
 
-    it('在標頭上半的右欄（不在名稱列、主價列內）；44px IconButton、aria-pressed＝是否已在目前清單', async () => {
-        m.wl = makeWl();
+    it('listsWithContract：以代碼＋商品類別比對；watchStarLabel 列出所在清單與停用原因', () => {
+        const lists = makeWl().serverLists;
+        expect(listsWithContract(lists, stock).map(l => l.id)).toEqual(['L3']);
+        expect(listsWithContract(lists, { code: '2330', security_type: 'FUT' } as ContractInfo)).toEqual([]);
+        expect(listsWithContract(lists, undefined)).toEqual([]);
+        expect(watchStarLabel([], null)).toBe('自選：未加入');
+        expect(watchStarLabel(['主要', '觀察'], null)).toBe('自選：已在 主要、觀察');
+        expect(watchStarLabel(['主要'], '自選清單更新中')).toBe('自選：已在 主要，自選清單更新中');
+    });
+
+    it('在標頭上半的右欄（不在名稱列、主價列內）；44px IconButton、aria-pressed＝已在任一清單，名稱列出所在清單', async () => {
+        m.wl = makeWl({ serverLists: makeWl().serverLists.map(l => ({ ...l, contracts: l.contracts.filter(c => c.code !== '2330') })) });
         await render();
         const b = star();
         expect(b.type).toBe('button');
         expect(b.props['aria-pressed']).toBe(false);
-        expect(b.props['aria-label']).toBe('自選（短線）');
+        expect(b.props['aria-label']).toBe('自選：未加入');
         // 版面：☆ 外框（watchStar）是 headTop 的直接子節點，與 headMain（名稱列＋主價列）並列
         let cell = b.parent!;
         while (typeof cell.type !== 'string') cell = cell.parent!;
@@ -1344,55 +1402,162 @@ describe('TradePage 自選 ☆', () => {
         expect(byId('trade-info-strip')).toBeTruthy();
         expect(top.findAll(n => n.props['data-testid'] === 'trade-info-strip')).toHaveLength(0);
 
-        m.wl = makeWl({ items: [{ contract: { code: '2330' } }] });
+        // 在非目前清單（觀察）也算已加入
+        m.wl = makeWl();
         await render();
         expect(star().props['aria-pressed']).toBe(true);
+        expect(star().props['aria-label']).toBe('自選：已在 觀察');
     });
 
-    it('加入：以已載入的合約呼叫 addSymbol（不重新解析）並以通知回報；完成前不能再按（aria-disabled，焦點不掉）', async () => {
-        let release!: () => void;
-        const wl = makeWl({ addSymbol: vi.fn(() => new Promise(r => { release = () => r(stock); })) });
+    it('按 ☆ 開面板（延遲載入）：列出每個清單的勾選、名稱、檔數與（目前）；開啟與勾選都不送出，「取消」捨棄', async () => {
+        const wl = makeWl();
         m.wl = wl;
         await render();
-        await act(async () => { star().props.onClick(); });
-        expect(wl.addSymbol).toHaveBeenCalledWith('2330', 'STK', stock);
-        // 處理中：只標 aria-disabled（disabled 會讓聚焦中的按鈕失去焦點），再按一次被忽略
-        expect(star().props.disabled).toBe(false);
-        expect(star().props['aria-disabled']).toBe(true);
-        expect(star().props['aria-label']).toBe('自選（短線），自選清單更新中');
-        await act(async () => { star().props.onClick(); });
-        expect(wl.addSymbol).toHaveBeenCalledTimes(1);
-        await act(async () => { release(); });
-        expect(m.notify).toHaveBeenCalledWith({ kind: 'ok', title: '已加入自選', body: '2330 台積電 已加入「短線」' });
-        expect(star().props.disabled).toBe(false);
-        expect(star().props['aria-disabled']).toBeUndefined();
-        expect(wl.removeSymbol).not.toHaveBeenCalled();
+        expect(picker()).toBeUndefined();
+        await openPicker();
+        expect(picker()!.props.title).toBe('加入自選');
+        expect(all('watch-picker-list').map(r => r.props['data-list-id'])).toEqual(['L1', 'L2', 'L3']);
+        expect(all('watch-picker-list').map(r => text(r))).toEqual(['我的自選1 檔', '短線（目前）0 檔', '觀察2 檔']);
+        expect(all('watch-picker-check').map(c => c.props.checked)).toEqual([false, false, true]);
+        expect(all('watch-picker-check').every(c => c.props.type === 'checkbox')).toBe(true);
+        await toggle('L1');
+        await toggle('L3');
+        expect(all('watch-picker-check').map(c => c.props.checked)).toEqual([true, false, false]);
+        noWrites(wl);
+        await act(async () => { one('watch-picker-cancel').props.onClick(); });
+        expect(picker()!.props.open).toBe(false);
+        noWrites(wl);
+        expect(m.notify).not.toHaveBeenCalled();
+        // 再開：勾選回到目前狀態
+        await openPicker();
+        expect(all('watch-picker-check').map(c => c.props.checked)).toEqual([false, false, true]);
+        // 沒改就按「完成」：只關閉，不送出、不通知
+        await done();
+        expect(picker()!.props.open).toBe(false);
+        noWrites(wl);
+        expect(m.notify).not.toHaveBeenCalled();
     });
 
-    it('StrictMode（開發版）：模擬卸載再掛載後，加入完成仍會恢復可按（mounted 旗標掛載時設回 true）', async () => {
+    it('「完成」依序套用差異：目前清單走 hook（帶已載入的合約），其他清單走 lib，最後重新讀取一次並通知；套用中 ☆ 為 aria-disabled', async () => {
+        const calls: string[] = [];
+        let releaseActive!: () => void;
+        const wl = makeWl({
+            addSymbol: vi.fn(() => new Promise(r => { calls.push('hook add'); releaseActive = () => r(stock); })),
+        });
+        m.addWl.mockImplementation(async (id: string) => { calls.push(`lib add ${id}`); return {}; });
+        m.removeWl.mockImplementation(async (id: string) => { calls.push(`lib remove ${id}`); return {}; });
+        m.emit.mockImplementation(() => { calls.push('emit'); });
+        m.wl = wl;
+        await render();
+        await openPicker();
+        await toggle('L1'); // 加入（其他清單）
+        await toggle('L2'); // 加入（目前清單）
+        await toggle('L3'); // 移出（其他清單）
+        await done();
+        expect(picker()!.props.open).toBe(false);
+        expect(wl.addSymbol).toHaveBeenCalledWith('2330', 'STK', stock);
+        // 套用中：只標 aria-disabled（disabled 會讓聚焦中的按鈕失去焦點），再按一次被忽略
+        expect(star().props.disabled).toBe(false);
+        expect(star().props['aria-disabled']).toBe(true);
+        expect(star().props['aria-label']).toBe('自選：已在 觀察，自選清單更新中');
+        await act(async () => { star().props.onClick(); });
+        expect(picker()!.props.open).toBe(false);
+        await act(async () => { releaseActive(); });
+        await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+        expect(calls).toEqual(['hook add', 'lib add L1', 'lib remove L3', 'emit']);
+        expect(m.addWl).toHaveBeenCalledWith('L1', [stock]);
+        expect(m.removeWl).toHaveBeenCalledWith('L3', [stock]);
+        expect(m.emit).toHaveBeenCalledTimes(1);
+        expect(m.emit).toHaveBeenCalledWith({ source: 'user' });
+        expect(wl.removeSymbol).not.toHaveBeenCalled();
+        expect(m.notify).toHaveBeenCalledTimes(1);
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'ok', title: '自選已更新', body: '2330 台積電：已加入 2 個清單、移出 1 個清單' });
+        expect(star().props['aria-disabled']).toBeUndefined();
+        expect(star().props.disabled).toBe(false);
+    });
+
+    it('只改目前清單：hook 的 removeSymbol，不發重新讀取事件', async () => {
+        // 目前清單是 L3（含 2330）：hook 的本機列表也有這檔（與伺服器一致）
+        const wl = makeWl({ activeListId: 'L3', items: [{ contract: { code: '2330' } }, { contract: { code: '2454' } }] });
+        m.wl = wl;
+        await render();
+        await openPicker();
+        expect(text(rowOf('L3'))).toBe('觀察（目前）2 檔');
+        await toggle('L3');
+        await done();
+        expect(wl.removeSymbol).toHaveBeenCalledWith('2330');
+        expect(m.addWl).not.toHaveBeenCalled();
+        expect(m.removeWl).not.toHaveBeenCalled();
+        expect(m.emit).not.toHaveBeenCalled();
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'ok', title: '自選已更新', body: '2330 台積電：移出 1 個清單' });
+    });
+
+    it('個別清單失敗：其餘照做、仍重新讀取一次，通知列出失敗的清單與原因', async () => {
+        const wl = makeWl({ addSymbol: vi.fn(async () => { throw new Error('自選清單已切換，請重新新增商品'); }) });
+        m.addWl.mockRejectedValue(new Error('HTTP 500'));
+        m.wl = wl;
+        await render();
+        await openPicker();
+        await toggle('L1');
+        await toggle('L2');
+        await toggle('L3');
+        await done();
+        expect(m.removeWl).toHaveBeenCalledWith('L3', [stock]);
+        expect(m.emit).toHaveBeenCalledTimes(1);
+        expect(m.notify).toHaveBeenCalledTimes(1);
+        expect(m.notify).toHaveBeenCalledWith({
+            kind: 'err',
+            title: '自選部分未更新',
+            body: '2330 台積電：移出 1 個清單；「短線」加入失敗：自選清單已切換，請重新新增商品；「我的自選」加入失敗：HTTP 500',
+        });
+        expect(star().props['aria-disabled']).toBeUndefined();
+
+        // 只改目前清單且失敗：仍發重新讀取，讓畫面與伺服器同步
+        m.emit.mockClear();
+        m.notify.mockClear();
+        await render();
+        await openPicker();
+        await toggle('L2');
+        await done();
+        expect(m.emit).toHaveBeenCalledTimes(1);
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: '自選更新失敗', body: '2330 台積電：「短線」加入失敗：自選清單已切換，請重新新增商品' });
+    });
+
+    it('面板與 ☆ 的清單名稱依這台裝置的群組順序（自選頁「排序群組」；新清單在最後）', async () => {
+        const data = new Map([['sj-mobile-watch-list-order-v1', JSON.stringify(['L3', 'gone', 'L2'])]]);
+        vi.stubGlobal('localStorage', { getItem: (k: string) => data.get(k) ?? null, setItem: vi.fn(), removeItem: vi.fn() });
+        const lists = makeWl().serverLists;
+        m.wl = makeWl({ serverLists: [{ ...lists[0]!, contracts: [STK_2330] }, lists[1]!, lists[2]!] });
+        await render();
+        expect(star().props['aria-label']).toBe('自選：已在 觀察、我的自選');
+        await openPicker();
+        expect(all('watch-picker-list').map(r => r.props['data-list-id'])).toEqual(['L3', 'L2', 'L1']);
+    });
+
+    it('沒有清單：面板顯示空狀態，「完成」不送出', async () => {
+        const wl = makeWl({ serverLists: [], activeListId: '' });
+        m.wl = wl;
+        await render();
+        expect(star().props['aria-label']).toBe('自選：未加入');
+        await openPicker();
+        expect(all('watch-picker-lists')).toHaveLength(0);
+        expect(text(picker()!)).toContain('還沒有自選清單');
+        await done();
+        noWrites(wl);
+    });
+
+    it('StrictMode（開發版）：模擬卸載再掛載後，套用完成仍會恢復可按（mounted 旗標掛載時設回 true）', async () => {
         let release!: () => void;
         const wl = makeWl({ addSymbol: vi.fn(() => new Promise(r => { release = () => r(stock); })) });
         m.wl = wl;
         await act(async () => { view = create(createElement(StrictMode, null, createElement(TradePage, { code: '2330' }))); });
-        await act(async () => { star().props.onClick(); });
+        await openPicker();
+        await toggle('L2');
+        await done();
         expect(star().props['aria-disabled']).toBe(true);
         await act(async () => { release(); });
+        await act(async () => { await new Promise(r => setTimeout(r, 0)); });
         expect(star().props['aria-disabled']).toBeUndefined();
-        expect(star().props.disabled).toBe(false);
-    });
-
-    it('移出：已在清單時呼叫 removeSymbol 並通知；失敗時以錯誤通知顯示原因', async () => {
-        const wl = makeWl({ items: [{ contract: { code: '2330' } }] });
-        m.wl = wl;
-        await render();
-        await settleClick();
-        expect(wl.removeSymbol).toHaveBeenCalledWith('2330');
-        expect(m.notify).toHaveBeenLastCalledWith({ kind: 'ok', title: '已移出自選', body: '2330 台積電 已從「短線」移除' });
-
-        m.wl = makeWl({ addSymbol: vi.fn(async () => { throw new Error('自選清單已切換，請重新新增商品'); }) });
-        await render();
-        await settleClick();
-        expect(m.notify).toHaveBeenLastCalledWith({ kind: 'err', title: '加入自選失敗', body: '自選清單已切換，請重新新增商品' });
         expect(star().props.disabled).toBe(false);
     });
 
@@ -1412,22 +1577,30 @@ describe('TradePage 自選 ☆', () => {
             await render();
             expect(star().props.disabled, JSON.stringify(over)).toBe(true);
             await act(async () => { star().props.onClick(); });
-            expect(w.addSymbol).not.toHaveBeenCalled();
+            expect(picker(), JSON.stringify(over)).toBeUndefined();
         }
         m.useContract.mockReturnValue(undefined);
         m.wl = makeWl();
         await render();
         expect(star().props.disabled).toBe(true);
-        expect(star().props['aria-label']).toBe('自選（短線），商品載入中');
+        expect(star().props['aria-label']).toBe('自選：未加入，商品載入中');
+        m.useContract.mockReturnValue({ ...stock, combo: {} });
+        await render();
+        expect(star().props.disabled).toBe(true);
+        expect(star().props['aria-label']).toBe('自選：已在 觀察，組合商品不能加入自選');
+        await act(async () => { star().props.onClick(); });
+        expect(picker()).toBeUndefined();
     });
 
-    it('S1：☆ 加入與移出都不開下單或委託面板，lib 送單／改單／刪單 0 次', async () => {
+    it('S1：☆、面板的勾選、「取消」「完成」都不開下單或委託面板，lib 送單／改單／刪單 0 次', async () => {
         m.wl = makeWl();
         await render();
-        await settleClick();
-        m.wl = makeWl({ items: [{ contract: { code: '2330' } }] });
-        await render();
-        await settleClick();
+        await openPicker();
+        for (const id of ['L1', 'L2', 'L3']) await toggle(id);
+        await act(async () => { one('watch-picker-cancel').props.onClick(); });
+        await openPicker();
+        for (const id of ['L1', 'L2', 'L3']) await toggle(id);
+        await done();
         expect(m.openTicket).not.toHaveBeenCalled();
         expect(m.openOrderAction).not.toHaveBeenCalled();
         for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();

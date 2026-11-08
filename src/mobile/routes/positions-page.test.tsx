@@ -27,6 +27,14 @@ const m = vi.hoisted(() => {
         privMoney: false,
         locked: false,
         ydNotice: undefined as string | undefined,
+        /** useServerInfo()：永豐環境（出清預覽的環境標籤）；null＝未確認 */
+        serverInfo: null as { simulation: boolean } | null,
+        /** 玉山 bridge 環境 */
+        esunEnv: 'SIMULATION',
+        /** getMobileUi()：下單面板、委託操作面板（多選市價出清開始前檢查） */
+        ui: { ticket: null as unknown, orderAction: null as unknown },
+        /** getRiskSettings()：手機一律開啟手動下單確認（start.ts 釘住）；多選市價出清每筆送出前檢查 */
+        risk: { confirmManualOrders: true },
         placeStockExitByShares: vi.fn(),
         placeQuickOrder: vi.fn(),
         notify: vi.fn(),
@@ -50,6 +58,7 @@ function same(a?: Acc | null, b?: Acc | null): boolean {
 }
 
 vi.mock('../../hooks/use-stream', () => ({ useTradingLive: () => m.live }));
+vi.mock('../../lib/risk', () => ({ getRiskSettings: () => m.risk }));
 vi.mock('../../lib/account-store', () => ({
     useAccounts: () => m.accounts,
     getAccountState: () => m.accounts,
@@ -68,8 +77,10 @@ vi.mock('../../lib/contracts-cache', () => ({
     getCachedContract: (code: string) => m.contracts[code],
     ensureContract: m.ensureContract,
 }));
-vi.mock('../../lib/server-info-store', () => ({
-    useServerInfo: () => null,
+vi.mock('../../lib/server-info-store', async (importOriginal) => ({
+    // 其餘沿用實作（批次出清的授權經 lib/order-confirm 載入）；畫面用到的兩個 hook 固定
+    ...(await importOriginal<typeof import('../../lib/server-info-store')>()),
+    useServerInfo: () => m.serverInfo,
     yesterdayQuantityNotice: () => m.ydNotice,
 }));
 vi.mock('../components/position-esun-details', () => ({
@@ -78,11 +89,19 @@ vi.mock('../components/position-esun-details', () => ({
 // 玉山規則用真正的 validateEsunStockOrder（closePlanFor 在說明面板就以玉山規則逐腳檢查）
 vi.mock('../../lib/esun', async () => {
     const mapping = await vi.importActual<typeof import('../../lib/esun/order-mapping')>('../../lib/esun/order-mapping');
-    return { isEsunAccount: (a?: { broker_id?: string } | null) => !!a?.broker_id?.startsWith('ESUN'), validateEsunStockOrder: mapping.validateEsunStockOrder };
+    return {
+        isEsunAccount: (a?: { broker_id?: string } | null) => !!a?.broker_id?.startsWith('ESUN'),
+        validateEsunStockOrder: mapping.validateEsunStockOrder,
+        // 出清預覽面板的環境標籤（與路由徽章同一算法）
+        useEsunEnvironment: () => ({ environment: m.esunEnv }),
+    };
 });
 vi.mock('../../lib/flash-account', () => ({ accountMatches: (a?: Acc | null, b?: Acc | null) => same(a, b) }));
 vi.mock('../../lib/order-outcome', () => ({ reconcileAfterUnknownOutcome: m.reconcileAfterUnknownOutcome }));
 vi.mock('../../lib/privacy', () => ({
+    // 批次出清授權以真正的 accountConfirmLabel 比對帳戶標籤（lib/order-confirm 讀隱私模式）
+    getPrivacyMode: () => false,
+    maskAccountId: (id: string) => id,
     maskMoney: (t: string, p: boolean) => (p ? '•••••' : t),
     secretMoney: (t: string | number) => String(t),
     usePrivacyMode: () => false,
@@ -99,7 +118,10 @@ vi.mock('../../lib/trading-state', () => ({
     refreshTradingState: m.refreshTradingState,
     useTradingState: () => m.trading,
 }));
-vi.mock('../components/route-badge', () => ({ RouteBadge: () => null }));
+vi.mock('../components/route-badge', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../components/route-badge')>()),
+    RouteBadge: () => null,
+}));
 vi.mock('../components/account-switch-sheet', () => ({
     mobileAccountLabel: (a: { account_id: string }) => `***${a.account_id.slice(-4)}`,
     useAccountSwitchLocked: () => m.locked,
@@ -126,16 +148,19 @@ vi.mock('../lib/resume-gate-runtime', () => ({
     },
 }));
 vi.mock('../lib/hash-router', () => ({ navigate: m.navigate }));
-vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket }));
+vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, getMobileUi: () => m.ui }));
 vi.mock('../../lib/shioaji', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../../lib/shioaji')>()),
     fetchTradingLimits: m.fetchTradingLimits,
 }));
 
+import { accountConfirmLabel, type OrderConfirmRequest } from '../../lib/order-confirm';
 import { resetTradingCostSettings, setTradingCostSettings } from '../../lib/trading-cost-settings';
+import { SlideToConfirm } from '../components/slide-to-confirm';
+import { BATCH_STOPPED, batchExitAbortReason, decideBatchConfirm, isBatchExitActive, setBatchExit } from '../lib/batch-exit-auth';
 import { resetTradingLimitsForTest } from '../hooks/use-trading-limits';
 import { POSITIONS_VIEW_KEY, readPositionsView } from '../lib/positions-view';
-import { addOnBlockReason, addOnPlanFor, closePlanFor, COMPACT_TEXT, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
+import { addOnBlockReason, addOnPlanFor, batchGateProblem, batchLegs, batchSelectReason, closePlanFor, COMPACT_TEXT, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
 
 const stockAcc = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '' };
 const stockAcc2 = { account_type: 'S', broker_id: 'ESUN1', account_id: '7777777', person_id: 'A', signed: true, username: '' };
@@ -190,6 +215,10 @@ beforeEach(() => {
     m.privMoney = false;
     m.locked = false;
     m.ydNotice = undefined;
+    m.serverInfo = null;
+    m.esunEnv = 'SIMULATION';
+    m.ui = { ticket: null, orderAction: null };
+    m.risk = { confirmManualOrders: true };
     setPositions([stockPos(), futPos()]);
     for (const f of [m.placeStockExitByShares, m.placeQuickOrder, m.notify, m.reconcileAfterUnknownOutcome, m.openTicket, m.navigate, m.selectAccount, m.assertResumeReady, m.acknowledgeStaleData, m.retryResume]) f.mockReset();
     m.placeStockExitByShares.mockResolvedValue([]);
@@ -202,6 +231,7 @@ beforeEach(() => {
 afterEach(async () => {
     await act(async () => view?.unmount());
     view = undefined;
+    setBatchExit(false);
     vi.useRealTimers();
     vi.unstubAllGlobals();
 });
@@ -1168,6 +1198,28 @@ describe('「詳細｜精簡」檢視', () => {
         expect(textOf(one('position-total-pending'))).toContain('合計待確認：1 筆');
     });
 
+    it('精簡列第二列：現價＋兩平價（股票，依跳動價位、同詳細卡片）；期權顯示「均價」不標兩平；兩平算不出為「—」', async () => {
+        m.privMoney = true; // 價格不遮蔽（同詳細卡片的均價與兩平價）
+        setPositions([stockPos(), futPos(), stockPos({ id: 8, code: '9999' })]);
+        vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'compact' }));
+        await render();
+        expect(textOf(inCompact('2330', 'position-compact-price'))).toBe('現價 1,085');
+        expect(textOf(inCompact('2330', 'position-compact-ref'))).toBe('兩平價 1,060');
+        // 已過／未達兩平的文字照舊
+        expect(textOf(inCompact('2330', 'position-compact-status'))).toBe(COMPACT_TEXT.aboveBreakEven);
+        expect(textOf(inCompact('TXFL6', 'position-compact-price'))).toBe('現價 22,950');
+        expect(textOf(inCompact('TXFL6', 'position-compact-ref'))).toBe('均價 22,800');
+        expect(textOf(compactRowOf('TXFL6'))).not.toContain('兩平');
+        expect(textOf(inCompact('9999', 'position-compact-ref'))).toBe('兩平價 —');
+        // 與展開後的詳細卡片同值
+        await click(inCompact('2330', 'position-compact-toggle'));
+        expect(textOf(inRow('2330', 'position-breakeven'))).toBe('1,060');
+        // 現價、兩平價都在按鈕內（無障礙名稱含欄位名稱）；點列仍是展開
+        const toggle = inCompact('2330', 'position-compact-toggle');
+        expect(textOf(toggle)).toContain('現價 1,085');
+        expect(toggle.props['aria-expanded']).toBe(true);
+    });
+
     it('遮蔽金額：精簡列的淨損益與數量都遮蔽（報酬率不含金額照常）', async () => {
         m.privMoney = true;
         vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'compact' }));
@@ -1340,6 +1392,25 @@ describe('列的重繪範圍（稽核 P2）', () => {
         const futRow = view!.root.find(n => n.props['data-testid'] === 'position-compact-row' && n.props['data-code'] === 'TXFL6' && typeof n.type === 'string');
         expect(textOf(futRow.find(n => n.props['data-testid'] === 'position-compact-pnl'))).toBe('+31,000');
     });
+
+    it('精簡檢視：只有跳價那列的現價與兩平狀態更新並重繪，其他列不重繪', async () => {
+        vi.stubGlobal('localStorage', { getItem: () => 'compact', setItem: () => undefined });
+        const fut = futPos();
+        setPositions([stockPos(), fut]);
+        await render();
+        const s0 = renders('2330');
+        const f0 = renders('TXFL6');
+        // 股票跳價到兩平價以下：只換該列持倉物件
+        setPositions([stockPos({ last_price: 1055, pnl: 8_750 }), fut]);
+        await rerender();
+        expect(renders('2330')).toBeGreaterThan(s0);
+        expect(renders('TXFL6')).toBe(f0);
+        const stockRow = view!.root.find(n => n.props['data-testid'] === 'position-compact-row' && n.props['data-code'] === '2330' && typeof n.type === 'string');
+        const inStock = (id: string) => textOf(stockRow.find(n => n.props['data-testid'] === id && typeof n.type === 'string'));
+        expect(inStock('position-compact-price')).toBe('現價 1,055');
+        expect(inStock('position-compact-ref')).toBe('兩平價 1,060');
+        expect(inStock('position-compact-status')).toBe(COMPACT_TEXT.belowBreakEven);
+    });
 });
 
 describe('精簡列的無障礙名稱', () => {
@@ -1365,5 +1436,480 @@ describe('精簡列的無障礙名稱', () => {
         setPositions(rows);
         await rerender();
         expect(inRow('2330', 'position-close').props.disabled).toBe(true);
+    });
+});
+describe('多選市價出清（§7.7、§10 S10）', () => {
+    const txo = { ...txf, code: 'TXO23000L6', security_type: 'OPT', name: '台指選' } as ContractInfo;
+    const b2317 = { ...stk2330, code: '2317', name: '鴻海', limit_up: 220, limit_down: 180 } as ContractInfo;
+    /** 現股（含零股）、融資、永豐融券、期貨、選擇權（不列入） */
+    const mixed = () => [
+        stockPos(),
+        stockPos({ id: 4, cond: 'MarginTrading', quantity: 2000, yd_quantity: 2000 }),
+        stockPos({ id: 5, code: '2317', direction: 'Sell', cond: 'ShortSelling', quantity: 1000, price: 200, last_price: 199, pnl: 1_000, yd_quantity: 1000 }),
+        futPos(),
+        futPos({ id: 9, code: 'TXO23000L6', price: 100, last_price: 120, pnl: 1_000 }),
+    ];
+    const sendFns = () => [m.placeStockExitByShares, m.placeQuickOrder];
+    const rowsWith = (id: string) => all(id);
+    const selectOf = (code: string, nth = 0) => all('position-select').filter(n => {
+        let cur: ReactTestInstance | null = n;
+        while (cur && cur.props['data-code'] === undefined) cur = cur.parent;
+        return cur?.props['data-code'] === code;
+    })[nth]!;
+    const slide = () => view!.root.findAll(n => n.type === SlideToConfirm && n.props.testId === 'batch-exit-slide')[0];
+    /** 等延遲載入的面板（或某個 testid）出現 */
+    async function waitFor(id: string, ms = 5_000) {
+        const end = Date.now() + ms;
+        while (all(id).length === 0) {
+            if (Date.now() > end) throw new Error(`${id} 沒有出現`);
+            await act(async () => { await new Promise(r => setTimeout(r, 20)); });
+        }
+    }
+    /** 同 lib：一次確認（價格 null、股數或口數、單位、信用名稱、帳戶標籤），交給授權判斷（同根層確認面板的批次路徑） */
+    async function libConfirm(req: Omit<OrderConfirmRequest, 'simulation'>) {
+        const d = decideBatchConfirm({ ...req, simulation: true, awaitingMode: false });
+        if (d !== 'approve') throw new m.OrderConfirmCancelled();
+    }
+    const sent: string[] = [];
+    function fakeLib() {
+        m.placeStockExitByShares.mockImplementation(async (contract: ContractInfo, action: 'Buy' | 'Sell', shares: number, account: typeof stockAcc, opts: { orderCond?: string; beforeSend: () => void }) => {
+            const credit = opts.orderCond === 'MarginTrading' ? '融資' : opts.orderCond === 'ShortSelling' ? '融券' : undefined;
+            await libConfirm({ code: contract.code, action, price: null, quantity: shares, unit: '股', accountLabel: accountConfirmLabel(account), ...(credit ? { credit } : {}) });
+            opts.beforeSend();
+            sent.push(`${contract.code} ${action} ${shares}`);
+            return [];
+        });
+        m.placeQuickOrder.mockImplementation(async (contract: ContractInfo, action: 'Buy' | 'Sell', price: number | null, qty: number, opts: { account: typeof futAcc; beforeSend: () => void }) => {
+            await libConfirm({ code: contract.code, action, price, quantity: qty, unit: '口', accountLabel: accountConfirmLabel(opts.account) });
+            opts.beforeSend();
+            sent.push(`${contract.code} ${action} ${qty}`);
+            return {};
+        });
+    }
+
+    beforeEach(() => {
+        m.contracts = { '2330': stk2330, '2317': b2317, TXFL6: txf, TXO23000L6: txo };
+        m.serverInfo = { simulation: true };
+        setPositions(mixed());
+        sent.length = 0;
+    });
+
+    it('純函式：選擇權不列入；其餘依 closePlanFor；各腳文字與 lib 實際送出相同', () => {
+        expect(batchSelectReason(futPos({ code: 'TXO23000L6' }), txo)).toBe('選擇權不列入批次市價出清，請逐筆平倉');
+        expect(POSITIONS_TEXT.batchOption).toBe('選擇權不列入批次市價出清，請逐筆平倉');
+        expect(batchSelectReason(futPos(), txf)).toBeNull();
+        expect(batchSelectReason(stockPos(), undefined)).toBe(POSITIONS_TEXT.noContract);
+        expect(batchSelectReason(stockPos({ account: { ...stockAcc, signed: false } }), stk2330)).toBe(POSITIONS_TEXT.accountNotTradable);
+        const plan = (p: AccountedPosition, c: ContractInfo) => closePlanFor(p, c) as Exclude<ReturnType<typeof closePlanFor>, string>;
+        expect(batchLegs(plan(stockPos(), stk2330))).toEqual(['整張 3 張 市價 IOC', '零股 500 股以跌停價 963 盤中零股限價']);
+        expect(batchLegs(plan(stockPos({ cond: 'MarginTrading', quantity: 2000 }), stk2330))).toEqual(['整張 2 張 市價 IOC（融資）']);
+        expect(batchLegs(plan(stockPos({ direction: 'Sell', quantity: 300 }), stk2330))).toEqual(['零股 300 股以漲停價 1,175 盤中零股限價']);
+        expect(batchLegs(plan(futPos(), txf))).toEqual(['2 口 市價 IOC（平倉）']);
+    });
+
+    it('「選取」切換選取模式（aria-pressed）：每列勾選鍵（role=checkbox、aria-checked、名稱）；選擇權停用並說明；隱藏平倉與加碼', async () => {
+        await render();
+        const toggle = one('position-select-mode');
+        expect(toggle.props['aria-pressed']).toBe(false);
+        expect(rowsWith('position-select')).toHaveLength(0);
+        await click(toggle);
+        expect(one('position-select-mode').props['aria-pressed']).toBe(true);
+        const boxes = rowsWith('position-select');
+        expect(boxes).toHaveLength(5);
+        for (const b of boxes) {
+            expect(b.type).toBe('button');
+            expect(b.props.role).toBe('checkbox');
+            expect(b.props['aria-checked']).toBe(false);
+        }
+        expect(selectOf('2330').props['aria-label']).toBe('選取 2330 台積電 現股 多 3張+500股');
+        expect(selectOf('TXFL6').props['aria-label']).toBe('選取 TXFL6 台指期 期貨 多 2 口');
+        const opt = selectOf('TXO23000L6');
+        expect(opt.props.disabled).toBe(true);
+        expect(textOf(rowOf('TXO23000L6'))).toContain('選擇權不列入批次市價出清，請逐筆平倉');
+        expect(rowsWith('position-close')).toHaveLength(0);
+        expect(rowsWith('position-add')).toHaveLength(0);
+        // 勾選、點列（非按鈕處）都切換
+        await click(selectOf('2330'));
+        expect(selectOf('2330').props['aria-checked']).toBe(true);
+        await act(async () => { rowOf('TXFL6').props.onClick({ target: null }); });
+        expect(selectOf('TXFL6').props['aria-checked']).toBe(true);
+        expect(textOf(one('position-selected-count'))).toBe('已選 2 筆');
+        expect(textOf(one('position-clear-out'))).toBe('市價出清 2 筆');
+        // 選擇權列點了也不會被選
+        expect(rowOf('TXO23000L6').props.onClick).toBeUndefined();
+        // 離開選取模式：清除選取、恢復平倉與加碼
+        await click(one('position-select-mode'));
+        expect(rowsWith('position-select')).toHaveLength(0);
+        expect(rowsWith('position-close').length).toBeGreaterThan(0);
+        await click(one('position-select-mode'));
+        expect(textOf(one('position-selected-count'))).toBe('已選 0 筆');
+        expect(one('position-clear-out').props.disabled).toBe(true);
+    });
+
+    it('全選：頁面與帳戶組三態（aria-checked true／mixed／false）；只選可列入的列', async () => {
+        await render();
+        await click(one('position-select-mode'));
+        const groupBoxes = () => rowsWith('position-group-select');
+        expect(groupBoxes()).toHaveLength(2);
+        expect(groupBoxes()[0]!.props['aria-label']).toBe('全選 永豐證券 ***4567');
+        await click(selectOf('2330'));
+        expect(groupBoxes()[0]!.props['aria-checked']).toBe('mixed');
+        expect(one('position-select-all').props['aria-checked']).toBe('mixed');
+        await click(groupBoxes()[0]!);
+        expect(groupBoxes()[0]!.props['aria-checked']).toBe(true);
+        expect(textOf(one('position-selected-count'))).toBe('已選 3 筆');
+        // 期貨組：選擇權不可選 → 全選只選期貨
+        await click(groupBoxes()[1]!);
+        expect(groupBoxes()[1]!.props['aria-checked']).toBe(true);
+        expect(selectOf('TXO23000L6').props['aria-checked']).toBe(false);
+        expect(one('position-select-all').props['aria-checked']).toBe(true);
+        await click(one('position-select-all'));
+        expect(textOf(one('position-selected-count'))).toBe('已選 0 筆');
+        await click(one('position-select-all'));
+        expect(textOf(one('position-selected-count'))).toBe('已選 4 筆');
+        // 改篩選：清除選取
+        await act(async () => { view!.root.find(n => n.props.testId === 'position-market-filter').props.onChange('stock'); });
+        expect(textOf(one('position-selected-count'))).toBe('已選 0 筆');
+    });
+
+    it('已選的持倉數量改變或消失：移出選取並說明', async () => {
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        expect(textOf(one('position-selected-count'))).toBe('已選 4 筆');
+        const rows = mixed();
+        setPositions([stockPos({ quantity: 3000, yd_quantity: 3000 }), rows[1]!, rows[3]!, rows[4]!]);
+        await rerender();
+        expect(textOf(one('position-selected-count'))).toBe('已選 2 筆');
+        expect(textOf(one('position-select-note'))).toBe('2 筆已選的持倉已變動或不在清單，已移出選取');
+        expect(selectOf('2330').props['aria-checked']).toBe(false);
+    });
+
+    it('精簡檢視也有勾選鍵；點列切換選取（不展開）', async () => {
+        vi.stubGlobal('localStorage', { getItem: () => 'compact', setItem: () => undefined });
+        await render();
+        await click(one('position-select-mode'));
+        expect(rowsWith('position-select')).toHaveLength(5);
+        const rowBtn = view!.root.findAll(n => n.props['data-testid'] === 'position-compact-toggle' && typeof n.type === 'string')[0]!;
+        expect(rowBtn.props['aria-expanded']).toBeUndefined();
+        await click(rowBtn);
+        const after = view!.root.findAll(n => n.props['data-testid'] === 'position-compact-toggle' && typeof n.type === 'string')[0]!;
+        expect(after.props['aria-pressed']).toBe(true);
+        expect(rowsWith('position-row')).toHaveLength(0);
+        expect(textOf(one('position-selected-count'))).toBe('已選 1 筆');
+        const optRow = view!.root.findAll(n => n.props['data-testid'] === 'position-compact-row' && n.props['data-code'] === 'TXO23000L6' && typeof n.type === 'string')[0]!;
+        expect(textOf(optRow)).toContain('選擇權不列入批次市價出清，請逐筆平倉');
+    });
+
+    it('預覽面板（延遲載入）：依帳戶分組、環境標籤、動作與各腳、警語；滑動前不送出', async () => {
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        const sheet = view!.root.find(n => n.props.testId === 'batch-exit-sheet');
+        expect(sheet.props.title).toBe('市價出清 4 筆');
+        const heads = all('batch-exit-group-head').map(textOf);
+        expect(heads).toEqual(['永豐證券 ***4567模擬', '永豐期貨 ***4321模擬']);
+        expect(all('batch-exit-env').map(n => n.props['data-env'])).toEqual(['simulation', 'simulation']);
+        const items = all('batch-exit-item').map(textOf);
+        expect(items[0]).toContain('台積電 2330');
+        expect(items[0]).toContain('現股 多 3張+500股');
+        expect(items[0]).toContain('→ 市價賣出');
+        expect(items[0]).toContain('整張 3 張 市價 IOC');
+        expect(items[0]).toContain('零股 500 股以跌停價 963 盤中零股限價');
+        expect(items[1]).toContain('→ 市價融資賣出');
+        expect(items[2]).toContain('→ 市價融券買進');
+        expect(items[2]).toContain('整張 1 張 市價 IOC（融券）');
+        expect(items[3]).toContain('→ 市價平倉賣出');
+        expect(items[3]).toContain('2 口 市價 IOC（平倉）');
+        expect(all('batch-exit-item').map(n => n.props['data-code'])).toEqual(['2330', '2330', '2317', 'TXFL6']);
+        expect(textOf(one('batch-exit-warn'))).toContain('市價 IOC 可能以不利價格成交，未成交部分自動取消。');
+        expect(textOf(one('batch-exit-warn'))).toContain('非交易時段送出會被券商拒絕。');
+        expect(all('batch-exit-production')).toHaveLength(0);
+        expect(slide()!.props.label).toBe('滑動送出 4 筆');
+        expect(slide()!.props.disabled).toBe(false);
+        for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        expect(m.openTicket).not.toHaveBeenCalled();
+        // 取消只關閉面板，仍在選取模式
+        await click(one('batch-exit-cancel'));
+        expect(all('batch-exit-sheet')).toHaveLength(0);
+        expect(one('position-select-mode').props['aria-pressed']).toBe(true);
+        for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+    });
+
+    it('預覽停用條件：環境未確認、閘門不允許、下單面板或確認進行中；正式環境有強警示', async () => {
+        m.serverInfo = null;
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        expect(all('batch-exit-env').map(n => n.props['data-env'])).toEqual(['unknown', 'unknown']);
+        expect(textOf(all('batch-exit-group-head')[0]!)).toContain('未確認');
+        expect(slide()!.props.disabled).toBe(true);
+        expect(slide()!.props.disabledReason).toBe('有帳戶的環境未確認（模擬／正式），不能送出');
+        // 直接呼叫 onConfirm（停用時）也不送
+        await act(async () => { slide()!.props.onConfirm(); });
+        m.serverInfo = { simulation: false };
+        await rerender();
+        expect(textOf(one('batch-exit-production'))).toContain('包含正式環境帳戶');
+        expect(slide()!.props.disabled).toBe(false);
+        m.live = false;
+        await rerender();
+        expect(slide()!.props.disabledReason).toBe(POSITIONS_TEXT.notLive);
+        m.live = true;
+        m.locked = true;
+        await rerender();
+        expect(slide()!.props.disabledReason).toBe(POSITIONS_TEXT.batchBusy);
+        for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        expect(isBatchExitActive()).toBe(false);
+    });
+
+    it('S1：選取模式、全選、開關預覽都不送單、不開下單面板與委託面板、不通知', async () => {
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(selectOf('2330'));
+        await click(selectOf('2330'));
+        for (const g of rowsWith('position-group-select')) await click(g);
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        await act(async () => { view!.root.find(n => n.props.testId === 'batch-exit-sheet').props.onClose(); });
+        await click(one('position-select-cancel'));
+        for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.notify).not.toHaveBeenCalled();
+        expect(m.reconcileAfterUnknownOutcome).not.toHaveBeenCalled();
+    });
+
+    it('滑動一次：依序送出（每筆經 executeClose、beforeSend、授權自動核准），面板不可關閉並顯示每筆狀態，結束摘要並離開選取模式', async () => {
+        fakeLib();
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        await act(async () => { slide()!.props.onConfirm(); });
+        expect(view!.root.find(n => n.props.testId === 'batch-exit-sheet').props.dismissible).toBe(false);
+        expect(all('batch-exit-stop')).toHaveLength(1);
+        await waitFor('batch-exit-summary');
+        expect(sent).toEqual(['2330 Sell 3500', '2330 Sell 2000', '2317 Buy 1000', 'TXFL6 Sell 2']);
+        expect(m.placeStockExitByShares.mock.calls[1]![4]).toMatchObject({ orderCond: 'MarginTrading' });
+        expect(m.placeQuickOrder.mock.calls[0]![4]).toMatchObject({ account: futAcc, ocType: 'Cover', source: 'manual' });
+        expect(m.assertResumeReady).toHaveBeenCalledTimes(4);
+        expect(all('batch-exit-status').map(textOf)).toEqual(['已送出', '已送出', '已送出', '已送出']);
+        expect(textOf(one('batch-exit-summary'))).toBe('已送出 4 筆');
+        expect(m.notify).toHaveBeenCalledTimes(1);
+        expect(m.notify.mock.calls[0]![0]).toEqual({ kind: 'ok', title: '市價出清結果', body: '已送出 4 筆' });
+        expect(isBatchExitActive()).toBe(false);
+        expect(one('position-select-mode').props['aria-pressed']).toBe(false);
+        expect(view!.root.find(n => n.props.testId === 'batch-exit-sheet').props.dismissible).toBe(true);
+        await click(one('batch-exit-done'));
+        expect(all('batch-exit-sheet')).toHaveLength(0);
+        // 平倉鍵恢復可用（closingRef 已釋放）
+        expect(inRow('TXFL6', 'position-close').props.disabled).toBe(false);
+        expect(m.openTicket).not.toHaveBeenCalled();
+    });
+
+    it('滑動時閘門已關閉：不開始、顯示原因、不送出', async () => {
+        fakeLib();
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        const confirm = slide()!.props.onConfirm as () => void;
+        // 渲染後到滑動完成之間閘門變了（getResumeGate 讀到的最新值）
+        m.gate = { ...m.gate, state: 'resyncing' };
+        await act(async () => { confirm(); });
+        expect(textOf(one('batch-exit-note'))).toBe(`未送出：${POSITIONS_TEXT.resyncing}`);
+        for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        expect(isBatchExitActive()).toBe(false);
+    });
+
+    it('滑動當下委託操作面板或下單面板開著：不開始、顯示原因、不送出', async () => {
+        fakeLib();
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        m.ui = { ticket: null, orderAction: { tradeId: 'x', kind: 'menu', seq: 1 } };
+        await act(async () => { slide()!.props.onConfirm(); });
+        expect(textOf(one('batch-exit-note'))).toBe(`未送出：${POSITIONS_TEXT.batchBusy}`);
+        m.ui = { ticket: { code: '2330' }, orderAction: null };
+        await act(async () => { slide()!.props.onConfirm(); });
+        for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        expect(isBatchExitActive()).toBe(false);
+    });
+
+    it('已核准、送出中按「停止剩餘」：這筆照常送完，其餘未送出', async () => {
+        fakeLib();
+        let release!: () => void;
+        const inFlight = new Promise<void>(r => { release = r; });
+        // 第一筆：授權核准後（lib 已在送單）才卡住
+        m.placeStockExitByShares.mockImplementationOnce(async (contract: ContractInfo, action: 'Buy' | 'Sell', shares: number, account: typeof stockAcc, opts: { beforeSend: () => void }) => {
+            await libConfirm({ code: contract.code, action, price: null, quantity: shares, unit: '股', accountLabel: accountConfirmLabel(account) });
+            await inFlight;
+            opts.beforeSend();
+            sent.push(`${contract.code} ${action} ${shares}`);
+            return [];
+        });
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        await act(async () => { slide()!.props.onConfirm(); });
+        await click(one('batch-exit-stop'));
+        expect(textOf(one('batch-exit-stop'))).toBe('已停止：送出中的那一筆無法取消，其餘不再送出');
+        expect(batchExitAbortReason()).toBe(BATCH_STOPPED);
+        await act(async () => { release(); });
+        await waitFor('batch-exit-summary');
+        expect(sent).toEqual(['2330 Sell 3500']);
+        expect(all('batch-exit-status').map(textOf)).toEqual(['已送出', '未送出（已停止剩餘）', '未送出（已停止剩餘）', '未送出（已停止剩餘）']);
+        expect(isBatchExitActive()).toBe(false);
+    });
+
+    it('尚未核准（例如仍在等待伺服器模式）時按「停止剩餘」：這一筆也取消，全部未送出', async () => {
+        fakeLib();
+        let release!: () => void;
+        const beforeConfirm = new Promise<void>(r => { release = r; });
+        const base = m.placeStockExitByShares.getMockImplementation()!;
+        m.placeStockExitByShares.mockImplementationOnce(async (...args: unknown[]) => { await beforeConfirm; return base(...args); });
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        await act(async () => { slide()!.props.onConfirm(); });
+        await click(one('batch-exit-stop'));
+        await act(async () => { release(); });
+        await waitFor('batch-exit-summary');
+        expect(sent).toEqual([]);
+        expect(all('batch-exit-status').map(textOf)).toEqual(['未送出（已停止剩餘）', '未送出（已停止剩餘）', '未送出（已停止剩餘）', '未送出（已停止剩餘）']);
+        expect(textOf(one('batch-exit-summary'))).toBe('已送出 0 筆・未送出 4 筆');
+    });
+
+    it('遮蔽金額時預覽仍顯示明碼數量（送出前唯一看得到數量的畫面，同確認面板）', async () => {
+        m.privMoney = true;
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        const texts = all('batch-exit-item').map(textOf).join('｜');
+        expect(texts).toContain('多 3張+500股');
+        expect(texts).toContain('整張 3 張 市價 IOC');
+        expect(texts).toContain('零股 500 股');
+        expect(texts).not.toContain('•');
+    });
+
+    it('批次進行中（例如離開本頁前開始的）：平倉鍵停用，預覽滑塊停用並說明，不能開始另一個批次', async () => {
+        setBatchExit(true);
+        try {
+            await render();
+            expect(inRow('TXFL6', 'position-close').props.disabled).toBe(true);
+            await click(one('position-select-mode'));
+            await click(one('position-select-all'));
+            await click(one('position-clear-out'));
+            await waitFor('batch-exit-sheet');
+            expect(slide()!.props.disabledReason).toBe(POSITIONS_TEXT.batchBusy);
+            await act(async () => { slide()!.props.onConfirm(); });
+            for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
+        } finally {
+            setBatchExit(false);
+        }
+    });
+
+    it('卸載持倉頁：中止進行中的批次（尚未核准的那一筆會被根層確認面板取消）', async () => {
+        await render();
+        setBatchExit(true);
+        try {
+            await act(async () => view!.unmount());
+            view = undefined;
+            expect(batchExitAbortReason()).toBe(BATCH_STOPPED);
+        } finally {
+            setBatchExit(false);
+        }
+    });
+
+    it('每筆送出前的批次閘門：確認設定關閉、畫面在背景、重新同步過都停止；其餘同單筆平倉', () => {
+        expect(batchGateProblem(true, 0)).toBeNull();
+        expect(batchGateProblem(false, 0)).toBe(POSITIONS_TEXT.notLive);
+        m.gate = { ...m.gate, resumeSeq: 1 };
+        expect(batchGateProblem(true, 0)).toBe(POSITIONS_TEXT.batchResumed);
+        expect(batchGateProblem(true, 1)).toBeNull();
+        m.risk = { confirmManualOrders: false };
+        expect(batchGateProblem(true, 1)).toBe(POSITIONS_TEXT.batchNoConfirm);
+        m.risk = { confirmManualOrders: true };
+        vi.stubGlobal('document', { visibilityState: 'hidden' });
+        try {
+            expect(batchGateProblem(true, 1)).toBe(POSITIONS_TEXT.batchHidden);
+        } finally {
+            vi.unstubAllGlobals();
+            vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+        }
+    });
+
+    it('執行中回前景重新同步過（resumeSeq 改變）：停止剩餘（目前這筆之後不再送出）', async () => {
+        fakeLib();
+        let release!: () => void;
+        const inFlight = new Promise<void>(r => { release = r; });
+        m.placeStockExitByShares.mockImplementationOnce(async (contract: ContractInfo, action: 'Buy' | 'Sell', shares: number, account: typeof stockAcc, opts: { beforeSend: () => void }) => {
+            await libConfirm({ code: contract.code, action, price: null, quantity: shares, unit: '股', accountLabel: accountConfirmLabel(account) });
+            await inFlight;
+            opts.beforeSend();
+            sent.push(`${contract.code} ${action} ${shares}`);
+            return [];
+        });
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        await act(async () => { slide()!.props.onConfirm(); });
+        // 第一筆送出中回到前景又重新同步過（resumeSeq 改變）
+        m.gate = { ...m.gate, resumeSeq: m.gate.resumeSeq + 1 };
+        await act(async () => { release(); });
+        await waitFor('batch-exit-summary');
+        expect(sent).toEqual(['2330 Sell 3500']);
+        expect(all('batch-exit-status').map(textOf)).toEqual(['已送出', `未送出（${POSITIONS_TEXT.batchResumed}）`, `未送出（${POSITIONS_TEXT.batchResumed}）`, `未送出（${POSITIONS_TEXT.batchResumed}）`]);
+    });
+
+    it('結果未知：停止、通知並觸發對帳，不重送', async () => {
+        fakeLib();
+        m.placeStockExitByShares.mockImplementationOnce(async () => { throw new Error('network'); });
+        await render();
+        await click(one('position-select-mode'));
+        await click(one('position-select-all'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        await act(async () => { slide()!.props.onConfirm(); });
+        await waitFor('batch-exit-summary');
+        expect(m.placeStockExitByShares).toHaveBeenCalledTimes(1);
+        expect(m.placeQuickOrder).not.toHaveBeenCalled();
+        expect(m.reconcileAfterUnknownOutcome).toHaveBeenCalledTimes(1);
+        expect(all('batch-exit-status').map(textOf)[0]).toBe('結果未知（network）');
+        expect(m.notify.mock.calls[0]![0]).toMatchObject({ kind: 'err', title: '結果未知：請到委託頁按『更新』核對，勿重送' });
+        expect(all('batch-exit-retry')).toHaveLength(0);
+    });
+
+    it('單筆平倉進行中：不能開始批次（共用 closingRef）', async () => {
+        let release!: () => void;
+        m.placeQuickOrder.mockImplementationOnce(() => new Promise(r => { release = () => r({}); }));
+        await render();
+        await click(inRow('TXFL6', 'position-close'));
+        await click(one('position-close-continue'));
+        await click(one('position-select-mode'));
+        await click(selectOf('2330'));
+        await click(one('position-clear-out'));
+        await waitFor('batch-exit-sheet');
+        expect(slide()!.props.disabledReason).toBe(POSITIONS_TEXT.batchBusy);
+        await act(async () => { slide()!.props.onConfirm(); });
+        expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+        await act(async () => { release(); });
     });
 });

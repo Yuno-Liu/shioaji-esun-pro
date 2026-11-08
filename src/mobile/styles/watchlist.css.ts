@@ -565,6 +565,10 @@ export const rowChange = style({
     wordSpacing: '0.375rem',
 });
 
+// 編輯模式（列首移除鍵或多選勾選圈＋列尾「⋯」＋握把）比一般列少約 44px：窄螢幕＋大字時漲跌與漲跌幅放不下就換成兩行，
+// 不讓靠右的數字往左溢出、蓋到代碼（價格欄 minWidth 0）。一般列不變。
+globalStyle(`${rowHasLeading} ${rowChange}`, { whiteSpace: 'normal' });
+
 /** 迷你走勢 canvas（px 固定，不隨字級；字級「大」時縮窄讓出名稱欄） */
 export const spark = style({
     display: 'block',

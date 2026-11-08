@@ -83,3 +83,25 @@ describe('精簡列右欄：放不下時換行，字級「大」上下排列', (
         }
     });
 });
+
+describe('精簡列第二列：現價與兩平價（期權為均價）', () => {
+    it('橫跨名稱與損益兩欄（chevron 欄除外）、可換行、不裁切；chevron 跨兩列', () => {
+        const prices = styleBlock('compactPrices');
+        expect(prices).toMatch(/gridColumn:\s*'1 \/ 3'/);
+        expect(prices).toMatch(/flexWrap:\s*'wrap'/);
+        expect(prices).toMatch(/whiteSpace:\s*'nowrap'/);
+        expect(prices).not.toMatch(/overflow/);
+        expect(prices).not.toMatch(/textOverflow/);
+        expect(styleBlock('compactChevron')).toMatch(/gridRow:\s*'1 \/ span 2'/);
+    });
+});
+
+describe('選取模式（多選市價出清）：勾選鍵不擠壓精簡列', () => {
+    it('勾選鍵觸控區 ≥ TOUCH_MIN；列本體佔滿剩餘寬度，選取模式去掉 chevron 欄', () => {
+        const check = styleBlock('selectCheck');
+        expect(check).toMatch(/minWidth:\s*TOUCH_MIN/);
+        expect(check).toMatch(/minHeight:\s*TOUCH_MIN/);
+        expect(source).toMatch(/globalStyle\(`\$\{compactSelectable\} > \$\{compactRow\}`, \{[^}]*gridTemplateColumns:\s*'minmax\(min-content, 1fr\) auto'/);
+        expect(source).toMatch(/globalStyle\(`\$\{compactSelectable\} \$\{compactChevron\}`, \{ display: 'none' \}\)/);
+    });
+});

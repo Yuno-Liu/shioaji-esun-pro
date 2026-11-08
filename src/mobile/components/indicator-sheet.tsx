@@ -6,6 +6,8 @@
 // - 設定由 lib/mobile-indicators.ts 保存（localStorage），圖表即時套用。
 // - 快速範本（當沖、波段、長線）：一鍵取代目前設定，不跳確認；之後就地顯示「已套用」＋［復原］（一步，還原套用前的設定）。
 //   設定再被改動（加入、移除、改參數…）後復原失效、說明消失；復原後焦點回到該範本的套用鍵。
+// - 走勢模式另有「走勢副圖」：分時買賣力、大單／小單買賣力的開關與大單門檻（lib/line-indicators.ts，另一個儲存鍵）。
+//   開啟才下載當日逐筆；只有股票＋ETF 提供，其他商品停用並說明。
 // - 外觀沿用設計規格的元件語彙（elevatedBg 鍵、中性島輸入框、InlineNote 說明）；只改樣式，不改行為與 testid。
 
 import { useEffect, useId, useRef, useState } from 'react';
@@ -31,7 +33,14 @@ import {
     type MobileIndicatorSettings,
 } from '../lib/mobile-indicators';
 import * as styles from '../styles/chart.css';
+import {
+    LINE_FLOW_THRESHOLDS,
+    setLineIndicatorSettings,
+    thresholdLabel,
+    useLineIndicatorSettings,
+} from '../lib/line-indicators';
 import { InlineNote } from '../ui/inline-note';
+import { Segmented } from '../ui/segmented';
 import { BottomSheet } from './bottom-sheet';
 
 const SECTIONS: { category: IndicatorCategory; title: string }[] = [
@@ -44,6 +53,8 @@ export interface IndicatorSheetProps {
     onClose: () => void;
     /** 目前是走勢模式（指標只套用在 K 線） */
     lineMode?: boolean;
+    /** 走勢副圖（買賣力）是否支援目前商品（股票＋ETF） */
+    lineFlowSupported?: boolean;
 }
 
 /** 小數步進的參數用 decimal 鍵盤，整數用 numeric 鍵盤 */
@@ -56,7 +67,7 @@ function itemColor(item: MobileIndicator, def: IndicatorDef): string {
     return usesPaletteColor(def) ? paletteColor(item.color) : def.outputs[0]?.color ?? paletteColor(item.color);
 }
 
-export function IndicatorSheet({ open, onClose, lineMode = false }: IndicatorSheetProps) {
+export function IndicatorSheet({ open, onClose, lineMode = false, lineFlowSupported = false }: IndicatorSheetProps) {
     const ind = useMobileIndicators();
     const [editing, setEditing] = useState<string | null>(null);
     const item = editing ? ind.settings.items.find(i => i.id === editing) : undefined;
@@ -69,8 +80,61 @@ export function IndicatorSheet({ open, onClose, lineMode = false }: IndicatorShe
         <BottomSheet open={open} onClose={onClose} title={item ? '指標參數' : '技術指標'} testId='indicator-sheet'>
             {item
                 ? <IndicatorEditor item={item} onDone={() => setEditing(null)} />
-                : <IndicatorList lineMode={lineMode} onEdit={setEditing} />}
+                : <IndicatorList lineMode={lineMode} lineFlowSupported={lineFlowSupported} onEdit={setEditing} />}
         </BottomSheet>
+    );
+}
+
+const THRESHOLD_ITEMS = LINE_FLOW_THRESHOLDS.map(v => ({ value: v, label: thresholdLabel(v), ariaLabel: `大單門檻 ${thresholdLabel(v)}元`, testId: `line-flow-threshold-${v}` }));
+
+/** 走勢副圖：分時買賣力、大單／小單買賣力（只開關圖表顯示，不涉及下單） */
+function LineFlowSection({ supported }: { supported: boolean }) {
+    const ls = useLineIndicatorSettings();
+    const noteId = useId();
+    const toggle = (key: 'flow' | 'bigSmall', label: string, desc: string) => (
+        <div className={styles.defRow}>
+            <span className={styles.defText}>
+                <span className={styles.defName}>{label}</span>
+                <span className={styles.defDesc}>{desc}</span>
+            </span>
+            <button
+                type='button'
+                className={styles.smallButton}
+                aria-pressed={supported && ls[key]}
+                aria-label={label}
+                aria-describedby={supported ? undefined : noteId}
+                disabled={!supported}
+                onClick={() => setLineIndicatorSettings({ [key]: !ls[key] })}
+                data-testid={`line-flow-${key}`}
+            >
+                {supported && ls[key] ? '顯示中' : '已隱藏'}
+            </button>
+        </div>
+    );
+    return (
+        <section className={styles.section} aria-label='走勢副圖' data-testid='indicator-section-line'>
+            <h3 className={styles.sectionHead}><span>走勢副圖</span></h3>
+            {supported
+                ? <p className={styles.emptyActive}>開啟時下載當日全部逐筆（大型股可能數 MB），之後以即時成交累加。單位：張。</p>
+                : <p id={noteId} className={styles.limitNote} role='note' data-testid='line-flow-unsupported'>只提供股票與 ETF；指數、期貨、選擇權、權證沒有。</p>}
+            {toggle('flow', '分時買賣力', '每分鐘外盤（主動買）／內盤（主動賣）量與累積淨買力；不含開盤、收盤集合競價')}
+            {toggle('bigSmall', '大單／小單買賣力', '依單筆成交金額分大單、小單的累積淨買；為估算，非實際投資人身分')}
+            {supported && ls.bigSmall && (
+                <div className={styles.paramRow}>
+                    <span className={styles.paramLabel}>大單門檻（單筆成交金額 ≥）</span>
+                    <Segmented
+                        items={THRESHOLD_ITEMS}
+                        value={ls.threshold}
+                        onChange={v => setLineIndicatorSettings({ threshold: v })}
+                        semantics='toggle'
+                        ariaLabel='大單門檻'
+                        size='compact'
+                        variant='scroll'
+                        testId='line-flow-threshold'
+                    />
+                </div>
+            )}
+        </section>
     );
 }
 
@@ -140,7 +204,7 @@ function TemplateSection() {
     );
 }
 
-function IndicatorList({ lineMode, onEdit }: { lineMode: boolean; onEdit: (id: string) => void }) {
+function IndicatorList({ lineMode, lineFlowSupported, onEdit }: { lineMode: boolean; lineFlowSupported: boolean; onEdit: (id: string) => void }) {
     const ind = useMobileIndicators();
     const s = ind.settings;
     const baseId = useId();
@@ -148,9 +212,10 @@ function IndicatorList({ lineMode, onEdit }: { lineMode: boolean; onEdit: (id: s
         <div data-testid='indicator-list'>
             {lineMode && (
                 <div className={styles.sheetNote}>
-                    <InlineNote tone='info'>走勢圖只顯示均價線、當日最高最低與成交量；以下指標套用在 K 線（1 分以上）。</InlineNote>
+                    <InlineNote tone='info'>走勢圖顯示均價線、當日最高最低、成交量與下方的走勢副圖；其餘指標套用在 K 線（1 分以上）。</InlineNote>
                 </div>
             )}
+            {lineMode && <LineFlowSection supported={lineFlowSupported} />}
             <TemplateSection />
             <div className={styles.toggleRow}>
                 <span>成交量（K 線）</span>

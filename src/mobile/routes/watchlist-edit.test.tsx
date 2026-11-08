@@ -33,6 +33,7 @@ const m = vi.hoisted(() => ({
     updateOrderPrice: vi.fn(),
     updateOrderQty: vi.fn(),
     requestOrderConfirm: vi.fn(),
+    notify: vi.fn(),
 }));
 
 vi.mock('../../hooks/use-stream', () => ({ useQuote: () => undefined }));
@@ -58,6 +59,7 @@ vi.mock('../../lib/shioaji', () => ({
 }));
 vi.mock('../../lib/order-confirm', () => ({ requestOrderConfirm: m.requestOrderConfirm }));
 vi.mock('../../lib/api', () => ({ apiGet: vi.fn(async () => ({ code: [] })) }));
+vi.mock('../../lib/trade', () => ({ notify: m.notify }));
 vi.mock('../motion/haptics', () => ({ haptic: vi.fn(() => false) }));
 
 import { BottomSheet } from '../components/bottom-sheet';

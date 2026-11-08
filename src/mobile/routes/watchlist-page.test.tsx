@@ -100,6 +100,8 @@ vi.mock('../../lib/shioaji', () => ({
 vi.mock('../../lib/order-confirm', () => ({ requestOrderConfirm: m.requestOrderConfirm }));
 // 處置清單（regulatory_punish）走 lib/api 的 apiGet：記錄所有 GET，確認自選頁沒有其他請求
 vi.mock('../../lib/api', () => ({ apiGet: m.apiGet }));
+// 編輯模式 chunk 以 lib/trade 的 notify 回報多選刪除結果（lib/trade 載入時會碰 window，node 測試環境以假的取代）
+vi.mock('../../lib/trade', () => ({ notify: vi.fn() }));
 // 字級：只換 useThemeSettings（走勢元件的 themeKey 等仍用實作）
 vi.mock('../../lib/theme-store', async importOriginal => ({
     ...await importOriginal<typeof import('../../lib/theme-store')>(),

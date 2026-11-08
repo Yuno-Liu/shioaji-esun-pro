@@ -12,8 +12,10 @@
 // └［買 進］［賣 出］→ openTicket()（只開下單面板，送單一律經確認面板）；以 ShellSlot bottom 放進底部 chrome
 //
 // 主價列下緣的哨兵離開 main 頂端時，ShellSlot top 顯示精簡標頭（trade-compact；實心 panel，沒有 IntersectionObserver 時不顯示）。
-// 標頭右上的 ☆（trade-watch-star）：把目前商品加入／移出目前的自選清單（殼層常駐的 WatchlistProvider；aria-pressed＝已在清單）。
-// 清單載入中、更新中、載入失敗、合約未載入或組合商品時停用；結果以既有通知（lib/trade notify → ToastHost）回報。只改自選，不下單（S1）。
+// 標頭右上的 ☆（trade-watch-star）：開「加入自選」清單選擇面板（components/watch-picker-sheet.tsx，延遲載入），一次加入／移出
+// 多個自選清單（殼層常駐的 WatchlistProvider）；aria-pressed＝已在任一清單，無障礙名稱列出所在清單（「自選：已在 主要、觀察」）。
+// 清單載入中、更新中、載入失敗、套用中、合約未載入或組合商品時停用（套用中只標 aria-disabled，焦點不掉）；
+// 結果以既有通知（lib/trade notify → ToastHost）回報。只改自選，不下單（S1）。
 // 標頭的「代碼 名稱」是切換商品鍵（trade-switch；精簡標頭顯示時另有 trade-compact-switch）：開 TradeSwitchSheet 搜尋並切換，
 // 以 replace 導覽（返回鍵回到進交易頁之前的畫面）；只做查詢與導覽，不開下單面板。合約載入後記入「最近查看」（lib/recent-codes）。
 // code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。合約解析出的正規代碼與路由不同（小寫、舊指數代碼）時改寫路由。
@@ -37,6 +39,7 @@ import type { AccountedPosition } from '../../lib/types/portfolio';
 import { nowWallClockUtc } from '../../lib/utils/kbars';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
 import { loadCompanyTab } from '../components/company/load-company-tab';
+import { loadWatchPickerSheet } from '../components/load-watch-picker-sheet';
 import { DepthLadder, depthOddCapable, DepthOddToggle } from '../components/depth-ladder';
 import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from '../components/route-error-boundary';
 import { TickList } from '../components/tick-list';
@@ -54,6 +57,7 @@ import { fmtCompactInt, fmtInt, fmtStockLots, formatNumber, formatToTick } from 
 import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import { recordRecentCode } from '../lib/recent-codes';
 import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
+import { orderLists } from '../lib/watch-list-order';
 import { useOptionalMobileWatchlist } from '../lib/watchlist-context';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
@@ -190,6 +194,11 @@ const resetCompanyTab = () => { CompanyTab.reset(); };
 const TradeChipsSheet = retryableLazy(() => loadTradeChipsSheet().then(m => m.TradeChipsSheet), 'TradeChipsSheet');
 const resetChipsSheet = () => { TradeChipsSheet.reset(); };
 
+// ☆「加入自選」清單選擇面板：第一次按 ☆ 才 import，不閒置預載；第一次開啟後保持掛載（開關動畫正常）。
+// 載入失敗以底部面板「載入失敗」＋［重試］顯示（SheetLoadError），可關閉。
+const WatchPickerSheet = retryableLazy(() => loadWatchPickerSheet().then(m => m.WatchPickerSheet), 'WatchPickerSheet');
+const resetWatchPicker = () => { WatchPickerSheet.reset(); };
+
 type StatKey = 'open' | 'high' | 'low' | 'reference' | 'avg' | 'total' | 'last' | 'amount';
 
 const STAT_LABEL: Record<StatKey, string> = { open: '開', high: '高', low: '低', reference: '參', avg: '均', total: '總', last: '單', amount: '額' };
@@ -306,52 +315,67 @@ export function watchStarBlocked(
     return null;
 }
 
-/** 標頭 ☆：加入／移出目前的自選清單。不在 WatchlistProvider 內（測試、獨立掛載）時不顯示 */
+/** 含這個商品的清單（serverLists[].contracts 以代碼＋商品類別比對） */
+export function listsWithContract<L extends { contracts: readonly { code: string; security_type: string | null }[] }>(
+    lists: readonly L[],
+    contract: Pick<ContractInfo, 'code' | 'security_type'> | undefined,
+): L[] {
+    return contract ? lists.filter(l => l.contracts.some(c => c.code === contract.code && c.security_type === contract.security_type)) : [];
+}
+
+/** ☆ 的無障礙名稱：所在清單（或未加入），停用時附原因 */
+export function watchStarLabel(names: readonly string[], blocked: string | null): string {
+    return `自選：${names.length ? `已在 ${names.join('、')}` : '未加入'}${blocked ? `，${blocked}` : ''}`;
+}
+
+/** 標頭 ☆：開「加入自選」清單選擇面板（一次加入／移出多個清單）。不在 WatchlistProvider 內（測試、獨立掛載）時不顯示 */
 function WatchStar({ contract }: { contract: ContractInfo | undefined }) {
     const wl = useOptionalMobileWatchlist();
     const [busy, setBusy] = useState(false);
+    const [open, setOpen] = useState(false);
+    /** 面板第一次要求開啟後保持掛載 */
+    const [sheetMounted, setSheetMounted] = useState(false);
     const mounted = useRef(true);
     // StrictMode 會模擬卸載再掛載：掛載時要設回 true，否則之後 setBusy(false) 永遠不執行（☆ 一直停用）
     useEffect(() => {
         mounted.current = true;
         return () => { mounted.current = false; };
     }, []);
+    const onBusy = useCallback((b: boolean) => { if (mounted.current) setBusy(b); }, []);
+    const close = useCallback(() => setOpen(false), []);
     if (!wl) return null;
-    const code = contract?.code;
-    const watched = !!code && wl.items.some(i => i.contract.code === code);
-    const listName = wl.serverLists.find(l => l.id === wl.activeListId)?.name || '自選';
+    // 所在清單的名稱依這台裝置的群組順序（lib/watch-list-order.ts）
+    const inLists = listsWithContract(orderLists(wl.serverLists), contract);
     const blocked = watchStarBlocked(wl, contract, busy);
-    const toggle = async () => {
-        if (blocked || !contract) return;
-        const what = `${contract.code}${contract.name ? ` ${contract.name}` : ''}`;
-        setBusy(true);
-        try {
-            if (watched) {
-                await wl.removeSymbol(contract.code);
-                notify({ kind: 'ok', title: '已移出自選', body: `${what} 已從「${listName}」移除` });
-            } else {
-                await wl.addSymbol(contract.code, contract.security_type, contract);
-                notify({ kind: 'ok', title: '已加入自選', body: `${what} 已加入「${listName}」` });
-            }
-        } catch (e) {
-            notify({ kind: 'err', title: watched ? '移出自選失敗' : '加入自選失敗', body: e instanceof Error && e.message ? e.message : '請稍後再試' });
-        } finally {
-            if (mounted.current) setBusy(false);
-        }
-    };
     return (
-        <span className={styles.watchStar}>
-            <IconButton
-                ariaLabel={`自選（${listName}）${blocked ? `，${blocked}` : ''}`}
-                icon={Star}
-                pressed={watched}
-                // 處理中只標 aria-disabled（不設 disabled，按的人焦點不會掉）；點擊由 toggle 開頭的 blocked 檢查忽略
-                disabled={blocked !== null && !busy}
-                ariaDisabled={busy}
-                onClick={() => { void toggle(); }}
-                testId='trade-watch-star'
-            />
-        </span>
+        <>
+            <span className={styles.watchStar}>
+                <IconButton
+                    ariaLabel={watchStarLabel(inLists.map(l => l.name), blocked)}
+                    icon={Star}
+                    pressed={inLists.length > 0}
+                    // 套用中只標 aria-disabled（不設 disabled，按的人焦點不會掉）；點擊由 blocked 檢查忽略
+                    disabled={blocked !== null && !busy}
+                    ariaDisabled={busy}
+                    onClick={() => {
+                        if (blocked) return;
+                        setSheetMounted(true);
+                        setOpen(true);
+                    }}
+                    testId='trade-watch-star'
+                />
+            </span>
+            {sheetMounted && contract && (
+                <ModuleErrorBoundary
+                    onRetry={resetWatchPicker}
+                    fallback={props => <SheetLoadError {...props} open={open} onClose={close} testId='watch-picker-load-error' />}
+                >
+                    <Suspense fallback={null}>
+                        <WatchPickerSheet open={open} contract={contract} wl={wl} onClose={close} onBusy={onBusy} />
+                    </Suspense>
+                </ModuleErrorBoundary>
+            )}
+        </>
     );
 }
 
