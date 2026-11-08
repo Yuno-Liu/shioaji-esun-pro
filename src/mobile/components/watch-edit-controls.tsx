@@ -451,9 +451,12 @@ function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boole
     // 選取與確認
     const toggle = (id: string) => {
         if (mode !== 'select') return;
-        const next = new Set(sel);
-        if (!next.delete(id)) next.add(id);
-        setSel(next);
+        // 以前一個狀態計算：連續兩次點擊落在同一次渲染之前時，第二次不會蓋掉第一次
+        setSel(prev => {
+            const next = new Set(prev);
+            if (!next.delete(id)) next.add(id);
+            return next;
+        });
     };
     const picked = lists.filter(l => sel.has(l.id));
     const n = picked.length;
