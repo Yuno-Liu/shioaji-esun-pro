@@ -666,6 +666,12 @@ Stepper({ value: string; onChange(text: string): void; onStep(delta: 1 | -1): vo
 - 編輯模式（表頭「編輯」）：目前清單「重新命名」（`renameCurrentList`，改名會換清單 id；失敗時面板與編輯模式保持並顯示原因）、「刪除清單」（兩段式確認；只剩一個清單時停用；失敗顯示原因並保持編輯模式）。刪除清單鍵的 aria-label 以可見文字開頭：「刪除清單「名稱」」→ 確認時「確定刪除「名稱」清單」（WCAG 2.5.3）。空清單也顯示編輯鍵，才能重新命名或刪除。
 - 編輯模式每列：列首「−」開移除確認面板（沿用操作面板的移除流程與文字）；列尾「⋯」（操作面板）加握把；清單底部「加入股票」列（56px）開既有搜尋面板。編輯模式不顯示迷你走勢，讓出寬度給名稱。
 - 握把拖曳排序（`lib/watch-reorder.ts`）：手勢規則見 §8；放手位置有變才呼叫一次 `reorderSymbol`（hook 每次是 GET＋PUT＋GET）。清單載入中（loading）、結構更新中（structureBusy）、載入失敗（loadError）或清單不可寫入時停用握把（`canReorderList`）。握把 aria-label「拖曳以調整 代碼 名稱 的位置」、`aria-keyshortcuts="ArrowUp ArrowDown"`：↑／↓ 一次移一格，忽略按住不放的自動重複（`event.repeat`）與寫入中，移動後焦點回到被移動那列的握把，可連續移動。操作面板的上移、下移、移到最上保留。
+- 編輯模式延遲載入（第 1 期第 0 步，首屏 218.9 → 217.6 KiB）：
+  - 列首「−」、列尾「⋯」＋握把與 `useListReorder` 放在 `components/watch-edit-controls.tsx`（約 2.4 KiB gzip），經 `lib/deferred-modules.ts` 的 `loadWatchEditControls` 以三個 `retryableLazy` 載入；非編輯模式不載入。
+  - 列仍由自選頁渲染（QuoteRow 的 leading／trailing），進出編輯模式不重掛列。`useListReorder` 包成不渲染畫面的 `WatchEditReorder`，只在編輯模式且有清單時掛載，以 onChange 交回 { dragging, blocked, grip }，卸載時傳 null。
+  - 載入前與載入失敗時，列首、列尾是同尺寸空白佔位（aria-hidden，握把不做事）；失敗在清單上方顯示「載入失敗」＋［重試］（`watch-edit-load-error`），重試或再次進入編輯模式會重新 import。
+  - 殼層閒置預載呼叫自選頁匯出的 `preloadWatchEditControls`（三個 lazy 的 `preload()`），第一次進入編輯模式直接出現按鈕，不閃空白佔位（`watchlist-edit-preload.test.tsx`）。
+  - `watch-reorder` 不 import `motion/prefs`（減少動態由呼叫端傳入 `reducedMotion`），避免 prefs 被拆成另一個首屏 chunk。
 - 清單管理請求只在使用者操作時發出；交易安全：以上入口都不呼叫送單、改單、刪單函式（`watchlist-edit.test.tsx`）。
 
 **第二階段實作差異**（以程式碼為準）：
@@ -742,6 +748,45 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 - 重繪：即時價只在 memo 的 `SummaryCard`（標頭價格、市值、本益比）訂閱，每筆成交只重繪這張卡；子分頁與頁尾以 memo 隔開，成員名單排序以 useMemo 快取。切回五檔或明細時 `active=false`：改呼叫 `useQuote(null)`、不讀快照、不訂閱上下游與標的，隱藏期間不隨成交重繪；標頭仍持有同一檔的 refcount，切回時不重新訂閱。
 - 與桌面的差異：多顯示「統一編號」（資料集 `tax_id`，使用者明確要求），英文簡稱與市場也列進基本資料；manifest 與 `sources.json` 的免責說明都顯示（相同時去重）；桌面只放在滑鼠提示的說明（第三方資料 AI 整理提醒、快取說明、媒體報導說明、主要／兼營階段）改為可見或視覺隱藏文字；月營收表預設 6 個月、可展開到 36 個月（取代桌面長條提示的年增、月增）；表格可橫向捲動、產業鏈上／中／下游改直式三列；上下游即時漲跌一次最多 20 檔（桌面 40）。
 - 交易安全：只導覽（上市櫃關聯公司整列 `navigate` 開該股交易頁）與開外部連結（只接受 http／https，新分頁＋`rel="noopener noreferrer"`）；不呼叫 `openTicket`／`openOrderAction`，送單、改單、刪單 0 次（`company-tab.test.tsx` S1；`trade-page.test.tsx` S1 另加一輪「切到公司後點全部」）。
+- 估值與體質卡（第 1 期，`components/company/valuation-card.tsx`、`valuation.ts`）：財務子分頁頂部，只在有財報檔時顯示；只用同一份財報檔，不另發請求。
+  - 指標 2×2：
+    - 股價淨值比：即時價或收盤 ÷ 最新一季每股參考淨值。
+    - 負債比：負債總計 ÷ 資產總計。
+    - 盈餘品質：近四季營業現金流合計 ÷ 淨利合計（淨利為歸屬母公司業主），附文字結論「營業現金流高於／低於淨利」。
+    - 今年累計 EPS：`income_ytd` 的基本每股盈餘，對照去年同期與年增率；去年同期 ≤ 0 時不算成長率。
+  - 近 8 季獲利金額表：單季營收、毛利、營業利益、淨利，億元。金融業沒有毛利與營業利益時不顯示那兩欄。
+  - 缺資料、季別不連續或分母不為正時顯示「—」＋原因，不推估。
+  - 只有 P/B 一格隨成交重繪：`live-price.ts` 由標頭與 P/B 共用，同一檔 refcount，不新增訂閱。卡片沒有按鈕（S1）。
+
+**當沖資訊列與「籌碼與當沖」面板**（第 1 期；以程式碼為準）：
+
+- 位置：標頭最下方，在統計格、漲跌停列之後。整列是一顆按鈕 `trade-info-strip`（aria-haspopup=dialog、aria-expanded、高度 ≥ TOUCH_MIN）。
+  - 一般文件流，不在殼層槽，不用 fixed／sticky／absolute。
+  - 膠囊可換行、不截斷，最後是「說明 ›」。
+- 膠囊依序（`lib/trade-info.ts`，testid `trade-info-*`）：
+  - 可當沖／先賣，只有 STK（合約 `day_trade`）：「可當沖・可先賣」「僅先買後賣」「不可當沖」。
+  - 漲跌停狀態：
+    - 鎖漲停：價位在漲停、最佳委買在漲停且委賣已空。
+    - 漲停未鎖。
+    - 漲停：五檔兩側都空，無法判斷。
+    - 接近漲停：距停板 ≤ 參考價的 1%。
+    - 跌停同理。
+    - 只看成交或快照價。只有在停板時才讀含五檔的報價判斷是否鎖住，與五檔共用訂閱；平常資訊列不隨五檔重繪。
+  - 振幅小條＋「振幅 x.xx%」：振幅＝（最高 − 最低）÷ 參考價。
+    - 有漲跌停的股票與期貨：用 `lib/day-range` 以參考價為中心的尺。
+    - 選擇權、指數、權證：整條是今日最低到最高。
+    - 附視覺隱藏的位置文字。
+  - 量比，只有 STK（`lib/volume-ratio`）：今日累計量 ÷ 前一交易日量；快照日期與成交不同時不顯示。
+  - 處置股，只有 STK。
+  - 期貨只有漲跌停與振幅；選擇權、指數只有振幅；指數沒有資料時整列不渲染。
+- 面板 `trade-chips-sheet`（`components/trade-info/trade-chips-sheet.tsx`）：第一次點資訊列才 import（retryableLazy＋ModuleErrorBoundary＋SheetLoadError），唯讀。內容：
+  - 融資融券：成數、單位、可否；停資、停券時寫出原因（成數或單位為 0）。
+  - 可借券源（`short_stock_sources`）與合約上的資券餘額。
+  - 處置狀態：名單還沒成功取得過時寫「處置名單尚未取得」（`usePunishedListLoaded`），不當成未處置。
+  - 當沖資格與規則：證交稅取自 `lib/day-trade-tax`；期權、權證、指數各自說明。
+  - 資訊列各項目的定義。
+  - 查詢失敗時顯示［重新查詢融資融券與券源］，只重讀失敗的那一項。
+- 交易安全：資訊列與面板不呼叫 `openTicket`／`openOrderAction` 或任何送單、改單、刪單函式（§10 S1 表）。
 
 ### 7.4 下單面板（`order-ticket-sheet.tsx`、`ticket/*`、`order-ticket.css.ts`）
 
@@ -998,6 +1043,9 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 | 委託列、成交列、委託操作面板的名稱顯示 | 列上 Chip 只 `openOrderAction` | `orders-names.test.tsx` |
 | 持倉「損益兩平」列與計算明細面板、今日額度列 | 只開唯讀面板或導覽到帳戶頁；面板內沒有平倉、加碼鍵，平倉流程不變 | `positions-page.test.tsx` |
 | 持倉「詳細｜精簡」切換、精簡列與展開 | 切換只改顯示方式；精簡列只展開或收合；展開後的平倉、加碼沿用既有流程（說明面板或 `openTicket`） | `positions-page.test.tsx` |
+| 交易頁當沖資訊列、「籌碼與當沖」面板（含［重新查詢］） | 只開唯讀面板；［重新查詢］只重讀融資融券與券源 | `trade-chips-sheet.test.tsx`；`trade-page.test.tsx` 的「TradePage 當沖資訊列」，以及原本按遍全頁按鈕的 S1 |
+| 公司分頁「估值與體質」卡 | 沒有按鈕 | `valuation-card.test.tsx` |
+| 自選編輯鍵延遲載入（佔位、［重試］） | 只做清單管理；［重試］只重新 import | `watchlist-deferred.test.tsx`、`watchlist-edit-preload.test.tsx` |
 
 ---
 
@@ -1064,6 +1112,12 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
   - 逐檔查詢、K 線、報價 0；送單、改單、刪單 0。
 - 委託、成交、已實現損益的名稱查詢：每個不重複代碼本 session 最多 1 個合約 GET（資料本身有名稱或合約快取命中時 0；失敗不重試）；FUT／OPT 合約解析時 lib 會連帶預取升降單位表。
 - 持倉頁今日額度列：共用 `use-trading-limits` 模組層快取（60 秒 TTL、手動最短 10 秒），每個證券帳戶每 60 秒最多 1 次查詢，與帳戶頁額度卡、下單面板共用；期貨帳戶不查。淨損益與兩平價是純計算，新增請求 0。
+- 交易頁當沖資訊列與「籌碼與當沖」面板（第 1 期）：
+  - 每次進入交易頁：處置清單 GET ≤1，只有 STK 且頁面在前景；與自選頁共用模組層快取，30 分鐘內 0。資訊列其他請求 0。
+  - 開面板（只有 STK）：credit_enquire POST 與 short_stock_sources POST 各 ≤1，以每檔每個台北交易日計（`lib/trade-chips`）。credit_enquire 與下單面板共用 `loadCreditEnquire` 的成功快取。
+  - 失敗不自動重試；使用者每按一次［重新查詢］，只重讀失敗的那一項各 1 次。
+  - 期權與指數 0；送單、改單、刪單 0。
+- 估值與體質卡：新增請求 0（用同一份財報檔）；P/B 用公司分頁已有的報價（同一檔 refcount）。
 - 低階 Android 預設降低透明度；Chrome DevTools 4× CPU 降速下面板拖曳、滑塊、自選 200 列捲動 p95 幀時間 ≤16.7ms、無 >50ms long task；實機 30 分鐘記憶體不持續成長。
 - 首屏 JS（gzip）增量估計：spring＋tween 0.9、gesture 0.9、prefs／haptics／ui-settings 0.5、sheet-stack＋sheet-context 0.5、BottomSheet v2 增量 2.0、SlideToConfirm v2 增量 0.6、ToastHost v2 增量 0.9、殼層（slots、捲動記憶、html 屬性、狀態列）0.9、Segmented＋IconButton＋PageHeader 0.7、新增 lucide 圖示約 9 個 1.5 → **合計約 9.4 KiB**（目標首屏 ≤218 KiB，上限增量 10 KiB）。Stepper、DirectionToggle、QuickChips、PopUpButton、Grouped、InlineNote 等落在既有 lazy chunk。CSS（gzip）增量 ≤12 KiB。
 - 量測：`pnpm exec vite build --config vite.fork.config.ts` 後依規格 §9.4 加總 `dist/mobile.html` 引用的 script 與 modulepreload gzip 大小，PR 附前後數字。
@@ -1091,6 +1145,13 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
   - 兩次都只有零星 1 筆 64–88ms 長任務。主執行緒其餘時間主要是樣式、版面與繪製（P12，需實機 trace 再處理）。
 - **首屏**：本輪後手機首屏 **217.7 KiB**（16 個 JS），仍在 ≤218 KiB 內但只剩 0.3 KiB。增加的 1.2 KiB 是殼層必須常駐的閒置預載排程、`preload()` 與快取格式化（`lib/utils/ticksize` 原本就在首屏，沒有重複帶入）。桌面 `index.html` 771.6 KiB、`approval.html` 79.2 KiB 不變。**之後再加首屏程式碼前必須先拆分**，候選：自選編輯模式才用到的 `watch-reorder.ts` 改延遲載入。
 - **上游同步後**（2026-11-06，上游 65 個提交）：手機首屏 **218.9 KiB**（16 個 JS），**超過本節目標 0.9 KiB**，仍遠低於規格 §9.4 的 400 KB。增加的 1.2 KiB 全在共用的 `src` chunk（上游 lib：搜尋改版、權證市場分類等），手機自有 chunk 沒變。下一步：把 `watch-reorder.ts` 拆成編輯模式才載入（`useListReorder` 由列表元件一直呼叫，需把編輯模式列表拆成延遲元件，另案處理）。桌面 `index.html` 802.7 KiB（上游新功能）、`approval.html` 79.3 KiB。
+- **第 1 期**（2026-11-08）：
+  - 第 0 步：自選編輯模式的編輯鍵與拖曳排序延遲載入（§7.2），首屏 218.9 → **217.6 KiB**（15 個 JS）。
+  - 加入估值卡與當沖資訊列後：首屏 217.8 KiB（223,015 bytes，16 個 JS）。兩者都在延遲載入的 chunk：
+    - 交易頁 chunk 21.7 → 22.9 KiB。
+    - 「籌碼與當沖」面板約 3.6 KiB。
+    - `volume-ratio` 共用 chunk 約 9.5 KiB（lib 的 volume-ratio、day-range 等），隨交易頁載入。
+  - 螢幕常亮 `lib/wake-lock` 改為開關開啟且瀏覽器支援時才動態載入（`hooks/use-wake-lock`；開關預設關閉）：首屏 −494 bytes → 222,521 bytes（217.3 KiB）。帳戶頁設定區塊照常匯入同一個模組顯示狀態；載入完成前關掉開關或卸載不會啟動。
 - 未處理（需要修改 `src/lib`，R2 不允許，列入 §16）：trading-state 每筆 tick 重算全部持倉並發布、每秒以 BroadcastChannel 傳出整份 state（P2 根因、P14）；SSE 第一次連線就發 RECONNECT 合約刷新，冷啟動同一份合約抓 3 次（P4）；自選快照等全部合約 info 才讀，LCP 被最慢的一筆卡住（P5）；首屏帶入 Tauri 橋接、閃電下單模組、MockEsunDriver 與玉山整合（P6、P7、P8、P15，稽核估計合計約 50 KiB gzip）。
 
 ---
@@ -1156,7 +1217,7 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
 9. 淺色綠對白 4.34（theme 層級，另案）。
 10. 通知雙錨點的使用者接受度（G1）。
 11. 面板退場期間 TicketForm 多存活約 0.3–0.5 秒仍訂閱行情：無副作用，但 `onBusyChange(false)` 須在真正卸載時呼叫（沿用 `order-ticket-sheet.tsx:116`）。
-12. 首屏 JS（gzip）：第二階段後 226.3 KiB，收尾後 214.7 KiB；加入快速切換商品後 213.1 KiB；自選改版後 211.3 KiB（迷你走勢與搜尋面板延遲載入）；加入排行同自選列、自選增減、公司分頁、產業頁、名稱與額度、淨損益後 216.5 KiB（16 個 JS）；效能稽核優化（preload、逐一閒置預載、快取格式化）後 **217.7 KiB**，在目標 ≤218 KiB 內但只剩約 0.3 KiB，下次加首屏程式碼前必須先拆分（§13）；上游同步（2026-11-06）後 218.9 KiB，因上游 lib 成長超過目標 0.9 KiB，待拆分 `watch-reorder.ts`（§13）。
+12. 首屏 JS（gzip）：第二階段後 226.3 KiB，收尾後 214.7 KiB；加入快速切換商品後 213.1 KiB；自選改版後 211.3 KiB（迷你走勢與搜尋面板延遲載入）；加入排行同自選列、自選增減、公司分頁、產業頁、名稱與額度、淨損益後 216.5 KiB（16 個 JS）；效能稽核優化（preload、逐一閒置預載、快取格式化）後 **217.7 KiB**，在目標 ≤218 KiB 內但只剩約 0.3 KiB，下次加首屏程式碼前必須先拆分（§13）；上游同步（2026-11-06）後 218.9 KiB，因上游 lib 成長超過目標 0.9 KiB；第 1 期（2026-11-08）拆分 `watch-reorder.ts` 後 217.6 KiB，加入估值卡與當沖資訊列後 217.8 KiB，再把螢幕常亮改為開啟設定才載入後 217.3 KiB（§13）。
 13. 第二階段各畫面的實機項目（§7.2、§7.7、§7.8 的「待實機確認」，以及 §7.3 的長按震動與選價列捲動）尚未驗收；實機驗收清單見規格 §14.3。
 14. 自選改版的實機項目：canvas 在 DPR 2／3 的清晰度與進出畫面時是否閃爍、200 列快速捲動、底部指數列在真實 bar 材質上的對比、以 ContractBase 直接訂閱 IX0001／IX0043 是否收到推播、第一次開搜尋面板的延遲、快速下單鍵與列的誤觸。
 15. 本輪（排行同自選列、自選增減與排序、公司分頁、產業頁、名稱與額度、淨損益）的實機項目，都只有單元測試與靜態檢查，沒有實機或瀏覽器視覺 QA：
@@ -1181,6 +1242,20 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
     - 效能：trading-state 每筆 tick 重算全部持倉並發布、每秒以 BroadcastChannel 傳出整份 state；冷啟動合約重複抓 3 次；LCP 等全部合約 info；首屏帶入桌面專用與玉山模組（§13 末）。
     - 實機待確認：iOS 15.4（沒有 `requestIdleCallback`）預載後切分頁不再閃「載入中」；Android 省流量模式只預載必要模組；HSTS 生效後不要再用 `http://<機器>.ts.net:8080` 開啟；精簡列在 360／390 寬三檔字級的換行（期權列最高約 109px）。
 
+18. 第 1 期的實機項目（目前只有單元測試與靜態檢查）：
+    - 交易頁當沖資訊列：
+      - 360 寬三種字級的換行，以及「說明 ›」靠右。
+      - 振幅小條在深淺色主題的對比。
+      - 標頭變高約 44px 後，首屏還看得到多少圖表。
+      - iOS 15.4 第一次點資訊列到面板出現的延遲（fallback 為 null，載入期間沒有回饋）。
+    - 「籌碼與當沖」面板：
+      - 當沖規則與處置說明是通則文字，需人工核對。
+      - 券源、融資融券單位、資券餘額照桌面顯示原始數字，單位待確認。
+    - 自選編輯模式：
+      - iOS 15.4／Android 第一次進入是否直接出現按鈕（已閒置預載）。
+      - 握把拖曳、邊緣自動捲動、減少動態時跨 chunk 的行為。
+      - 離線時佔位與「載入失敗」的版面。
+    - 估值卡：金融業與虧損公司實際財報的顯示；P/B 在盤中與收盤後的價格來源。
 ---
 
 ## 17. 第二輪候選與不做清單
