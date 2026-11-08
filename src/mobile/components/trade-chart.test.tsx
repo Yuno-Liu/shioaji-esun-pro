@@ -122,6 +122,7 @@ import {
     updateIndicatorParams,
     type MobileIndicatorSettings,
 } from '../lib/mobile-indicators';
+import { getLimitRange, resetLimitRangeForTest } from '../lib/chart-limit-range';
 import { resetLineFlowForTest } from '../lib/line-flow';
 import { resetLineIndicatorSettingsForTest, setLineIndicatorSettings } from '../lib/line-indicators';
 import * as cs from '../styles/chart.css';
@@ -202,6 +203,7 @@ beforeEach(() => {
     resetIndicatorSettingsForTest();
     resetLineIndicatorSettingsForTest();
     resetLineFlowForTest();
+    resetLimitRangeForTest();
     m.fetchTicks.mockReset().mockResolvedValue(FLOW_TICKS);
     m.timeScale.setVisibleLogicalRange.mockClear();
     m.timeScale.fitContent.mockClear();
@@ -327,8 +329,9 @@ describe('TradeChart', () => {
     it('走勢模式使用 BaselineSeries（參考價基準線）＋均價線＋成交量副圖，不畫 MA 等指標', async () => {
         await render([], 'line');
         // 成交量在有量的歷史載入後才建立（pane 1），所以排在均價線之後
-        expect(m.chart.addSeries.mock.calls.map(c => c[0])).toEqual(['Baseline', 'Line', 'Histogram']);
-        expect(m.chart.addSeries.mock.calls[2]![2]).toBe(1);
+        // 均價線之後是 X 軸用的空白點 series（整個時段），成交量有量才建立（pane 1）
+        expect(m.chart.addSeries.mock.calls.map(c => c[0])).toEqual(['Baseline', 'Line', 'Line', 'Histogram']);
+        expect(m.chart.addSeries.mock.calls[3]![2]).toBe(1);
     });
 
     it('可互動的圖表容器帶 data-allow-pinch="true"（平台手勢防護略過這一區）', async () => {
@@ -1132,7 +1135,8 @@ describe('TradeChart 走勢成交量副圖', () => {
             view = create(createElement(TradeChart, { code: '001', contract: { ...contract, code: '001', security_type: 'IND' } as ContractInfo, period: 'line', lines: [] }), { createNodeMock: nodeMock });
         });
         await tick(50);
-        expect(seriesTypes()).toEqual(['Baseline']);
+        // 指數沒有均價線；只多 X 軸用的空白點 series
+        expect(seriesTypes()).toEqual(['Baseline', 'Line']);
         expect(wrap().props.className).toBe(cs.frame[0]);
         await press(12, 100, 100);
         await release(12, 100);
@@ -1143,7 +1147,7 @@ describe('TradeChart 走勢成交量副圖', () => {
     it('量全為 0 時不建副圖（外框 0 副圖）；之後有量的成交才建立並整段 setData，同一分鐘的成交 update 最後一根', async () => {
         m.fetchChartHistory.mockReset().mockResolvedValue({ ...LINE_KBARS, Volume: [0, 0, 0] });
         await render([], 'line');
-        expect(seriesTypes()).toEqual(['Baseline', 'Line']);
+        expect(seriesTypes()).toEqual(['Baseline', 'Line', 'Line']); // 主圖、均價線、X 軸空白點；沒有量副圖
         expect(wrap().props.className).toBe(cs.frame[0]);
         expect(legendText()).not.toContain('成交量');
 
@@ -1373,6 +1377,185 @@ describe('TradeChart 走勢副圖：分時買賣力、大單／小單買賣力',
         await press(12, 350, 100);
         await release(12, 350);
         await act(async () => { setLineIndicatorSettings({ flow: false, bigSmall: false }); });
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.openOrderAction).not.toHaveBeenCalled();
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
+    });
+});
+
+describe('TradeChart 走勢 X 軸固定與漲跌停範圍', () => {
+    const chartOptions = () => (m.createChart.mock.calls.at(-1) as unknown as [unknown, Record<string, unknown>])[1];
+    const axisIndex = () => m.chart.addSeries.mock.calls.findIndex(c => (c[1] as { lineVisible?: boolean } | undefined)?.lineVisible === false);
+    const axisPoints = () => m.allSeries[axisIndex()]!.setData.mock.calls.at(-1)![0] as Array<{ time: number; value?: number }>;
+    const hm = (tm: number) => new Date(tm * 1000).toISOString().slice(5, 16).replace('T', ' ');
+    const press = async (x: number, y: number, ms: number) => {
+        await act(async () => { wrap().props.onPointerDown(ptr(x, y)); });
+        await tick(ms);
+    };
+    const release = async (x: number, y: number) => { await act(async () => { wrap().props.onPointerUp(ptr(x, y)); }); };
+    const tapAt = async (x: number, y: number) => { await press(x, y, 100); await release(x, y); };
+    const mainProvider = () => (m.chart.addSeries.mock.calls[0]![1] as { autoscaleInfoProvider: (o: () => unknown) => unknown }).autoscaleInfoProvider;
+    const avgProvider = () => (m.chart.addSeries.mock.calls[1]![1] as { autoscaleInfoProvider: (o: () => unknown) => unknown }).autoscaleInfoProvider;
+    const titles = () => mainSeries().priceLines.map(pl => `${pl.opts.title}@${pl.opts.price}`);
+    const renderWith = async (c: ContractInfo, period: 'line' | '5m' = 'line', code = '2330') => {
+        // 每次掛載重新記錄 series（mainProvider、titles 看這一次的圖表）
+        m.chart.addSeries.mockClear();
+        m.allSeries.length = 0;
+        await act(async () => {
+            view = create(createElement(TradeChart, { code, contract: c, period, lines: [] }), { createNodeMock: nodeMock });
+        });
+        await tick(50);
+    };
+    beforeEach(() => {
+        m.fetchChartHistory.mockReset().mockResolvedValue(LINE_KBARS);
+        m.timeScale.fitContent.mockClear();
+        m.chart.setCrosshairPosition.mockClear();
+        Object.values(m.send).forEach(f => f.mockReset());
+    });
+
+    it('走勢關閉拖移、縮放、滾輪、軸拖曳、雙擊重設與慣性；X 軸兩端固定；K 線仍可拖移、縮放', async () => {
+        await render([], 'line');
+        const o = chartOptions();
+        expect(o.handleScroll).toBe(false);
+        expect(o.handleScale).toBe(false);
+        expect(o.kineticScroll).toEqual({ touch: false, mouse: false });
+        expect(o.timeScale).toMatchObject({ rightOffset: 0, fixLeftEdge: true, lockVisibleTimeRangeOnResize: true });
+        // fixRightEdge 會把右端鎖在最後一根有資料的點（右側未到的時段被切掉）
+        expect((o.timeScale as { fixRightEdge?: boolean }).fixRightEdge).toBeUndefined();
+        await unmount();
+        m.chart.addSeries.mockClear();
+        await render([], '5m');
+        const k = chartOptions();
+        expect(k.handleScroll).toMatchObject({ horzTouchDrag: true, pressedMouseMove: true, mouseWheel: true, vertTouchDrag: false });
+        expect(k.handleScale).toMatchObject({ pinch: true, mouseWheel: true, axisDoubleClickReset: true });
+        expect(k.kineticScroll).toBeUndefined();
+        expect(axisIndex()).toBe(-1);
+    });
+
+    it('X 軸涵蓋整個時段：09:01～13:30 每分鐘一個空白點（只有開盤三分鐘的資料，右側留白），並 fitContent', async () => {
+        await render([], 'line');
+        const pts = axisPoints();
+        expect(pts).toHaveLength(270);
+        expect(pts.every(p => p.value === undefined)).toBe(true);
+        expect(hm(pts[0]!.time)).toBe('11-05 09:01');
+        expect(hm(pts.at(-1)!.time)).toBe('11-05 13:30');
+        expect(m.timeScale.fitContent).toHaveBeenCalled();
+        // 尺寸改變（全螢幕、外框加高）後仍是整個時段
+        m.timeScale.fitContent.mockClear();
+        for (const [fn] of m.timeScale.subscribeSizeChange.mock.calls.slice(-2)) (fn as () => void)();
+        expect(m.timeScale.fitContent).toHaveBeenCalled();
+    });
+
+    it('換時段（回前景重抓到新的一天）：X 軸換成新時段', async () => {
+        await render([], 'line');
+        m.fetchChartHistory.mockReset().mockResolvedValue({ ...LINE_KBARS, datetime: LINE_KBARS.datetime.map(d => d.replace('11-05', '11-06')) });
+        m.gate = { resumeSeq: 1 };
+        await act(async () => { view!.update(createElement(TradeChart, { code: '2330', contract, period: 'line', lines: [] })); });
+        await tick(50);
+        expect(hm(axisPoints()[0]!.time)).toBe('11-06 09:01');
+        expect(axisPoints()).toHaveLength(270);
+        expect(m.createChart).toHaveBeenCalledTimes(1);
+    });
+
+    it('期貨夜盤：15:01～隔日 05:00 共 840 分鐘', async () => {
+        m.fetchChartHistory.mockReset().mockResolvedValue({ ...LINE_KBARS, datetime: ['2026-11-05 15:01:00', '2026-11-05 15:02:00', '2026-11-05 15:03:00'] });
+        await renderWith({ ...contract, security_type: 'FUT', code: 'TXFL6' } as ContractInfo, 'line', 'TXFL6');
+        const pts = axisPoints();
+        expect(pts).toHaveLength(840);
+        expect(hm(pts[0]!.time)).toBe('11-05 15:01');
+        expect(hm(pts.at(-1)!.time)).toBe('11-06 05:00');
+    });
+
+    it('沒有成交的分鐘也占位置：輕點依時間吸附到最近的一根，「同一點」以那一根的時間位置判斷', async () => {
+        m.fetchChartHistory.mockReset().mockResolvedValue({ ...LINE_KBARS, datetime: ['2026-11-05 09:01:00', '2026-11-05 09:05:00', '2026-11-05 09:06:00'] });
+        await render([], 'line');
+        await tapAt(72, 100); // 邏輯 3.6 → 第 4 分鐘 09:05
+        expect(textOf(byTestId('chart-readout')[0]!)).toContain('09:05');
+        await tapAt(24, 100); // 邏輯 1.2 → 09:02 → 最近的是 09:01
+        expect(textOf(byTestId('chart-readout')[0]!)).toContain('09:01');
+        await tapAt(8, 100); // 離 09:01（x 0）8px：同一點 → 收起
+        expect(byTestId('chart-readout')).toHaveLength(0);
+        await tapAt(290, 100); // 右側未到的時段 → 最後一根
+        expect(textOf(byTestId('chart-readout')[0]!)).toContain('09:06');
+    });
+
+    it('點主圖價格軸：切換漲跌停範圍（Y 軸固定為跌停～漲停、均價線不參與、畫漲停跌停線、顯示標示）；不出資訊列、不選價；再點還原', async () => {
+        await render([], 'line');
+        expect(mainProvider()(() => 'auto')).toBe('auto');
+        await tapAt(310, 100);
+        expect(getLimitRange()).toBe(true);
+        expect(mainProvider()(() => 'auto')).toEqual({ priceRange: { minValue: 963, maxValue: 1175 } });
+        expect(avgProvider()(() => 'auto')).toBeNull();
+        expect(titles()).toEqual(expect.arrayContaining(['漲停@1175', '跌停@963']));
+        expect(mainSeries().priceLines.find(pl => pl.opts.title === '漲停')!.opts.color).toBe('#f00');
+        const badge = byTestId('chart-range-badge');
+        expect(badge).toHaveLength(1);
+        expect(badge[0]!.props['aria-pressed']).toBe('true');
+        expect(textOf(badge[0]!)).toBe('漲跌停範圍');
+        expect(byTestId('chart-readout')).toHaveLength(0);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(m.chart.setCrosshairPosition).not.toHaveBeenCalled();
+
+        await tapAt(310, 100);
+        expect(getLimitRange()).toBe(false);
+        expect(mainProvider()(() => 'auto')).toBe('auto');
+        expect(byTestId('chart-range-badge')).toHaveLength(0);
+        expect((mainSeries() as unknown as { removePriceLine: ReturnType<typeof vi.fn> }).removePriceLine).toHaveBeenCalled();
+    });
+
+    it('點標示也能回到自動範圍；量副圖的價格軸不觸發', async () => {
+        await render([], 'line');
+        await tick(20); // 版面定位：主圖高 200
+        await tapAt(310, 250); // 量副圖的價格軸
+        expect(getLimitRange()).toBe(false);
+        await tapAt(310, 100);
+        expect(getLimitRange()).toBe(true);
+        await act(async () => { byTestId('chart-range-badge')[0]!.props.onClick(); });
+        expect(getLimitRange()).toBe(false);
+        expect(byTestId('chart-range-badge')).toHaveLength(0);
+    });
+
+    it('指數、沒有正數漲跌停、K 線：點價格軸不切換也不顯示標示；提示文字只在可切換時提到價格軸', async () => {
+        await renderWith({ ...contract, security_type: 'IND' } as ContractInfo);
+        await tapAt(310, 100);
+        expect(getLimitRange()).toBe(false);
+        expect(textOf(view!.root.findAll(n => n.type === 'p')[0]!)).not.toContain('價格軸');
+        await unmount();
+        await renderWith({ ...contract, limit_up: 0 } as ContractInfo);
+        await tapAt(310, 100);
+        expect(getLimitRange()).toBe(false);
+        await unmount();
+        await renderWith(contract, '5m');
+        await tapAt(310, 100);
+        expect(getLimitRange()).toBe(false);
+        await unmount();
+        await renderWith(contract);
+        expect(textOf(view!.root.findAll(n => n.type === 'p')[0]!)).toBe('點圖看價格，長按選價；點價格軸看漲跌停');
+    });
+
+    it('狀態在本次使用期間沿用（換檔、換週期再回走勢）；沒有漲跌停的商品不套用；全螢幕仍顯示標示；期權補畫漲跌停線', async () => {
+        await render([], 'line');
+        await tapAt(310, 100);
+        await unmount();
+        await renderWith({ ...contract, code: '2317', limit_up: 220, limit_down: 180 } as ContractInfo, 'line', '2317');
+        expect(byTestId('chart-range-badge')).toHaveLength(1);
+        expect(mainProvider()(() => 'auto')).toEqual({ priceRange: { minValue: 180, maxValue: 220 } });
+        await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+        expect(byTestId('chart-range-badge')).toHaveLength(1);
+        await unmount();
+        await renderWith({ ...contract, security_type: 'IND', limit_up: 0, limit_down: 0 } as ContractInfo, 'line', '001');
+        expect(byTestId('chart-range-badge')).toHaveLength(0);
+        expect(mainProvider()(() => 'auto')).toBe('auto');
+        await unmount();
+        await renderWith({ ...contract, security_type: 'FUT', code: 'TXFL6', limit_up: 30000, limit_down: 25000 } as ContractInfo, 'line', 'TXFL6');
+        expect(titles()).toEqual(expect.arrayContaining(['漲停@30000', '跌停@25000']));
+        expect(getLimitRange()).toBe(true);
+    });
+
+    it('S1：點價格軸、點標示都不開下單面板，lib 送出函式 0 次', async () => {
+        await render([], 'line');
+        await tapAt(310, 100);
+        await act(async () => { byTestId('chart-range-badge')[0]!.props.onClick(); });
         expect(m.openTicket).not.toHaveBeenCalled();
         expect(m.openOrderAction).not.toHaveBeenCalled();
         for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
