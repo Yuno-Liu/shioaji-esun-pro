@@ -227,6 +227,18 @@ function ReadoutLine({ store, onClose }: { store: ReadoutStore; onClose: () => v
     const r = useSyncExternalStore(store.subscribe, store.get, store.get);
     if (!r) return null;
     const tone = styles.dirText[r.dir];
+    const closeButton = r.source === 'tap' ? (
+        <button
+            type='button'
+            className={cs.readoutClose}
+            onPointerDown={e => e.stopPropagation()}
+            onClick={onClose}
+            aria-label='關閉價格資訊'
+            data-testid='chart-readout-close'
+        >
+            ✕
+        </button>
+    ) : null;
     return (
         <div className={cs.readout} data-testid='chart-readout' data-source={r.source}>
             <span className={cs.readoutPill} role='group' aria-label={r.ariaLabel}>
@@ -234,29 +246,22 @@ function ReadoutLine({ store, onClose }: { store: ReadoutStore; onClose: () => v
                 <span className={`${cs.readoutPrice} ${tone}`} aria-hidden='true' data-testid='chart-readout-price'>
                     {r.priceLabel ? `${r.priceLabel} ${r.price}` : r.price}
                 </span>
-                {r.volume !== null && (
-                    <span className={cs.readoutTime} aria-hidden='true' data-testid='chart-readout-volume'>{`量 ${r.volume}`}</span>
-                )}
-                {(r.change || r.source === 'tap') && (
-                    // 漲跌與 ✕ 同一組換行：字級大放不下時整組到第二行，✕ 不會單獨落到下一行
+                {/* 量放在漲跌之後（不夾在價格與漲跌之間，免得「量 25 ▲5」被讀成量的漲跌），與無障礙名稱的順序相同。
+                    以組為單位換行：［漲跌］［量 ✕］；沒有量時 ✕ 跟著漲跌，✕ 不會單獨落到下一行 */}
+                {r.change && (
                     <span className={cs.readoutTail}>
-                        {r.change && (
-                            <span className={tone} aria-hidden='true' data-testid='chart-readout-change'>
-                                {`${r.change.label ? `${r.change.label} ` : ''}${r.change.text} (${r.change.pct})`}
-                            </span>
+                        <span className={tone} aria-hidden='true' data-testid='chart-readout-change'>
+                            {`${r.change.label ? `${r.change.label} ` : ''}${r.change.text} (${r.change.pct})`}
+                        </span>
+                        {r.volume === null && closeButton}
+                    </span>
+                )}
+                {(r.volume !== null || (!r.change && closeButton)) && (
+                    <span className={cs.readoutTail}>
+                        {r.volume !== null && (
+                            <span className={cs.readoutTime} aria-hidden='true' data-testid='chart-readout-volume'>{`量 ${r.volume}`}</span>
                         )}
-                        {r.source === 'tap' && (
-                            <button
-                                type='button'
-                                className={cs.readoutClose}
-                                onPointerDown={e => e.stopPropagation()}
-                                onClick={onClose}
-                                aria-label='關閉價格資訊'
-                                data-testid='chart-readout-close'
-                            >
-                                ✕
-                            </button>
-                        )}
+                        {(r.volume !== null || !r.change) && closeButton}
                     </span>
                 )}
             </span>

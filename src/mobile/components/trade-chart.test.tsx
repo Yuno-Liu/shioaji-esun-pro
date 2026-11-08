@@ -902,6 +902,12 @@ describe('TradeChart 點選價格資訊', () => {
         const group = readoutNodes()[0]!.findAll(n => n.props.role === 'group')[0]!;
         expect(group.props['aria-label']).toBe('09:02，價格 1,080，漲跌 上漲 10，漲跌幅 +0.93%，成交量 20');
         expect(textOf(byTestId('chart-readout-volume')[0]!)).toBe('量 20');
+        // 順序：價格 → 漲跌 → 量 → ✕（量不夾在價格與漲跌之間）；［漲跌］與［量 ✕］各自成組換行，✕ 跟著量
+        const order = group.findAll(n => typeof n.type === 'string' && /^chart-readout-(price|change|volume|close)$/.test(String(n.props['data-testid'] ?? '')))
+            .map(n => String(n.props['data-testid']).slice('chart-readout-'.length));
+        expect(order).toEqual(['price', 'change', 'volume', 'close']);
+        const volumeGroup = byTestId('chart-readout-volume')[0]!.parent!;
+        expect(volumeGroup.findAll(n => n.props['data-testid'] === 'chart-readout-close' && typeof n.type === 'string')).toHaveLength(1);
         // 資訊列在圖例第一列（同一個容器，往下排，不另疊一層）
         expect(byTestId('chart-legend')[0]!.findAll(n => n.props['data-testid'] === 'chart-readout')).toHaveLength(1);
         expect(byTestId('chart-pick')).toHaveLength(0);
