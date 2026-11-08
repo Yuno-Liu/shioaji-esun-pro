@@ -897,3 +897,154 @@ export const lotHead = style({
     marginBottom: SPACE.s1,
     ...NUMERIC,
 });
+
+// ---- 多選市價出清：選取模式與底部工具列（設計規格 §7.7、§10 S10；預覽／進度面板的樣式在 batch-exit.css.ts）----
+
+/** 勾選鍵（button role=checkbox）：觸控區 TOUCH_MIN，內含 22px 方框；停用時降低不透明度並另有原因文字 */
+export const selectCheck = style([pressable, focusRing, {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flex: '0 0 auto',
+    minWidth: TOUCH_MIN,
+    minHeight: TOUCH_MIN,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    color: vars.color.foreground,
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&:disabled': { opacity: 0.45, cursor: 'default' },
+    },
+}]);
+
+/** 勾選方框：未勾＝外框；勾選或部分勾選＝accent 實心＋白色圖示（selectBoxOn） */
+export const selectBox = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    boxSizing: 'border-box',
+    width: '1.375rem',
+    height: '1.375rem',
+    borderRadius: RADIUS.xs,
+    border: `1.5px solid ${vars.color.borderBright}`,
+    background: vars.color.panel,
+});
+
+export const selectBoxOn = style([fill.accent.large, {
+    borderColor: 'transparent',
+}]);
+
+export const selectIcon = style({
+    width: '1rem',
+    height: '1rem',
+    strokeWidth: 3,
+});
+
+/** 部分勾選（aria-checked=mixed）的橫線 */
+export const selectDash = style({
+    width: '0.625rem',
+    height: '2px',
+    borderRadius: '1px',
+    background: 'currentColor',
+});
+
+/** 詳細列選取模式的第一行：勾選鍵在最前（左邊緣與文字起點對齊，觸控區往左延伸到列內距） */
+export const rowSelectCheck = style({
+    marginLeft: `calc(-1 * ${SPACE.s3})`,
+    marginTop: `calc(-1 * ${SPACE.s2})`,
+    marginBottom: `calc(-1 * ${SPACE.s2})`,
+});
+
+/** 精簡列選取模式：勾選鍵＋列本體 */
+export const compactSelectable = style({
+    display: 'flex',
+    alignItems: 'stretch',
+    minWidth: 0,
+    paddingLeft: SPACE.s1,
+});
+
+// 列本體在勾選鍵右側：佔滿剩餘寬度、左內距縮小；選取模式不展開，去掉 chevron 欄（讓出勾選鍵佔用的寬度，360 寬字級大不溢出）
+globalStyle(`${compactSelectable} > ${compactRow}`, {
+    flex: '1 1 auto',
+    width: 'auto',
+    paddingLeft: SPACE.s1,
+    gridTemplateColumns: 'minmax(min-content, 1fr) auto',
+});
+
+globalStyle(`${compactSelectable} ${compactChevron}`, { display: 'none' });
+
+/** 不能列入批次的原因（列內小字，不只靠停用外觀） */
+export const selectReason = style({
+    margin: 0,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
+/** 精簡列的原因：與列文字起點對齊（勾選鍵右側） */
+export const compactSelectReason = style({
+    padding: `0 ${SPACE.s4} ${SPACE.s2} calc(${SPACE.s1} + ${TOUCH_MIN})`,
+});
+
+/** 組標頭的「全選」：勾選鍵＋文字（標頭在頁面底色上，文字用 foreground） */
+export const groupSelect = style([selectCheck, {
+    gap: SPACE.s1,
+    paddingRight: SPACE.s2,
+    ...TEXT.footnote,
+    fontWeight: 600,
+}]);
+
+/** 標頭「選取」切換鍵（aria-pressed）：accent 文字鍵 */
+export const headerToggle = style([actionBase, {
+    border: 'none',
+    background: 'transparent',
+    color: vars.color.accent,
+    padding: `0 ${SPACE.s2}`,
+    selectors: {
+        '&[aria-pressed="true"]': { color: vars.color.foreground },
+    },
+}]);
+
+/** 底部配件槽（ShellSlot bottom，bar 材質上文字一律 foreground） */
+export const selectBar = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: SPACE.s2,
+    padding: `${SPACE.s2} ${INSET_R} ${SPACE.s2} ${INSET_X}`,
+    minWidth: 0,
+});
+
+export const selectBarRow = style({
+    display: 'flex',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: SPACE.s2,
+    minWidth: 0,
+});
+
+export const selectBarCount = style({
+    flex: '1 1 auto',
+    minWidth: 0,
+    ...TEXT.callout,
+    fontWeight: 600,
+    ...NUMERIC,
+    color: vars.color.foreground,
+});
+
+/** 「市價出清 N 筆」：danger 外框（不用實心紅綠，避免與新單買賣鍵混淆）；只開預覽面板，仍需滑動 */
+export const clearOutButton = style([actionBase, {
+    width: '100%',
+    border: `1px solid ${vars.color.danger}`,
+    background: vars.color.panel,
+    color: vars.color.foreground,
+}]);
+
+export const textButton = style([actionBase, {
+    border: 'none',
+    background: 'transparent',
+    color: vars.color.accent,
+    padding: `0 ${SPACE.s2}`,
+}]);

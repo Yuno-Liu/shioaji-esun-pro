@@ -39,9 +39,17 @@
 //   未展開的列不掛詳細卡片子樹；切換時以切換鍵為錨點保留捲動位置；減少動態時不做展開動畫。
 // - 重繪範圍（稽核 P2）：詳細列與精簡列以 memo 包起來，只比該列用到的值（持倉物件參考、淨損益數值、遮蔽、平倉停用…）；
 //   交易狀態重估市價時只有跳價的那列重繪（本頁最大損益改變時全部重繪以更新損益條比例）。列的按鈕經 rowActions 轉給最新的處理函式。
+// - 多選市價出清（使用者要求；§7.7、§10 S10）：標頭「選取」（aria-pressed）進入選取模式。兩種檢視的每列都有勾選鍵
+//   （button role=checkbox、aria-checked、名稱「選取 代碼 名稱 條件 多空 數量」、≥ TOUCH_MIN）；每個帳戶組與頁面各有三態「全選」。
+//   可列入＝closePlanFor 有平倉方式且不是選擇權（batchSelectReason）；不可列入的列勾選鍵停用並顯示原因。選取模式隱藏平倉、加碼
+//   （詳細列整個動作列），點列切換選取（精簡列不展開）。底部配件槽（ShellSlot bottom）：已選 N 筆、全選、取消、「市價出清 N 筆」。
+//   離開選取模式或改篩選清除選取；已選的持倉消失、數量改變或變成不可列入時移出選取並說明。
+//   「市價出清 N 筆」只開預覽面板（components/batch-exit-sheet，延遲載入）；滑動一次後由 lib/batch-exit 的 runBatchExit 依序送出：
+//   每筆仍經 executeClose（beforeSend: closeBeforeSend），lib 的確認請求由 lib/batch-exit-auth 比對預期內容後自動核准（不顯示確認面板）。
+//   與單筆平倉共用 closingRef（任一進行中另一個不能開始）；下單面板或確認進行中（useAccountSwitchLocked）也不能開始。
 
-import { ChevronRight, RotateCw, Wallet } from 'lucide-react';
-import { memo, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
+import { Check, ChevronRight, RotateCw, Wallet } from 'lucide-react';
+import { memo, Suspense, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { useTradingLive } from '../../hooks/use-stream';
 import { getAccountState, selectAccount, useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
@@ -50,6 +58,7 @@ import { isEsunAccount } from '../../lib/esun';
 import { findEsunInventoryDetail, getEsunInventoryDetailsSnapshot, subscribeEsunInventoryDetails } from '../../lib/esun/account-details';
 import { accountMatches } from '../../lib/flash-account';
 import { SHARES_PER_LOT } from '../../lib/odd-lot';
+import { getPendingOrderConfirm } from '../../lib/order-confirm';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
 import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../../lib/privacy';
 import { useServerInfo, yesterdayQuantityNotice } from '../../lib/server-info-store';
@@ -65,6 +74,7 @@ import type { Account, AccountedPosition, Position, StockPosition } from '../../
 import { fmtPct, fmtPrice, fmtSigned } from '../../lib/utils/format';
 import { fmtInt, fmtStockLots, formatToTick } from '../lib/num-format';
 import { mobileAccountLabel, useAccountSwitchLocked } from '../components/account-switch-sheet';
+import type { BatchPhase, BatchViewGroup } from '../components/batch-exit-sheet';
 import { BottomSheet, SheetFooter } from '../components/bottom-sheet';
 import { PositionEsunDetails } from '../components/position-esun-details';
 import { breakEvenRelationText, PNL_TEXT, pnlTags, PositionPnlSheet } from '../components/position-pnl-sheet';
@@ -86,11 +96,13 @@ import {
 import { PositionSummaryCard } from '../components/position-summary';
 import { ResumeGateNote } from '../components/resume-gate-note';
 import { RouteBadge } from '../components/route-badge';
+import { ModuleErrorBoundary, retryableLazy, SheetLoadError } from '../components/route-error-boundary';
 import { classifyTicketOutcome, OUTCOME_UNKNOWN_TITLE } from '../hooks/use-mobile-ticket';
 import { useResumeGate } from '../hooks/use-resume-gate';
+import { batchSummaryText, runBatchExit, type BatchExitItem, type BatchItemState } from '../lib/batch-exit';
 import { navigate } from '../lib/hash-router';
 import { breakEvenRelation, computeStockPnl, stockPnlInputOf, todayStockFills, type StockPnl, type TodayFills } from '../lib/position-pnl';
-import { openTicket, type TicketCond, type TicketLot } from '../lib/mobile-store';
+import { getMobileUi, openTicket, type TicketCond, type TicketLot } from '../lib/mobile-store';
 import { readPositionsView, writePositionsView, type PositionsView } from '../lib/positions-view';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { assertResumeReady, getResumeGate, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
@@ -105,6 +117,7 @@ import { InlineNote } from '../ui/inline-note';
 import { PageHeader } from '../ui/page-header';
 import { PopUpButton } from '../ui/pop-up-button';
 import { Segmented } from '../ui/segmented';
+import { ShellSlot } from '../ui/shell-slots';
 import { Skeleton } from '../ui/skeleton';
 
 /** 「⟳」更新持倉的冷卻時間 */
@@ -142,6 +155,10 @@ export const POSITIONS_TEXT = {
     pnlNoContract: '商品資料尚未載入，淨損益待確認',
     pnlUnsupported: '此信用條件不估算費稅，淨損益待確認',
     pnlNoPrice: '缺現價，淨損益待確認',
+    batchOption: '選擇權不列入批次市價出清，請逐筆平倉',
+    batchBusy: '其他平倉、下單面板或確認進行中，暫時不能出清',
+    batchEnvUnknown: '有帳戶的環境未確認（模擬／正式），未送出',
+    batchFailed: '出清中斷（程式錯誤），未處理的持倉未送出；請到委託頁按「更新」核對',
 } as const;
 
 // ---- 純函式（測試用匯出）----
@@ -275,6 +292,37 @@ export async function executeClose(plan: ClosePlan): Promise<void> {
         source: 'manual',
         beforeSend: closeBeforeSend,
     });
+}
+
+// ---- 多選市價出清（§7.7、§10 S10）----
+
+/**
+ * 不能列入多選市價出清的原因；可以時回 null。範圍＝股票（現股、融資、融券、現股當沖）＋期貨；選擇權不列入。
+ * 其餘條件與單筆平倉相同（closePlanFor）；商品資料未載入時無法區分期貨與選擇權，也不能列入。
+ */
+export function batchSelectReason(p: AccountedPosition, contract: ContractInfo | undefined): string | null {
+    if (!isStockPosition(p) && contract?.security_type === 'OPT') return POSITIONS_TEXT.batchOption;
+    const plan = closePlanFor(p, contract);
+    return typeof plan === 'string' ? plan : null;
+}
+
+/**
+ * 實際送出的各腳（與 lib 相同）：股票整張以市價 IOC（信用部位帶信用條件）、零股以跌停（賣）／漲停（買）價盤中零股限價；
+ * 期貨以市價 IOC、倉別平倉。數量依遮蔽金額處理，價格不遮蔽。
+ */
+export function batchLegs(plan: ClosePlan, privMoney: boolean): string[] {
+    const n = (v: number) => maskMoney(fmtInt(v), privMoney);
+    if (plan.kind === 'futures') return [`${n(plan.lots)} 口 市價 IOC（平倉）`];
+    const lots = Math.floor(plan.shares / SHARES_PER_LOT);
+    const odd = plan.shares % SHARES_PER_LOT;
+    const legs: string[] = [];
+    if (lots > 0) legs.push(`整張 ${n(lots)} 張 市價 IOC${plan.orderCond ? `（${creditExitLabel(plan.orderCond)}）` : ''}`);
+    if (odd > 0) {
+        const sell = plan.action === 'Sell';
+        const price = sell ? plan.contract.limit_down : plan.contract.limit_up;
+        legs.push(`零股 ${n(odd)} 股以${sell ? '跌停' : '漲停'}價 ${formatToTick(plan.contract, price)} 盤中零股限價`);
+    }
+    return legs;
 }
 
 /** 加碼時交給 openTicket 的內容（一次性帶入；面板仍依規則驗證） */
@@ -453,6 +501,63 @@ interface RowProps {
     onOpenPnl: () => void;
     /** 精簡列展開時：嵌在精簡列的 li 內（div＋id，供 aria-controls），不重複第一行（代碼、條件、多空數量、損益已在精簡列） */
     embeddedId?: string;
+    /** 選取模式（多選市價出清）；一般模式為 null／undefined。嵌入的詳細卡片不使用 */
+    select?: RowSelect | null;
+    onToggleSelect?: () => void;
+}
+
+/** 選取模式的列狀態：checked＝已選；reason＝不能列入批次的原因（勾選鍵停用並顯示文字） */
+export interface RowSelect {
+    checked: boolean;
+    reason: string | null;
+}
+
+export function rowSelectEqual(a: RowSelect | null | undefined, b: RowSelect | null | undefined): boolean {
+    if (!a || !b) return !a === !b;
+    return a.checked === b.checked && a.reason === b.reason;
+}
+
+/** 勾選鍵的無障礙名稱，例如「選取 2330 台積電 現股 多 3張」（數量依遮蔽金額處理） */
+export function selectLabel(p: AccountedPosition, contract: ContractInfo | undefined, privMoney: boolean): string {
+    return `選取 ${p.code}${contract?.name ? ` ${contract.name}` : ''} ${positionCondText(p, contract)} ${sideText(p.direction)} ${maskMoney(positionQtyText(p), privMoney)}`;
+}
+
+/** 勾選鍵：button role=checkbox（aria-checked 可為 mixed），觸控區 TOUCH_MIN；有 children 時同時顯示文字 */
+function SelectCheck({ checked, disabled, label, onToggle, className, testId, children }: {
+    checked: boolean | 'mixed';
+    disabled?: boolean;
+    label: string;
+    onToggle: () => void;
+    className?: string;
+    testId: string;
+    children?: ReactNode;
+}) {
+    return (
+        <button
+            type='button'
+            role='checkbox'
+            aria-checked={checked}
+            aria-label={label}
+            disabled={disabled}
+            className={className ?? styles.selectCheck}
+            onClick={onToggle}
+            data-testid={testId}
+        >
+            <span className={checked ? `${styles.selectBox} ${styles.selectBoxOn}` : styles.selectBox} aria-hidden='true'>
+                {/* 部分勾選以 CSS 橫線表示（不另載 lucide Minus：它與委託頁共用會多一個 chunk，首屏預載清單變長） */}
+                {checked === 'mixed' ? <span className={styles.selectDash} /> : checked && <Check className={styles.selectIcon} focusable='false' />}
+            </span>
+            {children}
+        </button>
+    );
+}
+
+/** 點列（非按鈕處）切換選取（觸控方便；鍵盤與報讀以勾選鍵操作） */
+function rowTapToggle(onToggle: (() => void) | undefined) {
+    return (e: MouseEvent) => {
+        const target = e.target as { closest?: (selector: string) => unknown } | null;
+        if (!target?.closest?.('button, a')) onToggle?.();
+    };
 }
 
 function Cell({ label, children, className, testId }: { label: string; children: ReactNode; className?: string; testId?: string }) {
@@ -471,7 +576,7 @@ function pnlSrLabel(rp: RowPnl): string {
     return d !== undefined && d < 1 ? `淨損益（含手續費 ${discountText(d)} 折、證交稅）` : '淨損益（含手續費、證交稅）';
 }
 
-function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsPnl, ydNotice, expanded, rp, onClose, onAddOn, onToggleDetail, onOpenPnl, embeddedId }: RowProps) {
+function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsPnl, ydNotice, expanded, rp, onClose, onAddOn, onToggleDetail, onOpenPnl, embeddedId, select, onToggleSelect }: RowProps) {
     const contract = useContract(p.code);
     const long = p.direction === 'Buy';
     const stock = isStockPosition(p);
@@ -490,9 +595,21 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
     const relation = sp ? breakEvenRelationText(sp, p.last_price) : null;
     const money = (v: number | null) => maskMoney(v === null ? '—' : fmtInt(Math.round(v)), privMoney);
     const embedded = embeddedId !== undefined;
+    // 選取模式：第一行最前加勾選鍵，隱藏動作列（平倉、加碼、看圖、庫存明細）與加碼說明，點列切換選取
+    const sel = embedded ? null : select ?? null;
     const body = (
         <>
             {!embedded && <div className={styles.rowHead}>
+                {sel && (
+                    <SelectCheck
+                        checked={sel.checked}
+                        disabled={sel.reason !== null}
+                        label={selectLabel(p, contract, privMoney)}
+                        onToggle={() => onToggleSelect?.()}
+                        className={`${styles.selectCheck} ${styles.rowSelectCheck}`}
+                        testId='position-select'
+                    />
+                )}
                 <span className={styles.rowCode}>{p.code}</span>
                 {contract?.name && <span className={styles.rowName}>{contract.name}</span>}
                 <span className={styles.tag}>{positionCondText(p, contract)}</span>
@@ -505,6 +622,7 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                     <span data-testid='position-pnl'>{shown === null ? '—' : maskMoney(fmtSigned(shown, 0), privMoney)}</span>
                 </span>
             </div>}
+            {sel?.reason && <p className={styles.selectReason} data-testid='position-select-reason'>{sel.reason}</p>}
             <div className={styles.rowMeta}>
                 <RouteBadge account={p.account} />
                 {p.account && <span>{mobileAccountLabel(p.account, priv)}</span>}
@@ -545,7 +663,7 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                     <span className={styles.pnlBarFill[(shown ?? 0) > 0 ? 'up' : 'down']} style={{ transform: scaleXOf(bar / 100) }} />
                 </div>
             )}
-            <div className={styles.rowActions}>
+            {!sel && <div className={styles.rowActions}>
                 {esun && (
                     <button
                         type='button'
@@ -564,16 +682,26 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                     看圖
                     <ChevronRight className={styles.actionIcon} aria-hidden='true' focusable='false' />
                 </button>
-            </div>
-            {addOnReason
+            </div>}
+            {!sel && (addOnReason
                 ? <p className={styles.rowNote} data-testid='position-add-note'>{addOnReason}</p>
-                : addOnNote && <p className={styles.rowNote} data-testid='position-add-note'>{addOnNote}</p>}
+                : addOnNote && <p className={styles.rowNote} data-testid='position-add-note'>{addOnNote}</p>)}
             {esun && expanded && <PositionEsunDetails position={p} />}
         </>
     );
     return embedded
         ? <div id={embeddedId} className={styles.compactDetail} data-testid='position-row' data-code={p.code}>{body}</div>
-        : <li className={styles.row} data-testid='position-row' data-code={p.code}>{body}</li>;
+        : (
+            <li
+                className={styles.row}
+                data-testid='position-row'
+                data-code={p.code}
+                data-selected={sel ? String(sel.checked) : undefined}
+                onClick={sel && sel.reason === null ? rowTapToggle(onToggleSelect) : undefined}
+            >
+                {body}
+            </li>
+        );
 }
 
 // ---- 列的重繪範圍（稽核 P2）----
@@ -612,6 +740,7 @@ export function rowPropsEqual(a: RowProps, b: RowProps): boolean {
         && a.ydNotice === b.ydNotice
         && a.expanded === b.expanded
         && a.embeddedId === b.embeddedId
+        && rowSelectEqual(a.select, b.select)
         && rowPnlEqual(a.rp, b.rp);
 }
 
@@ -658,16 +787,19 @@ interface CompactRowProps {
     onToggle: () => void;
     /** 展開時嵌入的詳細卡片 props（未展開的列不掛詳細卡片子樹） */
     detail: Omit<RowProps, 'embeddedId'>;
+    /** 選取模式：列前加勾選鍵，點列切換選取（不展開） */
+    select?: RowSelect | null;
+    onToggleSelect?: () => void;
 }
 
 /** 精簡列的 memo 比較：收合時只比精簡列用到的欄位；展開時再比嵌入的詳細卡片 */
 export function compactRowPropsEqual(a: CompactRowProps, b: CompactRowProps): boolean {
-    if (a.p !== b.p || a.privMoney !== b.privMoney || a.open !== b.open || !rowPnlEqual(a.rp, b.rp)) return false;
+    if (a.p !== b.p || a.privMoney !== b.privMoney || a.open !== b.open || !rowSelectEqual(a.select, b.select) || !rowPnlEqual(a.rp, b.rp)) return false;
     return !a.open || rowPropsEqual(a.detail, b.detail);
 }
 
 /** 精簡列：左＝名稱／代碼・條件・多空數量；右＝淨損益／報酬率・兩平狀態；第二列＝現價＋兩平價（期權均價）；點一下就地展開既有詳細卡片 */
-function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail }: CompactRowProps) {
+function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail, select, onToggleSelect }: CompactRowProps) {
     const contract = useContract(p.code);
     const detailId = useId();
     const shown = rp.value;
@@ -675,14 +807,16 @@ function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail }: Compac
     const status = compactStatusText(p, rp);
     const name = contract?.name;
     const ref = compactRefPrice(p, rp);
-    return (
-        <li className={styles.compactItem} data-testid='position-compact-row' data-code={p.code}>
+    const toggleSelect = () => onToggleSelect?.();
+    const row = (
             <button
                 type='button'
                 className={styles.compactRow}
-                aria-expanded={open}
-                aria-controls={open ? detailId : undefined}
-                onClick={onToggle}
+                aria-expanded={select ? undefined : open}
+                aria-controls={open && !select ? detailId : undefined}
+                aria-pressed={select ? select.checked : undefined}
+                disabled={select ? select.reason !== null : undefined}
+                onClick={select ? toggleSelect : onToggle}
                 data-testid='position-compact-toggle'
             >
                 <span className={styles.compactLeft}>
@@ -713,7 +847,25 @@ function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail }: Compac
                     <span data-testid='position-compact-ref'>{ref.label} {ref.value}</span>
                 </span>
             </button>
-            {open && <MemoPositionRow {...detail} embeddedId={detailId} />}
+    );
+    return (
+        <li className={styles.compactItem} data-testid='position-compact-row' data-code={p.code} data-selected={select ? String(select.checked) : undefined}>
+            {select ? (
+                <>
+                    <div className={styles.compactSelectable}>
+                        <SelectCheck
+                            checked={select.checked}
+                            disabled={select.reason !== null}
+                            label={selectLabel(p, contract, privMoney)}
+                            onToggle={toggleSelect}
+                            testId='position-select'
+                        />
+                        {row}
+                    </div>
+                    {select.reason && <p className={`${styles.selectReason} ${styles.compactSelectReason}`} data-testid='position-select-reason'>{select.reason}</p>}
+                </>
+            ) : row}
+            {open && !select && <MemoPositionRow {...detail} embeddedId={detailId} />}
         </li>
     );
 }
@@ -842,6 +994,28 @@ function AddOnSwitchSheet({ position, current, priv, locked, error, onCancel, on
     );
 }
 
+// 多選市價出清的預覽與進度面板：進入選取模式時預載，按「市價出清 N 筆」才掛載；載入失敗以 SheetLoadError 提示（可重試）
+const BatchExitSheet = retryableLazy(() => import('../components/batch-exit-sheet').then(m => m.BatchExitSheet), 'BatchExitSheet');
+const resetBatchExitSheet = () => { BatchExitSheet.reset(); };
+
+interface BatchState {
+    phase: BatchPhase;
+    /** 執行中與完成後：滑動當下的清單快照（預覽時用目前的選取即時組出） */
+    groups: BatchViewGroup[];
+    states: Record<string, BatchItemState> | null;
+    stop: boolean;
+    /** 滑動後未開始的原因（閘門、環境未確認、其他流程進行中） */
+    feedback: string | null;
+}
+
+/** 滑動當下可送出的一筆（尚未加上環境） */
+interface BatchCandidate {
+    key: string;
+    position: AccountedPosition;
+    plan: ClosePlan;
+    accountKey: string;
+}
+
 export function PositionsPage() {
     const trading = useTradingState();
     const accounts = useAccounts();
@@ -876,7 +1050,7 @@ export function PositionsPage() {
     // 商品資料（名稱、漲跌停價、期貨／選擇權別）預先載入快取；失敗時該列平倉停用並說明。
     // 載入完成後遞增 contractsTick，讓市場分段以最新快取重新歸類。
     const codesKey = [...new Set(positions.map(p => p.code))].sort().join(',');
-    const [, setContractsTick] = useState(0);
+    const [contractsTick, setContractsTick] = useState(0);
     useEffect(() => {
         if (!codesKey) return;
         let alive = true;
@@ -984,7 +1158,15 @@ export function PositionsPage() {
 
     // ---- 平倉 ----
     const mounted = useRef(true);
-    useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+    // 多選市價出清：卸載時要求停止剩餘（送出中的那一筆無法取消）
+    const batchStopRef = useRef(false);
+    useEffect(() => {
+        mounted.current = true;
+        return () => {
+            mounted.current = false;
+            batchStopRef.current = true;
+        };
+    }, []);
     const [closeKey, setCloseKey] = useState<string | null>(null);
     const [closing, setClosing] = useState(false);
     const closingRef = useRef(false);
@@ -1070,17 +1252,177 @@ export function PositionsPage() {
         openTicket(plan.request);
     };
 
-    // ---- 列的動作（memo 列用）：穩定的轉接函式，每次呼叫都轉給最新一次提交的處理函式 ----
-    const latestRowHandlers = useRef({ openClose, onAddOn, toggleDetail, toggleCompact });
+    // ---- 多選市價出清（§7.7、§10 S10）：選取 → 預覽面板滑動一次 → 依序送出 ----
+    const [selecting, setSelecting] = useState(false);
+    /** 已選：positionKey → 選取時的數量（數量改變就移出選取） */
+    const [selected, setSelected] = useState<ReadonlyMap<string, number>>(() => new Map());
+    const [selectNote, setSelectNote] = useState<string | null>(null);
+    const [batch, setBatch] = useState<BatchState | null>(null);
+    const batchRunning = batch?.phase === 'running';
+    const selectReasonCache = new Map<string, string | null>();
+    const selectReasonOf = (p: AccountedPosition): string | null => {
+        const key = positionKey(p);
+        if (!selectReasonCache.has(key)) selectReasonCache.set(key, batchSelectReason(p, getCachedContract(p.code)));
+        return selectReasonCache.get(key) ?? null;
+    };
+    const exitSelecting = () => {
+        setSelecting(false);
+        setSelected(new Map());
+        setSelectNote(null);
+    };
+    const toggleSelecting = () => {
+        if (batchRunning) return;
+        if (selecting) { exitSelecting(); return; }
+        void BatchExitSheet.preload();
+        setSelecting(true);
+    };
+    const setManySelected = (ps: readonly AccountedPosition[], on: boolean) => setSelected(prev => {
+        const next = new Map(prev);
+        for (const p of ps) {
+            if (on) next.set(positionKey(p), p.quantity);
+            else next.delete(positionKey(p));
+        }
+        return next;
+    });
+    const toggleSelect = (p: AccountedPosition) => {
+        if (batchRunning || selectReasonOf(p) !== null) return;
+        setManySelected([p], !selected.has(positionKey(p)));
+    };
+    /** 全選三態：可選的列全部已選＝true、部分＝mixed、都沒選＝false */
+    const selectState = (ps: readonly AccountedPosition[]): boolean | 'mixed' => {
+        const n = ps.filter(p => selected.has(positionKey(p))).length;
+        return n === 0 ? false : n === ps.length ? true : 'mixed';
+    };
+    // 篩選改變：清除選取（不讓被篩掉的持倉以看不見的選取留在批次裡）
+    const changeMarket = (v: PositionMarketFilter) => { setMarket(v); setSelected(new Map()); };
+    const changeFilter = (v: string) => { setFilterKey(v); setSelected(new Map()); };
+    // 已選的持倉消失、數量改變或變成不可列入：移出選取並說明（執行中與完成後不動）
+    useEffect(() => {
+        if (!selected.size || batch?.phase === 'running' || batch?.phase === 'done') return;
+        const byKey = new Map(positions.map(p => [positionKey(p), p]));
+        const next = new Map<string, number>();
+        for (const [k, q] of selected) {
+            const p = byKey.get(k);
+            if (p && p.quantity === q && batchSelectReason(p, getCachedContract(p.code)) === null) next.set(k, q);
+        }
+        if (next.size === selected.size) return;
+        setSelected(next);
+        setSelectNote(`${selected.size - next.size} 筆已選的持倉已變動或不在清單，已移出選取`);
+    }, [positions, selected, batch?.phase, contractsTick]);
+
+    // 預覽清單（依畫面順序、依帳戶分組）與滑動當下要送出的內容
+    const batchGroups: BatchViewGroup[] = [];
+    const batchCandidates: BatchCandidate[] = [];
+    if (selecting && selected.size > 0) {
+        for (const g of groupPositionsByAccount(sortedRows.filter(p => selected.has(positionKey(p))))) {
+            if (!g.account) continue;
+            const items: BatchViewGroup['items'] = [];
+            for (const p of g.rows) {
+                const c = getCachedContract(p.code);
+                const plan = closePlanFor(p, c);
+                if (typeof plan === 'string' || batchSelectReason(p, c) !== null) continue;
+                const key = positionKey(p);
+                batchCandidates.push({ key, position: p, plan, accountKey: g.key });
+                items.push({
+                    key,
+                    code: p.code,
+                    ...(c?.name ? { name: c.name } : {}),
+                    summary: `${positionCondText(p, c)} ${sideText(p.direction)} ${maskMoney(positionQtyText(p), privMoney)}`,
+                    actionText: closeActionText(plan),
+                    legs: batchLegs(plan, privMoney),
+                });
+            }
+            if (items.length) batchGroups.push({ key: g.key, account: g.account, label: groupLabel(g.account, priv), items });
+        }
+    }
+    // 不能開始的原因（預覽面板停用滑塊並顯示）：單筆平倉進行中、下單面板或確認進行中、閘門
+    const batchBlock = closing || switchLocked ? POSITIONS_TEXT.batchBusy : gateProblem;
+    const latestLive = useRef({ positions, live });
     useLayoutEffect(() => {
-        latestRowHandlers.current = { openClose, onAddOn, toggleDetail, toggleCompact };
+        latestLive.current = { positions, live };
+    });
+
+    const startBatch = async (envs: ReadonlyMap<string, boolean | undefined>) => {
+        // 與單筆平倉共用 closingRef：其他平倉、下單面板、委託操作面板或確認進行中都不開始（滑動當下再讀一次最新狀態）
+        if (closingRef.current || batchRunning) return;
+        const ui = getMobileUi();
+        const busy = switchLocked || ui.ticket !== null || ui.orderAction !== null || getPendingOrderConfirm() !== null;
+        const problem = busy ? POSITIONS_TEXT.batchBusy : closeGateProblem(live, getResumeGate());
+        const items: BatchExitItem[] = [];
+        let envProblem = false;
+        for (const c of batchCandidates) {
+            const simulation = envs.get(c.accountKey);
+            if (typeof simulation !== 'boolean') envProblem = true;
+            else items.push({ key: c.key, position: c.position, plan: c.plan, simulation });
+        }
+        const why = problem ?? (envProblem ? POSITIONS_TEXT.batchEnvUnknown : null);
+        if (why || items.length === 0) {
+            setBatch(b => b && { ...b, feedback: why ? `未送出：${why}` : null });
+            return;
+        }
+        closingRef.current = true;
+        batchStopRef.current = false;
+        setClosing(true);
+        const states: Record<string, BatchItemState> = {};
+        for (const it of items) states[it.key] = { status: 'waiting' };
+        setBatch({ phase: 'running', groups: batchGroups, states, stop: false, feedback: null });
+        try {
+            await runBatchExit(items, {
+                current: (item) => {
+                    const p = latestLive.current.positions.find(x => positionKey(x) === item.key);
+                    return p ? { position: p, plan: closePlanFor(p, getCachedContract(p.code)) } : null;
+                },
+                gateProblem: () => closeGateProblem(latestLive.current.live, getResumeGate()),
+                execute: executeClose,
+                stopRequested: () => batchStopRef.current,
+                onState: (i, st) => {
+                    const key = items[i]!.key;
+                    if (mounted.current) setBatch(b => b && { ...b, states: { ...b.states, [key]: st } });
+                },
+            });
+        } catch (err) {
+            // 執行器本身出錯（不應發生）：還沒處理的列標未送出；送出中的列結果未知並觸發對帳
+            notify({ kind: 'err', title: POSITIONS_TEXT.batchFailed, body: errorText(err) });
+            reconcileAfterUnknownOutcome();
+            if (mounted.current) {
+                setBatch(b => b && {
+                    ...b,
+                    states: Object.fromEntries(Object.entries(b.states ?? {}).map(([k, st]) => [k,
+                        st.status === 'waiting' ? { status: 'not-sent', reason: POSITIONS_TEXT.batchFailed }
+                            : st.status === 'sending' ? { status: 'unknown', reason: errorText(err) } : st])),
+                });
+            }
+        } finally {
+            closingRef.current = false;
+            if (mounted.current) {
+                setClosing(false);
+                setBatch(b => b && { ...b, phase: 'done' });
+                exitSelecting();
+            }
+        }
+    };
+    const stopBatch = () => {
+        batchStopRef.current = true;
+        setBatch(b => b && { ...b, stop: true });
+    };
+    const closeBatch = () => {
+        if (!batchRunning) setBatch(null);
+    };
+
+    // ---- 列的動作（memo 列用）：穩定的轉接函式，每次呼叫都轉給最新一次提交的處理函式 ----
+    const latestRowHandlers = useRef({ openClose, onAddOn, toggleDetail, toggleCompact, toggleSelect });
+    useLayoutEffect(() => {
+        latestRowHandlers.current = { openClose, onAddOn, toggleDetail, toggleCompact, toggleSelect };
     });
     const rowActions = useMemo(() => ({
         close: (p: AccountedPosition) => latestRowHandlers.current.openClose(p),
         addOn: (p: AccountedPosition, contract: ContractInfo | undefined) => latestRowHandlers.current.onAddOn(p, contract),
         toggleDetail: (key: string) => latestRowHandlers.current.toggleDetail(key),
         toggleCompact: (key: string) => latestRowHandlers.current.toggleCompact(key),
+        select: (p: AccountedPosition) => latestRowHandlers.current.toggleSelect(p),
     }), []);
+    const selectableRows = selecting ? sortedRows.filter(p => selectReasonOf(p) === null) : [];
+    const pageSelect = selectState(selectableRows);
 
     const reconcile = reconcileText(query);
     const loading = query.updatedAt === null && !query.error;
@@ -1092,13 +1434,25 @@ export function PositionsPage() {
             <PageHeader
                 title='持倉'
                 actions={(
-                    <IconButton
-                        icon={RotateCw}
-                        ariaLabel={cooling ? '更新持倉（冷卻中）' : '更新持倉'}
-                        disabled={cooling}
-                        onClick={onRefresh}
-                        testId='position-refresh'
-                    />
+                    <>
+                        <button
+                            type='button'
+                            className={styles.headerToggle}
+                            aria-pressed={selecting}
+                            disabled={batchRunning || (!selecting && positions.length === 0)}
+                            onClick={toggleSelecting}
+                            data-testid='position-select-mode'
+                        >
+                            選取
+                        </button>
+                        <IconButton
+                            icon={RotateCw}
+                            ariaLabel={cooling ? '更新持倉（冷卻中）' : '更新持倉'}
+                            disabled={cooling}
+                            onClick={onRefresh}
+                            testId='position-refresh'
+                        />
+                    </>
                 )}
             />
 
@@ -1109,7 +1463,7 @@ export function PositionsPage() {
                     testId='position-market-filter'
                     items={MARKET_FILTERS.map(f => ({ value: f.key, label: f.label, testId: `position-market-${f.key}` }))}
                     value={market}
-                    onChange={setMarket}
+                    onChange={changeMarket}
                 />
             </div>
 
@@ -1120,7 +1474,7 @@ export function PositionsPage() {
                     testId='position-account-filter'
                     value={activeFilter}
                     options={[{ value: '', label: '帳戶：全部' }, ...accountOptions.map(([k, a]) => ({ value: k, label: groupLabel(a, priv) }))]}
-                    onChange={setFilterKey}
+                    onChange={changeFilter}
                 />
                 <PopUpButton<PositionSortMode>
                     className={styles.picker}
@@ -1191,12 +1545,26 @@ export function PositionsPage() {
             ) : (
                 groups.map(g => {
                     const gt = netTotals(g.rows, pnlOf);
+                    const groupSelectable = selecting ? g.rows.filter(p => selectReasonOf(p) === null) : [];
+                    const groupState = selectState(groupSelectable);
                     return (
                     <GroupedSection
                         key={g.key || 'unknown'}
                         testId='position-group'
                         header={(
                             <span className={styles.groupHeader} data-testid='position-group-header'>
+                                {selecting && (
+                                    <SelectCheck
+                                        checked={groupSelectable.length ? groupState : false}
+                                        disabled={groupSelectable.length === 0 || batchRunning}
+                                        label={`全選 ${groupLabel(g.account, priv)}`}
+                                        onToggle={() => setManySelected(groupSelectable, groupState !== true)}
+                                        className={styles.groupSelect}
+                                        testId='position-group-select'
+                                    >
+                                        全選
+                                    </SelectCheck>
+                                )}
                                 <span className={styles.groupTitle}>{groupLabel(g.account, priv)}</span>
                                 <span className={styles.groupStat}>{g.count} 筆</span>
                                 {g.value && (
@@ -1231,16 +1599,21 @@ export function PositionsPage() {
                                     onToggleDetail: () => rowActions.toggleDetail(key),
                                     onOpenPnl: () => setPnlKey(key),
                                 };
-                                if (view !== 'compact') return <MemoPositionRow key={key} {...detail} />;
+                                // 選取模式：每列勾選鍵（不可列入時停用並顯示原因）
+                                const select: RowSelect | null = selecting ? { checked: selected.has(key), reason: selectReasonOf(p) } : null;
+                                const onToggleSelect = () => rowActions.select(p);
+                                if (view !== 'compact') return <MemoPositionRow key={key} {...detail} select={select} onToggleSelect={onToggleSelect} />;
                                 return (
                                     <MemoPositionCompactRow
                                         key={key}
                                         p={p}
                                         privMoney={privMoney}
                                         rp={detail.rp}
-                                        open={compactOpen.has(key)}
+                                        open={!selecting && compactOpen.has(key)}
                                         onToggle={() => rowActions.toggleCompact(key)}
                                         detail={detail}
+                                        select={select}
+                                        onToggleSelect={onToggleSelect}
                                     />
                                 );
                             })}
@@ -1272,6 +1645,58 @@ export function PositionsPage() {
                     onCancel={cancelClose}
                     onContinue={(plan) => { void continueClose(plan); }}
                 />
+            )}
+            {/* 選取模式：底部配件槽（ShellSlot bottom，不在捲動容器內；殼層讓出高度，最後一列可捲到工具列上方） */}
+            {selecting && (
+                <ShellSlot slot='bottom'>
+                    <div className={styles.selectBar} data-testid='position-select-bar'>
+                        {selectNote && <p className={styles.selectReason} role='status' data-testid='position-select-note'>{selectNote}</p>}
+                        <div className={styles.selectBarRow}>
+                            <span className={styles.selectBarCount} data-testid='position-selected-count'>已選 {fmtInt(selected.size)} 筆</span>
+                            <SelectCheck
+                                checked={selectableRows.length ? pageSelect : false}
+                                disabled={selectableRows.length === 0 || batchRunning}
+                                label='全選'
+                                onToggle={() => setManySelected(selectableRows, pageSelect !== true)}
+                                className={styles.groupSelect}
+                                testId='position-select-all'
+                            >
+                                全選
+                            </SelectCheck>
+                            <button type='button' className={styles.textButton} disabled={batchRunning} onClick={exitSelecting} data-testid='position-select-cancel'>取消</button>
+                        </div>
+                        <button
+                            type='button'
+                            className={styles.clearOutButton}
+                            disabled={selected.size === 0 || batchRunning}
+                            onClick={() => setBatch({ phase: 'preview', groups: [], states: null, stop: false, feedback: null })}
+                            data-testid='position-clear-out'
+                        >
+                            市價出清 {fmtInt(selected.size)} 筆
+                        </button>
+                    </div>
+                </ShellSlot>
+            )}
+            {batch && (
+                <ModuleErrorBoundary
+                    onRetry={resetBatchExitSheet}
+                    fallback={props => <SheetLoadError {...props} open onClose={closeBatch} testId='batch-exit-load-error' />}
+                >
+                    <Suspense fallback={null}>
+                        <BatchExitSheet
+                            phase={batch.phase}
+                            groups={batch.phase === 'preview' ? batchGroups : batch.groups}
+                            states={batch.states}
+                            blockReason={batchBlock}
+                            note={batch.feedback ?? selectNote}
+                            stopRequested={batch.stop}
+                            summary={batch.phase === 'done' ? batchSummaryText(Object.values(batch.states ?? {})) : null}
+                            onConfirm={(envs) => { void startBatch(envs); }}
+                            onStop={stopBatch}
+                            onClose={closeBatch}
+                        />
+                    </Suspense>
+                </ModuleErrorBoundary>
             )}
             {switchKey !== null && (
                 <AddOnSwitchSheet
