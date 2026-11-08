@@ -1,5 +1,6 @@
 // 帳戶頁（規格 §6.7、§10）：風控一鍵鎖單（鎖定立即生效、解除需滑動確認）、
-// 「手動下單確認」一律顯示鎖定開啟且不可關閉（不寫入桌面設定）、明示只對本裝置有效、遮蔽金額；
+// 「手動下單確認」一律顯示鎖定開啟且不可關閉（帳戶頁本身不寫入；開啟由 start.ts 的 pinManualOrderConfirm 維持）、
+// 明示鎖定只對本裝置有效且同一瀏覽器的桌面網頁版也會套用、遮蔽金額；
 // 資金／交割行事曆／交易額度／已實現損益／玉山帳務概覽／永豐預收（按需讀取＋冷卻）、三個樁的掛載位置。
 import { readFileSync } from 'node:fs';
 import { createElement, StrictMode, useSyncExternalStore } from 'react';
@@ -271,9 +272,13 @@ describe('AccountPage risk controls', () => {
         expect(m.setRiskSettings).toHaveBeenCalledWith({ locked: false });
     });
 
-    it('shows that the lock only applies to this device', async () => {
+    it('shows that the lock only applies to this device, including the desktop web page in the same browser', async () => {
         await render();
-        expect(textOf(byTestId('risk-device-only'))).toContain('此鎖定只對本裝置有效');
+        const note = textOf(byTestId('risk-device-only'));
+        expect(note).toContain('此鎖定只對本裝置有效');
+        // sj-pro-risk 是同源 localStorage：同一瀏覽器的桌面網頁版共用，不能宣稱「不會同步到桌面」
+        expect(note).toContain('同一瀏覽器開啟的桌面網頁版也會套用');
+        expect(note).not.toContain('不會同步到桌面');
     });
 
     it('manual order confirmation is shown locked on and cannot be turned off', async () => {
