@@ -1,6 +1,7 @@
 // 帳戶頁（規格 §6.7、§10）：風控一鍵鎖單（鎖定立即生效、解除需滑動確認）、
 // 「手動下單確認」一律顯示鎖定開啟且不可關閉（不寫入桌面設定）、明示只對本裝置有效、遮蔽金額；
 // 資金／交割行事曆／交易額度／已實現損益／玉山帳務概覽／永豐預收（按需讀取＋冷卻）、三個樁的掛載位置。
+import { readFileSync } from 'node:fs';
 import { createElement, StrictMode, useSyncExternalStore } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -35,6 +36,19 @@ const m = vi.hoisted(() => {
         setPrivacyMoney: vi.fn(),
         contracts: {} as Record<string, { code: string; name: string }>,
         ensureContract: vi.fn(),
+        // S1：lib 的送單／改單／刪單（帳戶頁任何入口都不得呼叫）
+        send: {
+            placeStockOrder: vi.fn(),
+            placeFuturesOrder: vi.fn(),
+            placeComboOrder: vi.fn(),
+            cancelOrder: vi.fn(),
+            cancelVerifiedOrder: vi.fn(),
+            cancelOrders: vi.fn(),
+            cancelComboOrder: vi.fn(),
+            updateOrderPrice: vi.fn(),
+            updateOrderQty: vi.fn(),
+        },
+        esunSend: { placeStockOrder: vi.fn(), cancelOrder: vi.fn() },
     };
 });
 
@@ -69,6 +83,7 @@ vi.mock('../../lib/esun', () => ({
         refreshHealth: m.refreshHealth,
         getBridgeHealth: () => m.esunHealth,
         fetchAccountOverview: m.fetchAccountOverview,
+        ...m.esunSend,
     },
     isEsunAccount: (a?: { broker_id?: string } | null) => !!a?.broker_id?.startsWith('ESUN'),
     isEsunBroker: (b?: string | null) => !!b?.startsWith('ESUN'),
@@ -97,6 +112,7 @@ vi.mock('../../lib/shioaji', () => ({
     fetchStockReserveSummary: m.fetchStockReserveSummary,
     fetchStockReserveDetail: m.fetchStockReserveDetail,
     fetchEarmarkingDetail: m.fetchEarmarkingDetail,
+    ...m.send,
 }));
 vi.mock('../../lib/settle-date', () => ({ settleDateLabel: (raw: string) => raw, bizDateLabel: (t: number) => `biz+${t}` }));
 vi.mock('../../lib/realized-name', () => ({ canonicalBrokerCode: (c: string) => c.trim(), realizedCodeCandidates: (c: string) => [c.trim()] }));
@@ -117,6 +133,8 @@ vi.mock('../components/account/device-settings-section', () => ({ DeviceSettings
 vi.mock('../components/account/esun-reconnect-section', () => ({ EsunReconnectSection: () => createElement('div', { 'data-testid': 'stub-esun-reconnect' }) }));
 
 import { loadTradingLimits, resetTradingLimitsForTest, TRADING_LIMITS_MIN_REFRESH_MS } from '../hooks/use-trading-limits';
+import { resetOnDemandForTest } from '../lib/account-on-demand';
+import { PNL_ESUN_QUERIES_PER_MIN } from '../lib/account-pnl';
 import { resetContractNamesForTest } from '../lib/contract-names';
 import { createScrollMemory, ScrollRestorer } from '../lib/scroll-memory';
 import { openTodayLimits, resetTodayLimitsFocusForTest, TODAY_LIMITS_ID } from '../components/account/today-limits';
@@ -149,6 +167,13 @@ const testIdOrder = (): string[] => view!.root.findAll(n => typeof n.type === 's
 async function click(id: string) {
     await act(async () => { byTestId(id).props.onClick(); });
 }
+async function pickPeriod(label: string) {
+    const b = byTestId('pnl-period').findAll(n => n.type === 'button').find(n => textOf(n) === label)!;
+    await act(async () => { b.props.onClick(); });
+}
+async function setDate(id: 'pnl-begin' | 'pnl-end', value: string) {
+    await act(async () => { byTestId(id).props.onChange({ target: { value } }); });
+}
 
 function stockPnl(id: number, code: string, pnl: number) {
     return { id, code, quantity: 1, pnl, date: twDate(0).replace(/-/g, ''), dseq: `D${id}`, price: 100, pr_ratio: 0, cond: 'Cash', seqno: `S${id}` };
@@ -168,6 +193,8 @@ beforeEach(() => {
     resetTodayLimitsFocusForTest();
     m.contracts = {};
     m.ensureContract.mockReset().mockRejectedValue(new Error('not found'));
+    Object.values(m.send).forEach(f => f.mockClear());
+    Object.values(m.esunSend).forEach(f => f.mockClear());
     m.risk = { enabled: false, maxQty: 0, maxDailyLoss: 0, locked: false, escCancelAll: false, confirmManualOrders: false, orderLineLock: false };
     m.riskListeners.clear();
     m.setRiskSettings.mockClear();
@@ -592,6 +619,201 @@ describe('AccountPage realized P&L', () => {
         await click('pnl-esun-detail-toggle');
         expect(textOf(byTestId('pnl-esun-cost-total'))).toBe('$2,655');
         expect(textOf(byTestId('pnl-esun-detail'))).toContain('09:01:02');
+    });
+});
+
+describe('AccountPage realized P&L custom range', () => {
+    // 固定系統日期（不依賴今天是星期幾或月初）：2026-11-09 10:00 台北；冷卻／全域間隔用注入的時鐘
+    const NOW = Date.UTC(2026, 10, 9, 2, 0, 0);
+    let t = 0;
+    beforeEach(() => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(NOW);
+        t = NOW;
+        resetOnDemandForTest(() => t);
+    });
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+    const pnlCalls = () => m.fetchProfitLoss.mock.calls.length + m.fetchProfitLossSummary.mock.calls.length;
+    const queryButton = () => byTestId('pnl-query');
+    async function openCustom() {
+        await render();
+        await click('account-pnl-toggle'); // 展開：讀取「今日」（2 帳戶 × 列表＋彙總）
+        expect(pnlCalls()).toBe(4);
+        await pickPeriod('自訂');
+    }
+
+    it('first switch defaults to the last 30 days, waits for 查詢, then sends exactly the displayed range', async () => {
+        await openCustom();
+        expect(byTestId('pnl-begin').props.value).toBe('2026-10-11');
+        expect(byTestId('pnl-end').props.value).toBe('2026-11-09');
+        expect(textOf(byTestId('pnl-range'))).toBe('2026-10-11 ～ 2026-11-09（台北日期，共 30 天）');
+        expect(allByTestId('pnl-idle')).toHaveLength(1);
+        expect(pnlCalls()).toBe(4);
+        expect(queryButton().props.disabled).toBe(false);
+        await click('pnl-query');
+        expect(m.fetchProfitLoss).toHaveBeenCalledWith('S', stock, '2026-10-11', '2026-11-09');
+        expect(m.fetchProfitLoss).toHaveBeenCalledWith('F', fut, '2026-10-11', '2026-11-09');
+        expect(m.fetchProfitLossSummary).toHaveBeenCalledWith('S', stock, '2026-10-11', '2026-11-09');
+        expect(m.fetchProfitLossSummary).toHaveBeenCalledWith('F', fut, '2026-10-11', '2026-11-09');
+        expect(pnlCalls()).toBe(8);
+        expect(allByTestId('pnl-total')).toHaveLength(1);
+    });
+
+    it('labels the native date fields and sets min / max (end ≤ today, begin ≤ end, begin ≥ end − 179)', async () => {
+        await openCustom();
+        const begin = byTestId('pnl-begin');
+        const end = byTestId('pnl-end');
+        expect(begin.props.type).toBe('date');
+        expect(end.props.type).toBe('date');
+        // 可見標籤＝無障礙名稱（label 包住 input）
+        expect(begin.parent!.type).toBe('label');
+        expect(textOf(begin.parent!)).toBe('起日');
+        expect(textOf(end.parent!)).toBe('迄日');
+        expect(end.props.max).toBe('2026-11-09');
+        expect(begin.props.max).toBe('2026-11-09');
+        expect(begin.props.min).toBe('2026-05-14');
+        await setDate('pnl-end', '2026-10-01');
+        expect(byTestId('pnl-begin').props.max).toBe('2026-10-01');
+        expect(byTestId('pnl-begin').props.min).toBe('2026-04-05');
+    });
+
+    it('changing a date returns to idle; the next query uses the new dates', async () => {
+        await openCustom();
+        await click('pnl-query');
+        expect(allByTestId('pnl-total')).toHaveLength(1);
+        await setDate('pnl-begin', '2026-10-01');
+        expect(allByTestId('pnl-idle')).toHaveLength(1);
+        expect(allByTestId('pnl-total')).toHaveLength(0);
+        expect(textOf(byTestId('pnl-range'))).toBe('2026-10-01 ～ 2026-11-09（台北日期，共 40 天）');
+        expect(pnlCalls()).toBe(8);
+        await click('pnl-query');
+        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('F', fut, '2026-10-01', '2026-11-09');
+        expect(pnlCalls()).toBe(12);
+    });
+
+    it('invalid ranges disable 查詢 with a role=status reason, keep the typed dates, and send nothing', async () => {
+        await openCustom();
+        const cases: [Partial<Record<'pnl-begin' | 'pnl-end', string>>, string][] = [
+            [{ 'pnl-begin': '2026-05-13', 'pnl-end': '2026-11-09' }, '區間最多 180 天（目前 181 天）。'],
+            [{ 'pnl-begin': '2026-11-05', 'pnl-end': '2026-11-01' }, '起日不能晚於迄日。'],
+            [{ 'pnl-begin': '2026-11-01', 'pnl-end': '2026-11-10' }, '迄日不能晚於今天（2026-11-09）。'],
+            [{ 'pnl-begin': '' }, '請選擇起日。'],
+        ];
+        for (const [dates, reason] of cases) {
+            for (const [id, value] of Object.entries(dates)) await setDate(id as 'pnl-begin' | 'pnl-end', value);
+            const status = byTestId('pnl-range-problem');
+            expect(status.props.role).toBe('status');
+            expect(textOf(status)).toBe(reason);
+            expect(byTestId('pnl-begin').props['aria-describedby']).toBe(status.props.id);
+            expect(queryButton().props.disabled).toBe(true);
+            expect(textOf(queryButton())).toBe('查詢');
+            expect(allByTestId('pnl-idle')).toHaveLength(0);
+            // 不偷偷修正
+            for (const [id, value] of Object.entries(dates)) expect(byTestId(id).props.value).toBe(value);
+            await click('pnl-query');
+        }
+        expect(pnlCalls()).toBe(4);
+        // 改成剛好 180 天：原因消失、可以查詢
+        await setDate('pnl-begin', '2026-05-14');
+        await setDate('pnl-end', '2026-11-09');
+        expect(allByTestId('pnl-range-problem')).toHaveLength(0);
+        expect(textOf(byTestId('pnl-range'))).toContain('共 180 天');
+        expect(queryButton().props.disabled).toBe(false);
+        await click('pnl-query');
+        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('F', fut, '2026-05-14', '2026-11-09');
+    });
+
+    it('E.SUN: 4 queries per minute across ranges; the 5th waits for the oldest to leave the window', async () => {
+        m.accounts = { accounts: [esunStock], selectedStock: esunStock, selectedFutures: null, loaded: true, loadError: false };
+        const start = t;
+        await render();
+        await click('account-pnl-toggle'); // 第 1 次：今日（t+0）
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(1);
+        expect(textOf(byTestId('pnl-esun-limit'))).toBe(`玉山已實現損益最長查詢 180 天，每分鐘最多查詢 ${PNL_ESUN_QUERIES_PER_MIN} 次。`);
+        await pickPeriod('自訂');
+        for (const [i, begin] of ['2026-10-12', '2026-10-13', '2026-10-14'].entries()) {
+            t = start + (i + 1) * 10_000; // 第 2～4 次：t+10s、t+20s、t+30s，各一個不同區間
+            await setDate('pnl-begin', begin);
+            await click('pnl-query');
+        }
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(4);
+        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('S', esunStock, '2026-10-14', '2026-11-09');
+        // 第 5 次（另一個區間）：等 t+0 那次滑出視窗 → 還有 30 秒
+        await setDate('pnl-begin', '2026-10-15');
+        expect(queryButton().props.disabled).toBe(true);
+        expect(textOf(queryButton())).toBe('查詢（30 秒）');
+        await click('pnl-query'); // 強按也不送出
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(4);
+        t = start + 50_000;
+        await rerender();
+        expect(textOf(queryButton())).toBe('查詢（10 秒）');
+        t = start + 60_000;
+        await rerender();
+        expect(textOf(queryButton())).toBe('查詢');
+        expect(queryButton().props.disabled).toBe(false);
+        await click('pnl-query');
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(5);
+        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('S', esunStock, '2026-10-15', '2026-11-09');
+        // 視窗又滿：下一個區間要等 t+10s 那次滑出
+        await setDate('pnl-begin', '2026-10-16');
+        expect(textOf(queryButton())).toBe('查詢（10 秒）');
+    });
+
+    it('SinoPac only: a different range can be queried right away (no E.SUN window)', async () => {
+        await openCustom(); // 展開時已查「今日」
+        expect(queryButton().props.disabled).toBe(false);
+        expect(textOf(queryButton())).toBe('查詢');
+        await click('pnl-query');
+        expect(pnlCalls()).toBe(8);
+        for (const begin of ['2026-10-20', '2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24']) {
+            await setDate('pnl-begin', begin);
+            expect(textOf(queryButton())).toBe('查詢');
+            await click('pnl-query');
+        }
+        expect(pnlCalls()).toBe(28);
+        expect(m.fetchProfitLoss).toHaveBeenLastCalledWith('F', fut, '2026-10-24', '2026-11-09');
+        expect(textOf(byTestId('pnl-range'))).toContain('2026-10-24');
+    });
+
+    it('keeps the custom dates for the session (period switch and remount), without storage', async () => {
+        await openCustom();
+        await setDate('pnl-begin', '2026-09-01');
+        await setDate('pnl-end', '2026-09-30');
+        await pickPeriod('今日');
+        expect(allByTestId('pnl-begin')).toHaveLength(0);
+        await pickPeriod('自訂');
+        expect(byTestId('pnl-begin').props.value).toBe('2026-09-01');
+        expect(byTestId('pnl-end').props.value).toBe('2026-09-30');
+        await act(async () => view?.unmount());
+        await render();
+        await click('account-pnl-toggle');
+        await pickPeriod('自訂');
+        expect(byTestId('pnl-begin').props.value).toBe('2026-09-01');
+        expect(byTestId('pnl-end').props.value).toBe('2026-09-30');
+        // 只存在模組層：卡片不讀寫任何 storage
+        const src = readFileSync(new URL('../components/account/realized-pnl-card.tsx', import.meta.url), 'utf8');
+        expect(src).not.toMatch(/localStorage|sessionStorage|indexedDB/);
+    });
+
+    it('S1: every control in the custom range flow sends, amends or cancels no order', async () => {
+        await openCustom();
+        await click('pnl-query');
+        await setDate('pnl-begin', '2026-01-01'); // 不合法（> 180 天）
+        await click('pnl-query');
+        await setDate('pnl-begin', '2026-08-01');
+        await click('pnl-query');
+        const buttons = () => byTestId('account-pnl').findAll(n => n.type === 'button');
+        const count = buttons().length;
+        for (let i = 0; i < count; i++) {
+            const b = buttons()[i];
+            if (!b || b.props.disabled) continue;
+            await act(async () => b.props.onClick?.());
+        }
+        for (const f of [...Object.values(m.send), ...Object.values(m.esunSend)]) expect(f).not.toHaveBeenCalled();
+        // 只呼叫唯讀查詢
+        expect(m.fetchProfitLoss).toHaveBeenCalled();
     });
 });
 

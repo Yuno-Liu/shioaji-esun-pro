@@ -3,6 +3,7 @@
 //        segThumb＋e1＋1px accent 環（深色拇指與軌道亮度差小，靠 accent 環達 ≥3:1）；
 //        只轉場 transform（240ms EASE.sheet，CSS 轉場從目前值重新導向、可中途打斷）與 opacity。
 // scroll：可橫向捲動的膠囊列，選中 accentDim 底＋accent 文字。
+// wrap：同 scroll 的膠囊，放不下時換行（選項多、360 寬／字級大時不擠壓、不藏在捲動外）；列間 8px。
 // 尺寸：regular 外觀 TOUCH_MIN；compact 外觀 2.25rem、點擊區擴到 TOUCH_MIN。
 import { style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
@@ -87,6 +88,15 @@ export const scroller = style({
     // 上下各留 4px：compact 膠囊的擴張點擊區不被裁切
     padding: '4px 0',
     selectors: { '&::-webkit-scrollbar': { display: 'none' } },
+});
+
+/** wrap 變體：膠囊換行；列間 8px（compact 膠囊點擊區上下各擴 4px，不重疊） */
+export const wrapper = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    columnGap: '0.375rem',
+    rowGap: '8px',
+    minWidth: 0,
 });
 
 export const pill = style([expandHit, {

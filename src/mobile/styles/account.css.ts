@@ -663,6 +663,41 @@ export const limitsLineNote = style({
 
 // ---- 已實現損益 ----
 
+/** 自訂區間：起日／迄日兩欄；字級「大」改單欄（日期欄文字較長，不擠壓） */
+export const dateFields = style({
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+    gap: SPACE.s2,
+    margin: `${SPACE.s2} 0 0`,
+    selectors: {
+        'html[data-sj-font-scale="1.3"] &': { gridTemplateColumns: 'minmax(0, 1fr)' },
+    },
+});
+
+/** 可見標籤（footnote）在日期欄上方；整個 label 包住 input */
+export const dateField = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: SPACE.s1,
+    minWidth: 0,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});
+
+/** 原生日期欄：沿用 numberInput 外觀（TOUCH_MIN 高、≥16px 字級防 iOS 縮放），撐滿欄寬、靠左 */
+export const dateInput = style([numberInput, {
+    display: 'block',
+    flex: 'none',
+    width: '100%',
+    minWidth: 0,
+    textAlign: 'left',
+    selectors: {
+        // iOS Safari 的日期值預設置中
+        '&::-webkit-date-and-time-value': { textAlign: 'left' },
+        '&[aria-invalid="true"]': { borderColor: vars.color.danger },
+    },
+}]);
+
 export const totalLine = style({
     display: 'flex',
     alignItems: 'baseline',

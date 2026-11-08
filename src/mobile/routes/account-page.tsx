@@ -18,7 +18,7 @@ import { DisplayCard } from '../components/account/display-card';
 import { EsunOverviewCard } from '../components/account/esun-overview-card';
 import { FundsSections } from '../components/account/funds-section';
 import { LimitsCard } from '../components/account/limits-card';
-import { RealizedPnlCard } from '../components/account/realized-pnl-card';
+import { RealizedPnlCard, resetRealizedPnlCardForTest } from '../components/account/realized-pnl-card';
 import { ReserveCard } from '../components/account/reserve-card';
 import { RiskCard } from '../components/account/risk-card';
 import { ServerCard } from '../components/account/server-card';
@@ -36,6 +36,7 @@ export { USAGE_REFRESH_MS } from '../components/account/server-card';
 export function resetAccountPageCacheForTest(): void {
     resetSettlementCacheForTest();
     resetOnDemandForTest();
+    resetRealizedPnlCardForTest();
 }
 
 export function AccountPage() {

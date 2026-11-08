@@ -1,6 +1,6 @@
 // 按需查詢快取：同時只發一次、冷卻內不重查、失敗保留舊資料且不自動重送
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { canLoadOnDemand, cooldownLeftSec, getOnDemandState, loadOnDemand, resetOnDemandForTest } from './account-on-demand';
+import { canLoadOnDemand, cooldownLeftSec, gateLeftSec, getOnDemandState, loadOnDemand, resetOnDemandForTest } from './account-on-demand';
 
 let now = 1_000_000;
 afterEach(() => resetOnDemandForTest());
@@ -48,5 +48,62 @@ describe('loadOnDemand', () => {
         expect(await loadOnDemand('b', async () => 2, 30_000)).toBe(true);
         expect(getOnDemandState('b').data).toBe(2);
         expect(getOnDemandState(null).data).toBeNull();
+    });
+
+    it('a shared sliding-window gate allows max loads per window across keys; skipped loads use no quota', async () => {
+        resetOnDemandForTest(() => now);
+        const gate = { name: 'g', max: 3, windowMs: 60_000 };
+        const fetcher = vi.fn(async () => 1);
+        const start = now;
+        expect(gateLeftSec(gate, now)).toBe(0);
+        for (const k of ['a', 'b', 'c']) {
+            expect(await loadOnDemand(k, fetcher, 30_000, gate)).toBe(true);
+            now += 10_000;
+        }
+        // 第 4 次（t+30s）：等最舊一次（t+0）滑出視窗 → 30 秒
+        expect(gateLeftSec(gate, now)).toBe(30);
+        expect(await loadOnDemand('d', fetcher, 30_000, gate)).toBe(false);
+        expect(getOnDemandState('d')).toMatchObject({ loading: false, attemptedAt: null });
+        // 被擋下的嘗試不占額度；最舊一次剛好滿 60 秒就滑出
+        now = start + 59_999;
+        expect(gateLeftSec(gate, now)).toBe(1);
+        now = start + 60_000;
+        expect(gateLeftSec(gate, now)).toBe(0);
+        expect(await loadOnDemand('d', fetcher, 30_000, gate)).toBe(true);
+        // 視窗又滿了：下一個要等 b（t+10s）滑出
+        expect(gateLeftSec(gate, now)).toBe(10);
+        expect(fetcher).toHaveBeenCalledTimes(4);
+        // 沒帶 gate 的 key 不受影響；不同名稱的閘門各自計數；reset 清空閘門
+        expect(await loadOnDemand('e', fetcher, 30_000)).toBe(true);
+        expect(gateLeftSec({ name: 'other', max: 3, windowMs: 60_000 }, now)).toBe(0);
+        resetOnDemandForTest(() => now);
+        expect(gateLeftSec(gate, now)).toBe(0);
+    });
+
+    it('a fetcher that throws synchronously sends nothing and uses no gate quota', async () => {
+        resetOnDemandForTest(() => now);
+        const gate = { name: 'g', max: 1, windowMs: 60_000 };
+        const boom = vi.fn((): Promise<number> => { throw new Error('bad request'); });
+        expect(await loadOnDemand('a', boom, 30_000, gate)).toBe(true);
+        expect(getOnDemandState('a')).toMatchObject({ loading: false, error: 'bad request' });
+        expect(gateLeftSec(gate, now)).toBe(0);
+        const ok = vi.fn(async () => 1);
+        expect(await loadOnDemand('b', ok, 30_000, gate)).toBe(true);
+        expect(ok).toHaveBeenCalledTimes(1);
+        expect(gateLeftSec(gate, now)).toBe(60);
+    });
+
+    it('a gate ignores passes stamped in the future (device clock moved back) instead of locking for the jump', async () => {
+        resetOnDemandForTest(() => now);
+        const gate = { name: 'g', max: 2, windowMs: 60_000 };
+        const fetcher = vi.fn(async () => 1);
+        expect(await loadOnDemand('a', fetcher, 30_000, gate)).toBe(true);
+        expect(await loadOnDemand('b', fetcher, 30_000, gate)).toBe(true);
+        expect(gateLeftSec(gate, now)).toBe(60);
+        // 系統時間往回調一小時：舊紀錄變成「未來」→ 不計入（bridge 端仍有自己的限制），不會鎖 1 小時
+        now -= 3_600_000;
+        expect(gateLeftSec(gate, now)).toBe(0);
+        expect(await loadOnDemand('c', fetcher, 30_000, gate)).toBe(true);
+        expect(fetcher).toHaveBeenCalledTimes(3);
     });
 });

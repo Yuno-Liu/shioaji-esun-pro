@@ -1115,6 +1115,16 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 從持倉頁額度列跳來（`openTodayLimits()`）：卡片掛載時消化跳轉請求，把捲動與聚焦延到 `queueMicrotask`，在殼層 `ScrollRestorer` 還原記住的捲動位置之後才 `scrollIntoView` 並聚焦（`preventScroll`），StrictMode 下只執行一次（`account-page.test.tsx`）。不發額外請求。
 - 已實現損益列的商品名稱：名稱為主、代碼為次，規則同 §7.6 末的「名稱規則」；玉山列直接用成交明細的名稱，不查詢。
 
+**已實現損益自訂區間**（第 3 批，使用者要求「帳戶損益查詢增加自訂日期範圍但最大範圍不能超過限制」；以程式碼為準）：
+
+- 期間改為五個：今日／本週／本月／近 30 天／自訂（`PNL_PERIODS`）。五個等寬分段在 360 寬放不下（字級 1.3 時「近 30 天」會壓到鄰段），改用 `ui/segmented` 新增的 `wrap` 變體：與 scroll 同樣的膠囊，放不下時換行，列間 8px（擴張點擊區不重疊）。
+- 選「自訂」時出現起日、迄日兩個原生 `<input type="date">`（手機開系統日期選擇器）；`<label>` 包住 input，可見標籤即無障礙名稱；外觀沿用 `numberInput`（≥44px、≥16px 字級），字級 1.3 改單欄。`max`：迄日＝台北今天、起日＝迄日；`min`：起日＝迄日 − 179 天。min／max 只是選擇器提示，手動輸入仍由程式驗證。
+- 驗證（`lib/account-pnl.ts` `customRangeProblem`，依序）：「請選擇起日。」／「請選擇迄日。」；「起日不是有效的日期。」／「迄日不是有效的日期。」；「迄日不能晚於今天（YYYY-MM-DD）。」；「起日不能晚於迄日。」；「區間最多 180 天（目前 N 天）。」。不合法時沒有查詢 key：「查詢」停用、原因以 role=status 顯示在日期欄下方（input 標 aria-invalid 並以 aria-describedby 關聯），不送出任何請求，也不自動修正日期。
+- 上限：兩家券商一律最多 180 天、含起訖日（迄日 − 起日 ≤ 179），比 lib 的 `clampEsunDateRange180Days`（允許相差 180 天）更嚴，所以玉山查詢區間永遠不會被裁切，畫面上的區間就是實際查詢的區間。
+- 起訖存在模組層（本次使用期間保留，切換期間或離開帳戶頁再回來都還在；不寫 localStorage 等任何 storage）；第一次切到自訂帶近 30 天（今天 − 29 到今天）。日期列顯示目前區間與天數（「2026-10-11 ～ 2026-11-09（台北日期，共 30 天）」），結果以區間為 key，列表永遠對應這一列。
+- 讀取：切到自訂或改了起日／迄日就是新的區間 key，回到「按「查詢」讀取」，按「查詢」前 0 個請求；送出的 begin／end 就是畫面上的起訖日。
+- 頻率：所選帳戶含玉山時，所有已實現損益查詢（不分區間）共用滑動視窗「任意 60 秒最多 4 次」（`PNL_ESUN_QUERIES_PER_MIN`；`lib/account-on-demand` 的 gate `{ name, max, windowMs }`）；滿了「查詢」停用並顯示到最舊一次滑出視窗的剩餘秒數（與冷卻倒數取大者），玉山說明改為「玉山已實現損益最長查詢 180 天，每分鐘最多查詢 4 次。」。依據：bridge 的 `profit_loss_limiter` 限 10 次／分，只在快取未命中時取額度（`_cached_query`：single-flight 填充鎖之後、快取鍵＝日期區間、TTL 10 秒）；每次查詢發出 2 個同區間 GET `/esun/portfolio/profit-loss`（列表＋彙總），通常只占 1 個額度、最壞 2 個，4 次 ≤ 8 < 10，留空間給同一個 bridge 上的桌面版。只有永豐帳戶時不套用視窗，維持原本「同一區間＋帳戶 30 秒不重查」。
+
 ### 7.9 市場（`#/market`、`#/market/signals`，`routes/market-page.tsx`）
 
 第 1 期把底部「產業」分頁改為「市場」（以程式碼為準）：
@@ -1236,6 +1246,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 | 排序群組的多選刪除群組（選取、勾選、取消、刪除、返回、確定刪除） | 只刪除自選清單（lib `deleteWatchlist`、hook `deleteCurrentList`），不呼叫送單、改單、刪單，也不開 `openTicket`／`openOrderAction` | `watchlist-group-delete.test.tsx`、`watch-group-delete.test.tsx` |
 | 持倉選取模式（選取、勾選、全選、取消、開關預覽） | 滑動前不送單、不開下單面板與委託面板；送出只在預覽滑動後經 `runBatchExit` → `executeClose`（S10） | `positions-page.test.tsx` |
 | 通知中心（狀態列鈴、面板、［全部清除］兩段、SheetLoadError 重試） | 只開唯讀面板與清除記憶體通知紀錄 | `status-bar-notices.test.tsx`、`notice-center-sheet.test.tsx` |
+| 已實現損益自訂區間（期間膠囊、起日／迄日、查詢） | 只改起訖日（模組層）或發出唯讀損益查詢（`fetchProfitLoss`／`fetchProfitLossSummary`），不呼叫送單、改單、刪單，也不開下單或委託面板 | `account-page.test.tsx`、`account-pnl.test.ts`、`account-on-demand.test.ts` |
 
 ---
 
@@ -1366,6 +1377,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 - **第 3 批**（2026-11-08，自選頁「持倉」分段）：首屏 **222,666 bytes（217.4 KiB，15 個 JS）**，+154 bytes：分段標籤、lazy 入口與預載項目、預載對照表多兩個 chunk（holdings-list 1.9 KiB、與持倉頁共用的 position-text 0.6 KiB）。剩約 0.55 KiB。
 - **第 3 批**（2026-11-09，走勢 X 軸固定與漲跌停範圍，全在交易頁 chunk）：首屏 **222,495 bytes**（不變，差異為 chunk 雜湊的 gzip 浮動）。
 - 未處理（需要修改 `src/lib`，R2 不允許，列入 §16）：trading-state 每筆 tick 重算全部持倉並發布、每秒以 BroadcastChannel 傳出整份 state（P2 根因、P14）；SSE 第一次連線就發 RECONNECT 合約刷新，冷啟動同一份合約抓 3 次（P4）；自選快照等全部合約 info 才讀，LCP 被最慢的一筆卡住（P5）；首屏帶入 Tauri 橋接、閃電下單模組、MockEsunDriver 與玉山整合（P6、P7、P8、P15，稽核估計合計約 50 KiB gzip）。
+- **第 3 批**（2026-11-09，已實現損益自訂區間）：首屏 **222,529 bytes**（+17：segmented 的 wrap 變體在首屏 `ui/segmented`；卡片、日期欄、驗證與玉山視窗都在延遲載入的帳戶頁 chunk），在 223,232 內。
 
 ---
 
@@ -1502,6 +1514,7 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
       - 多選刪除：底部配件槽與指數列並存時的高度；iOS 15.4 的 accent-color 勾選框外觀。
       - ☆ 面板：重新讀取的成本會隨目前清單的檔數增加（每檔一次合約資訊），大清單時留意。
       - 多選刪除群組：瀏覽器假資料實測（390 寬字級小、360 寬字級 1.3）確認畫面、0 請求直到確定、DELETE 次數、伺服器狀態、摘要與焦點都正確。待實機確認：確認畫面標題（tabIndex −1、無焦點框）的 VoiceOver／TalkBack 朗讀；360 寬字級「大」時底部「已選 N 個」、停用原因與兩顆鍵的換行；刪除目前群組後編輯模式結束，焦點落到頁面（與工具列「刪除清單」相同，未另外處理）。
+    - 已實現損益自訂區間：瀏覽器假資料實測（360 寬字級 1／1.15／1.3）：期間膠囊 4＋1、3＋2、3＋2 換行，無重疊、無文字溢出、無水平溢出，膠囊點擊區與日期欄 ≥44px，字級 1.3 日期欄單欄；只有永豐帳戶時切到自訂可立即查詢；選玉山帳戶時展開＋3 個不同區間共 4 次通過（8 個 GET profit-loss），第 5 次停用並顯示「查詢（55 秒）」。待實機確認：iOS（含 15.4）與 Android 的日期選擇器是否遵守 min／max（不遵守時仍由驗證擋下）；按日期欄的清除鍵後應顯示「請選擇起日。」；iOS 日期欄在 360 寬兩欄（字級 1／1.15）是否被內建最小寬度擠壓；字級 1 時膠囊 4＋1、「自訂」單獨一列的觀感；role=status 原因插入時螢幕閱讀器是否朗讀。
 ---
 
 ## 17. 第二輪候選與不做清單

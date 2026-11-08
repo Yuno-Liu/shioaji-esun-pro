@@ -1,7 +1,18 @@
 // 已實現損益：區間（台北日期）與合計規則（sum 優先、列表加總後備、逐帳戶判斷、|損益| 排序）
 import { describe, expect, it } from 'vitest';
 import type { ProfitLoss, ProfitLossSummaryTotal } from '../../lib/shioaji';
-import { aggregateRealizedPnl, marketPnlTotal, pnlDateRange, type PnlPart } from './account-pnl';
+import {
+    aggregateRealizedPnl,
+    customRangeBounds,
+    customRangeProblem,
+    marketPnlTotal,
+    PNL_MAX_RANGE_DAYS,
+    PNL_ESUN_QUERIES_PER_MIN,
+    PNL_PERIODS,
+    pnlDateRange,
+    pnlRangeDays,
+    type PnlPart,
+} from './account-pnl';
 
 // 2026-11-05（週四）10:00 台北 = 02:00 UTC
 const THU = Date.UTC(2026, 10, 5, 2, 0, 0);
@@ -82,5 +93,69 @@ describe('aggregateRealizedPnl', () => {
         const r = aggregateRealizedPnl([{ market: 'S', accountKey: 'a', list: null, sum: null, errors: ['x'] }]);
         expect(r.total).toBeNull();
         expect(r.rows).toEqual([]);
+    });
+});
+
+// 自訂區間：固定時間（不依賴今天是星期幾或月初）。2026-11-09 10:00 台北 = 02:00 UTC
+const NOW = Date.UTC(2026, 10, 9, 2, 0, 0);
+
+describe('custom range', () => {
+    it('adds 自訂 as the last period option', () => {
+        expect(PNL_PERIODS.map(p => p.text)).toEqual(['今日', '本週', '本月', '近 30 天', '自訂']);
+    });
+
+    it('counts days including both ends; invalid dates count as null', () => {
+        expect(pnlRangeDays('2026-11-09', '2026-11-09')).toBe(1);
+        expect(pnlRangeDays('2026-10-11', '2026-11-09')).toBe(30);
+        // 跨月底與閏年 2 月
+        expect(pnlRangeDays('2028-02-28', '2028-03-01')).toBe(3);
+        expect(pnlRangeDays('2026-02-30', '2026-03-01')).toBeNull();
+        expect(pnlRangeDays('', '2026-03-01')).toBeNull();
+    });
+
+    it('allows exactly 180 days (inclusive) and rejects 181 with the current count', () => {
+        expect(PNL_MAX_RANGE_DAYS).toBe(180);
+        expect(customRangeProblem('2026-05-14', '2026-11-09', NOW)).toBeNull();
+        expect(customRangeProblem('2026-05-13', '2026-11-09', NOW)).toBe('區間最多 180 天（目前 181 天）。');
+        expect(customRangeProblem('2026-04-23', '2026-11-09', NOW)).toBe('區間最多 180 天（目前 201 天）。');
+        // 與今天無關的歷史區間也一樣：180 天可以、181 天不行
+        expect(customRangeProblem('2025-01-01', '2025-06-29', NOW)).toBeNull();
+        expect(customRangeProblem('2025-01-01', '2025-06-30', NOW)).toMatch(/目前 181 天/);
+        expect(customRangeProblem('2026-11-09', '2026-11-09', NOW)).toBeNull();
+    });
+
+    it('rejects begin after end, end after today (Taipei), and blank or invalid dates', () => {
+        expect(customRangeProblem('2026-11-05', '2026-11-01', NOW)).toBe('起日不能晚於迄日。');
+        expect(customRangeProblem('2026-11-01', '2026-11-10', NOW)).toBe('迄日不能晚於今天（2026-11-09）。');
+        expect(customRangeProblem('', '2026-11-09', NOW)).toBe('請選擇起日。');
+        expect(customRangeProblem('2026-11-01', '', NOW)).toBe('請選擇迄日。');
+        expect(customRangeProblem('2026-02-30', '2026-11-09', NOW)).toBe('起日不是有效的日期。');
+        expect(customRangeProblem('2026-11-01', '2026/11/09', NOW)).toBe('迄日不是有效的日期。');
+        expect(customRangeProblem('0005-01-01', '2026-11-09', NOW)).toBe('起日不是有效的日期。');
+    });
+
+    it('uses the Taipei date for "today" even when UTC is still the previous day', () => {
+        // 2026-11-09 23:30 UTC = 2026-11-10 07:30 台北
+        const late = Date.UTC(2026, 10, 9, 23, 30);
+        expect(customRangeProblem('2026-11-01', '2026-11-10', late)).toBeNull();
+        expect(customRangeProblem('2026-11-01', '2026-11-11', late)).toBe('迄日不能晚於今天（2026-11-10）。');
+    });
+
+    it('bounds: end max = today; begin max = end; begin min = end − 179 days', () => {
+        expect(customRangeBounds('2026-11-09', NOW)).toEqual({ endMax: '2026-11-09', beginMax: '2026-11-09', beginMin: '2026-05-14' });
+        expect(customRangeBounds('2026-10-01', NOW)).toEqual({ endMax: '2026-11-09', beginMax: '2026-10-01', beginMin: '2026-04-05' });
+        // 迄日無效或晚於今天：以今天為準
+        expect(customRangeBounds('', NOW).beginMax).toBe('2026-11-09');
+        expect(customRangeBounds('2026-12-01', NOW).beginMin).toBe('2026-05-14');
+        // 由 min 推得的區間正好是上限
+        const b = customRangeBounds('2026-10-01', NOW);
+        expect(pnlRangeDays(b.beginMin, '2026-10-01')).toBe(PNL_MAX_RANGE_DAYS);
+    });
+
+    it('the E.SUN window stays under the bridge limit of 10 per minute even in the worst case (2 quota per query)', () => {
+        // fetchProfitLoss＋fetchProfitLossSummary → 2 個同區間 GET /esun/portfolio/profit-loss；快取未命中才占額度，最壞 2 個
+        const worstQuotaPerQuery = 2;
+        expect(PNL_ESUN_QUERIES_PER_MIN).toBe(4);
+        expect(PNL_ESUN_QUERIES_PER_MIN * worstQuotaPerQuery).toBeLessThan(10);
     });
 });

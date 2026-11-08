@@ -3,6 +3,7 @@ import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Segmented, thumbStyle, type SegmentedProps } from './segmented';
+import * as styles from './segmented.css';
 
 type V = 'ROD' | 'IOC' | 'FOK';
 const ITEMS = [
@@ -93,6 +94,15 @@ describe('Segmented', () => {
         await render({ variant: 'scroll', semantics: 'tabs' });
         expect(hosts(n => n.type === 'span' && n.props['aria-hidden'] === 'true')).toHaveLength(0);
         expect(btn('ROD').props['aria-selected']).toBe(true);
+    });
+
+    it('wrap variant renders the same pills in a wrapping group (not the scroller)', async () => {
+        await render({ variant: 'wrap' });
+        expect(hosts(n => n.type === 'span' && n.props['aria-hidden'] === 'true')).toHaveLength(0);
+        const group = hosts(n => n.props.role === 'group')[0]!;
+        expect(group.props.className).toBe(styles.wrapper);
+        expect(btn('ROD').props.className).toContain(styles.pill);
+        expect(btn('ROD').props['aria-pressed']).toBe(true);
     });
 
     it('disabled reason: footnote below the group linked by aria-describedby (plus an external id)', async () => {
