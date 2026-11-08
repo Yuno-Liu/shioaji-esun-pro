@@ -3,8 +3,8 @@
 // 依參考圖改版：兩行列版面、市場標記、處置徽章、迷你走勢（只為可見列讀 K 線）、快速下單鍵（S1）、清單分頁、底部指數列。
 // 底部指數列以 ContractBase 直接訂閱 IX0001／IX0043（lib/quote-ownership），不經 useQuote；
 // rowQuoteCalls() 仍排除這兩檔，確保列訂閱的斷言不受指數列影響（指數列另有專門測試）。
-// 迷你走勢是延遲載入（lib/deferred-modules.ts）：beforeAll 先讓 lazy 載入完成，之後各測試的可見列同步渲染走勢
-// （載入中／失敗的佔位見 watchlist-deferred.test.tsx）。
+// 迷你走勢、搜尋面板與編輯模式的列首／列尾鍵是延遲載入（lib/deferred-modules.ts）：beforeAll 先讓 lazy 載入完成，
+// 之後各測試同步渲染（載入中／失敗的佔位見 watchlist-deferred.test.tsx）。
 import { createElement, useState, useSyncExternalStore } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -221,6 +221,13 @@ beforeAll(async () => {
     await act(async () => { view!.root.find(n => n.props['data-testid'] === 'watch-search' && n.type === 'button').props.onClick(); });
     await settleUntil(() => searchSheet().length > 0);
     expect(searchSheet()).toHaveLength(1);
+    // 編輯模式的列首、列尾鍵與拖曳排序同樣延遲載入（components/watch-edit-controls.tsx）：進一次編輯模式讓 lazy 載入完成，
+    // 之後各測試進入編輯模式時「⋯」、握把同步出現
+    const grips = () => view!.root.findAll(n => n.props['data-testid'] === 'watch-row-grip' && typeof n.type === 'string');
+    await act(async () => { view!.root.find(n => n.props['data-testid'] === 'watch-edit' && n.type === 'button').props.onClick(); });
+    await settleUntil(() => grips().length > 0 && grips()[0]!.props.disabled === false);
+    expect(grips()).toHaveLength(1);
+    expect(grips()[0]!.props.disabled).toBe(false);
     await act(async () => view!.unmount());
     view = undefined;
     vi.unstubAllGlobals();

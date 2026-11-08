@@ -1,4 +1,6 @@
-// src/mobile/routes/sector-page.tsx — 產業流向分頁（#/sector，延遲載入）
+// src/mobile/routes/sector-page.tsx — 產業流向（「市場」分頁的第一個分段，#/market；由 routes/market-page.tsx 渲染，隨市場頁延遲載入）
+//
+// 只在顯示產業流向分段時掛載：下列訂閱與建底只在這段期間發生（切到「盤中異動」即卸載、釋放）。
 //
 // 資料（重用桌面既有的純資料邏輯，不修改它們）：
 // - useIcSectorFlow(true)：本頁掛載期間 retain 上市（IX0001）／上櫃（IX0043）的群組指標串流（成交值、加權漲跌），
@@ -19,7 +21,7 @@
 // 產業列只開說明面板，不呼叫任何下單、改單、刪單函式（§10 S1）。
 
 import { Factory } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
     getIcBootstrapGroupWeights,
     getIcBootstrapStatus,
@@ -168,7 +170,8 @@ function SummaryColumn({ title, rows, testId }: { title: string; rows: readonly 
     );
 }
 
-export function SectorPage() {
+/** header：取代預設的頁首（市場頁傳入「市場」標題＋分段）；未給時維持原本的「產業流向」頁首 */
+export function SectorPage({ header }: { header?: ReactNode } = {}) {
     // 掛載期間 retain 群組指標串流並記錄流向；卸載釋放（lib 的 ref-count）。
     // 非 429 建底錯誤後 60 秒內再進入：先不 retain（retain 會讓 lib 重新建底），冷卻結束或按［重試］才開始。
     const [holding, setHolding] = useState(() => {
@@ -282,7 +285,7 @@ export function SectorPage() {
 
     return (
         <div className={s.page} data-testid='sector-page'>
-            <PageHeader title='產業流向' />
+            {header ?? <PageHeader title='產業流向' />}
             <div className={s.inset}>
                 <Segmented items={MARKET_ITEMS} value={market} onChange={changeMarket} semantics='toggle' ariaLabel='市場' testId='sector-market' />
                 <p className={s.pageNote} data-testid='sector-flow-note'>

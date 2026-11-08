@@ -6,6 +6,7 @@ import { parseUsage, quotaState, type Usage } from '../../../lib/server-monitor'
 import { useServerInfo } from '../../../lib/server-info-store';
 import { fetchHealth, fetchInfo } from '../../../lib/shioaji';
 import type { Health } from '../../../lib/types/health';
+import { shareHealth } from '../../lib/ca-expiry-check';
 import * as styles from '../../styles/account.css';
 import { ProgressBar, type BarTone } from '../../ui/bars';
 import { Card, Item, useNow, type Tone } from './account-ui';
@@ -54,7 +55,8 @@ export function ServerCard() {
         setLastCheck(Date.now());
         setError(null);
         fetchInfo().catch(() => undefined);
-        fetchHealth({ signal: controller.signal }).then(
+        // 登記給前景憑證提醒沿用（lib/ca-expiry-check.ts），同一分鐘內不重複讀
+        shareHealth(fetchHealth({ signal: controller.signal })).then(
             h => { if (!controller.signal.aborted) setHealth(h); },
             () => { if (!controller.signal.aborted) setError('伺服器狀態讀取失敗'); },
         );

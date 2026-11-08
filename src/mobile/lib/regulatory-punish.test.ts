@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const m = vi.hoisted(() => ({ apiGet: vi.fn() }));
 vi.mock('../../lib/api', () => ({ apiGet: m.apiGet }));
 
-import { PUNISH_PATH, PUNISH_REFRESH_MS, refreshPunishedCodes, resetPunishedCodesForTest, usePunishedCodes } from './regulatory-punish';
+import { PUNISH_PATH, PUNISH_REFRESH_MS, refreshPunishedCodes, resetPunishedCodesForTest, usePunishedCodes, usePunishedListLoaded } from './regulatory-punish';
 import { createElement } from 'react';
 import { act, create } from 'react-test-renderer';
 
@@ -51,5 +51,52 @@ describe('refreshPunishedCodes', () => {
         expect(m.apiGet).toHaveBeenCalledTimes(1);
         expect([...seen]).toEqual(['2317']);
         await act(async () => view.unmount());
+    });
+
+    it('usePunishedListLoaded：成功讀到名單（code 為陣列）才為 true；失敗、格式不符都維持 false', async () => {
+        let loaded: boolean | undefined;
+        function Probe() {
+            loaded = usePunishedListLoaded();
+            return null;
+        }
+        let view: ReturnType<typeof create> | undefined;
+        await act(async () => { view = create(createElement(Probe)); });
+        expect(loaded).toBe(false);
+        const t0 = 2_000_000;
+        m.apiGet.mockRejectedValueOnce(new Error('503'));
+        refreshPunishedCodes(t0);
+        await act(async () => { await flush(); });
+        expect(loaded).toBe(false);
+        m.apiGet.mockResolvedValueOnce({ message: 'oops' });
+        refreshPunishedCodes(t0 + PUNISH_REFRESH_MS);
+        await act(async () => { await flush(); });
+        expect(loaded).toBe(false);
+        m.apiGet.mockResolvedValueOnce({ code: [] });
+        refreshPunishedCodes(t0 + 2 * PUNISH_REFRESH_MS);
+        await act(async () => { await flush(); });
+        expect(loaded).toBe(true);
+        // 之後格式不符：保留上次的名單（不清空）
+        m.apiGet.mockResolvedValueOnce({ code: ['2330'] });
+        refreshPunishedCodes(t0 + 2.5 * PUNISH_REFRESH_MS);
+        await act(async () => { await flush(); });
+        m.apiGet.mockResolvedValueOnce({ unexpected: true });
+        refreshPunishedCodes(t0 + 3.5 * PUNISH_REFRESH_MS);
+        await act(async () => { await flush(); });
+        expect(loaded).toBe(true);
+        let seen: ReadonlySet<string> = new Set();
+        function Codes() {
+            seen = usePunishedCodes(false);
+            return null;
+        }
+        let codesView: ReturnType<typeof create> | undefined;
+        await act(async () => { codesView = create(createElement(Codes)); });
+        expect([...seen]).toEqual(['2330']);
+        await act(async () => codesView?.unmount());
+        // 之後失敗：保留已取得（舊名單仍有效）
+        m.apiGet.mockRejectedValueOnce(new Error('503'));
+        refreshPunishedCodes(t0 + 3 * PUNISH_REFRESH_MS);
+        await act(async () => { await flush(); });
+        expect(loaded).toBe(true);
+        await act(async () => view?.unmount());
     });
 });

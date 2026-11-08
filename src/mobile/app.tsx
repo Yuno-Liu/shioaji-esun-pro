@@ -8,7 +8,7 @@
 //   backdrop-filter／will-change／contain:paint（保護 fixed 全螢幕圖表）。
 
 import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
-import { Briefcase, ChartCandlestick, ClipboardList, Factory, Star, UserRound, type LucideIcon } from 'lucide-react';
+import { Activity, Briefcase, ChartCandlestick, ClipboardList, Star, UserRound, type LucideIcon } from 'lucide-react';
 import { useTradingState } from '../lib/trading-state';
 import { ensureStream } from '../lib/stream';
 import type { Trade } from '../lib/types/order';
@@ -17,13 +17,12 @@ import { OrderConfirmSheet } from './components/order-confirm-sheet';
 import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from './components/route-error-boundary';
 import { StatusBar } from './components/status-bar';
 import { ToastHost } from './components/toast-host';
-import { SecureContextGate } from './gate/secure-context-gate';
 import { useFillSound } from './hooks/use-fill-sound';
 import { useHtmlAttributes } from './hooks/use-html-attributes';
 import { useRiskPnlFeed } from './hooks/use-risk-pnl-feed';
 import { useWakeLock } from './hooks/use-wake-lock';
-import { loadRankingList, loadSearchSheet, loadWatchListSheet, loadWatchSparkline } from './lib/deferred-modules';
-import { formatRoute, isCanonicalHash, navigate, parseHash, useHashRoute, type MobileRoute, type MobileTab } from './lib/hash-router';
+import { loadNoticeCenterSheet, loadRankingList, loadSearchSheet, loadWatchListSheet, loadWatchSparkline } from './lib/deferred-modules';
+import { formatRoute, isCanonicalHash, lastMarketSegment, navigate, parseHash, useHashRoute, type MobileRoute, type MobileTab } from './lib/hash-router';
 import { constrainedNetwork, currentConnection, schedulePrefetchSequence } from './lib/idle-prefetch';
 import { closeOrderAction, closeTicket, setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
 import { startResumeGate } from './lib/resume-gate-runtime';
@@ -32,7 +31,7 @@ import type { SecureContextDiagnostics } from './lib/secure-context';
 import { useSheetStack } from './lib/sheet-stack';
 import { WatchlistProvider } from './lib/watchlist-context';
 import { prefersReducedMotion } from './motion/prefs';
-import { WatchlistPage } from './routes/watchlist-page';
+import { preloadWatchEditControls, WatchlistPage } from './routes/watchlist-page';
 import * as layout from './styles/layout.css';
 import { SHELL_VAR } from './styles/tokens';
 import { SheetRootContext } from './ui/sheet-context';
@@ -42,7 +41,8 @@ import { ShellSlotsContext, type ShellSlotTargets } from './ui/shell-slots';
 // 其餘分頁與下單／委託操作面板在第一次用到時才載入，並在首屏完成後閒置時預先抓取（規格 §9.4：首次載入 JS ≤ 400 KB）。
 // 自選頁的「排行」分段、列的迷你走勢與搜尋面板同樣延遲載入（載入入口在 lib/deferred-modules.ts），也列入閒置預載。
 const loadTradePage = () => import('./routes/trade-page');
-const loadSectorPage = () => import('./routes/sector-page');
+// 市場分頁（產業流向＋盤中異動分段）；盤中異動是市場頁內再延遲載入的另一個 chunk
+const loadMarketPage = () => import('./routes/market-page');
 const loadOrdersPage = () => import('./routes/orders-page');
 const loadPositionsPage = () => import('./routes/positions-page');
 const loadAccountPage = () => import('./routes/account-page');
@@ -51,14 +51,14 @@ const loadActionSheet = () => import('./components/order-action-sheet');
 
 // retryableLazy：載入失敗後按［重試］會換一個新的 lazy 重新 import（React.lazy 會永久快取失敗的 promise）
 const TradePage = retryableLazy(() => loadTradePage().then(m => m.TradePage), 'TradePage');
-const SectorPage = retryableLazy(() => loadSectorPage().then(m => m.SectorPage), 'SectorPage');
+const MarketPage = retryableLazy(() => loadMarketPage().then(m => m.MarketPage), 'MarketPage');
 const OrdersPage = retryableLazy(() => loadOrdersPage().then(m => m.OrdersPage), 'OrdersPage');
 const PositionsPage = retryableLazy(() => loadPositionsPage().then(m => m.PositionsPage), 'PositionsPage');
 const AccountPage = retryableLazy(() => loadAccountPage().then(m => m.AccountPage), 'AccountPage');
 const OrderTicketSheet = retryableLazy(() => loadTicketSheet().then(m => m.OrderTicketSheet), 'OrderTicketSheet');
 const OrderActionSheet = retryableLazy(() => loadActionSheet().then(m => m.OrderActionSheet), 'OrderActionSheet');
 
-const ROUTE_MODULES = [TradePage, SectorPage, OrdersPage, PositionsPage, AccountPage];
+const ROUTE_MODULES = [TradePage, MarketPage, OrdersPage, PositionsPage, AccountPage];
 const resetRouteModules = () => { for (const page of ROUTE_MODULES) page.reset(); };
 const resetTicketSheet = () => { OrderTicketSheet.reset(); };
 const resetActionSheet = () => { OrderActionSheet.reset(); };
@@ -66,9 +66,12 @@ const resetActionSheet = () => { OrderActionSheet.reset(); };
 const PREFETCH_DELAY_MS = 1_500;
 
 /**
- * 閒置預載的順序：最可能先用到的在前（自選列的迷你走勢、下單面板、搜尋面板、交易頁…），清單名稱面板、產業頁與排行最後。
- * 分頁與面板呼叫 retryableLazy 的 preload()：resolve 後第一次進入直接渲染、不 suspend（稽核 P3）；自選頁內的模組呼叫載入入口。
+ * 閒置預載的順序：最可能先用到的在前（自選列的迷你走勢、下單面板、搜尋面板、交易頁…），清單名稱面板、自選編輯模式的拖曳排序、市場頁與排行最後。
+ * （盤中異動分段的 chunk 不在這裡：市場頁掛載後閒置時才預載，見 routes/market-page.tsx，首屏 0 位元組。）
+ * 分頁與面板呼叫 retryableLazy 的 preload()：resolve 後第一次進入直接渲染、不 suspend（稽核 P3）；自選頁內的模組呼叫載入入口，
+ * 自選編輯鍵例外：呼叫自選頁匯出的 preloadWatchEditControls（三個 lazy 的 preload），第一次進入編輯模式不閃空白佔位。
  * essential：省流量或 2g／3g 時仍預載的（迷你走勢、下單面板、交易頁；稽核 P10），其餘等真正用到才載入。
+ * 最後是通知中心面板（同一個 chunk 帶憑證到期提醒，載入後執行；essential：省流量時也提醒，本身很小）。
  */
 const DEFERRED_MODULES: readonly { load: () => Promise<unknown>; essential?: true }[] = [
     { load: loadWatchSparkline, essential: true },
@@ -80,8 +83,12 @@ const DEFERRED_MODULES: readonly { load: () => Promise<unknown>; essential?: tru
     { load: AccountPage.preload },
     { load: OrderActionSheet.preload },
     { load: loadWatchListSheet },
-    { load: SectorPage.preload },
+    { load: preloadWatchEditControls },
+    { load: MarketPage.preload },
     { load: loadRankingList },
+    // 最後一項：通知中心面板的 chunk，載入後執行前景憑證到期提醒（每個台北日最多一次，見 lib/ca-expiry-check.ts）。
+    // essential：省流量時也提醒；promise 在檢查結束（或放棄）時才 resolve，它是最後一項，不擋其他預載。
+    { load: () => loadNoticeCenterSheet().then(m => m.runCaExpiryCheck()), essential: true },
 ];
 
 /**
@@ -175,13 +182,13 @@ function RouteFallback() {
 const TAB_META: Record<MobileTab, { label: string; icon: LucideIcon }> = {
     watchlist: { label: '自選', icon: Star },
     trade: { label: '交易', icon: ChartCandlestick },
-    sector: { label: '產業', icon: Factory },
+    market: { label: '市場', icon: Activity },
     orders: { label: '委託', icon: ClipboardList },
     positions: { label: '持倉', icon: Briefcase },
     account: { label: '帳戶', icon: UserRound },
 };
 
-const TAB_ORDER: readonly MobileTab[] = ['watchlist', 'trade', 'sector', 'orders', 'positions', 'account'];
+const TAB_ORDER: readonly MobileTab[] = ['watchlist', 'trade', 'market', 'orders', 'positions', 'account'];
 
 /** 未成交筆數（委託分頁徽章）：狀態屬 ACTIVE_ORDER_STATUSES 且剩餘量 > 0 */
 export function countWorkingOrders(trades: readonly Trade[]): number {
@@ -215,7 +222,9 @@ function TabBar({ active, currentCode, onReselect }: { active: MobileTab; curren
         <nav className={layout.tabBar} aria-label='主要分頁' data-testid='mobile-tab-bar'>
             {TAB_ORDER.map(tab => {
                 const { label, icon: Icon } = TAB_META[tab];
-                const route: MobileRoute = tab === 'trade' ? { name: 'trade', code: currentCode } : { name: tab };
+                // 市場分頁帶回本 session 上次的分段（產業流向／盤中異動）
+                const route: MobileRoute = tab === 'trade' ? { name: 'trade', code: currentCode }
+                    : tab === 'market' ? { name: 'market', segment: lastMarketSegment() } : { name: tab };
                 const badge = tab === 'orders' && working > 0 ? working : 0;
                 const reconcile = tab === 'orders' && reconcilePending;
                 const current = active === tab;
@@ -251,7 +260,7 @@ function RoutePage({ route }: { route: MobileRoute }) {
     switch (route.name) {
         case 'watchlist': return <WatchlistPage />;
         case 'trade': return <TradePage code={route.code} />;
-        case 'sector': return <SectorPage />;
+        case 'market': return <MarketPage segment={route.segment} />;
         case 'orders': return <OrdersPage />;
         case 'positions': return <PositionsPage />;
         case 'account': return <AccountPage />;
@@ -304,7 +313,7 @@ export function MobileShell() {
     useScrollRecorder(getMain, scrollMemory);
     const onReselect = useCallback(() => scrollToTop(mainRef.current), []);
 
-    // 正規化 hash（空白或無法辨識 → #/watchlist），不新增歷史紀錄
+    // 正規化 hash（空白或無法辨識 → #/watchlist；舊書籤 #/sector → #/market），不新增歷史紀錄
     useEffect(() => {
         if (typeof location !== 'undefined' && !isCanonicalHash(location.hash)) navigate(parseHash(location.hash), { replace: true });
     }, [routeKey]);
@@ -379,7 +388,29 @@ export function MobileShell() {
     );
 }
 
+// 非 secure context 的「需要 HTTPS」說明頁：只有這種情況才載入（說明文字與診斷不進首屏，設計規格 §13）。
+// 載入中與載入失敗時顯示最小的靜態說明；兩者都不建立任何連線、不掛載交易畫面（規格 R1）。
+const loadSecureContextGate = () => import('./gate/secure-context-gate');
+const SecureContextGate = retryableLazy(() => loadSecureContextGate().then(m => m.SecureContextGate), 'SecureContextGate');
+
+function GateFallback() {
+    return (
+        <main data-testid='secure-context-gate-fallback'>
+            <h1>需要 HTTPS</h1>
+            <p>手機交易頁只能經 HTTPS 開啟；目前的連線不是安全環境，無法下單。</p>
+        </main>
+    );
+}
+
 export function MobileApp({ secure, diagnostics }: { secure: boolean; diagnostics?: SecureContextDiagnostics }) {
-    if (!secure) return <SecureContextGate diagnostics={diagnostics} />;
+    if (!secure) {
+        return (
+            <ModuleErrorBoundary fallback={() => <GateFallback />}>
+                <Suspense fallback={<GateFallback />}>
+                    <SecureContextGate diagnostics={diagnostics} />
+                </Suspense>
+            </ModuleErrorBoundary>
+        );
+    }
     return <MobileShell />;
 }

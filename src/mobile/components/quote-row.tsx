@@ -2,6 +2,8 @@
 //
 // - 列 64px：第一行名稱（排行在名稱前加名次），第二行代碼＋市場標記＋徽章（試撮、處置）＋附加資訊（排行的量／值／價差）；
 //   右側成交價（漲跌色＋PriceFlash）與第二行「漲跌 漲跌幅」或總量（純文字、漲跌色）；迷你走勢；列尾快速下單鍵。
+// - 日內區間小條：價格欄正下方的細軌（今日最低→最高）標記現價位置；只用列已有的 tick／指數／快照（排行：scanner）的高低，
+//   不發請求；缺資料、最高＝最低、試撮時不顯示。位置與高低寫進列按鈕的無障礙名稱（小條本身 aria-hidden）。
 // - 可見列追蹤：整頁共用一個 IntersectionObserver（createVisibilityTracker）；只有可見列掛載行情探針（自選）與走勢 canvas。
 // - 迷你走勢延遲載入（lib/deferred-modules.ts loadWatchSparkline）；不可見、載入中、載入失敗、無合約都是同尺寸空白佔位。
 // - 快速下單鍵（<prefix>-row-ticket）是列按鈕的兄弟節點，只呼叫 onTicket（呼叫端只開下單面板，設計規格 §10 S1）。
@@ -9,7 +11,7 @@
 // - 本檔不 import 行情 hook：自選以 probe 傳入行情探針（WatchQuoteProbe），排行是快照資料、不訂閱。
 
 import { ArrowLeftRight } from 'lucide-react';
-import { Suspense, useCallback, useEffect, useRef, useState, type ComponentType, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+import { Suspense, useCallback, useEffect, useRef, useState, type ComponentType, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import type { PriceQuoteState } from '../../hooks/use-stream';
 import { useThemeSettings } from '../../lib/theme-store';
 import type { ContractBase, ContractInfo } from '../../lib/types/contract';
@@ -50,7 +52,13 @@ export interface RowQuoteView {
     simtrade: boolean;
     /** 總量（股票、期權為張／口；指數不顯示） */
     vol?: number;
+    /** 今日最高、最低（日內區間小條；缺少時不顯示） */
+    high?: number;
+    low?: number;
 }
+
+/** 有限正數才留下 */
+const pos = (n: number | undefined) => (n !== undefined && n > 0 && Number.isFinite(n) ? n : undefined);
 
 /**
  * 即時 tick／指數優先，沒有時退回快照收盤。
@@ -71,6 +79,7 @@ export function rowQuoteView(contract: Pick<ContractInfo, 'reference'> & Partial
     const pct = chg !== undefined && ref ? (chg / ref) * 100 : snapshot?.change_rate;
     const dir = chg === undefined || !Number.isFinite(chg) || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down';
     const vol = index || contract.security_type === 'IND' ? undefined : tick ? Number(tick.total_volume) : snapshot?.total_volume;
+    const day = tick ?? index;
     return {
         close: close !== undefined && Number.isFinite(close) ? close : undefined,
         chg: chg !== undefined && Number.isFinite(chg) ? chg : undefined,
@@ -78,7 +87,16 @@ export function rowQuoteView(contract: Pick<ContractInfo, 'reference'> & Partial
         dir,
         simtrade: tick?.simtrade === true,
         vol: vol !== undefined && Number.isFinite(vol) && vol >= 0 ? vol : undefined,
+        high: pos(day ? Number(day.high) : snapshot?.high),
+        low: pos(day ? Number(day.low) : snapshot?.low),
     };
+}
+
+/** 現價在今日高低區間的位置（0＝最低、1＝最高，超出時夾住）；缺資料、最高 ≤ 最低、試撮時 null（不顯示小條） */
+export function dayRangePosition(v: RowQuoteView): number | null {
+    const { close, high, low } = v;
+    if (v.simtrade || close === undefined || high === undefined || low === undefined || !(high > low)) return null;
+    return Math.min(1, Math.max(0, (close - low) / (high - low)));
 }
 
 const ARROW: Record<RowQuoteView['dir'], string> = { up: '▲', down: '▼', flat: '' };
@@ -375,8 +393,11 @@ export function QuoteRow({
         : ([signedChg, pctText].filter(Boolean).join(' ') || '—');
     // 總量沒有方向；數值缺少時也不著色
     const changeTone: RowQuoteView['dir'] = metric === 'vol' || changeText === '—' ? 'flat' : view.dir;
+    const range = dayRangePosition(view);
+    const rangePct = range === null ? 0 : Math.round(range * 100);
     const ariaLabel = `${ariaPrefix}${code} ${name}${tag ? ` ${MARKET_FULL[tag]}` : ''}，${view.simtrade ? `${SIM_LABEL} ` : ''}${priceText}，${DIR_TEXT[view.dir]} ${chgText} ${pctText}`.trim()
         + (volText ? `，總量 ${volText}` : '')
+        + (range === null ? '' : `，今日最低 ${fmtPrice(view.low!)} 最高 ${fmtPrice(view.high!)}，現價位於區間 ${rangePct}%`)
         + (punished ? `，${PUNISH_LABEL}股` : '')
         + ariaSuffix;
 
@@ -440,6 +461,7 @@ export function QuoteRow({
                         <span data-testid={t('price')}>{priceText}</span>
                     </span>
                     <span className={`${styles.rowChange} ${styles.tone[changeTone]}`} data-testid={t('change')} data-metric={metric}>{changeText}</span>
+                    {range !== null && <span className={styles.dayRange} style={{ '--p': `${rangePct}%` } as CSSProperties} aria-hidden='true' data-testid={t('range')} />}
                 </span>
                 {spark && (!sparkContract
                     ? <SparkPlaceholder state='na' testId={t('spark-blank')} />

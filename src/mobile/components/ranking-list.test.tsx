@@ -66,7 +66,10 @@ import { Segmented } from '../ui/segmented';
 import { QuoteRow } from './quote-row';
 
 import {
+    filterRanking,
     getRankingState,
+    isEtfCode,
+    isWarrantCode,
     RANKING_CACHE_MS,
     RANKING_COOLDOWN_MS,
     RANKING_COUNT,
@@ -190,13 +193,16 @@ describe('sortRanking', () => {
 
 describe('requestRanking（快取與冷卻）', () => {
     it('各排行的 fetchScanner 參數（伺服器 ascending 相反：true＝由大到小）', async () => {
-        for (const kind of ['gainers', 'losers', 'volume', 'amount', 'range'] as const) requestRanking(kind);
+        for (const kind of ['gainers', 'losers', 'priceUp', 'priceDown', 'volume', 'amount', 'ticks', 'range'] as const) requestRanking(kind);
         await flush();
         expect(m.fetchScanner.mock.calls).toEqual([
             ['ChangePercentRank', RANKING_COUNT, true],
             ['ChangePercentRank', RANKING_COUNT, false],
+            ['ChangePriceRank', RANKING_COUNT, true],
+            ['ChangePriceRank', RANKING_COUNT, false],
             ['VolumeRank', RANKING_COUNT, true],
             ['AmountRank', RANKING_COUNT, true],
+            ['TickCountRank', RANKING_COUNT, true],
             ['DayRangeRank', RANKING_COUNT, true],
         ]);
         expect(RANKING_COUNT).toBe(30);
@@ -710,5 +716,167 @@ describe('RankingList — 迷你走勢的合約解析（排行沒有交易所）
             await setVisible(true, 'A1');
             expect(calls()).toEqual(['A1', 'A1']);
         });
+    });
+});
+// ---- P1：漲跌價差、成交筆數排行與前端篩選（不發新請求）----
+
+describe('RankingList — 漲價差、跌價差、成交筆數', () => {
+    it('漲價差由大到小、跌價差由小到大（依漲跌元，不依漲跌幅）；成交筆數保留伺服器名次', () => {
+        const hiPx = item('HI', 1100, 50); // +50 元（+4.76%）
+        const loPx = item('LO', 22, 2); // +2 元（+10%）
+        const dn = item('DN', 900, -30);
+        const bad = item('X', 0, 0, { change_price: Number.NaN });
+        expect(sortRanking('priceUp', [loPx, bad, dn, hiPx]).map(i => i.code)).toEqual(['HI', 'LO', 'DN', 'X']);
+        expect(sortRanking('priceDown', [hiPx, loPx, bad, dn]).map(i => i.code)).toEqual(['DN', 'LO', 'HI', 'X']);
+        expect(sortRanking('ticks', [loPx, dn, hiPx]).map(i => i.code)).toEqual(['LO', 'DN', 'HI']);
+    });
+
+    it('種類標籤與順序；切到新種類各讀一次、帶正確參數（伺服器 ascending 相反）', async () => {
+        expect(RANKING_DEFS.map(d => d.label)).toEqual(['漲幅', '跌幅', '漲價差', '跌價差', '成交量', '成交值', '成交筆數', '高低價差']);
+        await render();
+        for (const k of ['priceUp', 'priceDown', 'ticks', 'priceUp'] as const) {
+            await act(async () => { one(`ranking-kind-${k}`).props.onClick(); });
+            await flush();
+        }
+        // 最後切回漲價差：30 秒快取內不再讀
+        expect(m.fetchScanner.mock.calls).toEqual([
+            ['ChangePercentRank', 30, true],
+            ['ChangePriceRank', 30, true],
+            ['ChangePriceRank', 30, false],
+            ['TickCountRank', 30, true],
+        ]);
+    });
+});
+
+describe('排行篩選（純函式）', () => {
+    it('ETF：00 開頭（含 6 碼、債券、槓桿反向）', () => {
+        for (const c of ['0050', '00878', '006208', '00679B', '00631L']) expect(isEtfCode(c), c).toBe(true);
+        for (const c of ['2330', '1101', '8069']) expect(isEtfCode(c), c).toBe(false);
+    });
+
+    it('權證：6 碼、03–08 或 7 開頭；股票、ETF、ETN、特別股不算', () => {
+        for (const c of ['030001', '08123P', '700123', '73012P']) expect(isWarrantCode(c), c).toBe(true);
+        for (const c of ['2330', '0050', '006208', '020000', '2881A', '6488']) expect(isWarrantCode(c), c).toBe(false);
+    });
+
+    it('過濾後名次維持原名次；處置名單未取得（null）時不排除處置股', () => {
+        const list = [item('2330', 100, 1), item('0050', 100, 1), item('2317', 100, 1), item('030001', 1, 0.1)];
+        const all = { noPunished: true, noEtf: true, noWarrant: true };
+        expect(filterRanking(list, all, new Set(['2317'])).map(x => [x.item.code, x.rank])).toEqual([['2330', 1]]);
+        expect(filterRanking(list, all, null).map(x => [x.item.code, x.rank])).toEqual([['2330', 1], ['2317', 3]]);
+        expect(filterRanking(list, { noPunished: false, noEtf: false, noWarrant: false }, new Set(['2317']))).toHaveLength(4);
+    });
+});
+
+describe('RankingList — 篩選晶片', () => {
+    const codes = () => byTestId('ranking-row').map(r => r.props['data-code']);
+    const rank = (code: string) => {
+        const row = byTestId('ranking-row').find(r => r.props['data-code'] === code)!;
+        return textOf(row.findAll(n => n.props['data-testid'] === 'ranking-rank' && typeof n.type === 'string')[0]!);
+    };
+    const list = () => [item('2330', 110, 10), item('0050', 105, 5), item('2317', 103, 3), item('030001', 1.01, 0.01)];
+
+    it('三個切換鍵（aria-pressed、可見文字、群組名稱）；排除後名次不變、狀態列寫出排除檔數；不發新請求', async () => {
+        m.apiGet.mockResolvedValue({ code: ['2317'] });
+        m.fetchScanner.mockResolvedValue(list());
+        await render();
+        await flush();
+        const group = one('ranking-filters');
+        expect(group.props.role).toBe('group');
+        expect(group.props['aria-label']).toBe('排行篩選');
+        const btn = (k: string) => one(`ranking-filter-${k}`);
+        expect(['noPunished', 'noEtf', 'noWarrant'].map(k => textOf(btn(k)))).toEqual(['排除處置', '排除 ETF', '排除權證']);
+        expect(['noPunished', 'noEtf', 'noWarrant'].map(k => btn(k).props['aria-pressed'])).toEqual([false, false, false]);
+        expect(codes()).toEqual(['2330', '0050', '2317', '030001']);
+
+        await act(async () => { btn('noEtf').props.onClick(); });
+        expect(btn('noEtf').props['aria-pressed']).toBe(true);
+        expect(codes()).toEqual(['2330', '2317', '030001']);
+        expect(rank('2317')).toBe('3');
+        expect(textOf(one('ranking-updated'))).toContain('・已排除 1 檔・');
+
+        await act(async () => { btn('noPunished').props.onClick(); });
+        await act(async () => { btn('noWarrant').props.onClick(); });
+        expect(codes()).toEqual(['2330']);
+        expect(textOf(one('ranking-updated'))).toContain('・已排除 3 檔・');
+
+        // 再按一次關閉
+        await act(async () => { btn('noEtf').props.onClick(); });
+        expect(codes()).toEqual(['2330', '0050']);
+        expect(rank('0050')).toBe('2');
+
+        // 請求數：排行 1、處置清單 1（篩選只在前端過濾）
+        expect(m.fetchScanner).toHaveBeenCalledTimes(1);
+        expect(m.apiGet.mock.calls.map(c => c[0])).toEqual([PUNISH_PATH]);
+    });
+
+    it('篩選跨種類與重新掛載保留；切換種類仍套用', async () => {
+        m.fetchScanner.mockResolvedValue(list());
+        await render();
+        await act(async () => { one('ranking-filter-noEtf').props.onClick(); });
+        await act(async () => { one('ranking-kind-volume').props.onClick(); });
+        await flush();
+        expect(codes()).not.toContain('0050');
+        await act(async () => view!.unmount());
+        await render();
+        expect(one('ranking-filter-noEtf').props['aria-pressed']).toBe(true);
+        expect(codes()).not.toContain('0050');
+    });
+
+    it('處置名單尚未取得：排除處置不隱藏任何列，並說明原因', async () => {
+        m.apiGet.mockRejectedValue(new Error('HTTP 503'));
+        m.fetchScanner.mockResolvedValue(list());
+        await render();
+        await flush();
+        await act(async () => { one('ranking-filter-noPunished').props.onClick(); });
+        expect(codes()).toEqual(['2330', '0050', '2317', '030001']);
+        expect(textOf(one('ranking-filter-punish-pending'))).toContain('處置名單尚未取得');
+        expect(one('ranking-filter-punish-pending').props.role).toBe('status');
+    });
+
+    it('全部被排除：顯示篩選空狀態（不是「沒有排行資料」）', async () => {
+        m.fetchScanner.mockResolvedValue([item('0050', 105, 5), item('00878', 22, 0.2)]);
+        await render();
+        await act(async () => { one('ranking-filter-noEtf').props.onClick(); });
+        expect(byTestId('ranking-filtered-empty')).toHaveLength(1);
+        expect(byTestId('ranking-empty')).toHaveLength(0);
+        expect(byTestId('ranking-list')).toHaveLength(0);
+    });
+
+    it('S1：篩選鍵與新種類分段只過濾／切換，不開下單或委託面板、送單／改單／刪單 0 次', async () => {
+        m.fetchScanner.mockResolvedValue(list());
+        await render();
+        for (const k of ORDER_FNS) m[k].mockClear();
+        for (const f of ['noPunished', 'noEtf', 'noWarrant', 'noEtf']) {
+            await act(async () => { one(`ranking-filter-${f}`).props.onClick(); });
+        }
+        for (const k of ['priceUp', 'priceDown', 'ticks'] as const) {
+            await act(async () => { one(`ranking-kind-${k}`).props.onClick(); });
+            await flush();
+        }
+        expect(getMobileUi().ticket).toBeNull();
+        expect(getMobileUi().orderAction).toBeNull();
+        expect(props.onOpen).not.toHaveBeenCalled();
+        expect(props.onAdd).not.toHaveBeenCalled();
+        for (const k of ORDER_FNS) expect(m[k], k).not.toHaveBeenCalled();
+    });
+});
+
+describe('排行列的日內區間小條（與自選相同）', () => {
+    it('scanner 的今日最高、最低進入列（位置寫進無障礙名稱）；最高＝最低時不顯示', async () => {
+        m.fetchScanner.mockResolvedValue([
+            item('2330', 1100, 100, { high: 1110, low: 1060 }),
+            item('2317', 210, 10),
+        ]);
+        await render();
+        const rowOf = (code: string) => view!.root.find(n => n.props['data-testid'] === 'ranking-row' && n.props['data-code'] === code && typeof n.type === 'string');
+        const bar = rowOf('2330').findAll(n => n.props['data-testid'] === 'ranking-range' && typeof n.type === 'string');
+        expect(bar).toHaveLength(1);
+        expect(bar[0]!.props.style).toEqual({ '--p': '80%' });
+        expect(byTestId('ranking-row-button')[0]!.props['aria-label']).toContain('今日最低 1,060 最高 1,110，現價位於區間 80%');
+        // item() 的高低都等於成交價
+        expect(rowOf('2317').findAll(n => n.props['data-testid'] === 'ranking-range')).toHaveLength(0);
+        // 不多發請求
+        expect(m.fetchScanner).toHaveBeenCalledTimes(1);
     });
 });

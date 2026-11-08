@@ -1,5 +1,6 @@
 // 交易頁（規格 §6.2）：標頭文字、持倉摘要（遮金額）、未成交筆數、買進／賣出只開下單面板
-import { createElement, useSyncExternalStore, type ReactElement } from 'react';
+import { readFileSync } from 'node:fs';
+import { StrictMode, createElement, useSyncExternalStore, type ReactElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractInfo } from '../../lib/types/contract';
@@ -21,6 +22,14 @@ const m = vi.hoisted(() => ({
     snapshot: undefined as unknown,
     snapshotListeners: new Set<() => void>(),
     chartProps: [] as unknown[],
+    // 當沖資訊列：處置名單（usePunishedCodes 的 active 參數）與「籌碼與當沖」面板替身收到的 props
+    punished: new Set<string>() as ReadonlySet<string>,
+    punishActive: [] as boolean[],
+    punishLoaded: true,
+    chipsSheetProps: [] as { open: boolean; contract: { code: string }; punished: boolean | null }[],
+    // 自選 ☆：殼層 WatchlistProvider 的替身（null＝不在 Provider 內）與通知
+    wl: null as unknown,
+    notify: vi.fn(),
     // S1：lib 的送單／改單／刪單函式（交易頁任何入口都不得呼叫）
     send: {
         placeStockOrder: vi.fn(),
@@ -49,6 +58,23 @@ vi.mock('../components/company/load-company-tab', async () => {
     const { createElement: h } = await import('react');
     return { loadCompanyTab: async () => ({ CompanyTab: (props: { contract?: { code: string } }) => h('div', { 'data-testid': 'company-stub' }, props.contract?.code ?? '') }) };
 });
+// 處置名單（交易頁只在股票、前景時讀）：以替身取代，不發請求
+vi.mock('../lib/regulatory-punish', () => ({
+    usePunishedCodes: (active: boolean) => { m.punishActive.push(active); return m.punished; },
+    usePunishedListLoaded: () => m.punishLoaded,
+}));
+// 「籌碼與當沖」面板（延遲載入）：以替身取代，不讀融資融券與券源（內容、請求與 S1 另見 components/trade-info/trade-chips-sheet.test.tsx）
+vi.mock('../components/trade-info/load-trade-chips-sheet', async () => {
+    const { createElement: h } = await import('react');
+    return {
+        loadTradeChipsSheet: async () => ({
+            TradeChipsSheet: (props: { open: boolean; contract: { code: string }; punished: boolean | null }) => {
+                m.chipsSheetProps.push(props);
+                return props.open ? h('div', { 'data-testid': 'chips-sheet-stub' }, props.contract.code) : null;
+            },
+        }),
+    };
+});
 vi.mock('../../lib/shioaji', () => ({
     fetchSnapshots: m.fetchSnapshots,
     placeStockOrder: m.send.placeStockOrder,
@@ -61,7 +87,8 @@ vi.mock('../../lib/shioaji', () => ({
     updateOrderQty: m.send.updateOrderQty,
 }));
 vi.mock('../lib/mobile-order', () => ({ submitMobileOrder: m.send.submitMobileOrder }));
-vi.mock('../../lib/trade', () => ({ placeQuickOrder: m.send.placeQuickOrder, cancelAllOrders: m.send.cancelAllOrders }));
+vi.mock('../../lib/trade', () => ({ placeQuickOrder: m.send.placeQuickOrder, cancelAllOrders: m.send.cancelAllOrders, notify: m.notify }));
+vi.mock('../lib/watchlist-context', () => ({ useOptionalMobileWatchlist: () => m.wl }));
 vi.mock('../../lib/market-snapshot-store', () => ({
     getMarketSnapshot: () => m.snapshot,
     subscribeMarketSnapshots: (l: () => void) => { m.snapshotListeners.add(l); return () => { m.snapshotListeners.delete(l); }; },
@@ -73,9 +100,10 @@ import { setMotionClockForTest } from '../motion/spring';
 import { pressable, pressableRow } from '../styles/primitives.css';
 import { SIZE } from '../styles/tokens';
 import * as tradeStyles from '../styles/trade.css';
+import * as tradeInfoStyles from '../styles/trade-info.css';
 import { card as groupedCard } from '../ui/grouped.css';
-import { ShellSlotsContext } from '../ui/shell-slots';
-import { dayTradeText, deliveryMonthText, positionSummaries, scrolledPast, sessionText, statKeys, summaryUsesStockUnits, TradePage, workingOrderCount } from './trade-page';
+import { ShellSlot, ShellSlotsContext } from '../ui/shell-slots';
+import { dayTradeText, deliveryMonthText, positionSummaries, watchStarBlocked, scrolledPast, sessionText, statKeys, summaryUsesStockUnits, TradePage, workingOrderCount } from './trade-page';
 
 const stock = {
     exchange: 'TSE', code: '2330', security_type: 'STK', target_code: null, name: '台積電', currency: 'TWD',
@@ -116,6 +144,12 @@ beforeEach(() => {
     m.snapshot = undefined;
     m.snapshotListeners.clear();
     m.chartProps.length = 0;
+    m.punished = new Set();
+    m.punishActive.length = 0;
+    m.punishLoaded = true;
+    m.chipsSheetProps.length = 0;
+    m.wl = null;
+    m.notify.mockReset();
     Object.values(m.send).forEach(f => f.mockReset());
 });
 afterEach(async () => {
@@ -1050,5 +1084,352 @@ describe('交易狀態只重繪需要它的葉節點（稽核 P2）', () => {
         expect(chartRenders()).toBeGreaterThan(c0);
         expect((m.chartProps.at(-1) as { lines: { key: string; price: number }[] }).lines.find(l => l.key.startsWith('cost'))?.price).toBe(1060);
         expect(text(byId('trade-summary'))).toContain('現股 4張 · 均價 1,060');
+    });
+});
+
+// ---- 當沖資訊列與「籌碼與當沖」面板（設計規格 §7.3、§10 S1、§13） ----
+
+describe('TradePage 當沖資訊列：報價與合約不是同一交易日', () => {
+    const chipIds = () => view!.root.findAll(n => typeof n.type === 'string' && /^trade-info-(daytrade|limit|range|ratio|punish)$/.test(String(n.props['data-testid'] ?? '')))
+        .map(n => String(n.props['data-testid']));
+
+    it('盤前快照仍是分割前的價格（快照推出的參考價與合約差很多）：不顯示停板膠囊，小條改畫最低到最高', async () => {
+        // 合約已換成今天的參考價 1,070 與漲跌停；快照是昨天的 188.65（漲 2.00 → 快照的參考 186.65）
+        m.useQuote.mockReturnValue(undefined); // 還沒有成交：主價用快照
+        m.snapshot = { code: '2330', datetime: '2026-11-05 13:30:00', close: 188.65, change_price: 2, change_rate: 1.07, total_volume: 23456, open: 187, high: 190, low: 186.5 };
+        await render();
+        // 沒有同一天檢查時 188.65 ≤ 跌停 963 會被當成「跌停」
+        expect(chipIds()).not.toContain('trade-info-limit');
+        expect(chipIds()).toContain('trade-info-range');
+        expect(byId('trade-info-bar').props['data-mode']).toBe('span');
+        // 振幅以快照自身的參考價（186.65）計：(190 − 186.5) ÷ 186.65
+        expect(text(byId('trade-info-range'))).toContain(`振幅 ${((3.5 / 186.65) * 100).toFixed(2)}%`);
+    });
+
+    it('同一交易日（快照推出的參考價＝合約參考價）：照常判停板', async () => {
+        m.useQuote.mockReturnValue(undefined);
+        m.snapshot = { code: '2330', datetime: '2026-11-06 10:00:00', close: 1175, change_price: 105, change_rate: 9.81, total_volume: 23456, open: 1080, high: 1175, low: 1075 };
+        await render();
+        expect(chipIds()).toContain('trade-info-limit');
+        expect(text(byId('trade-info-limit'))).toBe('漲停');
+        expect(byId('trade-info-bar').props['data-mode']).toBe('rail');
+    });
+});
+
+describe('TradePage 當沖資訊列', () => {
+    const CHIP_ID = /^trade-info-(daytrade|limit|range|ratio|punish)$/;
+    const chipKeys = () => byId('trade-info-strip')
+        .findAll(n => typeof n.type === 'string' && CHIP_ID.test(String(n.props['data-testid'] ?? '')))
+        .map(n => String(n.props['data-testid']).slice('trade-info-'.length));
+    const strips = () => view!.root.findAll(n => typeof n.type === 'string' && n.props['data-testid'] === 'trade-info-strip');
+    const settle = async () => { for (let i = 0; i < 4; i++) await act(async () => { await Promise.resolve(); }); };
+    const fut = { ...stock, code: 'TXFL6', security_type: 'FUT', exchange: 'TAIFEX', name: '臺股期貨', underlying_kind: 'I', delivery_month: '202612', limit_up: 24640, limit_down: 20160, reference: 22400, day_trade: '' } as ContractInfo;
+    const opt = { ...stock, code: 'TXO22400L6', security_type: 'OPT', exchange: 'TAIFEX', name: '臺指選擇權', limit_up: 2500, limit_down: 0.1, reference: 260, day_trade: '' } as ContractInfo;
+    const ind = { ...stock, code: '001', security_type: 'IND', exchange: 'TSE', name: '加權指數', limit_up: 0, limit_down: 0, reference: 22000, day_trade: '' } as ContractInfo;
+    const use = (c: ContractInfo) => { m.useContract.mockReturnValue(c); m.ensureContract.mockResolvedValue(c); };
+
+    it('股票：依序顯示可當沖／先賣、接近漲停、振幅小條、量比、處置；處置名單只在股票時讀', async () => {
+        m.punished = new Set(['2330']);
+        m.snapshot = { code: '2330', datetime: '2026-11-06 09:30:00', close: 1085, change_price: 15, change_rate: 1.4, total_volume: 20000, yesterday_volume: 20000 };
+        m.useQuote.mockReturnValue({ tick: { code: '2330', date: '2026/11/06', time: '10:00:00', close: '1165', price_chg: '95', open: '1080', high: '1170', low: '1075', total_volume: 23456 } });
+        await render();
+        expect(chipKeys()).toEqual(['daytrade', 'limit', 'range', 'ratio', 'punish']);
+        expect(text(byId('trade-info-daytrade'))).toBe('可當沖・可先賣');
+        expect(text(byId('trade-info-limit'))).toBe('接近漲停');
+        expect(text(byId('trade-info-range'))).toContain('振幅 8.88%');
+        expect(text(byId('trade-info-range'))).toContain('現價位於今日最低到最高的'); // 小條的文字等價（視覺隱藏）
+        expect(byId('trade-info-bar').props['aria-hidden']).toBe('true');
+        expect(byId('trade-info-bar').props['data-mode']).toBe('rail');
+        expect(text(byId('trade-info-ratio'))).toBe('量比 1.17');
+        expect(text(byId('trade-info-punish'))).toBe('處置股');
+        expect(m.punishActive.at(-1)).toBe(true);
+        // 既有標頭不變：「可當沖」徽章與漲跌停列照舊
+        expect(text(byId('trade-daytrade'))).toBe('可當沖');
+        expect(text(byId('trade-info'))).toContain('漲停 1,175');
+    });
+
+    it('當沖狀態：僅先買後賣、不可當沖（文字，不只靠顏色）', async () => {
+        use({ ...stock, day_trade: 'OnlyBuy' });
+        await render();
+        expect(text(byId('trade-info-daytrade'))).toBe('僅先買後賣');
+        await act(async () => view?.unmount());
+        use({ ...stock, day_trade: 'No' });
+        await render();
+        expect(text(byId('trade-info-daytrade'))).toBe('不可當沖');
+    });
+
+    it('漲跌停狀態：鎖漲停（委賣已空）、漲停未鎖、鎖跌停、跌停（沒有五檔）；只有參考價時不判斷', async () => {
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '1175', price_chg: '105', total_volume: 1 }, bidask: { bid_price: ['1175', '1170'], bid_volume: [900, 3], ask_price: [], ask_volume: [] } });
+        await render();
+        expect(text(byId('trade-info-limit'))).toBe('鎖漲停');
+        await act(async () => view?.unmount());
+
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '1175', price_chg: '105', total_volume: 1 }, bidask: { bid_price: ['1170'], bid_volume: [3], ask_price: ['1175'], ask_volume: [5] } });
+        await render();
+        expect(text(byId('trade-info-limit'))).toBe('漲停未鎖');
+        await act(async () => view?.unmount());
+
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '963', price_chg: '-107', total_volume: 1 }, bidask: { bid_price: [], bid_volume: [], ask_price: ['963'], ask_volume: [800] } });
+        await render();
+        expect(text(byId('trade-info-limit'))).toBe('鎖跌停');
+        await act(async () => view?.unmount());
+
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '963', price_chg: '-107', total_volume: 1 } });
+        await render();
+        expect(text(byId('trade-info-limit'))).toBe('跌停');
+        await act(async () => view?.unmount());
+
+        m.useQuote.mockReturnValue(undefined);
+        use({ ...stock, reference: 1175 });
+        await render();
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-info-limit' })).toHaveLength(0);
+        expect(chipKeys()).toEqual(['daytrade']);
+    });
+
+    it('期貨：只顯示漲跌停狀態與振幅；不顯示當沖、量比、處置，也不讀處置名單', async () => {
+        use(fut);
+        m.punished = new Set(['TXFL6']);
+        m.snapshot = { code: 'TXFL6', datetime: '2026-11-06 09:30:00', close: 22450, change_price: 50, change_rate: 0.2, total_volume: 1000, yesterday_volume: 1000 };
+        m.useQuote.mockReturnValue({ tick: { code: 'TXFL6', date: '2026/11/06', time: '10:00:00', close: '24500', price_chg: '2100', open: '22400', high: '24550', low: '22380', total_volume: 80000 } });
+        await render('TXFL6');
+        expect(chipKeys()).toEqual(['limit', 'range']);
+        expect(text(byId('trade-info-limit'))).toBe('接近漲停');
+        expect(m.punishActive.length).toBeGreaterThan(0);
+        expect(m.punishActive.every(a => a === false)).toBe(true);
+    });
+
+    it('選擇權：只顯示振幅（整條是最低到最高）', async () => {
+        use(opt);
+        m.useQuote.mockReturnValue({ tick: { code: 'TXO22400L6', close: '270', price_chg: '10', open: '250', high: '300', low: '240', total_volume: 10 } });
+        await render('TXO22400L6');
+        expect(chipKeys()).toEqual(['range']);
+        expect(byId('trade-info-bar').props['data-mode']).toBe('span');
+        expect(m.punishActive.every(a => a === false)).toBe(true);
+    });
+
+    it('指數：只顯示振幅；沒有高低資料時整列不佔版面', async () => {
+        use(ind);
+        m.useQuote.mockReturnValue({ index: { close: '22100', reference: '22000', open: '22010', high: '22200', low: '21900' } });
+        await render('001');
+        expect(chipKeys()).toEqual(['range']);
+        expect(text(byId('trade-info-range'))).toContain('振幅 1.36%');
+        await act(async () => view?.unmount());
+        m.useQuote.mockReturnValue(undefined);
+        await render('001');
+        expect(strips()).toHaveLength(0);
+    });
+
+    it('點資訊列只開唯讀「籌碼與當沖」面板（點了才載入）；S1：openTicket／openOrderAction 與 lib 送出函式 0 次', async () => {
+        m.punished = new Set(['2330']);
+        await render();
+        expect(m.chipsSheetProps).toHaveLength(0);
+        const strip = byId('trade-info-strip');
+        expect(strip.type).toBe('button');
+        expect(strip.props['aria-haspopup']).toBe('dialog');
+        expect(strip.props['aria-expanded']).toBe(false);
+        expect(text(strip)).toContain('開啟籌碼與當沖說明');
+        await act(async () => { strip.props.onClick(); });
+        await settle();
+        expect(view!.root.findAllByProps({ 'data-testid': 'chips-sheet-stub' })).toHaveLength(1);
+        expect(m.chipsSheetProps.at(-1)).toMatchObject({ open: true, punished: true, contract: { code: '2330' } });
+        expect(byId('trade-info-strip').props['aria-expanded']).toBe(true);
+        await act(async () => { (m.chipsSheetProps.at(-1) as unknown as { onClose: () => void }).onClose(); });
+        expect(m.chipsSheetProps.at(-1)).toMatchObject({ open: false });
+        expect(byId('trade-info-strip').props['aria-expanded']).toBe(false);
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.openOrderAction).not.toHaveBeenCalled();
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
+    });
+
+    it('處置名單還沒成功取得過：面板拿到 null（寫「處置名單尚未取得」，不當成未處置），資訊列沒有處置膠囊', async () => {
+        m.punishLoaded = false;
+        await render();
+        expect(chipKeys()).not.toContain('punish');
+        await act(async () => { byId('trade-info-strip').props.onClick(); });
+        await settle();
+        expect(m.chipsSheetProps.at(-1)).toMatchObject({ open: true, punished: null, contract: { code: '2330' } });
+        // 名單取得後（不在名單）：false
+        m.punishLoaded = true;
+        await render();
+        await act(async () => { byId('trade-info-strip').props.onClick(); });
+        await settle();
+        expect(m.chipsSheetProps.at(-1)).toMatchObject({ open: true, punished: false });
+    });
+
+    it('遮擋：資訊列在標頭內、一般文件流，排在圖表、分頁列與五檔之前；不在殼層槽，樣式不用 fixed／sticky／absolute、z-index 或負邊界', async () => {
+        m.useQuote.mockReturnValue({
+            tick: { code: '2330', close: '1085', price_chg: '15', open: '1065', high: '1090', low: '1060', total_volume: 23456 },
+            bidask: { bid_price: ['1080'], bid_volume: [5], ask_price: ['1085'], ask_volume: [4] },
+        });
+        await render();
+        const strip = byId('trade-info-strip');
+        const ancestors: unknown[] = [];
+        for (let p = strip.parent; p; p = p.parent) ancestors.push(p.type);
+        expect(ancestors).toContain('header');
+        expect(ancestors).not.toContain(ShellSlot);
+        // 文件順序：資訊列 → 分頁列（五檔｜明細｜公司）
+        const order = byId('page-trade')
+            .findAll(n => typeof n.type === 'string' && ['trade-info-strip', 'trade-panel-row'].includes(String(n.props['data-testid'])))
+            .map(n => n.props['data-testid']);
+        expect(order).toEqual(['trade-info-strip', 'trade-panel-row']);
+        expect(String(strip.props.className)).toBe(tradeInfoStyles.strip);
+        const src = readFileSync(new URL('../styles/trade-info.css.ts', import.meta.url), 'utf8');
+        const start = src.indexOf('export const strip = style(');
+        const block = src.slice(start, src.indexOf('\nexport ', start + 1));
+        expect(block).not.toMatch(/position:\s*'(fixed|sticky|absolute)'/);
+        expect(block).not.toMatch(/zIndex|transform|translate/);
+        expect(block).not.toMatch(/margin\w*:\s*[`'"]-/);
+        expect(block).toContain('minHeight: TOUCH_MIN');
+        expect(block).toContain("flexWrap: 'wrap'");
+        // 五檔與分頁列的樣式不受影響（trade.css.ts 沒有引用資訊列樣式）
+        expect(readFileSync(new URL('../styles/trade.css.ts', import.meta.url), 'utf8')).not.toContain('trade-info');
+    });
+});
+
+// ---- P1：標頭 ☆ 加入／移出目前的自選清單（殼層 WatchlistProvider；§10 S1） ----
+
+describe('TradePage 自選 ☆', () => {
+    type Wl = {
+        items: { contract: { code: string } }[];
+        loading: boolean;
+        structureBusy: boolean;
+        loadError: boolean;
+        serverLists: { id: string; name: string }[];
+        activeListId: string | null;
+        addSymbol: ReturnType<typeof vi.fn>;
+        removeSymbol: ReturnType<typeof vi.fn>;
+    };
+    const makeWl = (over: Partial<Wl> = {}): Wl => ({
+        items: [],
+        loading: false,
+        structureBusy: false,
+        loadError: false,
+        serverLists: [{ id: 'L1', name: '我的自選' }, { id: 'L2', name: '短線' }],
+        activeListId: 'L2',
+        addSymbol: vi.fn(async () => stock),
+        removeSymbol: vi.fn(async () => undefined),
+        ...over,
+    });
+    const star = () => byId('trade-watch-star');
+    const settleClick = async () => {
+        await act(async () => { star().props.onClick(); });
+        await act(async () => { await Promise.resolve(); });
+    };
+
+    it('不在 WatchlistProvider 內時不顯示', async () => {
+        await render();
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-watch-star' })).toHaveLength(0);
+    });
+
+    it('在標頭上半的右欄（不在名稱列、主價列內）；44px IconButton、aria-pressed＝是否已在目前清單', async () => {
+        m.wl = makeWl();
+        await render();
+        const b = star();
+        expect(b.type).toBe('button');
+        expect(b.props['aria-pressed']).toBe(false);
+        expect(b.props['aria-label']).toBe('自選（短線）');
+        // 版面：☆ 外框（watchStar）是 headTop 的直接子節點，與 headMain（名稱列＋主價列）並列
+        let cell = b.parent!;
+        while (typeof cell.type !== 'string') cell = cell.parent!;
+        expect(cell.props.className).toBe(tradeStyles.watchStar);
+        let top = cell.parent!;
+        while (typeof top.type !== 'string') top = top.parent!;
+        expect(top.props.className).toBe(tradeStyles.headTop);
+        const main = top.findAll(n => n.props.className === tradeStyles.headMain);
+        expect(main).toHaveLength(1);
+        expect(main[0]!.findAll(n => n.props['data-testid'] === 'trade-watch-star')).toHaveLength(0);
+        expect(main[0]!.findAll(n => n.props['data-testid'] === 'trade-switch' && n.type === 'button')).toHaveLength(1);
+        expect(main[0]!.findAll(n => n.props['data-testid'] === 'trade-price')).toHaveLength(1);
+        // 當沖資訊列在標頭下方另一個區塊，不在 headTop 內
+        expect(byId('trade-info-strip')).toBeTruthy();
+        expect(top.findAll(n => n.props['data-testid'] === 'trade-info-strip')).toHaveLength(0);
+
+        m.wl = makeWl({ items: [{ contract: { code: '2330' } }] });
+        await render();
+        expect(star().props['aria-pressed']).toBe(true);
+    });
+
+    it('加入：以已載入的合約呼叫 addSymbol（不重新解析）並以通知回報；完成前不能再按（aria-disabled，焦點不掉）', async () => {
+        let release!: () => void;
+        const wl = makeWl({ addSymbol: vi.fn(() => new Promise(r => { release = () => r(stock); })) });
+        m.wl = wl;
+        await render();
+        await act(async () => { star().props.onClick(); });
+        expect(wl.addSymbol).toHaveBeenCalledWith('2330', 'STK', stock);
+        // 處理中：只標 aria-disabled（disabled 會讓聚焦中的按鈕失去焦點），再按一次被忽略
+        expect(star().props.disabled).toBe(false);
+        expect(star().props['aria-disabled']).toBe(true);
+        expect(star().props['aria-label']).toBe('自選（短線），自選清單更新中');
+        await act(async () => { star().props.onClick(); });
+        expect(wl.addSymbol).toHaveBeenCalledTimes(1);
+        await act(async () => { release(); });
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'ok', title: '已加入自選', body: '2330 台積電 已加入「短線」' });
+        expect(star().props.disabled).toBe(false);
+        expect(star().props['aria-disabled']).toBeUndefined();
+        expect(wl.removeSymbol).not.toHaveBeenCalled();
+    });
+
+    it('StrictMode（開發版）：模擬卸載再掛載後，加入完成仍會恢復可按（mounted 旗標掛載時設回 true）', async () => {
+        let release!: () => void;
+        const wl = makeWl({ addSymbol: vi.fn(() => new Promise(r => { release = () => r(stock); })) });
+        m.wl = wl;
+        await act(async () => { view = create(createElement(StrictMode, null, createElement(TradePage, { code: '2330' }))); });
+        await act(async () => { star().props.onClick(); });
+        expect(star().props['aria-disabled']).toBe(true);
+        await act(async () => { release(); });
+        expect(star().props['aria-disabled']).toBeUndefined();
+        expect(star().props.disabled).toBe(false);
+    });
+
+    it('移出：已在清單時呼叫 removeSymbol 並通知；失敗時以錯誤通知顯示原因', async () => {
+        const wl = makeWl({ items: [{ contract: { code: '2330' } }] });
+        m.wl = wl;
+        await render();
+        await settleClick();
+        expect(wl.removeSymbol).toHaveBeenCalledWith('2330');
+        expect(m.notify).toHaveBeenLastCalledWith({ kind: 'ok', title: '已移出自選', body: '2330 台積電 已從「短線」移除' });
+
+        m.wl = makeWl({ addSymbol: vi.fn(async () => { throw new Error('自選清單已切換，請重新新增商品'); }) });
+        await render();
+        await settleClick();
+        expect(m.notify).toHaveBeenLastCalledWith({ kind: 'err', title: '加入自選失敗', body: '自選清單已切換，請重新新增商品' });
+        expect(star().props.disabled).toBe(false);
+    });
+
+    it('清單載入中、更新中、載入失敗、合約未載入、組合商品：停用並在無障礙名稱說明原因', async () => {
+        const wl = { loading: false, structureBusy: false, loadError: false };
+        expect(watchStarBlocked(wl, stock, false)).toBeNull();
+        expect(watchStarBlocked(wl, undefined, false)).toBe('商品載入中');
+        expect(watchStarBlocked(wl, { combo: {} } as never, false)).toBe('組合商品不能加入自選');
+        expect(watchStarBlocked({ ...wl, loadError: true }, stock, false)).toBe('自選清單載入失敗');
+        expect(watchStarBlocked({ ...wl, loading: true }, stock, false)).toBe('自選清單更新中');
+        expect(watchStarBlocked({ ...wl, structureBusy: true }, stock, false)).toBe('自選清單更新中');
+        expect(watchStarBlocked(wl, stock, true)).toBe('自選清單更新中');
+
+        for (const over of [{ loading: true }, { structureBusy: true }, { loadError: true }]) {
+            const w = makeWl(over);
+            m.wl = w;
+            await render();
+            expect(star().props.disabled, JSON.stringify(over)).toBe(true);
+            await act(async () => { star().props.onClick(); });
+            expect(w.addSymbol).not.toHaveBeenCalled();
+        }
+        m.useContract.mockReturnValue(undefined);
+        m.wl = makeWl();
+        await render();
+        expect(star().props.disabled).toBe(true);
+        expect(star().props['aria-label']).toBe('自選（短線），商品載入中');
+    });
+
+    it('S1：☆ 加入與移出都不開下單或委託面板，lib 送單／改單／刪單 0 次', async () => {
+        m.wl = makeWl();
+        await render();
+        await settleClick();
+        m.wl = makeWl({ items: [{ contract: { code: '2330' } }] });
+        await render();
+        await settleClick();
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.openOrderAction).not.toHaveBeenCalled();
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
     });
 });

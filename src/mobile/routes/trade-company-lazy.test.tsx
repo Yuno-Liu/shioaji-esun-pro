@@ -57,6 +57,9 @@ vi.mock('../../lib/shioaji', () => ({
     updateOrderPrice: m.send.updateOrderPrice,
     updateOrderQty: m.send.updateOrderQty,
 }));
+// 當沖資訊列的處置名單與「籌碼與當沖」面板：替身，不發請求（本檔只驗公司分頁）
+vi.mock('../lib/regulatory-punish', () => ({ usePunishedCodes: () => new Set<string>(), usePunishedListLoaded: () => false }));
+vi.mock('../components/trade-info/load-trade-chips-sheet', () => ({ loadTradeChipsSheet: async () => ({ TradeChipsSheet: () => null }) }));
 vi.mock('../lib/mobile-order', () => ({ submitMobileOrder: m.send.submitMobileOrder }));
 vi.mock('../../lib/trade', () => ({ placeQuickOrder: m.send.placeQuickOrder, cancelAllOrders: m.send.cancelAllOrders }));
 vi.mock('../../lib/market-snapshot-store', () => ({ getMarketSnapshot: () => undefined, subscribeMarketSnapshots: () => () => undefined }));

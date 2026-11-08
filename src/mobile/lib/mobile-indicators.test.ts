@@ -8,6 +8,7 @@ import {
     clampParam,
     defaultIndicatorSettings,
     getIndicatorSettings,
+    INDICATOR_TEMPLATES,
     indicatorLabel,
     indicatorName,
     indicatorWarmupBars,
@@ -18,6 +19,8 @@ import {
     MAX_PANES,
     MOBILE_INDICATOR_DEFS,
     MOBILE_INDICATORS_KEY,
+    templateSettings,
+    templateSummary,
     removeIndicator,
     resetIndicatorParams,
     resetIndicatorSettingsForTest,
@@ -236,5 +239,45 @@ describe('暖機根數與「資料不足」說明（F4:F4）', () => {
         expect(insufficientDataNote(dmi, { plus: false, minus: false, adx: false }, 30)).toBeNull();
         // 根數夠卻沒值（其他原因）不說是資料不足
         expect(insufficientDataNote({ line: 20 }, { line: true }, 25)).toBeNull();
+    });
+});
+
+describe('內建範本（當沖、波段、長線）', () => {
+    it('三個範本：只用手機可用的指標、參數 key 與定義完全相同且在範圍內，主圖／副圖都在上限內', () => {
+        expect(INDICATOR_TEMPLATES.map(t => t.label)).toEqual(['當沖', '波段', '長線']);
+        for (const t of INDICATOR_TEMPLATES) {
+            let overlays = 0;
+            let panes = 0;
+            for (const it of t.items) {
+                const def = DEF_BY_TYPE.get(it.type);
+                expect(def, `${t.id}:${it.type}`).toBeDefined();
+                expect(MOBILE_INDICATOR_DEFS.includes(def!), `${t.id}:${it.type}`).toBe(true);
+                expect(Object.keys(it.params).sort(), `${t.id}:${it.type}`).toEqual(def!.params.map(p => p.key).sort());
+                for (const p of def!.params) {
+                    // 已是合法值：夾住後不變
+                    expect(clampParam(p, it.params[p.key]), `${t.id}:${it.type}.${p.key}`).toBe(it.params[p.key]);
+                }
+                if (def!.category === 'overlay') overlays++;
+                else panes++;
+            }
+            expect(overlays, t.id).toBeLessThanOrEqual(MAX_OVERLAYS);
+            expect(panes, t.id).toBeLessThanOrEqual(MAX_PANES);
+            // 轉成設定後不丟任何一項（sanitize 不截掉）
+            expect(templateSettings(t).items).toHaveLength(t.items.length);
+        }
+    });
+
+    it('內容：當沖 VWAP＋MA5／MA20＋MACD、波段 MA5／20／60＋KD、長線 MA20／60／120＋RSI；成交量一律顯示', () => {
+        const byId = Object.fromEntries(INDICATOR_TEMPLATES.map(t => [t.id, t]));
+        expect(templateSummary(byId.daytrade!)).toBe('VWAP、MA(5)、MA(20)、MACD(12,26,9)');
+        expect(templateSummary(byId.swing!)).toBe('MA(5)、MA(20)、MA(60)、KD(9,3,3)');
+        expect(templateSummary(byId.long!)).toBe('MA(20)、MA(60)、MA(120)、RSI(14)');
+        for (const t of INDICATOR_TEMPLATES) {
+            const s = templateSettings(t);
+            expect(s.volume).toBe(true);
+            // 顏色依序、各不相同；id 唯一
+            expect(s.items.map(i => i.color)).toEqual(s.items.map((_, i) => i));
+            expect(new Set(s.items.map(i => i.id)).size).toBe(s.items.length);
+        }
     });
 });

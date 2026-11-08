@@ -53,4 +53,12 @@ describe('IconButton', () => {
         expect(svg.props.width).toBe(18);
         expect(String(svg.props.className)).toContain('lucide-x');
     });
+
+    it('children render after the icon (e.g. an aria-hidden badge); the name stays the aria-label', async () => {
+        await render({ ariaLabel: '通知，3 則未讀', children: createElement('span', { 'aria-hidden': 'true' }, '3') });
+        expect(button().props['aria-label']).toBe('通知，3 則未讀');
+        const kids = button().children as ReactTestInstance[];
+        expect(kids.map(k => k.type)).toEqual([Search, 'span']);
+        expect(text(button())).toBe('3');
+    });
 });

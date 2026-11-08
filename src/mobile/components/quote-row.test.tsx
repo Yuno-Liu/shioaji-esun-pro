@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../motion/haptics', () => ({ haptic: vi.fn(() => false) }));
 
 import * as wlStyles from '../styles/watchlist.css';
-import { LONG_PRESS_MS, QuoteRow, type QuoteRowProps } from './quote-row';
+import { dayRangePosition, LONG_PRESS_MS, QuoteRow, rowQuoteView, type QuoteRowProps, type RowQuoteView } from './quote-row';
 
 let view: ReactTestRenderer | undefined;
 const base: QuoteRowProps = {
@@ -124,5 +124,72 @@ describe('QuoteRow', () => {
         await render({ spark: false });
         expect(all('ranking-spark-blank')).toHaveLength(0);
         expect(all('ranking-row-button')[0]!.props.className).toContain(wlStyles.rowNoSpark);
+    });
+});
+
+// ---- P1：日內區間小條（首屏：只用列已有的高低價，不發請求）----
+
+describe('日內區間小條', () => {
+    const view0: RowQuoteView = { close: 100, chg: 1, pct: 1, dir: 'up', simtrade: false, vol: 10, high: 104, low: 99 };
+
+    it('rowQuoteView：高低價以即時 tick 優先（字串轉數字），其次指數、快照；無效值（0、非數字）為 undefined', () => {
+        const snapshot = { high: 105, low: 98, close: 100, total_volume: 5, change_rate: 0 } as never;
+        const tick = { close: '101', high: '103.5', low: '99', price_chg: '1', total_volume: 7, simtrade: false } as never;
+        expect(rowQuoteView({ reference: 100 }, snapshot, { tick, index: undefined })).toMatchObject({ high: 103.5, low: 99 });
+        const index = { close: '23000', reference: '22900', high: '23100', low: '22850' } as never;
+        expect(rowQuoteView({ reference: 0, security_type: 'IND' }, undefined, { tick: undefined, index })).toMatchObject({ high: 23100, low: 22850 });
+        expect(rowQuoteView({ reference: 100 }, snapshot, undefined)).toMatchObject({ high: 105, low: 98 });
+        const bad = rowQuoteView({ reference: 100 }, { ...(snapshot as object), high: 0, low: Number.NaN } as never, undefined);
+        expect(bad.high).toBeUndefined();
+        expect(bad.low).toBeUndefined();
+        expect(rowQuoteView({ reference: 100 }, undefined, undefined)).toMatchObject({ high: undefined, low: undefined });
+    });
+
+    it('dayRangePosition：0＝最低、1＝最高，超出夾住；缺資料、最高＝最低、試撮為 null', () => {
+        expect(dayRangePosition(view0)).toBeCloseTo(0.2);
+        expect(dayRangePosition({ ...view0, close: 99 })).toBe(0);
+        expect(dayRangePosition({ ...view0, close: 104 })).toBe(1);
+        expect(dayRangePosition({ ...view0, close: 110 })).toBe(1);
+        expect(dayRangePosition({ ...view0, close: 90 })).toBe(0);
+        expect(dayRangePosition({ ...view0, high: 100, low: 100 })).toBeNull();
+        expect(dayRangePosition({ ...view0, high: undefined })).toBeNull();
+        expect(dayRangePosition({ ...view0, low: undefined })).toBeNull();
+        expect(dayRangePosition({ ...view0, close: undefined })).toBeNull();
+        expect(dayRangePosition({ ...view0, simtrade: true })).toBeNull();
+    });
+
+    it('有高低價：價格欄內（絕對定位的裝飾，aria-hidden）以 --p 標記位置；無障礙名稱寫出最低、最高與位置', async () => {
+        await render({ staticView: view0 });
+        const bar = all('ranking-range');
+        expect(bar).toHaveLength(1);
+        expect(bar[0]!.props.className).toBe(wlStyles.dayRange);
+        expect(bar[0]!.props['aria-hidden']).toBe('true');
+        expect(bar[0]!.props.style).toEqual({ '--p': '20%' });
+        // 在價格欄內（不新增 grid 欄、不佔名稱欄）；不是可點的元素
+        expect(bar[0]!.parent!.props.className).toBe(wlStyles.priceCell);
+        expect(bar[0]!.type).toBe('span');
+        expect(bar[0]!.props.onClick).toBeUndefined();
+        expect(all('ranking-row-button')[0]!.props['aria-label']).toBe(
+            '2330 台積電 上市，100.00，漲 ▲1.00 +1.00%，總量 10，今日最低 99.00 最高 104.00，現價位於區間 20%',
+        );
+    });
+
+    it('最高＝最低、缺資料、試撮：不顯示小條，無障礙名稱不提區間', async () => {
+        for (const over of [{ high: 100, low: 100 }, { high: undefined, low: undefined }, { simtrade: true }]) {
+            await render({ staticView: { ...view0, ...over } });
+            expect(all('ranking-range'), JSON.stringify(over)).toHaveLength(0);
+            expect(all('ranking-row-button')[0]!.props['aria-label']).not.toContain('今日最低');
+            await act(async () => view!.unmount());
+            view = undefined;
+        }
+    });
+
+    it('S1：點列只開交易頁（onOpen），小條不攔點擊、不開下單面板', async () => {
+        const onOpen = vi.fn();
+        const onTicket = vi.fn();
+        await render({ staticView: view0, onOpen, onTicket });
+        await act(async () => { all('ranking-row-button')[0]!.props.onClick(); });
+        expect(onOpen).toHaveBeenCalledWith('2330');
+        expect(onTicket).not.toHaveBeenCalled();
     });
 });

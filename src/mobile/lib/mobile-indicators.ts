@@ -5,6 +5,7 @@
 //   讀寫都包 try/catch（私密瀏覽、停用儲存時退回記憶體），損毀或不認得的資料一律回預設。
 // - 上限（手機版面）：主圖疊加 MAX_OVERLAYS 個、副圖 MAX_PANES 個；預設＝MA(5)、MA(20)＋成交量（與 MVP 相同）。
 // - 參數依定義的 min／max／step 夾住；顏色以調色盤索引保存（只用於單一輸出的指標）。
+// - 內建範本（INDICATOR_TEMPLATES：當沖、波段、長線）：套用＝整份取代並寫入同一個儲存；復原由面板保留套用前的設定。
 
 import { useSyncExternalStore } from 'react';
 import { DEF_BY_TYPE, INDICATOR_DEFS, type IndicatorDef, type ParamDef } from '../../lib/indicator-defs';
@@ -305,6 +306,58 @@ export function setVolumeVisible(s: MobileIndicatorSettings, volume: boolean): M
     return s.volume === volume ? s : { ...s, volume };
 }
 
+// ---- 內建範本 ----
+
+export type IndicatorTemplateId = 'daytrade' | 'swing' | 'long';
+
+export interface IndicatorTemplate {
+    id: IndicatorTemplateId;
+    label: string;
+    items: readonly { type: string; params: Record<string, number> }[];
+}
+
+/**
+ * 內建範本（套用＝取代目前設定，成交量一律顯示）。每個都在 MAX_OVERLAYS／MAX_PANES 之內，
+ * 只用 MOBILE_INDICATOR_DEFS 裡的指標與參數 key（mobile-indicators.test 逐一驗證）。
+ */
+export const INDICATOR_TEMPLATES: readonly IndicatorTemplate[] = [
+    // 當沖：日內基準 VWAP＋短均線，副圖 MACD（成交量另外顯示）
+    { id: 'daytrade', label: '當沖', items: [
+        { type: 'vwap', params: {} },
+        { type: 'sma', params: { period: 5 } },
+        { type: 'sma', params: { period: 20 } },
+        { type: 'macd', params: { fast: 12, slow: 26, signal: 9 } },
+    ] },
+    // 波段：週、月、季線＋KD
+    { id: 'swing', label: '波段', items: [
+        { type: 'sma', params: { period: 5 } },
+        { type: 'sma', params: { period: 20 } },
+        { type: 'sma', params: { period: 60 } },
+        { type: 'kd', params: { period: 9, k: 3, d: 3 } },
+    ] },
+    // 長線：月、季、半年線＋RSI
+    { id: 'long', label: '長線', items: [
+        { type: 'sma', params: { period: 20 } },
+        { type: 'sma', params: { period: 60 } },
+        { type: 'sma', params: { period: 120 } },
+        { type: 'rsi', params: { period: 14 } },
+    ] },
+];
+
+/** 範本 → 設定（經 sanitize：參數夾住、上限、顏色依序 0、1、2…） */
+export function templateSettings(t: IndicatorTemplate): MobileIndicatorSettings {
+    return sanitizeIndicatorSettings({
+        version: 1,
+        volume: true,
+        items: t.items.map((it, i) => ({ id: `tpl-${t.id}-${i}`, type: it.type, params: it.params, color: i })),
+    });
+}
+
+/** 範本內容的簡述：「VWAP、MA(5)、MA(20)、MACD(12,26,9)」 */
+export function templateSummary(t: IndicatorTemplate): string {
+    return t.items.map(indicatorLabel).join('、');
+}
+
 /** 設定的穩定字串（作為 effect 依賴） */
 export function indicatorSettingsKey(s: MobileIndicatorSettings): string {
     return JSON.stringify(s);
@@ -366,6 +419,10 @@ export interface MobileIndicatorsApi {
     setColor: (id: string, color: number) => void;
     setVolume: (volume: boolean) => void;
     resetAll: () => void;
+    /** 套用範本（取代目前設定）；回傳套用前的設定（給「復原」用） */
+    applyTemplate: (t: IndicatorTemplate) => MobileIndicatorSettings;
+    /** 整份取代（「復原」：還原套用範本前的設定） */
+    replace: (s: MobileIndicatorSettings) => void;
 }
 
 const api: Omit<MobileIndicatorsApi, 'settings'> = {
@@ -376,6 +433,12 @@ const api: Omit<MobileIndicatorsApi, 'settings'> = {
     setColor: (id, color) => setIndicatorSettings(setIndicatorColor(getIndicatorSettings(), id, color)),
     setVolume: volume => setIndicatorSettings(setVolumeVisible(getIndicatorSettings(), volume)),
     resetAll: () => setIndicatorSettings(defaultIndicatorSettings()),
+    applyTemplate: t => {
+        const prev = getIndicatorSettings();
+        setIndicatorSettings(templateSettings(t));
+        return prev;
+    },
+    replace: s => setIndicatorSettings(sanitizeIndicatorSettings(s)),
 };
 
 export function useMobileIndicators(): MobileIndicatorsApi {

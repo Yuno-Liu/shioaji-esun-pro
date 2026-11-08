@@ -3,6 +3,7 @@
 // ┌ 標頭：名稱・市場・［可當沖］／大字成交價・漲跌・漲跌%・［漲停／跌停］［參考價］［試撮］
 // │       統計格（股票）開 高 均 總／參 低 單 額（期權無「額」；顏色相對參考價）
 // │       漲跌停價・非「可當沖」的當沖狀態（股票）或到期月份・時段（期權）
+// │       當沖資訊列（components/trade-info）：可當沖／先賣・漲跌停狀態・振幅小條・量比・處置 → 唯讀「籌碼與當沖」面板（延遲載入）
 // ├ 週期 Segmented（toggle）［走勢］［1分］［5分］［15分］［60分］［日］＋交易圖表（委託線、成本線、漲跌停、參考價）
 // ├ 五檔／明細／公司 Segmented（tabs）＋同列右側［整股｜盤中零股］（股票；明細、公司分頁時隱藏但保留狀態、窄螢幕換行）
 // │   （五檔買賣同列：委買量｜買價｜賣價｜委賣量、量條、五檔總量、買賣比與內外盤比）
@@ -11,12 +12,14 @@
 // └［買 進］［賣 出］→ openTicket()（只開下單面板，送單一律經確認面板）；以 ShellSlot bottom 放進底部 chrome
 //
 // 主價列下緣的哨兵離開 main 頂端時，ShellSlot top 顯示精簡標頭（trade-compact；實心 panel，沒有 IntersectionObserver 時不顯示）。
+// 標頭右上的 ☆（trade-watch-star）：把目前商品加入／移出目前的自選清單（殼層常駐的 WatchlistProvider；aria-pressed＝已在清單）。
+// 清單載入中、更新中、載入失敗、合約未載入或組合商品時停用；結果以既有通知（lib/trade notify → ToastHost）回報。只改自選，不下單（S1）。
 // 標頭的「代碼 名稱」是切換商品鍵（trade-switch；精簡標頭顯示時另有 trade-compact-switch）：開 TradeSwitchSheet 搜尋並切換，
 // 以 replace 導覽（返回鍵回到進交易頁之前的畫面）；只做查詢與導覽，不開下單面板。合約載入後記入「最近查看」（lib/recent-codes）。
 // code 來自 hash 路由（已過濾不合法代碼）；null＝尚未選商品。合約解析出的正規代碼與路由不同（小寫、舊指數代碼）時改寫路由。
 // 交易狀態（委託、持倉）只由葉節點訂閱：圖上的線、五檔的委託標記、持倉摘要（稽核 P2）；持倉市價重估不重繪標頭、五檔與圖表。
 
-import { ChevronDown } from 'lucide-react';
+import { ChevronDown, Star } from 'lucide-react';
 import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type Ref } from 'react';
 import { flushSync } from 'react-dom';
 import { useQuote } from '../../hooks/use-stream';
@@ -26,6 +29,7 @@ import { sessionWindowFor } from '../../lib/intraday-session';
 import { getMarketSnapshot, subscribeMarketSnapshots } from '../../lib/market-snapshot-store';
 import { fetchSnapshots } from '../../lib/shioaji';
 import { maskMoney, usePrivacyMoney } from '../../lib/privacy';
+import { notify } from '../../lib/trade';
 import { useTradingState } from '../../lib/trading-state';
 import type { ContractInfo, DayTrade, Exchange, SecurityType } from '../../lib/types/contract';
 import type { AccountedTrade } from '../../lib/types/order';
@@ -34,9 +38,12 @@ import { nowWallClockUtc } from '../../lib/utils/kbars';
 import { remainingWorkingOrderQuantity } from '../../lib/working-order-quantity';
 import { loadCompanyTab } from '../components/company/load-company-tab';
 import { DepthLadder, depthOddCapable, DepthOddToggle } from '../components/depth-ladder';
-import { ModuleErrorBoundary, ModuleLoadError, retryableLazy } from '../components/route-error-boundary';
+import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from '../components/route-error-boundary';
 import { TickList } from '../components/tick-list';
 import { TradeChart } from '../components/trade-chart';
+import { loadTradeChipsSheet } from '../components/trade-info/load-trade-chips-sheet';
+import { TradeInfoStrip } from '../components/trade-info/trade-info-strip';
+import { useDocumentVisible } from '../components/trade-info/use-document-visible';
 import { TradeSwitchSheet } from '../components/trade-switch-sheet';
 import { chartPriceLines, formatLinePrice, priceLinesKey } from '../lib/chart-model';
 import { CHART_PERIODS, DEFAULT_CHART_PERIOD, isChartPeriod, type ChartPeriod } from '../lib/chart-ranges';
@@ -46,12 +53,15 @@ import { openTicket, setCurrentCode } from '../lib/mobile-store';
 import { fmtCompactInt, fmtInt, fmtStockLots, formatNumber, formatToTick } from '../lib/num-format';
 import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import { recordRecentCode } from '../lib/recent-codes';
+import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
+import { useOptionalMobileWatchlist } from '../lib/watchlist-context';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
 import { focusRing, pressable } from '../styles/primitives.css';
 import { SIZE } from '../styles/tokens';
 import * as styles from '../styles/trade.css';
 import { GroupedSection } from '../ui/grouped';
+import { IconButton } from '../ui/icon-button';
 import { InlineNote } from '../ui/inline-note';
 import { usePriceFlash } from '../ui/price-flash';
 import * as flash from '../ui/price-flash.css';
@@ -176,6 +186,10 @@ const PANEL_ITEMS = [
 const CompanyTab = retryableLazy(() => loadCompanyTab().then(m => m.CompanyTab), 'CompanyTab');
 const resetCompanyTab = () => { CompanyTab.reset(); };
 
+// 「籌碼與當沖」說明面板（唯讀）：第一次點當沖資訊列才 import，不閒置預載；融資融券與券源的讀取也在面板模組內。
+const TradeChipsSheet = retryableLazy(() => loadTradeChipsSheet().then(m => m.TradeChipsSheet), 'TradeChipsSheet');
+const resetChipsSheet = () => { TradeChipsSheet.reset(); };
+
 type StatKey = 'open' | 'high' | 'low' | 'reference' | 'avg' | 'total' | 'last' | 'amount';
 
 const STAT_LABEL: Record<StatKey, string> = { open: '開', high: '高', low: '低', reference: '參', avg: '均', total: '總', last: '單', amount: '額' };
@@ -272,7 +286,76 @@ interface SwitchEntry {
     switchRef?: Ref<HTMLButtonElement>;
 }
 
-function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef }: { code: string; contract: ContractInfo | undefined } & SwitchEntry) {
+/** 當沖資訊列（標頭最下方）：處置名單與「籌碼與當沖」面板狀態由 TradeView 持有 */
+interface InfoEntry {
+    punished: boolean | null;
+    open: boolean;
+    onOpen: () => void;
+}
+
+/** 自選 ☆ 停用時的原因（寫進無障礙名稱）；可操作時 null */
+export function watchStarBlocked(
+    wl: { loading: boolean; structureBusy: boolean; loadError: boolean },
+    contract: Pick<ContractInfo, 'combo'> | undefined,
+    busy: boolean,
+): string | null {
+    if (!contract) return '商品載入中';
+    if (contract.combo) return '組合商品不能加入自選';
+    if (wl.loadError) return '自選清單載入失敗';
+    if (busy || wl.loading || wl.structureBusy) return '自選清單更新中';
+    return null;
+}
+
+/** 標頭 ☆：加入／移出目前的自選清單。不在 WatchlistProvider 內（測試、獨立掛載）時不顯示 */
+function WatchStar({ contract }: { contract: ContractInfo | undefined }) {
+    const wl = useOptionalMobileWatchlist();
+    const [busy, setBusy] = useState(false);
+    const mounted = useRef(true);
+    // StrictMode 會模擬卸載再掛載：掛載時要設回 true，否則之後 setBusy(false) 永遠不執行（☆ 一直停用）
+    useEffect(() => {
+        mounted.current = true;
+        return () => { mounted.current = false; };
+    }, []);
+    if (!wl) return null;
+    const code = contract?.code;
+    const watched = !!code && wl.items.some(i => i.contract.code === code);
+    const listName = wl.serverLists.find(l => l.id === wl.activeListId)?.name || '自選';
+    const blocked = watchStarBlocked(wl, contract, busy);
+    const toggle = async () => {
+        if (blocked || !contract) return;
+        const what = `${contract.code}${contract.name ? ` ${contract.name}` : ''}`;
+        setBusy(true);
+        try {
+            if (watched) {
+                await wl.removeSymbol(contract.code);
+                notify({ kind: 'ok', title: '已移出自選', body: `${what} 已從「${listName}」移除` });
+            } else {
+                await wl.addSymbol(contract.code, contract.security_type, contract);
+                notify({ kind: 'ok', title: '已加入自選', body: `${what} 已加入「${listName}」` });
+            }
+        } catch (e) {
+            notify({ kind: 'err', title: watched ? '移出自選失敗' : '加入自選失敗', body: e instanceof Error && e.message ? e.message : '請稍後再試' });
+        } finally {
+            if (mounted.current) setBusy(false);
+        }
+    };
+    return (
+        <span className={styles.watchStar}>
+            <IconButton
+                ariaLabel={`自選（${listName}）${blocked ? `，${blocked}` : ''}`}
+                icon={Star}
+                pressed={watched}
+                // 處理中只標 aria-disabled（不設 disabled，按的人焦點不會掉）；點擊由 toggle 開頭的 blocked 檢查忽略
+                disabled={blocked !== null && !busy}
+                ariaDisabled={busy}
+                onClick={() => { void toggle(); }}
+                testId='trade-watch-star'
+            />
+        </span>
+    );
+}
+
+function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef, info }: { code: string; contract: ContractInfo | undefined; info?: InfoEntry } & SwitchEntry) {
     const quote = useQuote(code, { narrow: true });
     const tick = quote?.tick;
     // 試撮期間仍以本頁看過的上一筆真實成交為最新價
@@ -307,51 +390,56 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef }:
 
     return (
         <header className={styles.header}>
-            <div className={styles.titleRow}>
-                <h1 className={styles.title}>
-                    {onOpenSwitch
-                        ? (
-                            <button
-                                ref={switchRef}
-                                type='button'
-                                className={`${styles.titleButton} ${pressable} ${focusRing}`}
-                                onClick={() => onOpenSwitch()}
-                                aria-haspopup='dialog'
-                                aria-expanded={switchOpen}
-                                aria-label={switchLabel}
-                                data-testid='trade-switch'
-                            >
-                                {title}
-                                <ChevronDown className={styles.titleIcon} aria-hidden='true' focusable='false' />
-                            </button>
-                        )
-                        : title}
-                </h1>
-                {contract && <span className={styles.subtle}>{exchangeText(contract.exchange)}</span>}
-                {contract && isStock && contract.day_trade === 'Yes' && <span className={styles.badge} data-testid='trade-daytrade'>可當沖</span>}
-            </div>
-            <div className={styles.priceRow} data-testid='trade-price'>
-                <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>
-                    <span ref={flashRef} className={flash.overlay} aria-hidden='true' />
-                    {priceText}
-                </span>
-                {q.source === 'reference' && <span className={styles.badge} data-testid='trade-price-reference'>參考價</span>}
-                {chg && (
-                    <span className={`${styles.change} ${styles.dirText[chg.dir]}`}>
-                        {changeText}
-                        {pctText}
-                    </span>
-                )}
-                {limit && (
-                    <span className={`${styles.badge} ${styles.badgeTone[limit]}`} data-testid='trade-limit'>
-                        {limit === 'up' ? '漲停' : '跌停'}
-                    </span>
-                )}
-                {q.sim && (
-                    <span className={styles.badge} title='試撮揭示價，非成交價' data-testid='trade-simtrade'>
-                        試撮 {fmt(q.sim.price)}
-                    </span>
-                )}
+            <div className={styles.headTop}>
+                <div className={styles.headMain}>
+                    <div className={styles.titleRow}>
+                        <h1 className={styles.title}>
+                            {onOpenSwitch
+                                ? (
+                                    <button
+                                        ref={switchRef}
+                                        type='button'
+                                        className={`${styles.titleButton} ${pressable} ${focusRing}`}
+                                        onClick={() => onOpenSwitch()}
+                                        aria-haspopup='dialog'
+                                        aria-expanded={switchOpen}
+                                        aria-label={switchLabel}
+                                        data-testid='trade-switch'
+                                    >
+                                        {title}
+                                        <ChevronDown className={styles.titleIcon} aria-hidden='true' focusable='false' />
+                                    </button>
+                                )
+                                : title}
+                        </h1>
+                        {contract && <span className={styles.subtle}>{exchangeText(contract.exchange)}</span>}
+                        {contract && isStock && contract.day_trade === 'Yes' && <span className={styles.badge} data-testid='trade-daytrade'>可當沖</span>}
+                    </div>
+                    <div className={styles.priceRow} data-testid='trade-price'>
+                        <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>
+                            <span ref={flashRef} className={flash.overlay} aria-hidden='true' />
+                            {priceText}
+                        </span>
+                        {q.source === 'reference' && <span className={styles.badge} data-testid='trade-price-reference'>參考價</span>}
+                        {chg && (
+                            <span className={`${styles.change} ${styles.dirText[chg.dir]}`}>
+                                {changeText}
+                                {pctText}
+                            </span>
+                        )}
+                        {limit && (
+                            <span className={`${styles.badge} ${styles.badgeTone[limit]}`} data-testid='trade-limit'>
+                                {limit === 'up' ? '漲停' : '跌停'}
+                            </span>
+                        )}
+                        {q.sim && (
+                            <span className={styles.badge} title='試撮揭示價，非成交價' data-testid='trade-simtrade'>
+                                試撮 {fmt(q.sim.price)}
+                            </span>
+                        )}
+                    </div>
+                </div>
+                <WatchStar contract={contract} />
             </div>
             <div ref={sentinelRef} className={styles.sentinel} aria-hidden='true' />
             {compact.available && (
@@ -392,6 +480,22 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef }:
                     {delivery && <span>到期 {delivery}</span>}
                     <span>{sessionText(contract.security_type, nowWallClockUtc())}</span>
                 </div>
+            )}
+            {/* 當沖資訊列：一般文件流、在統計格與漲跌停列之下；點擊只開唯讀說明面板（S1） */}
+            {contract && info && (
+                <TradeInfoStrip
+                    code={code}
+                    contract={contract}
+                    price={price}
+                    priceIsTrade={q.source === 'tick' || q.source === 'snapshot'}
+                    quoteRef={(q.source === 'tick' || q.source === 'snapshot') && q.price !== null && q.change !== null && q.price - q.change > 0 ? q.price - q.change : undefined}
+                    stats={stats}
+                    tickDate={stats.source === 'tick' ? (tick && !tick.simtrade ? tick : lastReal.current)?.date : undefined}
+                    snapshot={snapshot}
+                    punished={info.punished}
+                    open={info.open}
+                    onOpen={info.onOpen}
+                />
             )}
         </header>
     );
@@ -512,9 +616,26 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
     const tradable = contract ? contract.security_type !== 'IND' : true;
     const comboNote = contract?.combo ? '組合商品不支援手機下單' : null;
 
+    // 當沖資訊列的處置徽章：只有股票、且頁面在前景時讀處置名單（與自選頁共用模組層快取，30 分鐘內 0 次）
+    const isStk = contract?.security_type === 'STK';
+    const pageVisible = useDocumentVisible();
+    const punishedCodes = usePunishedCodes(isStk && pageVisible);
+    // 名單還沒成功取得過：null（面板寫「處置名單尚未取得」，不當成未處置）
+    const punishLoaded = usePunishedListLoaded();
+    const punished = isStk && contract && punishLoaded ? punishedCodes.has(contract.code) : null;
+    // 「籌碼與當沖」面板：第一次點資訊列才載入並掛載（換商品時整頁重建而關閉）
+    const [infoOpen, setInfoOpen] = useState(false);
+    const [infoMounted, setInfoMounted] = useState(false);
+    const openInfo = useCallback(() => {
+        setInfoMounted(true);
+        setInfoOpen(true);
+    }, []);
+    const closeInfo = useCallback(() => setInfoOpen(false), []);
+    const info: InfoEntry = { punished, open: infoOpen, onOpen: openInfo };
+
     return (
         <section className={styles.page} data-testid='page-trade'>
-            <Header code={sym} contract={contract} onOpenSwitch={onOpenSwitch} switchOpen={switchOpen} switchRef={switchRef} />
+            <Header code={sym} contract={contract} onOpenSwitch={onOpenSwitch} switchOpen={switchOpen} switchRef={switchRef} info={info} />
 
             <div className={styles.controlRow}>
                 <div className={styles.controlGrow}>
@@ -562,6 +683,17 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
             )}
 
             <TradePositionSummary orderable={orderable} sym={sym} isStock={isStock} />
+
+            {infoMounted && contract && (
+                <ModuleErrorBoundary
+                    onRetry={resetChipsSheet}
+                    fallback={props => <SheetLoadError {...props} open={infoOpen} onClose={closeInfo} testId='trade-chips-load-error' />}
+                >
+                    <Suspense fallback={null}>
+                        <TradeChipsSheet open={infoOpen} onClose={closeInfo} contract={contract} punished={punished} />
+                    </Suspense>
+                </ModuleErrorBoundary>
+            )}
 
             {tradable && (
                 <ShellSlot slot='bottom'>

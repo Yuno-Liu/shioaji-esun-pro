@@ -4,6 +4,7 @@ import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getIndicatorSettings, MOBILE_INDICATORS_KEY, resetIndicatorSettingsForTest, setIndicatorSettings } from '../lib/mobile-indicators';
+import { getMobileUi, resetMobileUiForTest } from '../lib/mobile-store';
 import { IndicatorSheet } from './indicator-sheet';
 
 const storage = new Map<string, string>();
@@ -139,5 +140,76 @@ describe('IndicatorSheet', () => {
     it('走勢模式顯示說明（指標只套用在 K 線）', async () => {
         await render(true);
         expect(textOf(one('indicator-list'))).toContain('走勢圖只顯示均價線');
+    });
+});
+
+describe('IndicatorSheet — 快速範本', () => {
+    const tpl = (id: string) => one(`indicator-template-${id}`);
+
+    it('三個範本各一列：名稱、內容說明、44px「套用」鍵（無障礙名稱寫出取代目前設定）', async () => {
+        await render();
+        const section = one('indicator-templates');
+        expect(section.props['aria-label']).toBe('快速範本');
+        expect(textOf(section)).toContain('當沖');
+        expect(textOf(section)).toContain('VWAP、MA(5)、MA(20)、MACD(12,26,9)＋成交量');
+        expect(textOf(section)).toContain('MA(5)、MA(20)、MA(60)、KD(9,3,3)＋成交量');
+        expect(textOf(section)).toContain('MA(20)、MA(60)、MA(120)、RSI(14)＋成交量');
+        expect(tpl('daytrade').props['aria-label']).toBe('套用「當沖」範本：VWAP、MA(5)、MA(20)、MACD(12,26,9)＋成交量（取代目前設定）');
+        expect(textOf(tpl('swing'))).toBe('套用');
+        expect(byId('indicator-template-applied')).toHaveLength(0);
+    });
+
+    it('套用：取代目前設定（不跳確認）、寫入 localStorage；成交量隱藏時也改回顯示', async () => {
+        await render();
+        await act(async () => { one('indicator-volume').props.onClick(); });
+        await act(async () => { one('indicator-add-cci').props.onClick(); });
+        await act(async () => { tpl('swing').props.onClick(); });
+        expect(labels()).toEqual(['sma:{"period":5}', 'sma:{"period":20}', 'sma:{"period":60}', 'kd:{"period":9,"k":3,"d":3}']);
+        expect(getIndicatorSettings().volume).toBe(true);
+        const saved = JSON.parse(storage.get(MOBILE_INDICATORS_KEY)!);
+        expect(saved.items.map((i: { type: string }) => i.type)).toEqual(['sma', 'sma', 'sma', 'kd']);
+        expect(textOf(one('indicator-section-overlay'))).toContain('已加入 3／4');
+        expect(textOf(one('indicator-section-pane'))).toContain('已加入 1／2');
+        const note = one('indicator-template-applied');
+        expect(note.props.role).toBe('status');
+        expect(textOf(note)).toContain('已套用「波段」範本');
+    });
+
+    it('復原（一步）：還原套用前的設定並寫入儲存；焦點回到範本鍵；說明消失', async () => {
+        const focus = vi.fn();
+        // react-test-renderer 沒有 DOM：以替身確認焦點移回範本鍵
+        await act(async () => {
+            view = create(createElement(IndicatorSheet, { open: true, onClose: () => undefined }), {
+                createNodeMock: el => ((el.props as Record<string, unknown>)['data-testid'] === 'indicator-template-daytrade' ? { focus } : {}),
+            });
+        });
+        await act(async () => { one('indicator-add-rsi').props.onClick(); });
+        const before = labels();
+        expect(before).toEqual(['sma:{"period":5}', 'sma:{"period":20}', 'rsi:{"period":14}']);
+        await act(async () => { tpl('daytrade').props.onClick(); });
+        expect(labels()[0]).toBe('vwap:{}');
+        await act(async () => { one('indicator-template-undo').props.onClick(); });
+        expect(labels()).toEqual(before);
+        expect(JSON.parse(storage.get(MOBILE_INDICATORS_KEY)!).items.map((i: { type: string }) => i.type)).toEqual(['sma', 'sma', 'rsi']);
+        expect(focus).toHaveBeenCalledTimes(1);
+        expect(byId('indicator-template-applied')).toHaveLength(0);
+    });
+
+    it('套用後再改設定：復原失效（說明消失），不會蓋掉後來的修改', async () => {
+        await render();
+        await act(async () => { tpl('long').props.onClick(); });
+        expect(byId('indicator-template-undo')).toHaveLength(1);
+        await act(async () => { one('indicator-add-ema').props.onClick(); });
+        expect(byId('indicator-template-applied')).toHaveLength(0);
+        expect(labels()).toContain('ema:{"period":12}');
+    });
+
+    it('S1：範本與復原只改圖表設定，不開下單或委託面板', async () => {
+        resetMobileUiForTest();
+        await render();
+        for (const id of ['daytrade', 'swing', 'long']) await act(async () => { tpl(id).props.onClick(); });
+        await act(async () => { one('indicator-template-undo').props.onClick(); });
+        expect(getMobileUi().ticket).toBeNull();
+        expect(getMobileUi().orderAction).toBeNull();
     });
 });

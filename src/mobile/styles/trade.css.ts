@@ -5,7 +5,7 @@
 // - 漲跌與買賣顏色只用 vars.color.up／down；實心填色以 primitives 的 fill（inkLarge／inkStrong 疊黑）。
 // - 精簡標頭、選價列為不透明 panel（canvas 與捲動內容上方不模糊）；只動畫 transform／opacity。
 // - 量條、比例條用 ui/bars（scaleX），不再以 width 轉場。
-import { keyframes, style, styleVariants } from '@vanilla-extract/css';
+import { globalStyle, keyframes, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
 import { expandHit } from '../ui/chip.css';
 import { fill, focusRing, hairlineBottom, pressable, pressableRow } from './primitives.css';
@@ -39,6 +39,36 @@ export const header = style({
     flexDirection: 'column',
     gap: '2px',
 });
+
+/**
+ * 標頭上半：［名稱列＋主價列｜☆］兩欄。☆ 自成一欄（auto），名稱、主價與徽章只在左欄換行，不會跑到 ☆ 底下（不重疊）。
+ * 不設欄距：☆ 的 44px 點擊區左側本來就有約 12px 空白，與名稱、主價自然分開；右欄越窄，名稱列與主價列越少換行。
+ */
+export const headTop = style({
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) auto',
+    alignItems: 'start',
+});
+
+export const headMain = style({
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+    minWidth: 0,
+});
+
+/**
+ * 加入／移出自選 ☆ 的外框（內含 IconButton 44×44）：上移 SPACE.s2、右移 SPACE.s4，只伸進標頭的上、右內距
+ * （點擊區貼齊頁面右緣、圖示靠近名稱列，右欄只佔約 28px）；已在自選（aria-pressed）時星號實心（形狀也不同，不只靠顏色）。
+ * 位移放在外框而不是 IconButton 本身：IconButton 的 margin: 0 在首屏 CSS，與延遲載入的本檔同權重，順序不可靠。
+ */
+export const watchStar = style({
+    display: 'flex',
+    marginTop: `calc(-1 * ${SPACE.s2})`,
+    marginRight: `calc(-1 * ${SPACE.s4})`,
+});
+
+globalStyle(`${watchStar} [aria-pressed="true"] svg`, { fill: 'currentColor' });
 
 export const titleRow = style({
     display: 'flex',

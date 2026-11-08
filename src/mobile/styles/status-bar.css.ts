@@ -3,12 +3,18 @@
 // - 非 LIVE（含 ResumeGate 非 ready）：整條以 ::before 淡染狀態色（opacity .14，高度不變）。
 // - 正式環境：下緣改 inset 2px danger。
 // - 狀態色固定（§4.8 規則 10）：success LIVE、amber 連線中／資料過期、danger 中斷／未恢復、accent 同步中。
-import { keyframes, style, styleVariants } from '@vanilla-extract/css';
+// - 加入通知鈴後的窄螢幕（360 寬、字級大、資料過期＋已鎖單）：環境膠囊永遠不被裁切——
+//   字級大時各段左右內距 0.5rem → 0.25rem；路由膠囊內先縮帳號、再縮券商名（省略號），環境膠囊不縮；
+//   寬 ≤400px 且字級大時不顯示路由的 ⌄（純裝飾，aria-hidden；按鈕名稱仍是「切換帳戶」）。
+import { globalStyle, keyframes, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
-import { focusRing, hairlineBottom, pressableRow } from './primitives.css';
+import { focusRing, hairlineBottom, inkLayer, pressableRow } from './primitives.css';
 import { sj } from './theme-vars.css';
 import { LOW_DPR, MORE_CONTRAST, RADIUS, REDUCED_MOTION, SAFE_LEFT, SAFE_RIGHT, SAFE_TOP, SPACE, TOUCH_MIN } from './tokens';
 import { TEXT } from './typography.css';
+
+/** 字級「大」（use-html-attributes 設在 html 上） */
+const FONT_LARGE = 'html[data-sj-font-scale="1.3"] &';
 
 const TONE_COLOR = {
     live: vars.color.success,
@@ -63,6 +69,7 @@ const segment = style([focusRing, {
     whiteSpace: 'nowrap',
     selectors: {
         '&:focus-visible': { outlineOffset: '-2px' },
+        [FONT_LARGE]: { padding: `0 ${SPACE.s1}` },
     },
 }]);
 
@@ -128,6 +135,12 @@ export const routePill = style([pillBase, {
     gap: '4px',
 }]);
 
+/**
+ * 券商名（第一個子元素）：可縮到 0、以省略號截斷。帳號（routeText）的 flex-shrink 大得多，所以先縮帳號、帳號縮完才縮券商名；
+ * 環境膠囊 flex none 不縮（不可用小於 1 的 flex-shrink：未凍結項目的係數和 < 1 時只分到等比例的負空間，會溢出）。
+ */
+globalStyle(`${routePill} > span:first-child`, { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' });
+
 /** 沒有帳戶：amber 1px 框＋foreground 文字（§4.8 規則 4：amber 不當小字顏色） */
 export const routeEmpty = style([pillBase, {
     maxWidth: '100%',
@@ -140,9 +153,15 @@ export const routeEmpty = style([pillBase, {
 export const routeLoading = style([pillBase, { color: vars.color.mutedForeground, fontWeight: 500 }]);
 
 /** 可省略號截斷的文字段 */
-export const routeText = style({ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' });
+export const routeText = style({ minWidth: 0, flexShrink: 1000, overflow: 'hidden', textOverflow: 'ellipsis' });
 
-export const chevron = style({ flex: '0 0 auto', color: vars.color.mutedForeground });
+export const chevron = style({
+    flex: '0 0 auto',
+    color: vars.color.mutedForeground,
+    '@media': {
+        'screen and (max-width: 400px)': { selectors: { [FONT_LARGE]: { display: 'none' } } },
+    },
+});
 
 // ---- 右：風控 ----
 
@@ -265,4 +284,29 @@ export const lockNotice = style({
     boxShadow: `inset 3px 0 0 ${vars.color.amber}`,
     color: vars.color.foreground,
     fontSize: TEXT.callout.fontSize,
+});
+
+// ---- 通知鈴：IconButton（點擊區 TOUCH_MIN）＋未讀徽章（IconButton 的 children，以按鈕定位）----
+
+/** 未讀數：danger 實心小膠囊白字（數字本身就是資訊，不只靠顏色）；不攔點擊、不隨字級放大到蓋住圖示 */
+export const badge = style({
+    position: 'absolute',
+    top: '4px',
+    right: '2px',
+    minWidth: '18px',
+    height: '18px',
+    padding: '0 5px',
+    boxSizing: 'border-box',
+    borderRadius: RADIUS.pill,
+    // 實心 danger＋inkStrong 疊黑（§4.8 規則 3：小字白字的對比）
+    backgroundColor: vars.color.danger,
+    backgroundImage: inkLayer.strong,
+    color: '#ffffff',
+    fontSize: '11px',
+    fontWeight: 700,
+    lineHeight: '18px',
+    textAlign: 'center',
+    fontVariantNumeric: 'tabular-nums',
+    pointerEvents: 'none',
+    zIndex: 2,
 });

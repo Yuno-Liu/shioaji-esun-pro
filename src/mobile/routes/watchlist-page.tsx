@@ -32,6 +32,11 @@
 //   拖曳中與放手後短時間內不觸發列點擊與長按；清單載入中、載入失敗（loadError）、結構更新中或清單不可寫入
 //   （canReplaceList false）時停用握把。鍵盤 ↑／↓ 一次移一格（忽略自動重複與寫入中），移動後焦點留在該列握把。
 //   操作面板的上移、下移、移到最上保留。
+//   延遲載入（首屏體積）：列首「−」、列尾「⋯」＋握把與 useListReorder 都在 components/watch-edit-controls.tsx
+//   （lib/deferred-modules.ts loadWatchEditControls，閒置預載），非編輯模式不載入。列仍由本頁渲染（QuoteRow 的
+//   leading／trailing），進出編輯模式不重掛列；useListReorder 包成不渲染畫面的 WatchEditReorder，只在編輯模式且有清單時
+//   掛載，把拖曳狀態與握把事件交回本頁。載入前與載入失敗時列首、列尾是同尺寸空白佔位（握把 NOOP），失敗在清單上方顯示
+//   「載入失敗」＋［重試］（再次進入編輯模式也會重新 import）；表頭、清單工具、加入股票與非編輯模式的列不受影響。
 //   編輯模式不顯示迷你走勢（列首、列尾各多一個鍵，讓出寬度給名稱）。
 // - 迷你走勢（使用者明確要求，有限制地做）：只為可見列讀取目前（或最近一段）交易時段的 1 分 K，模組層快取每檔每段一次
 //   （盤中讀過的收盤後補讀一次）、佇列同時 2 個，即時成交以分鐘為桶接在尾段（lib/watch-sparkline-data.ts）；
@@ -54,8 +59,8 @@
 //   K 線 POST 每個可見可交易列 ≤1（假日補找時 2，同時 2 個，每檔每段讀過即快取）；走勢 chunk 1 個（通常已閒置預載）。
 //   清單管理只在使用者操作時發出（新增、改名、刪除、移除、排序各自是 use-watchlist 的既有請求）。
 
-import { ChevronsUpDown, CircleMinus, GripVertical, MoreHorizontal, Pencil, Plus, Search, Star } from 'lucide-react';
-import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronsUpDown, Pencil, Plus, Search, Star } from 'lucide-react';
+import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQuote, type PriceQuoteState } from '../../hooks/use-stream';
 import type { WatchItem } from '../../hooks/use-watchlist';
 import { neighborCode } from '../../lib/list-move';
@@ -72,12 +77,13 @@ import {
 } from '../components/quote-row';
 import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from '../components/route-error-boundary';
 import { WatchIndexStrip } from '../components/watch-index-strip';
-import { loadRankingList, loadSearchSheet, loadWatchListSheet } from '../lib/deferred-modules';
+import { loadRankingList, loadSearchSheet, loadWatchEditControls, loadWatchListSheet } from '../lib/deferred-modules';
 import { navigate } from '../lib/hash-router';
 import { openTicket } from '../lib/mobile-store';
 import { usePunishedCodes } from '../lib/regulatory-punish';
-import { useListReorder, type ListReorder } from '../lib/watch-reorder';
+import type { ListReorder } from '../lib/watch-reorder';
 import { useMobileWatchlist } from '../lib/watchlist-context';
+import { prefersReducedMotion } from '../motion/prefs';
 import { fill, focusRing, pressable, pressableRow } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
 import { EmptyState } from '../ui/empty-state';
@@ -159,18 +165,70 @@ export function nextWatchMetric(m: WatchMetric): WatchMetric {
 // ---------------------------------------------------------------------------
 // 列
 
+// 編輯模式的列首、列尾鍵與拖曳排序只在編輯模式用到：延遲載入（同一個 chunk），閒置時由 app.tsx 預載。
+// 載入前與載入失敗時列首、列尾是同尺寸空白佔位、握把 NOOP；失敗以「載入失敗」＋［重試］顯示在清單上方（WatchEditReorder 的邊界），
+// 列內的邊界只放佔位、不顯示錯誤（editKey 改變時清除，重試後重新渲染）。
+const WatchEditReorder = retryableLazy(() => loadWatchEditControls().then(m => m.WatchEditReorder), 'WatchEditReorder');
+const WatchEditLeading = retryableLazy(() => loadWatchEditControls().then(m => m.WatchEditLeading), 'WatchEditLeading');
+const WatchEditTrailing = retryableLazy(() => loadWatchEditControls().then(m => m.WatchEditTrailing), 'WatchEditTrailing');
+/** 上次載入失敗時換新的 lazy（三個都要呼叫，不可短路）；未失敗時不動 */
+const resetWatchEditControls = () => {
+    WatchEditReorder.reset();
+    WatchEditLeading.reset();
+    WatchEditTrailing.reset();
+};
+/**
+ * 閒置預載（app.tsx）：三個 lazy 都先記住元件（retryableLazy.preload），第一次進入編輯模式直接渲染、不 suspend
+ * （只 import chunk 的話 lazy 仍會 suspend 一次，React 的 Suspense 節流會讓佔位多停留最多約 300ms）。
+ * 三個共用同一個 chunk，瀏覽器只抓一次；失敗時 preload 靜默，進入編輯模式再重新 import。
+ */
+export const preloadWatchEditControls = (): Promise<void> =>
+    Promise.all([WatchEditReorder.preload(), WatchEditLeading.preload(), WatchEditTrailing.preload()]).then(() => undefined);
+const noop = () => undefined;
+const NOOP_GRIP: ListReorder['grip'] = {
+    onPointerDown: noop,
+    onPointerMove: noop,
+    onPointerUp: noop,
+    onPointerCancel: noop,
+    onKeyDown: noop,
+    onClick: noop,
+};
+
+/** 列首、列尾編輯鍵的延遲載入槽：載入中與失敗時是同尺寸空白佔位（列寬不跳動、不顯示錯誤） */
+function EditSlot({ editKey, placeholder, children }: { editKey: number; placeholder: ReactNode; children: ReactNode }) {
+    return (
+        <ModuleErrorBoundary resetKey={String(editKey)} fallback={() => placeholder}>
+            <Suspense fallback={placeholder}>{children}</Suspense>
+        </ModuleErrorBoundary>
+    );
+}
+
+const LEADING_PLACEHOLDER = (
+    <span className={styles.rowLeading} aria-hidden='true' data-testid='watch-edit-leading-blank'>
+        <span className={styles.ticketSpacer} />
+    </span>
+);
+const TRAILING_PLACEHOLDER = (
+    <span className={`${styles.rowTrailing} ${styles.trailingPair}`} aria-hidden='true' data-testid='watch-edit-trailing-blank'>
+        <span className={styles.ticketSpacer} />
+        <span className={styles.ticketSpacer} />
+    </span>
+);
+
 interface WatchRowProps {
     item: WatchItem;
     index: number;
     tracker: VisibilityTracker | null;
     editing: boolean;
+    /** 編輯鍵重試次數：改變時清除列內編輯槽的錯誤狀態 */
+    editKey: number;
     metric: WatchMetric;
     /** 顯示迷你走勢：設定開啟且放得下（否則不掛載走勢欄、不請求、不留佔位） */
     spark: boolean;
     punished: boolean;
     /** 拖曳中的列 */
     dragging: boolean;
-    /** 握把停用（清單載入或結構更新中） */
+    /** 握把停用（清單載入或結構更新中，或拖曳排序尚未就緒） */
     gripDisabled: boolean;
     grip: ListReorder['grip'];
     onOpen: (code: string) => void;
@@ -179,7 +237,7 @@ interface WatchRowProps {
     onTicket: (code: string) => void;
 }
 
-const WatchRow = memo(function WatchRow({ item, index, tracker, editing, metric, spark, punished, dragging, gripDisabled, grip, onOpen, onActions, onRemove, onTicket }: WatchRowProps) {
+const WatchRow = memo(function WatchRow({ item, index, tracker, editing, editKey, metric, spark, punished, dragging, gripDisabled, grip, onOpen, onActions, onRemove, onTicket }: WatchRowProps) {
     const code = item.contract.code;
     const name = item.contract.name ?? '';
     const tradable = tradableContract(item.contract);
@@ -206,32 +264,14 @@ const WatchRow = memo(function WatchRow({ item, index, tracker, editing, metric,
             onTicket={onTicket}
             dragging={dragging}
             leading={editing ? (
-                <span className={styles.rowLeading}>
-                    <IconButton ariaLabel={`從自選移除 ${label}`} icon={CircleMinus} onClick={() => onRemove(code)} testId='watch-row-remove' />
-                </span>
+                <EditSlot editKey={editKey} placeholder={LEADING_PLACEHOLDER}>
+                    <WatchEditLeading code={code} label={label} onRemove={onRemove} />
+                </EditSlot>
             ) : undefined}
             trailing={editing ? (
-                <span className={`${styles.rowTrailing} ${styles.trailingPair}`}>
-                    <IconButton ariaLabel={`${code} 更多操作`} icon={MoreHorizontal} onClick={() => onActions(code)} testId='watch-more' />
-                    <button
-                        type='button'
-                        className={`${styles.grip} ${focusRing}`}
-                        aria-label={`拖曳以調整 ${label} 的位置`}
-                        aria-keyshortcuts='ArrowUp ArrowDown'
-                        disabled={gripDisabled}
-                        onPointerDown={e => grip.onPointerDown(code, e)}
-                        onPointerMove={grip.onPointerMove}
-                        onPointerUp={grip.onPointerUp}
-                        onPointerCancel={grip.onPointerCancel}
-                        onLostPointerCapture={grip.onPointerCancel}
-                        onKeyDown={e => grip.onKeyDown(code, e)}
-                        onClick={grip.onClick}
-                        onContextMenu={e => e.preventDefault()}
-                        data-testid='watch-row-grip'
-                    >
-                        <GripVertical size={20} aria-hidden='true' focusable='false' />
-                    </button>
-                </span>
+                <EditSlot editKey={editKey} placeholder={TRAILING_PLACEHOLDER}>
+                    <WatchEditTrailing code={code} label={label} gripDisabled={gripDisabled} grip={grip} onActions={onActions} />
+                </EditSlot>
             ) : undefined}
         />
     );
@@ -446,12 +486,23 @@ export function WatchlistPage() {
     const onAddRanked = useCallback(async (code: string) => { await addSymbol(code, 'STK'); }, [addSymbol]);
     const canAdd = !wl.loading && !wl.structureBusy && !wl.loadError;
 
-    // 拖曳排序（編輯模式的握把）：放手時位置有變才呼叫一次 reorderSymbol
+    // 拖曳排序（編輯模式的握把；延遲載入的 WatchEditReorder 把 useListReorder 的結果交回）：放手時位置有變才呼叫一次 reorderSymbol
     const listRef = useRef<HTMLUListElement | null>(null);
     const codes = useMemo(() => wl.items.map(i => i.contract.code), [wl.items]);
     const gripDisabled = !canReorderList(wl);
-    const reorder = useListReorder({ listRef, codes, disabled: gripDisabled || !editing, onMove: reorderSymbol });
-    const { blocked } = reorder;
+    const [reorder, setReorder] = useState<ListReorder | null>(null);
+    const reorderRef = useRef<ListReorder | null>(null);
+    const onReorder = useCallback((next: ListReorder | null) => {
+        reorderRef.current = next;
+        setReorder(next);
+    }, []);
+    const blocked = useCallback(() => reorderRef.current?.blocked() ?? false, []);
+    /** 編輯鍵載入失敗後按［重試］的次數：改變時清除列內編輯槽的錯誤狀態 */
+    const [editKey, setEditKey] = useState(0);
+    const retryEditControls = useCallback(() => {
+        resetWatchEditControls();
+        setEditKey(k => k + 1);
+    }, []);
     // 拖曳中與剛放手時不開交易頁、不開操作面板
     const openRow = useCallback((code: string) => { if (!blocked()) openTrade(code); }, [blocked, openTrade]);
     const openActions = useCallback((code: string) => {
@@ -638,7 +689,11 @@ export function WatchlistPage() {
                         className={`${styles.editButton} ${pressable} ${focusRing}`}
                         aria-label={editing ? '完成編輯' : '編輯自選'}
                         aria-pressed={editing}
-                        onClick={() => setEditing(v => !v)}
+                        onClick={() => {
+                            // 編輯鍵上次載入失敗：再次進入編輯模式時重新 import（未失敗時不動）
+                            if (!editing) resetWatchEditControls();
+                            setEditing(v => !v);
+                        }}
                         data-testid='watch-edit'
                     >
                         <Pencil className={styles.metricIcon} aria-hidden='true' focusable='false' />
@@ -657,6 +712,13 @@ export function WatchlistPage() {
                 />
             )}
 
+            {showList && editing && (
+                <ModuleErrorBoundary onRetry={retryEditControls} fallback={props => <ModuleLoadError {...props} testId='watch-edit-load-error' />}>
+                    <Suspense fallback={null}>
+                        <WatchEditReorder listRef={listRef} codes={codes} disabled={gripDisabled} onMove={reorderSymbol} reducedMotion={prefersReducedMotion} onChange={onReorder} />
+                    </Suspense>
+                </ModuleErrorBoundary>
+            )}
             {showList && (
                 <ul ref={listRef} className={styles.list} aria-label='自選商品' data-testid='watch-list'>
                     {wl.items.map((item, index) => (
@@ -666,12 +728,13 @@ export function WatchlistPage() {
                             index={index}
                             tracker={tracker}
                             editing={editing}
+                            editKey={editKey}
                             metric={metric}
                             spark={spark}
                             punished={punished.has(item.contract.code)}
-                            dragging={reorder.dragging === item.contract.code}
-                            gripDisabled={gripDisabled}
-                            grip={reorder.grip}
+                            dragging={reorder?.dragging === item.contract.code}
+                            gripDisabled={gripDisabled || !reorder}
+                            grip={reorder?.grip ?? NOOP_GRIP}
                             onOpen={openRow}
                             onActions={openActions}
                             onRemove={askRemove}
