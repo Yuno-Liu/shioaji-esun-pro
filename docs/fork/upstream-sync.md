@@ -52,7 +52,7 @@ git merge upstream/main                         # 不要 rebase：保留可追�
 | `vite.config.ts` | 9 | 0 | +198／−1 → 只剩 `/esun` proxy | 不再加入 fork 邏輯 |
 | `src/lib/account-store.ts` | 8 | 7 | +106／−18 | 只新增、不改簽章 |
 | `package.json` | 7 | 3 | +7／−2 | 只動 `scripts` 的 `esun-bridge`／`docker:*`；`name` 已改為 fork 名稱 |
-| `README.md` | 7 | 4 | +237／−13 → 只剩開頭 16 行 | fork 內容放 `docs/fork/` |
+| `README.md` | 7 | 4 | +237／−13 → +290／−0（開頭連續區塊） | fork 說明只放在檔案最前面、`# Shioaji Pro — 專業交易終端 Trading Terminal` 之前的一個連續區塊；從這一行到檔尾與上游逐位元組相同，衝突只會出現在開頭區塊。詳細內容放 `docs/fork/` |
 
 fork 自有、不會與上游衝突的檔案：`server/**`、`src/lib/esun/**`、`deploy/**`、`docs/fork/**`、`Dockerfile`、
 `docker-compose.yml`、`scripts/deploy-docker.*`、`esun-config*.example`、`.env.docker.example`、`.github/workflows/fork-ci.yml`，
@@ -146,7 +146,9 @@ docker build --target runner      -t shioaji-pro-web:sync .
 
 - [ ] `SHIOAJI_VERSION` 有變更時，`shioaji` 映像會自動改裝對應的 `shioaji-cli`；確認 PyPI 上有該版本，並在 UI 確認 `/api/v1/info` 的版本。
 - [ ] 上游 CI 的 pnpm 主版本（`pnpm/action-setup` 的 `version`）若改變，同步更新 `Dockerfile` 的 `PNPM_VERSION`。
-- [ ] `vite.config.ts` 與 `README.md` 仍只有最小的 fork 差異（見上表）。
+- [ ] `vite.config.ts` 仍只有最小的 fork 差異（見上表）。
+- [ ] `README.md` 的 fork 內容仍只在開頭的連續區塊，上游本文（從 `# Shioaji Pro — 專業交易終端 Trading Terminal` 到檔尾）未被改動：
+  `git diff upstream/main -- README.md` 只有一個從第 1 行開始、只含新增行的 hunk。合併衝突時保留上游本文，再把 fork 區塊放回最前面。
 - [ ] 上游若新增 `/api` 路徑、SSE 或 `index.html` 之外的 HTML 入口，確認 `deploy/nginx.conf.template` 的代理與快取規則仍適用。
   其他同源路徑（例如 2026-11 的 `/metadata/*`）在 nginx 會落到 `location /`、回 `index.html`，要確認執行期有後備。
 - [ ] 上游若在 `vite.config.ts` 或 tsconfig 加入新的建置期檔案（例如 `scripts/*.ts`），`Dockerfile` 的 builder 階段要一併 COPY。

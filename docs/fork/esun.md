@@ -47,7 +47,7 @@ flowchart TD
 
 ```powershell
 # Windows PowerShell
-Copy-Item esun-config.simulation.ini.example esun-config.simulation.ini   # 別名：esun-config.sim.ini
+Copy-Item esun-config.simulation.ini.example esun-config.simulation.ini   # 別名：esun-config.sim.ini、esun-config.test.ini
 Copy-Item esun-config.production.ini.example esun-config.production.ini   # 別名：esun-config.prod.ini
 ```
 
