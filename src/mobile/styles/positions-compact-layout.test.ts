@@ -83,3 +83,15 @@ describe('精簡列右欄：放不下時換行，字級「大」上下排列', (
         }
     });
 });
+
+describe('精簡列第二列：現價與兩平價（期權為均價）', () => {
+    it('橫跨名稱與損益兩欄（chevron 欄除外）、可換行、不裁切；chevron 跨兩列', () => {
+        const prices = styleBlock('compactPrices');
+        expect(prices).toMatch(/gridColumn:\s*'1 \/ 3'/);
+        expect(prices).toMatch(/flexWrap:\s*'wrap'/);
+        expect(prices).toMatch(/whiteSpace:\s*'nowrap'/);
+        expect(prices).not.toMatch(/overflow/);
+        expect(prices).not.toMatch(/textOverflow/);
+        expect(styleBlock('compactChevron')).toMatch(/gridRow:\s*'1 \/ span 2'/);
+    });
+});

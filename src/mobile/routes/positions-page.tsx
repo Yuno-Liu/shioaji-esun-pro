@@ -33,7 +33,8 @@
 //   今日買進股數：玉山庫存明細（分批成交日）→ 今日成交回報（委託查詢成功時）；都沒有則一般稅率並標「未判斷當沖」。
 //   期權維持券商損益並標「未扣費稅」。摘要、分組小計、損益條、損益／報酬率排序都用同一個值；無法計算的列不猜，標「合計待確認」。
 // - 「詳細｜精簡」檢視（篩選列行尾 Segmented toggle；lib/positions-view 存 localStorage，預設詳細）：
-//   精簡＝每個部位一列（名稱／代碼・條件・多空數量｜淨損益／報酬率・已過或未達兩平），帳戶分組、摘要、篩選、排序照常、摘要卡較緊湊。
+//   精簡＝每個部位一列（名稱／代碼・條件・多空數量｜淨損益／報酬率・已過或未達兩平；第二列現價＋兩平價，期權為均價），
+//   帳戶分組、摘要、篩選、排序照常、摘要卡較緊湊。
 //   點列（aria-expanded）就地展開既有詳細卡片（不重複第一行），再點收合；平倉、加碼、看圖入口與流程不變，不新增送單入口。
 //   未展開的列不掛詳細卡片子樹；切換時以切換鍵為錨點保留捲動位置；減少動態時不做展開動畫。
 // - 重繪範圍（稽核 P2）：詳細列與精簡列以 memo 包起來，只比該列用到的值（持倉物件參考、淨損益數值、遮蔽、平倉停用…）；
@@ -624,7 +625,19 @@ export const COMPACT_TEXT = {
     atBreakEven: '等於兩平',
     /** 精簡列報酬率的報讀標籤（視覺上只有數字） */
     returnSrLabel: '報酬率（估）',
+    breakEvenLabel: '兩平價',
+    avgLabel: '均價',
 } as const;
+
+/**
+ * 精簡列第二列的參考價：股票＝兩平價（rowPnlOf 的 StockPnl.breakEven，依跳動價位格式化，同詳細卡片；算不出為「—」）；
+ * 期權沒有兩平模型（不猜費用）→ 均價，標籤明確寫「均價」。價格不遮蔽（同詳細卡片的均價、兩平價）。
+ */
+export function compactRefPrice(p: Pick<Position, 'price'>, rp: RowPnl): { label: string; value: string } {
+    if (rp.deriv) return { label: COMPACT_TEXT.avgLabel, value: fmtPrice(p.price) };
+    const be = rp.stock?.breakEven;
+    return { label: COMPACT_TEXT.breakEvenLabel, value: be !== null && be !== undefined && rp.contract ? formatToTick(rp.contract, be) : '—' };
+}
 
 /**
  * 精簡列右側第二行的狀態文字（不只靠顏色）：股票＝現價與兩平價的關係（已過兩平／未達兩平／等於兩平）；
@@ -653,7 +666,7 @@ export function compactRowPropsEqual(a: CompactRowProps, b: CompactRowProps): bo
     return !a.open || rowPropsEqual(a.detail, b.detail);
 }
 
-/** 精簡列：左＝名稱／代碼・條件・多空數量；右＝淨損益／報酬率（缺時現價）・兩平狀態；點一下就地展開既有詳細卡片 */
+/** 精簡列：左＝名稱／代碼・條件・多空數量；右＝淨損益／報酬率・兩平狀態；第二列＝現價＋兩平價（期權均價）；點一下就地展開既有詳細卡片 */
 function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail }: CompactRowProps) {
     const contract = useContract(p.code);
     const detailId = useId();
@@ -661,6 +674,7 @@ function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail }: Compac
     const ret = rowReturnPct(p, rp);
     const status = compactStatusText(p, rp);
     const name = contract?.name;
+    const ref = compactRefPrice(p, rp);
     return (
         <li className={styles.compactItem} data-testid='position-compact-row' data-code={p.code}>
             <button
@@ -688,13 +702,16 @@ function PositionCompactRow({ p, privMoney, rp, open, onToggle, detail }: Compac
                     </span>
                     <span className={styles.compactSub}>
                         {/* 報讀標籤：視覺上只有數字，按鈕的無障礙名稱補上欄位名稱（同詳細卡片的「報酬率（估）」） */}
-                        {ret !== null
-                            ? <span className={styles.tone[pnlTone(ret)]}><span className={srOnly}>{COMPACT_TEXT.returnSrLabel}</span><span data-testid='position-compact-return'>{fmtPct(ret)}</span></span>
-                            : <span data-testid='position-compact-price'>現價 {fmtPrice(p.last_price)}</span>}
+                        {ret !== null && <span className={styles.tone[pnlTone(ret)]}><span className={srOnly}>{COMPACT_TEXT.returnSrLabel}</span><span data-testid='position-compact-return'>{fmtPct(ret)}</span></span>}
                         {status && <span data-testid='position-compact-status'>{status}</span>}
                     </span>
                 </span>
                 <ChevronRight className={styles.compactChevron} aria-hidden='true' focusable='false' />
+                {/* 第二列：現價＋兩平價（股票）或均價（期權沒有兩平模型，不估費用；明確標「均價」） */}
+                <span className={styles.compactPrices}>
+                    <span data-testid='position-compact-price'>現價 {fmtPrice(p.last_price)}</span>
+                    <span data-testid='position-compact-ref'>{ref.label} {ref.value}</span>
+                </span>
             </button>
             {open && <MemoPositionRow {...detail} embeddedId={detailId} />}
         </li>

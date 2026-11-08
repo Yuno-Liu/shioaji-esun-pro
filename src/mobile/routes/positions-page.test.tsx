@@ -1168,6 +1168,28 @@ describe('「詳細｜精簡」檢視', () => {
         expect(textOf(one('position-total-pending'))).toContain('合計待確認：1 筆');
     });
 
+    it('精簡列第二列：現價＋兩平價（股票，依跳動價位、同詳細卡片）；期權顯示「均價」不標兩平；兩平算不出為「—」', async () => {
+        m.privMoney = true; // 價格不遮蔽（同詳細卡片的均價與兩平價）
+        setPositions([stockPos(), futPos(), stockPos({ id: 8, code: '9999' })]);
+        vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'compact' }));
+        await render();
+        expect(textOf(inCompact('2330', 'position-compact-price'))).toBe('現價 1,085');
+        expect(textOf(inCompact('2330', 'position-compact-ref'))).toBe('兩平價 1,060');
+        // 已過／未達兩平的文字照舊
+        expect(textOf(inCompact('2330', 'position-compact-status'))).toBe(COMPACT_TEXT.aboveBreakEven);
+        expect(textOf(inCompact('TXFL6', 'position-compact-price'))).toBe('現價 22,950');
+        expect(textOf(inCompact('TXFL6', 'position-compact-ref'))).toBe('均價 22,800');
+        expect(textOf(compactRowOf('TXFL6'))).not.toContain('兩平');
+        expect(textOf(inCompact('9999', 'position-compact-ref'))).toBe('兩平價 —');
+        // 與展開後的詳細卡片同值
+        await click(inCompact('2330', 'position-compact-toggle'));
+        expect(textOf(inRow('2330', 'position-breakeven'))).toBe('1,060');
+        // 現價、兩平價都在按鈕內（無障礙名稱含欄位名稱）；點列仍是展開
+        const toggle = inCompact('2330', 'position-compact-toggle');
+        expect(textOf(toggle)).toContain('現價 1,085');
+        expect(toggle.props['aria-expanded']).toBe(true);
+    });
+
     it('遮蔽金額：精簡列的淨損益與數量都遮蔽（報酬率不含金額照常）', async () => {
         m.privMoney = true;
         vi.stubGlobal('localStorage', fakeStorage({ [POSITIONS_VIEW_KEY]: 'compact' }));
@@ -1339,6 +1361,25 @@ describe('列的重繪範圍（稽核 P2）', () => {
         expect(renders('2330')).toBe(s0);
         const futRow = view!.root.find(n => n.props['data-testid'] === 'position-compact-row' && n.props['data-code'] === 'TXFL6' && typeof n.type === 'string');
         expect(textOf(futRow.find(n => n.props['data-testid'] === 'position-compact-pnl'))).toBe('+31,000');
+    });
+
+    it('精簡檢視：只有跳價那列的現價與兩平狀態更新並重繪，其他列不重繪', async () => {
+        vi.stubGlobal('localStorage', { getItem: () => 'compact', setItem: () => undefined });
+        const fut = futPos();
+        setPositions([stockPos(), fut]);
+        await render();
+        const s0 = renders('2330');
+        const f0 = renders('TXFL6');
+        // 股票跳價到兩平價以下：只換該列持倉物件
+        setPositions([stockPos({ last_price: 1055, pnl: 8_750 }), fut]);
+        await rerender();
+        expect(renders('2330')).toBeGreaterThan(s0);
+        expect(renders('TXFL6')).toBe(f0);
+        const stockRow = view!.root.find(n => n.props['data-testid'] === 'position-compact-row' && n.props['data-code'] === '2330' && typeof n.type === 'string');
+        const inStock = (id: string) => textOf(stockRow.find(n => n.props['data-testid'] === id && typeof n.type === 'string'));
+        expect(inStock('position-compact-price')).toBe('現價 1,055');
+        expect(inStock('position-compact-ref')).toBe('兩平價 1,060');
+        expect(inStock('position-compact-status')).toBe(COMPACT_TEXT.belowBreakEven);
     });
 });
 

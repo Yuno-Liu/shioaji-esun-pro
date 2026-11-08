@@ -576,6 +576,7 @@ export const compactRow = style([pressableRow, {
     gridTemplateColumns: 'minmax(min-content, 1fr) auto auto',
     alignItems: 'center',
     columnGap: SPACE.s3,
+    rowGap: '0.125rem',
     boxSizing: 'border-box',
     width: '100%',
     minHeight: '60px',
@@ -691,8 +692,28 @@ export const compactSub = style({
     },
 });
 
-/** 展開提示：收合時朝右、展開時朝下（transform；減少動態時瞬間） */
+/**
+ * 第二列（橫跨名稱與損益兩欄，不含 chevron 欄）：現價＋兩平價（期權為均價）。
+ * 各項不縮不省略（價格被截斷會誤讀），放不下時整項換行；360 寬、字級 1.3 仍不水平捲動。
+ */
+export const compactPrices = style({
+    gridColumn: '1 / 3',
+    gridRow: 2,
+    display: 'flex',
+    flexWrap: 'wrap',
+    columnGap: SPACE.s3,
+    rowGap: '0.125rem',
+    minWidth: 0,
+    ...TEXT.footnote,
+    ...NUMERIC,
+    color: vars.color.mutedForeground,
+    whiteSpace: 'nowrap',
+});
+
+/** 展開提示：收合時朝右、展開時朝下（transform；減少動態時瞬間）；跨兩列垂直置中 */
 export const compactChevron = style([actionIcon, {
+    gridColumn: 3,
+    gridRow: '1 / span 2',
     color: vars.color.mutedForeground,
     transition: `transform ${DUR.tone}ms ${EASE.out}`,
     selectors: {
