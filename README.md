@@ -214,13 +214,13 @@ tailscale serve status    # 確認 https://<機器>.<tailnet>.ts.net 已轉到 1
 
 `deploy-docker.ps1` 另有 `-NoBuild`（不重新建置）、`-Port <埠>`、`-HostBridge`。修改 `.env` 後執行 `docker compose up -d` 套用。
 
-**`git pull` 之後更新**：執行 `pnpm run docker:deploy`（或 `./scripts/deploy-docker.sh up`）重新建置並啟動三個服務。只想重建 web（前端、手機版、nginx）時，**web 與永豐 sidecar 一定要一起重建**：
+**`git pull` 之後更新**：執行 `pnpm run docker:deploy`（或 `./scripts/deploy-docker.sh up`）重新建置並啟動三個服務；指令不指定服務時，compose 會在 web 重建後一併重建永豐 sidecar。只想重建 web（前端、手機版、nginx）時，指令裡 **web 與永豐 sidecar 一定要一起寫**：
 
 ```bash
 docker compose up -d --build shioaji-pro-web shioaji-server
 ```
 
-永豐 sidecar 使用 `network_mode: service:shioaji-pro-web`（共用 web 的網路命名空間）。只重建 web 時，sidecar 還留在舊的命名空間，nginx 連不到 `127.0.0.1:21322`，`/api/` 回 502。發生時執行 `docker compose up -d --force-recreate shioaji-pro-web shioaji-server` 讓兩者一起重建。
+永豐 sidecar 使用 `network_mode: service:shioaji-pro-web`（共用 web 的網路命名空間）。指令只寫 web（例如 `docker compose up -d --build shioaji-pro-web`）時，compose 不會重建 sidecar，它還留在舊 web 的命名空間，nginx 連不到 `127.0.0.1:21322`，`/api/` 回 502。發生時執行 `docker compose up -d --force-recreate shioaji-pro-web shioaji-server` 讓兩者一起重建。
 
 ## 模擬與正式環境
 
