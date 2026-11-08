@@ -97,6 +97,77 @@ export const legendValue = style({
     color: vars.color.foreground,
 });
 
+// ---- 價格資訊列（點選或長按追蹤：時間＋價格＋漲跌＋漲跌%；圖例的第一列，下方圖例往下排，不重疊） ----
+
+/** 獨佔圖例的一整列（圖例右側已留給價格軸） */
+export const readout = style({
+    flex: '1 0 100%',
+    display: 'flex',
+    minWidth: 0,
+});
+
+/** 含漲跌色小字：放在 islandBg 中性島（§4.8 規則 7）；放不下時以組為單位換行，不截斷 */
+export const readoutPill = style({
+    display: 'inline-flex',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: `0 ${SPACE.s2}`,
+    maxWidth: '100%',
+    padding: `0 0 0 ${SPACE.s1_5}`,
+    borderRadius: RADIUS.sm,
+    background: sj.islandBg,
+    color: vars.color.foreground,
+});
+
+/** 漲跌＋✕：同一組不拆行 */
+export const readoutTail = style({
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: SPACE.s1,
+    whiteSpace: 'nowrap',
+});
+
+export const readoutTime = style({
+    whiteSpace: 'nowrap',
+    color: vars.color.mutedForeground,
+});
+
+export const readoutPrice = style({
+    whiteSpace: 'nowrap',
+    fontWeight: 700,
+});
+
+/** ✕：圖例整體不接觸控（pointer-events none），只有這顆接；點擊區以 ::before 擴到 TOUCH_MIN 見方 */
+export const readoutClose = style([focusRing, {
+    position: 'relative',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: '1.5rem',
+    minHeight: '1.5em',
+    padding: 0,
+    margin: 0,
+    border: 'none',
+    borderRadius: RADIUS.sm,
+    background: 'transparent',
+    color: vars.color.mutedForeground,
+    font: 'inherit',
+    pointerEvents: 'auto',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&::before': {
+            content: '""',
+            position: 'absolute',
+            top: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
+            bottom: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
+            left: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
+            right: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
+        },
+    },
+}]);
+
 // ---- 工具列 ----
 
 /** 圖表下方：說明文字＋「指標」「全螢幕」Chip */

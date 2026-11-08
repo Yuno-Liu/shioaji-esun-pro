@@ -19,6 +19,12 @@
 //   一般模式下選價列出現時捲到可見範圍（main 的 scroll-padding-bottom 讓出底部 chrome），以免落在交易鍵列／分頁列後面；
 //   量測用沒有 transform 的外層（pickAnchor），進場動畫的 translateY 不影響捲動量。全螢幕與收回殘影不捲動。
 //   副圖上的十字線不拿來選價（座標不是價格）。點委託線標籤 → openOrderAction(tradeId, 'menu')。
+// - 輕點（沒拖超過 LONG_PRESS_SLOP_PX、未達 LONG_PRESS_MS、單指、不在按鈕上、落在主圖）：十字線吸附到最近一根並釘住，
+//   圖例第一列顯示價格資訊（lib/chart-readout.ts：走勢＝時間、價格、漲跌、漲跌%，基準同走勢基準線的參考價；
+//   K 線＝收盤與「較前一根」）。再點同一根、按 ✕、開始平移或雙指、換週期／商品／全螢幕時收起。
+//   長按追蹤時同一列跟著十字線。**輕點只顯示資訊，不開選價列、不開下單面板**。
+//   程式庫在觸控放開、資料更新、滑鼠移動時會自己移動或清除十字線：釘住期間在 crosshairMove 裡放回那一根。
+//   資訊列以小 store（useSyncExternalStore）只重繪該列，不重繪整個圖表元件。
 //   不支援拖曳委託線改價（規格 R7）。可互動區加 data-allow-pinch="true"（平台手勢防護略過這一區）。
 // - 橫向全螢幕：手機轉橫向（lib/chart-fullscreen.ts）或按「全螢幕」→ CSS 固定定位覆蓋全畫面（留安全區），
 //   上方週期＋指標＋「退出」，下方買進／賣出（只開下單面板）。iPhone Safari 沒有元素 Fullscreen API，
@@ -36,11 +42,12 @@ import {
     TrackingModeExitMode,
     type IChartApi,
     type IPriceLine,
+    type Logical,
     type ISeriesApi,
     type SeriesType,
     type UTCTimestamp,
 } from 'lightweight-charts';
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from 'react';
 import { useQuote } from '../../hooks/use-stream';
 import { useResumeGate } from '../hooks/use-resume-gate';
 import { nextChartHistoryRevision } from '../../lib/chart-history';
@@ -54,6 +61,7 @@ import type { Candle } from '../../lib/types/market';
 import { aggregate, kbarsToCandles, nowWallClockUtc, wallClockToUtc } from '../../lib/utils/kbars';
 import { roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
 import { formatToTick } from '../lib/num-format';
+import { chartReadout, createReadoutStore, type ReadoutStore } from '../lib/chart-readout';
 import { currentOrientationEnv, shouldAutoFullscreen } from '../lib/chart-fullscreen';
 import { fetchMobileChartHistory } from '../lib/chart-history-cache';
 import { getHistoryEntry, planHistory, setHistoryEntry } from '../lib/chart-history-freshness';
@@ -89,6 +97,8 @@ export const LONG_PRESS_MS = 450;
 /** 全螢幕週期 Segmented 的選項 */
 const PERIOD_ITEMS = CHART_PERIODS.map(p => ({ value: p.key, label: p.label }));
 export const LONG_PRESS_SLOP_PX = 10;
+/** 輕點釘住價格資訊後，再點離那一根 x 在這個距離內＝「再點同一點」（收起） */
+export const TAP_SAME_SPOT_PX = 12;
 /** 歷史與即時之間出現斷層時補抓歷史的最短間隔 */
 export const GAP_RELOAD_MIN_MS = 120_000;
 /** 走勢：即時成交與最後一根相隔超過這個秒數，且累計量顯示漏量時補抓（與桌面 intraday-chart 相同） */
@@ -190,6 +200,54 @@ export interface TradeChartProps {
     onPeriodChange?: (p: ChartPeriod) => void;
 }
 
+/** 按在按鈕上（選價列、委託線標籤、資訊列 ✕）：不算圖表上的輕點 */
+function isControl(target: EventTarget | null): boolean {
+    const el = target as { closest?: (sel: string) => unknown } | null;
+    return typeof el?.closest === 'function' && el.closest('button') !== null;
+}
+
+/**
+ * 價格資訊列（圖例第一列）：輕點釘住時有 ✕；長按追蹤時跟著十字線。
+ * 自己訂閱小 store，十字線移動只重繪這一列。
+ */
+function ReadoutLine({ store, onClose }: { store: ReadoutStore; onClose: () => void }) {
+    const r = useSyncExternalStore(store.subscribe, store.get, store.get);
+    if (!r) return null;
+    const tone = styles.dirText[r.dir];
+    return (
+        <div className={cs.readout} data-testid='chart-readout' data-source={r.source}>
+            <span className={cs.readoutPill} role='group' aria-label={r.ariaLabel}>
+                <span className={cs.readoutTime} aria-hidden='true'>{r.time}</span>
+                <span className={`${cs.readoutPrice} ${tone}`} aria-hidden='true' data-testid='chart-readout-price'>
+                    {r.priceLabel ? `${r.priceLabel} ${r.price}` : r.price}
+                </span>
+                {(r.change || r.source === 'tap') && (
+                    // 漲跌與 ✕ 同一組換行：字級大放不下時整組到第二行，✕ 不會單獨落到下一行
+                    <span className={cs.readoutTail}>
+                        {r.change && (
+                            <span className={tone} aria-hidden='true' data-testid='chart-readout-change'>
+                                {`${r.change.label ? `${r.change.label} ` : ''}${r.change.text} (${r.change.pct})`}
+                            </span>
+                        )}
+                        {r.source === 'tap' && (
+                            <button
+                                type='button'
+                                className={cs.readoutClose}
+                                onPointerDown={e => e.stopPropagation()}
+                                onClick={onClose}
+                                aria-label='關閉價格資訊'
+                                data-testid='chart-readout-close'
+                            >
+                                ✕
+                            </button>
+                        )}
+                    </span>
+                )}
+            </span>
+        </div>
+    );
+}
+
 export function TradeChart({ code, contract, period, lines, onPeriodChange }: TradeChartProps) {
     const theme = useThemeSettings();
     const themeK = themeKey(theme);
@@ -227,6 +285,15 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const trackingRef = useRef(false);
     const crossPriceRef = useRef<number | null>(null);
     const pressRef = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
+    /** 目前這次按壓（第一指）；tap＝仍可能是輕點（沒拖超過容許位移、不是多指、不在按鈕上、未進入追蹤） */
+    const gestureRef = useRef<{ x: number; y: number; tap: boolean } | null>(null);
+    /** 按著的指標（pointerId）：第二指＝雙指縮放 */
+    const pointersRef = useRef(new Set<number>());
+    /** 輕點（相對圖表的座標）：釘住或收起價格資訊（由圖表 effect 提供） */
+    const tapRef = useRef<(x: number, y: number) => void>(() => undefined);
+    /** 收起輕點的價格資訊；clearChart＝一併清掉十字線（長按進入追蹤時不清，十字線交給程式庫） */
+    const hideTapRef = useRef<(clearChart: boolean) => void>(() => undefined);
+    const [readout] = useState<ReadoutStore>(createReadoutStore);
 
     const [status, setStatus] = useState<Status>('loading');
     const [chartGen, setChartGen] = useState(0);
@@ -360,6 +427,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         let indTimer: ReturnType<typeof setTimeout> | null = null;
         /** 目前追蹤中的十字線資料（null＝顯示最新值） */
         let crossData: Map<unknown, unknown> | null = null;
+        /** 輕點釘住的那一根（時間）；null＝沒有 */
+        let tapTime: number | null = null;
+        readout.set(null);
 
         const volPoint = (b: Candle) => ({ time: t(b.time), value: b.volume, color: b.close >= b.open ? c.upVol : c.downVol });
         const mainPoint = (b: Candle) => (isLine ? { time: t(b.time), value: b.close } : { time: t(b.time), open: b.open, high: b.high, low: b.low, close: b.close });
@@ -806,7 +876,86 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleLayout);
         chart.timeScale().subscribeSizeChange(scheduleLayout);
 
-        // 十字線：長按追蹤時記錄價格（只在主圖）；圖例顯示該根的值
+        // ---- 價格資訊列：輕點釘住、長按追蹤 ----
+        const indexOfTime = (time: number): number => {
+            let lo = 0;
+            let hi = bars.length - 1;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                const v = bars[mid]!.time;
+                if (v === time) return mid;
+                if (v < time) lo = mid + 1;
+                else hi = mid - 1;
+            }
+            return -1;
+        };
+        const readoutAt = (i: number, source: 'tap' | 'track') => chartReadout(bars, i, {
+            mode: isLine ? 'line' : 'kbar',
+            daily: minutes >= 1440,
+            contract: contractRef.current,
+            reference: contractRef.current.reference,
+            source,
+        });
+        /** 第 i 根各 series 的值：圖例顯示該根（同長按追蹤） */
+        const crossDataAt = (i: number): Map<unknown, unknown> => {
+            const map = new Map<unknown, unknown>();
+            const all: ISeriesApi<SeriesType>[] = [main, ...(avgSeries ? [avgSeries] : []), ...inds.flatMap(r => r.outputs.map(o => o.series))];
+            for (const s of all) {
+                try {
+                    const d = s.dataByIndex(i);
+                    if (d) map.set(s, d);
+                } catch {
+                    // API 差異：該值顯示 —
+                }
+            }
+            return map;
+        };
+        const showTap = (i: number) => {
+            const bar = bars[i];
+            if (!bar) return;
+            tapTime = bar.time;
+            try {
+                // 程式設定的十字線不觸發 crosshairMove（skipEvent）
+                chart.setCrosshairPosition(bar.close, t(bar.time), main);
+            } catch {
+                // 十字線 API 差異不能讓圖表掛掉
+            }
+            crossData = crossDataAt(i);
+            publishLegend();
+            readout.set(readoutAt(i, 'tap'));
+        };
+        const hideTap = (clearChart: boolean) => {
+            if (tapTime === null) return;
+            tapTime = null;
+            readout.set(null);
+            if (!clearChart) return;
+            try { chart.clearCrosshairPosition(); } catch { /* 十字線 API 差異 */ }
+            if (crossData !== null) {
+                crossData = null;
+                publishLegend();
+            }
+        };
+        hideTapRef.current = hideTap;
+        tapRef.current = (x, y) => {
+            if (cancelled || bars.length === 0) return;
+            const ts = chart.timeScale();
+            const width = ts.width();
+            if (width > 0 && x > width) return; // 價格軸
+            const mainH = mainPaneHeightRef.current ?? host.clientHeight - 24;
+            if (y < 0 || y > mainH) return; // 時間軸、副圖
+            const logical = ts.coordinateToLogical(x);
+            if (logical === null || !Number.isFinite(logical)) return;
+            // 吸附到最近一根有資料的（走勢：有成交的那一分鐘）；超出兩端取第一根或最後一根
+            const i = Math.min(bars.length - 1, Math.max(0, Math.round(logical)));
+            // 再點同一點：收起。走勢一分鐘常只有 1px 寬，手指再點難免偏幾 px →
+            // 落在同一根，或離釘住那一根的 x 在 TAP_SAME_SPOT_PX 內，都算同一點
+            const pinned = tapTime === null ? -1 : indexOfTime(tapTime);
+            const pinnedX = pinned < 0 ? null : ts.logicalToCoordinate(pinned as Logical);
+            if (pinned === i || (pinnedX !== null && Math.abs(x - pinnedX) <= TAP_SAME_SPOT_PX)) hideTap(true);
+            else showTap(i);
+        };
+
+        // 十字線：長按追蹤時記錄價格（只在主圖）；圖例顯示該根的值；價格資訊列跟著十字線
         chart.subscribeCrosshairMove(param => {
             if (trackingRef.current && param.point) {
                 if (param.paneIndex !== undefined && param.paneIndex > 0) crossPriceRef.current = null;
@@ -815,7 +964,18 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                     if (p !== null && Number.isFinite(p)) crossPriceRef.current = p;
                 }
             }
+            // 輕點釘住期間：程式庫在觸控放開、資料更新（以像素位置重算）、滑鼠移動／移出時會移動或清除十字線 → 放回那一根。
+            // 手指按著時交給程式庫（長按追蹤、平移）；放開時由指標事件決定輕點、收起或追蹤。
+            if (tapTime !== null && !gestureRef.current) {
+                const i = indexOfTime(tapTime);
+                if (i < 0) hideTap(true); // 那一根已不在資料中（裁切、換時段）
+                else showTap(i);
+                return;
+            }
             const next = param.time !== undefined && param.seriesData ? (param.seriesData as Map<unknown, unknown>) : null;
+            const at = next !== null && param.point ? indexOfTime(Number(param.time)) : -1;
+            if (at >= 0) readout.set(readoutAt(at, 'track'));
+            else if (tapTime === null) readout.set(null);
             if (next === null && crossData === null) return;
             crossData = next;
             publishLegend();
@@ -848,6 +1008,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             cancelled = true;
             offTick();
             ingestRef.current = null;
+            tapRef.current = () => undefined;
+            hideTapRef.current = () => undefined;
+            readout.set(null);
             layoutRef.current = () => undefined;
             rebuildRef.current = () => undefined;
             retryRef.current = () => undefined;
@@ -991,9 +1154,21 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     };
     useEffect(() => clearPress, []);
     useEffect(() => { setPick(null); }, [code, period]);
+    // 進出全螢幕：收起輕點的價格資訊（換週期、商品時圖表重建，也會收起）
+    useEffect(() => { hideTapRef.current(true); }, [fullscreen]);
 
     const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
         if (e.pointerType === 'mouse' && e.button !== 0) return;
+        const pointers = pointersRef.current;
+        if (e.isPrimary !== false) pointers.clear(); // 新的第一指：清掉沒收到放開的舊紀錄
+        pointers.add(e.pointerId ?? 0);
+        if (pointers.size > 1) {
+            // 第二指：雙指縮放開始，不是輕點
+            if (gestureRef.current) gestureRef.current.tap = false;
+            hideTapRef.current(true);
+        } else {
+            gestureRef.current = { x: e.clientX, y: e.clientY, tap: !isControl(e.target) };
+        }
         clearPress();
         trackingRef.current = false;
         const x = e.clientX;
@@ -1003,6 +1178,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             const series = mainRef.current;
             if (!host || !series) return;
             trackingRef.current = true;
+            // 長按成立：不是輕點；十字線已由程式庫的追蹤模式接手（不清除）
+            if (gestureRef.current) gestureRef.current.tap = false;
+            hideTapRef.current(false);
             const rect = host.getBoundingClientRect();
             const mainH = mainPaneHeightRef.current;
             // 落在副圖：座標不是價格，不選價
@@ -1014,11 +1192,30 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         pressRef.current = { x, y, timer };
     };
     const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+        const g = gestureRef.current;
+        if (g?.tap && Math.hypot(e.clientX - g.x, e.clientY - g.y) > LONG_PRESS_SLOP_PX) {
+            // 拖曳超過容許位移：平移（或捲動）開始，收起輕點的價格資訊
+            g.tap = false;
+            hideTapRef.current(true);
+        }
         const press = pressRef.current;
         if (!press || trackingRef.current) return;
         if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > LONG_PRESS_SLOP_PX) clearPress();
     };
-    const onPointerEnd = () => {
+    /** released＝pointerup（pointercancel 不算輕點） */
+    const onPointerEnd = (e: ReactPointerEvent<HTMLDivElement>, released: boolean) => {
+        pointersRef.current.delete(e.pointerId ?? 0);
+        const g = gestureRef.current;
+        gestureRef.current = null;
+        if (released && g?.tap && !trackingRef.current) {
+            // 輕點：只釘住十字線與價格資訊，不開選價列、不開下單面板
+            try {
+                const rect = hostRef.current?.getBoundingClientRect();
+                if (rect) tapRef.current(g.x - rect.left, g.y - rect.top);
+            } catch {
+                // 圖表 API 差異不能讓頁面掛掉
+            }
+        }
         clearPress();
         if (!trackingRef.current) return;
         trackingRef.current = false;
@@ -1061,8 +1258,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const frameClass = fullscreen ? cs.frameFullscreen : cs.frame[(Math.min(paneCount, 2)) as 0 | 1 | 2];
     const periodLabel = CHART_PERIODS.find(p => p.key === period)?.label ?? '';
 
-    const renderLegend = (entries: LegendEntry[], top?: number) => (
+    const renderLegend = (entries: LegendEntry[], top?: number, withReadout = false) => (
         <div className={cs.legend} style={top !== undefined ? { top: `${top + 4}px` } : undefined} data-testid='chart-legend' aria-live='off'>
+            {withReadout && <ReadoutLine store={readout} onClose={() => hideTapRef.current(true)} />}
             {entries.map(l => (
                 <span key={l.id} className={cs.legendItem}>
                     <span className={cs.legendName} style={{ color: l.color }}>{l.name}</span>
@@ -1104,14 +1302,14 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 className={frameClass}
                 onPointerDown={onPointerDown}
                 onPointerMove={onPointerMove}
-                onPointerUp={onPointerEnd}
-                onPointerCancel={onPointerEnd}
+                onPointerUp={e => onPointerEnd(e, true)}
+                onPointerCancel={e => onPointerEnd(e, false)}
                 onContextMenu={e => e.preventDefault()}
                 data-allow-pinch='true'
                 data-testid='trade-chart'
             >
                 <div ref={hostRef} className={styles.chartHost} />
-                {mainLegend.length > 0 && renderLegend(mainLegend)}
+                {renderLegend(mainLegend, undefined, true)}
                 {paneLegends.map(l => <div key={l.id}>{renderLegend([l], paneTops[l.pane])}</div>)}
                 {orderLabels.map(l => (
                     <button
