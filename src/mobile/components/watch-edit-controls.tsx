@@ -18,10 +18,15 @@
 //   - 「刪除 N 檔」→ 確認面板列出要移除的商品；確定後依序（逐檔 await）呼叫 hook 的 removeSymbol（每檔 DELETE＋GET 清單），
 //     顯示進度；清單變忙碌（載入、結構更新）、出錯、換清單時停止。結束後關閉面板、結束多選並以 notify() 回報移除幾檔、幾檔未移除。
 //     開始前清單載入中、結構更新中、載入失敗（canReorderList 同一組條件）時停用。只改自選，不下單（S1）。
+// - 排序群組（GroupSortSheet，工具列「排序群組」開啟；兩個以上清單才可用、多選中不顯示）：
+//   面板直列每個群組（清單），握把拖曳（useListReorder，與自選列相同的手勢規則與減少動態）、握把上 ↑／↓ 鍵與每列的 ↑／↓ 鍵
+//   一次移一格；放手或移動即存（saveListOrder → localStorage，再以 onOrder 通知自選頁重繪），「完成」關閉。伺服器的自選清單沒有順序欄位與排序 API，
+//   順序只存在這台裝置（localStorage），桌面不受影響；不發任何網路請求。自選頁清單分頁與交易頁 ☆ 面板都依這個順序顯示。
 
-import { Circle, CircleCheck, CircleMinus, GripVertical, MoreHorizontal, Square, SquareCheck, SquareMinus } from 'lucide-react';
+import { ChevronDown, ChevronUp, Circle, CircleCheck, CircleMinus, GripVertical, MoreHorizontal, Square, SquareCheck, SquareMinus } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from 'react';
 import { notify } from '../../lib/trade';
+import { LIST_ORDER_KEY, orderLists, readListOrder } from '../lib/watch-list-order';
 import { useListReorder, type ListReorder } from '../lib/watch-reorder';
 import { useMobileWatchlist, type MobileWatchlist } from '../lib/watchlist-context';
 import { button } from '../styles/controls.css';
@@ -256,6 +261,125 @@ function RemoveConfirmSheet({ open, items, listName, disabled, run, onCancel, on
     );
 }
 
+// ---------------------------------------------------------------------------
+// 排序群組（只存在這台裝置）
+
+/** 存群組順序（清單 id 陣列；只存目前顯示的清單，已刪除的 id 因此移除）。寫入失敗（儲存空間不可用）時不保留 */
+export function saveListOrder(ids: readonly string[]): void {
+    try {
+        localStorage.setItem(LIST_ORDER_KEY, JSON.stringify(ids));
+    } catch {
+        // 無痕或配額不足：不保留
+    }
+}
+
+/** 把 from 移到 to 的位置（與 use-watchlist 的 reorderSymbol 相同語意）；任一不在清單中時回傳原陣列 */
+export function moveId(ids: readonly string[], from: string, to: string): readonly string[] {
+    const i = ids.indexOf(from);
+    const j = ids.indexOf(to);
+    if (i < 0 || j < 0 || i === j) return ids;
+    const next = ids.filter(id => id !== from);
+    next.splice(j, 0, from);
+    return next;
+}
+
+/** 排序群組面板：拖曳握把（或握把上 ↑／↓）、每列 ↑／↓ 鍵；移動即存在這台裝置，不發請求 */
+function GroupSortSheet({ open, onClose, reducedMotion, onOrder }: { open: boolean; onClose: () => void; reducedMotion: () => boolean; onOrder: () => void }) {
+    const { serverLists } = useMobileWatchlist();
+    /** 存在這台裝置的順序（開啟時重新讀取；移動時更新並存檔） */
+    const [saved, setSaved] = useState<readonly string[]>(readListOrder);
+    useEffect(() => { if (open) setSaved(readListOrder()); }, [open]);
+    const lists = useMemo(() => orderLists(serverLists, saved), [serverLists, saved]);
+    const ids = useMemo(() => lists.map(l => l.id), [lists]);
+    const listRef = useRef<HTMLUListElement | null>(null);
+    const move = useCallback((from: string, to: string) => {
+        const next = moveId(ids, from, to);
+        setSaved(next);
+        saveListOrder(next);
+        onOrder();
+    }, [ids, onOrder]);
+    const { dragging, grip } = useListReorder({ listRef, codes: ids, disabled: !open, onMove: move, reducedMotion });
+    /** ↑／↓ 鍵移動後把焦點放回同一列的同方向鍵（到頂／底而停用時改放另一個方向）；列以 id 為 key，DOM 搬移時可能失焦 */
+    const refocus = useRef<{ id: string; dir: 'up' | 'down' } | null>(null);
+    useLayoutEffect(() => {
+        const r = refocus.current;
+        refocus.current = null;
+        const row = r ? Array.from(listRef.current?.children ?? []).find(el => el.getAttribute('data-code') === r.id) : undefined;
+        if (!r || !row || typeof row.querySelector !== 'function') return;
+        const btn = row.querySelector<HTMLButtonElement>(`[data-dir="${r.dir}"]:not(:disabled)`) ?? row.querySelector<HTMLButtonElement>('[data-dir]:not(:disabled)');
+        btn?.focus();
+    }, [ids]);
+    const step = (id: string, dir: 'up' | 'down') => {
+        const to = ids[ids.indexOf(id) + (dir === 'up' ? -1 : 1)];
+        if (!to) return;
+        refocus.current = { id, dir };
+        move(id, to);
+    };
+
+    return (
+        <BottomSheet
+            open={open}
+            onClose={onClose}
+            title='排序群組'
+            testId='watch-group-sort'
+            footer={<button type='button' className={button.primary} onClick={onClose} data-testid='watch-group-sort-done'>完成</button>}
+        >
+            <div className={edit.sheetBody}>
+                <p className={edit.note}>拖曳右側握把，或按 ↑／↓ 調整自選頁群組分頁的順序。群組順序只存在這台裝置，桌面不受影響。</p>
+                <ul ref={listRef} className={edit.sheetList} aria-label='群組順序' data-testid='watch-group-sort-list'>
+                    {lists.map((l, i) => (
+                        <li key={l.id} data-code={l.id} className={`${edit.sheetItem}${dragging === l.id ? ` ${styles.rowDragging}` : ''}`} data-testid='watch-group-row'>
+                            <span className={edit.itemName}>{l.name}</span>
+                            <span className={edit.itemMeta}>{`${l.contracts.length} 檔`}</span>
+                            <span className={styles.trailingPair}>
+                                <button
+                                    type='button'
+                                    className={`${iconStyles.button.regular} ${pressable} ${focusRing}`}
+                                    aria-label={`上移「${l.name}」`}
+                                    disabled={i === 0}
+                                    onClick={() => step(l.id, 'up')}
+                                    data-dir='up'
+                                    data-testid='watch-group-up'
+                                >
+                                    <ChevronUp size={20} aria-hidden='true' focusable='false' />
+                                </button>
+                                <button
+                                    type='button'
+                                    className={`${iconStyles.button.regular} ${pressable} ${focusRing}`}
+                                    aria-label={`下移「${l.name}」`}
+                                    disabled={i === lists.length - 1}
+                                    onClick={() => step(l.id, 'down')}
+                                    data-dir='down'
+                                    data-testid='watch-group-down'
+                                >
+                                    <ChevronDown size={20} aria-hidden='true' focusable='false' />
+                                </button>
+                                <button
+                                    type='button'
+                                    className={`${styles.grip} ${focusRing}`}
+                                    aria-label={`拖曳以調整「${l.name}」的位置`}
+                                    aria-keyshortcuts='ArrowUp ArrowDown'
+                                    onPointerDown={e => grip.onPointerDown(l.id, e)}
+                                    onPointerMove={grip.onPointerMove}
+                                    onPointerUp={grip.onPointerUp}
+                                    onPointerCancel={grip.onPointerCancel}
+                                    onLostPointerCapture={grip.onPointerCancel}
+                                    onKeyDown={e => grip.onKeyDown(l.id, e)}
+                                    onClick={grip.onClick}
+                                    onContextMenu={e => e.preventDefault()}
+                                    data-testid='watch-group-grip'
+                                >
+                                    <GripVertical size={20} aria-hidden='true' focusable='false' />
+                                </button>
+                            </span>
+                        </li>
+                    ))}
+                </ul>
+            </div>
+        </BottomSheet>
+    );
+}
+
 /** 編輯模式說明文字（自選頁原本的 watch-edit-hint；移到這裡減少首屏體積）。confirmDelete＝刪除清單的確認中 */
 export function editHint(multiOn: boolean, lists: number, confirmDelete: boolean): string {
     if (multiOn) return '勾選要移除的商品（點一列也可以勾選），再按下方「刪除」。';
@@ -264,15 +388,17 @@ export function editHint(multiOn: boolean, lists: number, confirmDelete: boolean
 }
 
 /**
- * 編輯模式的清單工具（自選頁 listTools 內，接在「重新命名」「刪除清單」之後）：「多選」切換、「全選」、說明文字；
- * 多選中底部配件槽的選取列與確認面板
+ * 編輯模式的清單工具（自選頁 listTools 內，接在「重新命名」「刪除清單」之後）：「多選」切換、「全選」、「排序群組」、說明文字；
+ * 多選中底部配件槽的選取列與確認面板；排序群組面板。reducedMotion：系統減少動態（由自選頁傳入，同 WatchEditReorder）；
+ * onOrder：群組順序存檔後通知自選頁重繪清單分頁
  */
-export function WatchEditTools({ confirmDelete }: { confirmDelete: boolean }) {
+export function WatchEditTools({ confirmDelete, reducedMotion, onOrder }: { confirmDelete: boolean; reducedMotion: () => boolean; onOrder: () => void }) {
     const wl = useMobileWatchlist();
     const latest = useRef(wl);
     latest.current = wl;
     const { on, sel, run } = useMultiSelect();
     const [confirming, setConfirming] = useState(false);
+    const [sorting, setSorting] = useState(false);
     /** 刪除開始時的清單（進行中面板列出的仍是全部要移除的商品） */
     const [frozen, setFrozen] = useState<readonly { code: string; name: string }[] | null>(null);
     const listName = wl.serverLists.find(l => l.id === wl.activeListId)?.name ?? '自選';
@@ -338,6 +464,17 @@ export function WatchEditTools({ confirmDelete }: { confirmDelete: boolean }) {
                     全選
                 </button>
             )}
+            {!on && (
+                <button
+                    type='button'
+                    className={`${styles.listTool} ${pressable} ${focusRing}`}
+                    disabled={wl.serverLists.length < 2}
+                    onClick={() => setSorting(true)}
+                    data-testid='watch-group-sort-open'
+                >
+                    排序群組
+                </button>
+            )}
             {on && (
                 <ShellSlot slot='bottom'>
                     <div className={edit.bar} data-testid='watch-multi-bar'>
@@ -367,6 +504,7 @@ export function WatchEditTools({ confirmDelete }: { confirmDelete: boolean }) {
                 onCancel={() => { if (!multi.run) setConfirming(false); }}
                 onConfirm={() => void confirm()}
             />
+            <GroupSortSheet open={sorting} onClose={() => setSorting(false)} reducedMotion={reducedMotion} onOrder={onOrder} />
         </>
     );
 }

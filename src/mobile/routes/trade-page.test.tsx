@@ -1522,6 +1522,17 @@ describe('TradePage 自選 ☆', () => {
         expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: '自選更新失敗', body: '2330 台積電：「短線」加入失敗：自選清單已切換，請重新新增商品' });
     });
 
+    it('面板與 ☆ 的清單名稱依這台裝置的群組順序（自選頁「排序群組」；新清單在最後）', async () => {
+        const data = new Map([['sj-mobile-watch-list-order-v1', JSON.stringify(['L3', 'gone', 'L2'])]]);
+        vi.stubGlobal('localStorage', { getItem: (k: string) => data.get(k) ?? null, setItem: vi.fn(), removeItem: vi.fn() });
+        const lists = makeWl().serverLists;
+        m.wl = makeWl({ serverLists: [{ ...lists[0]!, contracts: [STK_2330] }, lists[1]!, lists[2]!] });
+        await render();
+        expect(star().props['aria-label']).toBe('自選：已在 觀察、我的自選');
+        await openPicker();
+        expect(all('watch-picker-list').map(r => r.props['data-list-id'])).toEqual(['L3', 'L2', 'L1']);
+    });
+
     it('沒有清單：面板顯示空狀態，「完成」不送出', async () => {
         const wl = makeWl({ serverLists: [], activeListId: '' });
         m.wl = wl;

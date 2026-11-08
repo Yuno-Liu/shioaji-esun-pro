@@ -16,7 +16,8 @@
 // - 分段「自選｜排行」（§13 Phase 3）：排行見 components/ranking-list.tsx（延遲載入），只在「排行」分段掛載時讀取；
 //   「排行」分段不掛載自選列，自選列的行情訂閱隨之釋放。分段選擇在模組層保留（切換分頁再回來不變）。
 // - 版面（設計規格 §7.2，依使用者參考圖改版）：PageHeader（搜尋）；Segmented tabs（自選｜排行）；
-//   清單列：多個清單時清單分頁（Segmented scroll 變體，選中的自動捲進可見範圍），只有一個清單時顯示名稱；最後是「＋」新增清單；
+//   清單列：多個清單時清單分頁（Segmented scroll 變體，選中的自動捲進可見範圍；順序依這台裝置的群組順序，
+//   lib/watch-list-order.ts），只有一個清單時顯示名稱；最後是「＋」新增清單；
 //   表頭「名稱｜指標切換鍵（watch-metric-toggle）｜編輯（watch-edit）」，都在表頭、不在列按鈕內（避免巢狀互動）；
 //   列 64px：名稱／代碼＋市場標記＋徽章（試撮、處置）｜成交價／「漲跌 漲跌幅」或總量（純文字、漲跌色）｜迷你走勢｜快速下單鍵。
 //   載入 Skeleton、空清單 EmptyState、錯誤 InlineNote。
@@ -30,6 +31,8 @@
 //     全選、底部「刪除 N 檔」→ 確認面板 → 逐檔 await removeSymbol（每檔 DELETE＋GET 清單）。多選狀態在編輯 chunk 內，
 //     本頁只把列點擊的代碼交給 blocked(code)（多選中切換勾選、不開交易頁）；多選中握把停用。
 //     編輯模式的說明文字（watch-edit-hint）也在 WatchEditTools（首屏體積；多選中改為多選的說明）。
+//   - 排序群組：編輯模式「排序群組」（同在 WatchEditTools）→ 面板拖曳或 ↑／↓ 調整清單分頁的順序。伺服器的自選清單沒有順序
+//     欄位與排序 API，順序只存在這台裝置（lib/watch-list-order.ts，localStorage），桌面不受影響，不發任何請求。
 // - 手指拖曳排序（使用者要求；lib/watch-reorder.ts）：編輯模式每列列尾有握把（touch-action none，只有握把能拖，
 //   列的其他區域照常捲動，§8）；列以 transform 跟手指、其他列以 transform 讓位（減少動態時不做讓位動畫）、靠近
 //   main 上下緣自動捲動；放手時位置有變才呼叫一次 reorderSymbol（hook 每次是 GET＋PUT＋GET）；pointercancel 還原；
@@ -64,7 +67,7 @@
 //   清單管理只在使用者操作時發出（新增、改名、刪除、移除、排序各自是 use-watchlist 的既有請求）。
 
 import { ChevronsUpDown, Pencil, Plus, Search, Star } from 'lucide-react';
-import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
 import { useQuote, type PriceQuoteState } from '../../hooks/use-stream';
 import type { WatchItem } from '../../hooks/use-watchlist';
 import { neighborCode } from '../../lib/list-move';
@@ -86,6 +89,7 @@ import { navigate } from '../lib/hash-router';
 import { openTicket } from '../lib/mobile-store';
 import { usePunishedCodes } from '../lib/regulatory-punish';
 import type { ListReorder } from '../lib/watch-reorder';
+import { orderLists } from '../lib/watch-list-order';
 import { useMobileWatchlist } from '../lib/watchlist-context';
 import { prefersReducedMotion } from '../motion/prefs';
 import { fill, focusRing, pressable, pressableRow } from '../styles/primitives.css';
@@ -523,6 +527,8 @@ export function WatchlistPage() {
     }, [blocked]);
 
     const activeList = wl.serverLists.find(l => l.id === wl.activeListId);
+    // 群組（清單）分頁的順序只存在這台裝置（lib/watch-list-order.ts，每次渲染讀取）；編輯模式「排序群組」存檔後以 bumpOrder 重繪
+    const [orderKey, bumpOrder] = useReducer((n: number) => n + 1, 0);
     const ranking = segment === 'ranking';
     const showList = !ranking && wl.items.length > 0;
     const metricLabel = WATCH_METRIC_LABEL[metric];
@@ -578,7 +584,7 @@ export function WatchlistPage() {
         if (!scroller || !selected) return;
         const delta = revealDelta(scroller.getBoundingClientRect(), selected.getBoundingClientRect());
         if (delta !== 0) scroller.scrollLeft += delta;
-    }, [showListTabs, wl.activeListId, wl.serverLists.length]);
+    }, [showListTabs, wl.activeListId, wl.serverLists.length, orderKey]);
 
     const structureBusy = wl.structureBusy || listBusy;
 
@@ -606,7 +612,7 @@ export function WatchlistPage() {
                         {showListTabs ? (
                             <div ref={listTabsRef} className={styles.listTabs}>
                                 <Segmented<string>
-                                    items={wl.serverLists.map(l => ({ value: l.id, label: l.name, testId: `watch-list-tab-${l.id}` }))}
+                                    items={orderLists(wl.serverLists).map(l => ({ value: l.id, label: l.name, testId: `watch-list-tab-${l.id}` }))}
                                     value={wl.activeListId}
                                     onChange={id => { if (id !== wl.activeListId) wl.setActiveList(id); }}
                                     semantics='tabs'
@@ -644,7 +650,7 @@ export function WatchlistPage() {
                             {listBusy ? '刪除中…' : confirmDelete ? `確定刪除「${activeList.name}」` : '刪除清單'}
                         </button>
                         <EditSlot editKey={editKey} placeholder={null}>
-                            <WatchEditTools confirmDelete={confirmDelete} />
+                            <WatchEditTools confirmDelete={confirmDelete} reducedMotion={prefersReducedMotion} onOrder={bumpOrder} />
                         </EditSlot>
                     </div>
                 )}

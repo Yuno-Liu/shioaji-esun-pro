@@ -1,7 +1,7 @@
 // src/mobile/components/watch-picker-sheet.tsx — 交易頁 ☆「加入自選」：一次加入／移出多個自選清單（設計規格 §7.3）
 //
 // - 延遲載入（components/load-watch-picker-sheet.ts；交易頁第一次按 ☆ 才 import，不閒置預載）。
-// - 列出伺服器上的每個自選清單（名稱、檔數，目前清單標「（目前）」）與勾選狀態：商品是否在該清單以
+// - 依這台裝置的群組順序（lib/watch-list-order.ts）列出伺服器上的每個自選清單（名稱、檔數，目前清單標「（目前）」）與勾選狀態：商品是否在該清單以
 //   serverLists[].contracts 的代碼＋商品類別比對（listsWithContract）。沒有清單時顯示空狀態（這裡不建立清單）。
 // - 使用者勾選任意清單後按「完成」才送出差異；「取消」或關閉面板捨棄。
 // - 送出（applyWatchPicks；依序、逐一 await）：
@@ -19,6 +19,7 @@ import { addWatchlistContracts, removeWatchlistContracts, type ServerWatchlist }
 import { notify } from '../../lib/trade';
 import type { ContractInfo } from '../../lib/types/contract';
 import { emitWatchlistChanged } from '../../lib/watchlist-sync';
+import { orderLists } from '../lib/watch-list-order';
 import type { MobileWatchlist } from '../lib/watchlist-context';
 import { button } from '../styles/controls.css';
 import { pressableRow } from '../styles/primitives.css';
@@ -83,14 +84,14 @@ export interface WatchPickerSheetProps {
     open: boolean;
     contract: ContractInfo;
     wl: MobileWatchlist;
-    /** 依序顯示的清單（預設 wl.serverLists） */
-    lists?: readonly ServerWatchlist[];
     onClose: () => void;
     /** 套用中（交易頁的 ☆ 以 aria-disabled 表示） */
     onBusy: (busy: boolean) => void;
 }
 
-export function WatchPickerSheet({ open, contract, wl, lists = wl.serverLists, onClose, onBusy }: WatchPickerSheetProps) {
+export function WatchPickerSheet({ open, contract, wl, onClose, onBusy }: WatchPickerSheetProps) {
+    // 依這台裝置的群組順序顯示（lib/watch-list-order.ts；自選頁編輯模式「排序群組」）
+    const lists = orderLists(wl.serverLists);
     /** 使用者改過的勾選（清單 id → 勾選）；沒改過的清單顯示目前狀態。每次開啟清空 */
     const [picks, setPicks] = useState<ReadonlyMap<string, boolean>>(() => new Map());
     useEffect(() => { if (open) setPicks(new Map()); }, [open]);

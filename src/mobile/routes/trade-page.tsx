@@ -57,6 +57,7 @@ import { fmtCompactInt, fmtInt, fmtStockLots, formatNumber, formatToTick } from 
 import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import { recordRecentCode } from '../lib/recent-codes';
 import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
+import { orderLists } from '../lib/watch-list-order';
 import { useOptionalMobileWatchlist } from '../lib/watchlist-context';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
@@ -343,7 +344,8 @@ function WatchStar({ contract }: { contract: ContractInfo | undefined }) {
     const onBusy = useCallback((b: boolean) => { if (mounted.current) setBusy(b); }, []);
     const close = useCallback(() => setOpen(false), []);
     if (!wl) return null;
-    const inLists = listsWithContract(wl.serverLists, contract);
+    // 所在清單的名稱依這台裝置的群組順序（lib/watch-list-order.ts）
+    const inLists = listsWithContract(orderLists(wl.serverLists), contract);
     const blocked = watchStarBlocked(wl, contract, busy);
     return (
         <>
