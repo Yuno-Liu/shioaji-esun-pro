@@ -37,7 +37,9 @@ export const BATCH_WAIT_MS = 10_000;
 let active = false;
 let armed: ExpectedConfirm | null = null;
 let abortReason: string | null = null;
-let waitUntil = 0;
+// 等待模式：第一次 wait 起算；逾時由計時器設旗標（不比對牆鐘：系統時間被調整也不會永遠等待）
+let waitStarted = false;
+let timedOut = false;
 let timer: ReturnType<typeof setTimeout> | undefined;
 const listeners = new Set<() => void>();
 
@@ -56,7 +58,8 @@ export const batchExitAbortReason = (): string | null => abortReason;
 export function armBatchExit(expected: ExpectedConfirm | null): void {
     armed = active && abortReason === null ? expected : null;
     clearTimeout(timer);
-    waitUntil = 0;
+    waitStarted = false;
+    timedOut = false;
 }
 
 /** 開始（true）或結束（false，finally 一定呼叫）批次；兩者都清除 arm 與中止原因 */
@@ -96,11 +99,11 @@ export function decideBatchConfirm(r: OrderConfirmRequest): BatchDecision {
     const a = armed;
     if (!a) return reject('unarmed');
     if (r.awaitingMode) {
-        if (!waitUntil) {
-            waitUntil = Date.now() + BATCH_WAIT_MS;
-            timer = setTimeout(emit, BATCH_WAIT_MS);
+        if (!waitStarted) {
+            waitStarted = true;
+            timer = setTimeout(() => { timedOut = true; emit(); }, BATCH_WAIT_MS);
         }
-        return Date.now() < waitUntil ? 'wait' : reject('timeout');
+        return timedOut ? reject('timeout') : 'wait';
     }
     const why = mismatch(r, a);
     if (why) return reject(why);

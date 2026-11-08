@@ -131,6 +131,30 @@ describe('decideBatchConfirm', () => {
         off();
     });
 
+    it('等待中系統時間被往回調：計時器到時仍逾時（不比對牆鐘，不會永遠等待）', () => {
+        vi.useFakeTimers();
+        setBatchExit(true);
+        armBatchExit(expected);
+        expect(decideBatchConfirm(request({ awaitingMode: true, simulation: null }))).toBe('wait');
+        vi.setSystemTime(Date.now() - 3_600_000);
+        vi.advanceTimersByTime(BATCH_WAIT_MS);
+        expect(decideBatchConfirm(request({ awaitingMode: true, simulation: null }))).toBe('reject');
+        expect(batchExitAbortReason()).toBe('timeout');
+    });
+
+    it('換下一筆 arm 會重新起算等待時間', () => {
+        vi.useFakeTimers();
+        setBatchExit(true);
+        armBatchExit(expected);
+        expect(decideBatchConfirm(request({ awaitingMode: true, simulation: null }))).toBe('wait');
+        vi.advanceTimersByTime(BATCH_WAIT_MS - 1);
+        armBatchExit(expected);
+        vi.advanceTimersByTime(BATCH_WAIT_MS - 1);
+        expect(decideBatchConfirm(request({ awaitingMode: true, simulation: null }))).toBe('wait');
+        vi.advanceTimersByTime(BATCH_WAIT_MS);
+        expect(decideBatchConfirm(request({ awaitingMode: true, simulation: null }))).toBe('reject');
+    });
+
     it('結束批次（finally）清除：之後回 none；再開始的批次沒有舊的 arm 與中止原因', () => {
         const listener = vi.fn();
         const off = subscribeBatchExit(listener);
