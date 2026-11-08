@@ -75,7 +75,9 @@ export const legend = style({
     top: '4px',
     left: SPACE.s2,
     right: '64px', // 留給右側價格軸
-    zIndex: 1,
+    // 程式庫的上層 canvas（十字線）是 z-index 2：圖例要同層（DOM 在後）才蓋得過，
+    // 否則圖例裡的按鈕（資訊列 ✕、「漲跌停範圍」）點下去落在 canvas 上。圖例本身 pointer-events none，不擋圖表
+    zIndex: 2,
     display: 'flex',
     flexWrap: 'wrap',
     gap: `0 ${SPACE.s2}`,
@@ -166,6 +168,36 @@ export const readoutClose = style([focusRing, {
             bottom: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
             left: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
             right: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
+        },
+    },
+}]);
+
+/** 「漲跌停範圍」標示（走勢主圖圖例第一個）：點一下回到自動範圍。圖例不接觸控，只有這顆接；點擊區以 ::before 擴到 TOUCH_MIN */
+export const rangeBadge = style([focusRing, {
+    position: 'relative',
+    display: 'inline-flex',
+    alignItems: 'center',
+    margin: 0,
+    padding: `0 ${SPACE.s1_5}`,
+    border: `0.5px solid ${vars.color.borderBright}`,
+    borderRadius: RADIUS.sm,
+    background: sj.islandBg,
+    color: vars.color.foreground,
+    font: 'inherit',
+    fontWeight: 600,
+    whiteSpace: 'nowrap',
+    pointerEvents: 'auto',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+    selectors: {
+        '&::before': {
+            content: '""',
+            position: 'absolute',
+            top: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
+            bottom: `min(0px, calc((100% - ${TOUCH_MIN}) / 2))`,
+            left: 0,
+            right: 0,
         },
     },
 }]);

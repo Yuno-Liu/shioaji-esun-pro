@@ -7,6 +7,15 @@
 //   跟著使用者的漲跌配色（ChartColors upVol／downVol，比價格線淡）。指數、量全為 0 或沒有資料時不建副圖（外框維持 0 副圖）；
 //   之後有量（例如開盤第一筆成交）才建立。一般模式下外框改變（退出全螢幕、副圖晚建）後把副圖拉回 PANE_HEIGHT_PX
 //   （K 線指標副圖同樣適用）；全螢幕依比例分配。
+// - 走勢 X 軸固定為整個交易時段（win：股票 09:00–13:30、期貨日盤／夜盤）：隱藏的 axisSeries 在時段每一分鐘放一個
+//   空白點（whitespace），時間軸因此是線性的整個時段，線從左往右隨時間長出、右側未到的時段留白；走勢關閉拖移、
+//   縮放、滾輪、軸拖曳與雙擊重設（沒有拖移就沒有慣性捲動），fixLeftEdge＋lockVisibleTimeRangeOnResize（不用 fixRightEdge：
+//   它把右端鎖在最後一根有資料的點，會切掉右側留白），
+//   套用歷史、換時段、尺寸改變時 fitContent。量與買賣力副圖共用同一條時間軸。邏輯位置＝時段內第幾分鐘
+//   （logicalOfBar／barAtLogical），沒有成交的分鐘也占位置；輕點吸附到最近的一根。K 線維持可拖移、可縮放。
+// - 走勢「漲跌停範圍」（lib/chart-limit-range.ts，模組層狀態，預設自動）：輕點主圖右側價格軸切換，主圖 Y 軸固定為
+//   [跌停, 漲停]（主 series 的 autoscaleInfoProvider；均價線不參與），並畫出漲停／跌停線（股票本來就有，期權補畫）；
+//   主圖圖例前有「漲跌停範圍」按鈕（aria-pressed），點它回到自動。指數或沒有正數漲跌停時不切換。
 // - 走勢副圖指標（股票＋ETF，指標面板「走勢副圖」開啟；lib/line-indicators.ts 設定、lib/line-flow.ts 逐筆彙總）：
 //   排在量副圖之後（量固定在 pane 1）。分時買賣力＝每分鐘外盤（正柱，漲色）／內盤（負柱，跌色）＋累積淨買力線
 //   （另一個不顯示座標的疊加刻度，否則每分鐘的柱會被壓扁）；大單／小單買賣力＝依單筆成交金額門檻分類的兩條累積淨買線。
@@ -35,7 +44,7 @@
 //   長按追蹤時同一列跟著十字線。**輕點只顯示資訊，不開選價列、不開下單面板**。
 //   程式庫在觸控放開、資料更新、滑鼠移動時會自己移動或清除十字線：釘住期間在 crosshairMove 裡放回那一根。
 //   資訊列以小 store（useSyncExternalStore）只重繪該列，不重繪整個圖表元件。
-//   不支援拖曳委託線改價（規格 R7）。可互動區加 data-allow-pinch="true"（平台手勢防護略過這一區）。
+//   不支援拖曳委託線改價（規格 R7）。K 線的可互動區加 data-allow-pinch="true"（平台手勢防護略過這一區）；走勢不縮放，不加。
 // - 橫向全螢幕：手機轉橫向（lib/chart-fullscreen.ts）或按「全螢幕」→ CSS 固定定位覆蓋全畫面（留安全區），
 //   上方週期＋指標＋「退出」，下方買進／賣出（只開下單面板）。iPhone Safari 沒有元素 Fullscreen API，
 //   手動進入時若支援才另對 <html> 呼叫 requestFullscreen（底部面板才仍看得到），不依賴它。
@@ -50,6 +59,7 @@ import {
     LineSeries,
     LineStyle,
     TrackingModeExitMode,
+    type AutoscaleInfo,
     type IChartApi,
     type IPriceLine,
     type Logical,
@@ -73,6 +83,7 @@ import { roundToTick, tickDecimals, tickSizeFor } from '../../lib/utils/ticksize
 import { formatToTick } from '../lib/num-format';
 import { chartReadout, createReadoutStore, type ReadoutStore } from '../lib/chart-readout';
 import { currentOrientationEnv, shouldAutoFullscreen } from '../lib/chart-fullscreen';
+import { hasLimitRange, setLimitRange, toggleLimitRange, useLimitRange } from '../lib/chart-limit-range';
 import { fetchMobileChartHistory } from '../lib/chart-history-cache';
 import { getHistoryEntry, planHistory, setHistoryEntry } from '../lib/chart-history-freshness';
 import { dayHighLow, formatIndicatorValue, intradayAverage, intradayBars, liveBarTime, priceLinesKey, type PriceLineSpec } from '../lib/chart-model';
@@ -330,6 +341,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const pointersRef = useRef(new Set<number>());
     /** 輕點（相對圖表的座標）：釘住或收起價格資訊（由圖表 effect 提供） */
     const tapRef = useRef<(x: number, y: number) => void>(() => undefined);
+    /** 漲跌停範圍模式改變：主圖重新自動縮放（由圖表 effect 提供） */
+    const rescaleRef = useRef<() => void>(() => undefined);
     /** 收起輕點的價格資訊；clearChart＝一併清掉十字線（長按進入追蹤時不清，十字線交給程式庫） */
     const hideTapRef = useRef<(clearChart: boolean) => void>(() => undefined);
     const [readout] = useState<ReadoutStore>(createReadoutStore);
@@ -372,6 +385,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         const precision = tickDecimals(tick);
         const priceFormat = { type: 'price' as const, precision, minMove: Number((10 ** -precision).toFixed(precision)) };
         const isIndex = ct.security_type === 'IND';
+        /** 走勢且開啟漲跌停範圍、商品有正數漲跌停 */
+        const limitActive = () => isLine && limitOnRef.current && hasLimitRange(contractRef.current);
 
         const chart = createChart(host, {
             autoSize: true,
@@ -392,11 +407,18 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 horzLine: { color: c.crosshair, labelBackgroundColor: c.labelBg },
             },
             rightPriceScale: { borderColor: c.border },
-            timeScale: { borderColor: c.border, timeVisible: minutes < 1440, secondsVisible: false, rightOffset: 2 },
-            // 單指水平拖曳平移；垂直滑動留給頁面捲動
-            handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
-            // 雙指縮放；價格軸不給拖（維持自動縮放，委託線標籤位置才準）
-            handleScale: { pinch: true, mouseWheel: true, axisPressedMouseMove: { time: true, price: false }, axisDoubleClickReset: true },
+            timeScale: isLine
+                // 走勢：X 軸固定為整個時段（axisSeries 的空白點）；左端貼齊、尺寸改變時保留同一段時間；
+                // 不用 fixRightEdge：它把右端鎖在最後一根「有資料」的點，右側未到的時段（尾端空白點）會被切掉。
+                // 夜盤 840 分鐘要放進手機寬度，最小間距放寬
+                ? { borderColor: c.border, timeVisible: true, secondsVisible: false, rightOffset: 0, fixLeftEdge: true, lockVisibleTimeRangeOnResize: true, minBarSpacing: 0.01 }
+                : { borderColor: c.border, timeVisible: minutes < 1440, secondsVisible: false, rightOffset: 2 },
+            // K 線：單指水平拖曳平移（垂直滑動留給頁面捲動）。走勢：不拖移、不縮放（水平與垂直滑動都交給頁面）
+            handleScroll: isLine ? false : { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+            // K 線：雙指縮放；價格軸不給拖（維持自動縮放，委託線標籤位置才準）。走勢：全部關閉
+            handleScale: isLine ? false : { pinch: true, mouseWheel: true, axisPressedMouseMove: { time: true, price: false }, axisDoubleClickReset: true },
+            // 走勢沒有拖移，也就沒有慣性捲動；明確關閉
+            ...(isLine ? { kineticScroll: { touch: false, mouse: false } } : {}),
             // 觸控長按進入追蹤模式，手指放開即離開
             trackingMode: { exitMode: TrackingModeExitMode.OnTouchEnd },
         });
@@ -411,6 +433,11 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 bottomFillColor2: c.downVol,
                 lineWidth: 2,
                 priceFormat,
+                // 漲跌停範圍：Y 軸固定為 [跌停, 漲停]；否則自動
+                autoscaleInfoProvider: (original: () => AutoscaleInfo | null) => {
+                    const k = contractRef.current;
+                    return limitActive() ? { priceRange: { minValue: k.limit_down, maxValue: k.limit_up } } : original();
+                },
             })
             : chart.addSeries(CandlestickSeries, {
                 upColor: c.up,
@@ -437,8 +464,16 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 lastValueVisible: false,
                 crosshairMarkerVisible: false,
                 priceFormat,
+                // 漲跌停範圍時不參與縮放（不把範圍撐大）
+                autoscaleInfoProvider: (original: () => AutoscaleInfo | null) => (limitActive() ? null : original()),
             })
             : null;
+        // 走勢：整個時段每一分鐘一個空白點，X 軸因此固定為整個時段（applySessionAxis）
+        const axisSeries = isLine
+            ? chart.addSeries(LineSeries, { lineVisible: false, pointMarkersVisible: false, crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false })
+            : null;
+        /** axisSeries 目前對應的時段起點 */
+        let axisStart: number | null = null;
         chartRef.current = chart;
         mainRef.current = main;
         mainPaneHeightRef.current = null;
@@ -1019,6 +1054,20 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         const sumVolume = () => bars.reduce((sum, b) => sum + b.volume, 0);
 
         /** 套用一份歷史：保留比歷史尾端新的即時 K 棒；已顯示過時保留可見範圍（以距離最新一根的位置） */
+        /** 走勢：axisSeries 放滿目前時段每一分鐘的空白點（換時段才重設） */
+        const applySessionAxis = () => {
+            if (!axisSeries || !win || axisStart === win.start) return;
+            const pts: { time: UTCTimestamp }[] = [];
+            for (let tm = win.start + 60; tm <= win.end; tm += 60) pts.push({ time: t(tm) });
+            axisSeries.setData(pts);
+            axisStart = win.start;
+        };
+        /** 走勢：可見範圍＝整個時段（含右側未到的空白） */
+        const fitSession = () => {
+            if (axisStart === null) return;
+            try { chart.timeScale().fitContent(); } catch { /* 圖表已移除 */ }
+        };
+
         const applyHistory = (raw: Candle[]) => {
             const ts = chart.timeScale();
             const prevLen = bars.length;
@@ -1039,13 +1088,14 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             cumV = sumVolume();
             dirtyFrom = -1;
             loaded = true;
+            applySessionAxis();
             applyAll();
             syncFlowHandle();
-            if (range && live.length > 0) {
+            if (isLine) fitSession();
+            else if (range && live.length > 0) {
                 const shift = bars.length - prevLen;
                 ts.setVisibleLogicalRange({ from: range.from + shift, to: range.to + shift });
-            } else if (isLine) ts.fitContent();
-            else if (bars.length > INITIAL_VISIBLE_BARS) ts.setVisibleLogicalRange({ from: bars.length - INITIAL_VISIBLE_BARS, to: bars.length + 2 });
+            } else if (bars.length > INITIAL_VISIBLE_BARS) ts.setVisibleLogicalRange({ from: bars.length - INITIAL_VISIBLE_BARS, to: bars.length + 2 });
             else ts.fitContent();
             shownHistory = true;
             shownReady = bars.length > 0;
@@ -1081,6 +1131,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                         if (cancelled || mode === 'refresh') return false;
                         // 走勢載入失敗時仍以目前時段接即時成交
                         if (isLine && !win) win = sessionWindowFor(ct.security_type, nowWallClockUtc());
+                        applySessionAxis();
+                        fitSession();
                         syncFlowHandle();
                         // 收回預留的成交量副圖高度（之後有量的成交才建立）
                         if (lineVolAllowed && vol === null) setPaneCount(0);
@@ -1171,6 +1223,14 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
 
         chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleLayout);
         chart.timeScale().subscribeSizeChange(scheduleLayout);
+        // 走勢：尺寸改變（全螢幕、橫向、外框加高）後仍是整個時段
+        if (isLine) chart.timeScale().subscribeSizeChange(fitSession);
+        rescaleRef.current = () => {
+            if (cancelled) return;
+            // 換了 autoscaleInfoProvider 的結果：要求價格軸重新自動縮放；委託線標籤跟著重新定位
+            try { main.priceScale().applyOptions({ autoScale: true }); } catch { /* 舊版選項 */ }
+            scheduleLayout();
+        };
 
         // ---- 價格資訊列：輕點釘住、長按追蹤 ----
         const indexOfTime = (time: number): number => {
@@ -1195,12 +1255,29 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             volume: !isIndex,
         });
         /** 第 i 根各 series 的值：圖例顯示該根（同長按追蹤） */
+        /** 走勢（X 軸＝整個時段）：第 i 根的邏輯位置＝時段內第幾分鐘；K 線＝索引 */
+        const logicalOfBar = (i: number): number => (isLine && axisStart !== null ? (bars[i]!.time - (axisStart + 60)) / 60 : i);
+        /** 邏輯位置 → 最近一根（走勢依時間找最近的有成交那一分鐘；超出兩端取第一根或最後一根） */
+        const barAtLogical = (logical: number): number => {
+            if (!(isLine && axisStart !== null)) return Math.min(bars.length - 1, Math.max(0, Math.round(logical)));
+            const time = axisStart + 60 + Math.round(logical) * 60;
+            let lo = 0;
+            let hi = bars.length;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (bars[mid]!.time < time) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo >= bars.length) return bars.length - 1;
+            if (lo > 0 && time - bars[lo - 1]!.time <= bars[lo]!.time - time) return lo - 1;
+            return lo;
+        };
         const crossDataAt = (i: number): Map<unknown, unknown> => {
             const map = new Map<unknown, unknown>();
             const all: ISeriesApi<SeriesType>[] = [main, ...(avgSeries ? [avgSeries] : []), ...(isLine && vol ? [vol] : []), ...inds.flatMap(r => r.outputs.map(o => o.series))];
             for (const s of all) {
                 try {
-                    const d = s.dataByIndex(i);
+                    const d = s.dataByIndex(logicalOfBar(i));
                     if (d) map.set(s, d);
                 } catch {
                     // API 差異：該值顯示 —
@@ -1240,17 +1317,21 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             if (cancelled || bars.length === 0) return;
             const ts = chart.timeScale();
             const width = ts.width();
-            if (width > 0 && x > width) return; // 價格軸
             const mainH = mainPaneHeightRef.current ?? host.clientHeight - 24;
+            if (width > 0 && x > width) {
+                // 主圖的價格軸：走勢切換漲跌停範圍（不出資訊列、不選價）；副圖的價格軸不觸發
+                if (isLine && y >= 0 && y <= mainH && hasLimitRange(contractRef.current)) toggleLimitRange();
+                return;
+            }
             if (y < 0 || y > mainH) return; // 時間軸、副圖
             const logical = ts.coordinateToLogical(x);
             if (logical === null || !Number.isFinite(logical)) return;
             // 吸附到最近一根有資料的（走勢：有成交的那一分鐘）；超出兩端取第一根或最後一根
-            const i = Math.min(bars.length - 1, Math.max(0, Math.round(logical)));
+            const i = barAtLogical(logical);
             // 再點同一點：收起。走勢一分鐘常只有 1px 寬，手指再點難免偏幾 px →
             // 落在同一根，或離釘住那一根的 x 在 TAP_SAME_SPOT_PX 內，都算同一點
             const pinned = tapTime === null ? -1 : indexOfTime(tapTime);
-            const pinnedX = pinned < 0 ? null : ts.logicalToCoordinate(pinned as Logical);
+            const pinnedX = pinned < 0 ? null : ts.logicalToCoordinate(logicalOfBar(pinned) as Logical);
             if (pinned === i || (pinnedX !== null && Math.abs(x - pinnedX) <= TAP_SAME_SPOT_PX)) hideTap(true);
             else showTap(i);
         };
@@ -1314,6 +1395,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             offTick();
             ingestRef.current = null;
             tapRef.current = () => undefined;
+            rescaleRef.current = () => undefined;
             hideTapRef.current = () => undefined;
             readout.set(null);
             layoutRef.current = () => undefined;
@@ -1359,8 +1441,24 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         ingestRef.current?.(Number(index.close), wallClockToUtc(`${index.date}T${index.time}`), 0, null, false);
     }, [index]);
 
+    // ---- 漲跌停範圍（走勢） ----
+    const limitOn = useLimitRange();
+    const limitOnRef = useRef(limitOn);
+    limitOnRef.current = limitOn;
+    const limitActive = isLine && limitOn && hasLimitRange(contract);
+    // 漲停／跌停線：股票本來就在 lines 裡；期權等沒有的在漲跌停範圍時補畫
+    const effLines = useMemo(() => {
+        if (!limitActive) return lines;
+        const extra: PriceLineSpec[] = [];
+        if (!lines.some(l => l.kind === 'limit-up')) extra.push({ key: 'limit-up', price: contract.limit_up, kind: 'limit-up', label: '漲停' });
+        if (!lines.some(l => l.kind === 'limit-down')) extra.push({ key: 'limit-down', price: contract.limit_down, kind: 'limit-down', label: '跌停' });
+        return extra.length ? [...lines, ...extra] : lines;
+    }, [lines, limitActive, contract.limit_up, contract.limit_down]);
+    linesRef.current = effLines;
+    useEffect(() => { rescaleRef.current(); }, [limitActive, contract.limit_up, contract.limit_down, chartGen]);
+
     // ---- 水平線 ----
-    const linesKey = priceLinesKey(lines);
+    const linesKey = priceLinesKey(effLines);
     useEffect(() => {
         const series = mainRef.current;
         if (!series) return;
@@ -1575,6 +1673,19 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const renderLegend = (entries: LegendEntry[], top?: number, withReadout = false) => (
         <div className={cs.legend} style={top !== undefined ? { top: `${top + 4}px` } : undefined} data-testid='chart-legend' aria-live='off'>
             {withReadout && <ReadoutLine store={readout} onClose={() => hideTapRef.current(true)} />}
+            {withReadout && limitActive && (
+                <button
+                    type='button'
+                    className={cs.rangeBadge}
+                    aria-pressed='true'
+                    aria-label='漲跌停範圍（點一下回到自動範圍）'
+                    onPointerDown={e => e.stopPropagation()}
+                    onClick={() => setLimitRange(false)}
+                    data-testid='chart-range-badge'
+                >
+                    漲跌停範圍
+                </button>
+            )}
             {entries.map(l => (
                 <span key={l.id} className={cs.legendItem}>
                     <span className={cs.legendName} style={{ color: l.color }}>{l.name}</span>
@@ -1619,7 +1730,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                 onPointerUp={e => onPointerEnd(e, true)}
                 onPointerCancel={e => onPointerEnd(e, false)}
                 onContextMenu={e => e.preventDefault()}
-                data-allow-pinch='true'
+                // 走勢不縮放：不放行雙指（平台手勢防護照常擋下，頁面也不會被捏合縮放）
+                data-allow-pinch={isLine ? undefined : 'true'}
                 data-testid='trade-chart'
             >
                 <div ref={hostRef} className={styles.chartHost} />
@@ -1679,7 +1791,9 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             {!fullscreen && (
                 <div className={cs.toolRow}>
                     <p className={cs.toolNote}>
-                        {isLine ? '點一下看價格與漲跌；長按選價位，放開開啟下單面板' : period === '1D' ? '日 K 由 1 分 K 聚合，未含除權息調整' : '點一下看收盤與漲跌；長按選價位'}
+                        {isLine
+                            ? (hasLimitRange(contract) ? '點圖看價格，長按選價；點價格軸看漲跌停' : '點一下看價格與漲跌；長按選價位，放開開啟下單面板')
+                            : period === '1D' ? '日 K 由 1 分 K 聚合，未含除權息調整' : '點一下看收盤與漲跌；長按選價位'}
                     </p>
                     <Chip label='指標' className={cs.toolButton} onClick={() => setSheetOpen(true)} testId='chart-indicators' />
                     <Chip label='全螢幕' className={cs.toolButton} onClick={enterFullscreen} testId='chart-fs-enter' />
