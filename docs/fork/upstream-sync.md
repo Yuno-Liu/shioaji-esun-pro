@@ -87,7 +87,7 @@ git diff $(git merge-base HEAD upstream/main) -- <檔案> | grep -c '^[+-][^+-]'
 | `src/components/flash-order.tsx`、`src/lib/flash-trigger.ts` | 股票的持有量只算與面板信用條件相同 cond 的列（`sameCondRows`）；持倉依 cond 分開顯示（`stockPositionGroups`）；現股面板遇到融券空單時顯示「現股買進不會回補融券」；融券面板的買邊為「融券買（回補）」 | 原本融券空單與現股合併成一個淨額：有空單時，現股買進會被判成「減倉」而不附保護；淨額為 0 時，持倉列整個消失 |
 
 同一批修正也改了持倉面板平倉、全平、`placeStockExitByShares` 與成交投影（`src/components/bottom-dock-positions.tsx`、`src/lib/conditional/flatten.ts`、`src/lib/trade.ts`、`src/lib/portfolio-projection.ts`），讓信用部位能用正確的條件平倉並套用成交。合併時同樣要保留。
-測試時序修正（2026-11-08，使用者同意修改上游測試檔）：`src/components/candle-chart-order.test.tsx` 的兩個信用條件案例在 CI 負載高時常失敗——「融券／借券只能賣」點價後沒等下單函式被呼叫就讀參數，改為先 `vi.waitFor` 等到呼叫；「融券買進查無空單」的 `withTradingState` 改為先載入一次 mock 的 `trading-state`，元件的 `import()` 不再受前一個測試結束時重設 mock 的時序影響。合併上游時保留這兩處（上游若自行修正則以上游為準）。
+測試時序修正（2026-11-08，使用者同意修改上游測試檔）：`src/components/candle-chart-order.test.tsx` 的兩個信用條件案例在 CI 負載高時常失敗——「融券／借券只能賣」點價後沒等下單函式被呼叫就讀參數，改為先 `vi.waitFor` 等到呼叫；「融券買進查無空單」的 `withTradingState` 改為整個檔案只在第一次換成帶 `getTradingState` 的 mock、之後不再換回（原本每個測試結束時 `vi.doMock` 換回、下一個再換過去，CI 負載高時動態 `import()` 會取到換回的那份：`No "getTradingState" export is defined on the mock`），並先載入一次。合併上游時保留這兩處（上游若自行修正則以上游為準）。
 
 相關測試：`src/lib/odd-lot.test.ts`、`src/lib/trade-credit.test.ts`、`src/lib/credit-eligibility.test.ts`、`src/lib/chart-order-settings.test.ts`、`src/lib/flash-trigger.test.ts`、`src/components/order-ticket-credit.test.tsx`、`src/components/flash-order-credit.test.tsx`、`src/components/flash-order-short-cover.test.tsx`、`src/components/flash-order-cost.test.tsx`。上游若改寫這些規則，這些測試應該會失敗；不要直接改回上游的預期。
 

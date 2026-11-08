@@ -1190,13 +1190,18 @@ describe('chart order credit conditions', () => {
         expect(m.place.mock.calls[1]![4].afterConfirm).toBeUndefined();
     });
 
-    // 共用的 mock-order-reconciliation 把交易狀態換成只有 reconcileOrdersOnce；
-    // 這兩個測試另外提供持倉，結束後換回原本的形狀
+    // 共用的 mock-order-reconciliation 把交易狀態換成只有 reconcileOrdersOnce；這兩個測試另外提供持倉。
+    // fork：只在第一次換成帶 getTradingState 的形狀，之後不再換回。原本每個測試結束時 doMock 換回、下一個再換過去，
+    // CI 負載高時動態 import() 會取到換回的那份（vitest：No "getTradingState" export is defined on the mock），
+    // 提示變成 null。沒有提供持倉時 getTradingState 回 null，與原本「沒有這個函式」相同：元件讀不到持倉就不提醒。
+    let tradingStateMocked = false;
     const withTradingState = async () => {
-        vi.doMock('../lib/trading-state', () => ({ reconcileOrdersOnce, getTradingState: () => m.tradingState }));
-        onTestFinished(() => { m.tradingState = null; vi.doMock('../lib/trading-state', () => ({ reconcileOrdersOnce })); });
-        // fork：先載入一次這份 mock，點價時元件的 import() 直接取到它；不受前一個測試結束時重設 mock 的時序影響
-        // （CI 負載高時偶爾取到沒有 getTradingState 的版本，提示變成 null）
+        if (!tradingStateMocked) {
+            tradingStateMocked = true;
+            vi.doMock('../lib/trading-state', () => ({ reconcileOrdersOnce, getTradingState: () => m.tradingState }));
+        }
+        onTestFinished(() => { m.tradingState = null; });
+        // 先載入一次，點價時元件的 import() 直接取到這一份
         const ts = await import('../lib/trading-state');
         expect(typeof ts.getTradingState).toBe('function');
     };
