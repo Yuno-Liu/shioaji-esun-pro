@@ -1487,6 +1487,9 @@ def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.02) -> bool
     return predicate()
 
 
+_QUIET_ORDER = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1", "priceFlag": "0", "bsFlag": "R"}
+
+
 class _BridgeCase(unittest.TestCase):
     """Per-test temp config dir + persistent state dir + passwords."""
 
@@ -1734,7 +1737,11 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         self.assertIs(bridge.session, original)
         self.assertEqual(factory.login_calls, 1)  # no login attempt
         bridge.end_mutation()
-        # quiet period right after the mutation answered: refused (post-cancel read, second leg of a close)
+        # a counted request that never reached the SDK does not start the quiet period
+        self.assertEqual(bridge._last_mutation_end, 0.0)
+        # a mutation that reached the SDK does: refused right after it answered (post-cancel read, second leg of a close)
+        placed, code = bridge.place_order({"payload": _QUIET_ORDER, "expected_environment": "SIMULATION"})
+        self.assertEqual((code, placed["outcome"]), (200, "accepted"))
         res, status = bridge.switch_environment_with_status("PRODUCTION")
         self.assertEqual((status, res["code"]), (409, "ESUN_RECENT_MUTATION"))
         self.assertGreaterEqual(res["retryAfter"], 1)
@@ -1745,6 +1752,43 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         self.assertEqual(status, 200)
         self.assertEqual(bridge.environment, "PRODUCTION")
         self.assertFalse(bridge._env_switch_in_progress)
+
+    def test_refused_mutations_do_not_start_the_quiet_period(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        bridge = self.make_bridge(sim, RecordingFactory())
+        # environment mismatch (prelude) and switch-in-progress (prelude / HTTP layer): not sent, no quiet period
+        res, status = bridge.place_order({"payload": _QUIET_ORDER, "expected_environment": "PRODUCTION"})
+        self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ENV_MISMATCH", "not_sent"))
+        with bridge._mutations_cond:
+            bridge._env_switch_in_progress = True
+        res, status = bridge.place_order({"payload": _QUIET_ORDER, "expected_environment": "SIMULATION"})
+        self.assertEqual((status, res["code"]), (409, "ESUN_SWITCH_IN_PROGRESS"))
+        self.assertEqual(bridge.try_begin_request_mutation(), "switching")
+        with bridge._mutations_cond:
+            bridge._env_switch_in_progress = False
+        self.assertEqual(bridge._last_mutation_end, 0.0)  # neither refusal started the quiet period
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 200)
+
+    def test_swap_window_ends_before_the_old_websocket_is_closed(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        seen = []
+        holder = {}
+
+        class RecordingCloseSDK(MockSDK):
+            def close_websocket(self):
+                seen.append(holder["bridge"]._env_switch_in_progress)
+                super().close_websocket()
+
+        factory = RecordingFactory(mock_cls=RecordingCloseSDK)
+        bridge = self.make_bridge(sim, factory)
+        holder["bridge"] = bridge
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 200)
+        self.assertTrue(seen)  # the old session's WebSocket was closed...
+        self.assertFalse(any(seen))  # ...after the swap window ended
 
     def _slow_switch_bridge(self, mock_cls_extra=None):
         sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
@@ -1836,7 +1880,11 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         self.assertIs(bridge.session, old)
         self.assertEqual(bridge.environment, "SIMULATION")
         self.assertTrue(bridge.logged_in)
-        self.assertEqual(sdk_cls.logout_calls, 1)  # the abandoned client was logged out, never installed
+        self.assertEqual(sdk_cls.logout_calls, 0)  # never logged out (SDK logout may affect the installed session)
+        abandoned = factory.instances[-1]
+        self.assertIsNot(abandoned, old.sdk)
+        self.assertEqual(abandoned.ws_connect_calls, 0)  # never installed: no WebSocket was started for it
+        self.assertEqual(old.sdk.ws_close_calls, 0)  # the installed session's WebSocket was left alone
         self.assertFalse(bridge._env_switch_in_progress)
         self.assertFalse(bridge.get_health()["envSwitchInProgress"])
         bridge.end_mutation()
