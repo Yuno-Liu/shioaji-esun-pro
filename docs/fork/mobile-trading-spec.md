@@ -494,6 +494,7 @@ createRoot(document.getElementById('root')!).render(
 
 - 單指拖曳平移、雙指縮放（`handleScroll`、`handleScale`）。
 - **長按**進入追蹤模式（lightweight-charts 的 `trackingMode`，觸控長按啟用），十字線價格以 `roundToTick(contract, price)` 取整；放開後浮出「以 1,080 買進／賣出」→ 開啟下單面板並**帶入價格**，**不會直接送單**。
+- 長按選價下單是本裝置設定（帳戶 › 本裝置「圖表長按選價下單」，`sj-mobile-device-v1` 的 `chartPricePick`，**預設關**）：關閉時長按只看價格（十字線與資訊列，放開釘在該根），不浮出選價列、不開下單面板；開啟後同上一條。詳見設計規格 §7.3。
 - 點委託線標籤 → 開啟該筆的委託操作面板（改價／減量／刪單）。
 - **不支援拖曳委託線改價**。
 - 橫向旋轉（P1）：圖表全螢幕＋週期列，底部保留買進／賣出按鈕。

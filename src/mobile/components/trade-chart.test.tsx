@@ -4,6 +4,7 @@
 // 重抓不重建（B6）：補抓沿用同一個圖表、保留選價列與可見範圍。試撮揭示不入圖。
 // W2：依指標設定建立／移除 series（主圖、副圖 pane＋levels）、參數變更、指標節流、圖例、走勢均價線與最高最低、
 // 全螢幕（手動／橫向自動）與 data-allow-pinch。
+// 長按選價下單是本裝置設定（預設關）：以下既有長按選價的測試在 beforeEach 先開啟；關閉時的行為見檔尾「圖表長按選價下單設定」。
 import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -125,10 +126,11 @@ import {
 import { getLimitRange, resetLimitRangeForTest } from '../lib/chart-limit-range';
 import { resetLineFlowForTest } from '../lib/line-flow';
 import { resetLineIndicatorSettingsForTest, setLineIndicatorSettings } from '../lib/line-indicators';
+import { getMobileDeviceSettings, MOBILE_DEVICE_SETTINGS_KEY, resetMobileDeviceSettingsForTest, setMobileDeviceSettings } from '../lib/mobile-device-settings';
 import * as cs from '../styles/chart.css';
 import * as tradeStyles from '../styles/trade.css';
 import * as segmentedStyles from '../ui/segmented.css';
-import { GAP_RELOAD_MIN_MS, INDICATOR_FLUSH_MS, LONG_PRESS_MS, TAP_SAME_SPOT_PX, TradeChart } from './trade-chart';
+import { chartToolNote, GAP_RELOAD_MIN_MS, INDICATOR_FLUSH_MS, LONG_PRESS_MS, TAP_SAME_SPOT_PX, TradeChart } from './trade-chart';
 
 const contract = {
     exchange: 'TSE', code: '2330', security_type: 'STK', target_code: null, name: '台積電', currency: 'TWD',
@@ -204,6 +206,9 @@ beforeEach(() => {
     resetLineIndicatorSettingsForTest();
     resetLineFlowForTest();
     resetLimitRangeForTest();
+    // 既有長按選價的測試：先開啟「圖表長按選價下單」（預設關；關閉時的行為見檔尾）
+    resetMobileDeviceSettingsForTest();
+    setMobileDeviceSettings({ chartPricePick: true });
     m.fetchTicks.mockReset().mockResolvedValue(FLOW_TICKS);
     m.timeScale.setVisibleLogicalRange.mockClear();
     m.timeScale.fitContent.mockClear();
@@ -1560,6 +1565,183 @@ describe('TradeChart 走勢 X 軸固定與漲跌停範圍', () => {
         await act(async () => { byTestId('chart-range-badge')[0]!.props.onClick(); });
         expect(m.openTicket).not.toHaveBeenCalled();
         expect(m.openOrderAction).not.toHaveBeenCalled();
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
+    });
+});
+
+// ---- 圖表長按選價下單設定（本裝置，預設關）：關閉時長按只看價格，0 次 openTicket；開啟時同既有行為；切換即時套用 ----
+
+describe('TradeChart 圖表長按選價下單設定', () => {
+    beforeEach(() => {
+        // 回到預設（關）：清掉檔頭 beforeEach 寫入的開啟值、記憶體重設
+        storage.delete(MOBILE_DEVICE_SETTINGS_KEY);
+        resetMobileDeviceSettingsForTest();
+        m.fetchChartHistory.mockReset().mockResolvedValue(LINE_KBARS);
+        m.chart.setCrosshairPosition.mockClear();
+        m.chart.clearCrosshairPosition.mockClear();
+        m.haptic.mockReset();
+        Object.values(m.send).forEach(f => f.mockReset());
+    });
+
+    async function renderAs(period: 'line' | '5m', c: ContractInfo = contract, lines: PriceLineSpec[] = []) {
+        await act(async () => {
+            view = create(createElement(TradeChart, { code: c.code, contract: c, period, lines, onPeriodChange: vi.fn() }), { createNodeMock: nodeMock });
+        });
+        await tick(50);
+    }
+    const longPress = async (x: number, y: number, upX = x, upY = y) => {
+        await act(async () => { wrap().props.onPointerDown(ptr(x, y)); });
+        await tick(LONG_PRESS_MS + 10);
+        if (upX !== x || upY !== y) await act(async () => { wrap().props.onPointerMove(ptr(upX, upY)); });
+        await act(async () => { wrap().props.onPointerUp(ptr(upX, upY)); });
+    };
+    const tapAt = async (x: number, y: number) => {
+        await act(async () => { wrap().props.onPointerDown(ptr(x, y)); });
+        await tick(100);
+        await act(async () => { wrap().props.onPointerUp(ptr(x, y)); });
+    };
+    const note = () => textOf(view!.root.findAll(n => n.type === 'p')[0]!);
+    const readout = () => byTestId('chart-readout');
+
+    it('預設關閉', async () => {
+        expect(getMobileDeviceSettings().chartPricePick).toBe(false);
+    });
+
+    it('關閉（走勢）：長按不浮出選價列、不觸發 haptic；放開時釘在放開的那一根（同輕點）；0 次 openTicket', async () => {
+        await renderAs('line');
+        await longPress(12, 100); // logical 0.6 → 09:02
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(byTestId('chart-pick-closing')).toHaveLength(0);
+        expect(m.haptic).not.toHaveBeenCalled();
+        expect(readout()).toHaveLength(1);
+        expect(readout()[0]!.props['data-source']).toBe('tap');
+        expect(textOf(byTestId('chart-readout-price')[0]!)).toBe('1,080');
+        // 長按後拖到別根再放開：釘在放開的那一根
+        await longPress(12, 100, 52, 100); // logical 2.6 → 09:03
+        expect(textOf(byTestId('chart-readout-price')[0]!)).toBe('1,065');
+        // 再長按同一根：只釘住、不收起（長按不是切換）
+        await longPress(52, 100);
+        expect(readout()).toHaveLength(1);
+        // 長按價格軸：不切換漲跌停、不選價
+        await longPress(310, 100);
+        expect(getLimitRange()).toBe(false);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(m.haptic).not.toHaveBeenCalled();
+        expect(m.openTicket).not.toHaveBeenCalled();
+        for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
+    });
+
+    it('關閉（K 線、全螢幕）：長按都不浮出選價列；全螢幕買賣鍵照常只開下單面板', async () => {
+        m.fetchChartHistory.mockReset().mockResolvedValue(minuteKbars());
+        await renderAs('5m');
+        await longPress(100, 217);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(readout()).toHaveLength(1);
+        await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+        expect(rootNode().props['data-fullscreen']).toBe('true');
+        await longPress(100, 217);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(m.openTicket).not.toHaveBeenCalled();
+        await unmount();
+        m.fetchChartHistory.mockReset().mockResolvedValue(LINE_KBARS);
+        await renderAs('line');
+        await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+        await longPress(12, 100);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(m.haptic).not.toHaveBeenCalled();
+        expect(m.openTicket).not.toHaveBeenCalled();
+        await act(async () => { byTestId('chart-fs-buy')[0]!.props.onClick(); });
+        expect(m.openTicket.mock.calls).toEqual([[{ code: '2330', action: 'Buy', source: 'button' }]]);
+    });
+
+    it('關閉時點價格軸切換漲跌停、點委託線標籤開委託操作面板照常', async () => {
+        await renderAs('line');
+        await tapAt(310, 100);
+        expect(getLimitRange()).toBe(true);
+        await unmount();
+        m.fetchChartHistory.mockReset().mockResolvedValue(KBARS);
+        await renderAs('5m', contract, [ORDER_LINE]);
+        await act(async () => { byTestId('chart-order-label')[0]!.props.onClick(); });
+        expect(m.openOrderAction.mock.calls).toEqual([['o1', 'menu']]);
+        expect(m.openTicket).not.toHaveBeenCalled();
+    });
+
+    it('開啟：同既有行為（長按 haptic、放開浮出選價列、點「賣出」才開下單面板）', async () => {
+        setMobileDeviceSettings({ chartPricePick: true });
+        await renderAs('line');
+        await longPress(12, 100); // 假圖表 coordinateToPrice(100) = 1200 → 取整 1,200
+        expect(m.haptic.mock.calls).toEqual([['longPress']]);
+        expect(byTestId('chart-pick')).toHaveLength(1);
+        expect(readout()).toHaveLength(0);
+        expect(m.openTicket).not.toHaveBeenCalled();
+        await act(async () => { byTestId('chart-pick')[0]!.findAllByType('button')[1]!.props.onClick(); });
+        expect(m.openTicket.mock.calls).toEqual([[{ code: '2330', action: 'Sell', price: 1200, source: 'chart' }]]);
+    });
+
+    it('切換即時套用：開啟後長按選價、關閉時收起已浮出的選價列，提示文字跟著變', async () => {
+        await renderAs('line');
+        expect(note()).toBe('點圖看價格；點價格軸看漲跌停');
+        await longPress(12, 100);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        await act(async () => { setMobileDeviceSettings({ chartPricePick: true }); });
+        expect(note()).toBe('點圖看價格，長按選價；點價格軸看漲跌停');
+        await longPress(12, 100);
+        expect(byTestId('chart-pick')).toHaveLength(1);
+        await act(async () => { setMobileDeviceSettings({ chartPricePick: false }); });
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(note()).toBe('點圖看價格；點價格軸看漲跌停');
+        await longPress(12, 100);
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.createChart).toHaveBeenCalledTimes(1); // 切換不重建圖表
+    });
+
+    it('長按途中關閉：放開不浮出選價列', async () => {
+        setMobileDeviceSettings({ chartPricePick: true });
+        await renderAs('line');
+        await act(async () => { wrap().props.onPointerDown(ptr(12, 100)); });
+        await tick(LONG_PRESS_MS + 10);
+        await act(async () => { setMobileDeviceSettings({ chartPricePick: false }); });
+        await act(async () => { wrap().props.onPointerUp(ptr(12, 100)); });
+        expect(byTestId('chart-pick')).toHaveLength(0);
+        expect(m.openTicket).not.toHaveBeenCalled();
+    });
+
+    it('提示文字：關閉時不提長按選價', async () => {
+        expect(chartToolNote(true, true, false, false)).toBe('點圖看價格；點價格軸看漲跌停');
+        expect(chartToolNote(true, false, false, false)).toBe('點圖看價格');
+        expect(chartToolNote(false, false, false, false)).toBe('點一下看收盤與漲跌');
+        expect(chartToolNote(false, false, true, false)).toBe('日 K 由 1 分 K 聚合，未含除權息調整');
+        expect(chartToolNote(true, true, false, true)).toBe('點圖看價格，長按選價；點價格軸看漲跌停');
+        expect(chartToolNote(true, false, false, true)).toBe('點一下看價格與漲跌；長按選價位，放開開啟下單面板');
+        expect(chartToolNote(false, false, false, true)).toBe('點一下看收盤與漲跌；長按選價位');
+        for (const on of [true, false]) {
+            for (const [line, limit, daily] of [[true, true, false], [true, false, false], [false, false, false], [false, false, true]] as const) {
+                expect(chartToolNote(line, limit, daily, on).includes('長按')).toBe(on && !daily);
+            }
+        }
+        await renderAs('line', { ...contract, security_type: 'IND' } as ContractInfo);
+        expect(note()).toBe('點圖看價格');
+        await unmount();
+        m.fetchChartHistory.mockReset().mockResolvedValue(KBARS);
+        await renderAs('5m');
+        expect(note()).toBe('點一下看收盤與漲跌');
+    });
+
+    it('S1（關閉）：走勢／K 線、直向／全螢幕長按放開，lib 送出函式 0 次、openTicket 0 次', async () => {
+        for (const period of ['line', '5m'] as const) {
+            m.fetchChartHistory.mockReset().mockResolvedValue(period === 'line' ? LINE_KBARS : KBARS);
+            await renderAs(period, contract, [ORDER_LINE]);
+            await longPress(12, 100);
+            await longPress(100, 217);
+            await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+            await longPress(12, 100);
+            await longPress(100, 217);
+            expect(byTestId('chart-pick')).toHaveLength(0);
+            await unmount();
+        }
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.haptic).not.toHaveBeenCalled();
         for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
     });
 });

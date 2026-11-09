@@ -1,4 +1,4 @@
-// src/mobile/lib/mobile-device-settings.ts — 手機「本裝置」設定（震動回饋、螢幕常亮）
+// src/mobile/lib/mobile-device-settings.ts — 手機「本裝置」設定（震動回饋、螢幕常亮、圖表長按選價下單）
 //
 // - 只存在本裝置的 localStorage（'sj-mobile-device-v1'），不與桌面共用；讀寫都包 try/catch，
 //   不可用（無痕、被封鎖、測試的 node 環境）時退回記憶體，只在本次有效。
@@ -14,10 +14,15 @@ export interface MobileDeviceSettings {
     vibrate: boolean;
     /** 螢幕常亮（Wake Lock API；頁面可見時才持有） */
     wakeLock: boolean;
+    /** 圖表長按選價下單（長按浮出「以 X 買進／賣出」選價列）；關閉時長按只看價格資訊 */
+    chartPricePick: boolean;
 }
 
-/** 震動預設開：與規格 §5.5「成交時 Android 震動」的既有行為一致；螢幕常亮預設關（耗電） */
-export const DEFAULT_MOBILE_DEVICE_SETTINGS: Readonly<MobileDeviceSettings> = Object.freeze({ vibrate: true, wakeLock: false });
+/**
+ * 震動預設開：與規格 §5.5「成交時 Android 震動」的既有行為一致；螢幕常亮預設關（耗電）；
+ * 圖表長按選價下單預設關（避免誤開下單面板，由使用者自行開啟）
+ */
+export const DEFAULT_MOBILE_DEVICE_SETTINGS: Readonly<MobileDeviceSettings> = Object.freeze({ vibrate: true, wakeLock: false, chartPricePick: false });
 
 /** 成交短震的長度（毫秒） */
 export const FILL_VIBRATE_MS = 20;
@@ -28,6 +33,7 @@ export function sanitizeMobileDeviceSettings(v: unknown): MobileDeviceSettings {
     return {
         vibrate: typeof o.vibrate === 'boolean' ? o.vibrate : d.vibrate,
         wakeLock: typeof o.wakeLock === 'boolean' ? o.wakeLock : d.wakeLock,
+        chartPricePick: typeof o.chartPricePick === 'boolean' ? o.chartPricePick : d.chartPricePick,
     };
 }
 
@@ -52,7 +58,7 @@ export function getMobileDeviceSettings(): MobileDeviceSettings {
 export function setMobileDeviceSettings(patch: Partial<MobileDeviceSettings>): MobileDeviceSettings {
     const next = sanitizeMobileDeviceSettings({ ...getMobileDeviceSettings(), ...patch });
     const prev = getMobileDeviceSettings();
-    if (next.vibrate === prev.vibrate && next.wakeLock === prev.wakeLock) return prev;
+    if (next.vibrate === prev.vibrate && next.wakeLock === prev.wakeLock && next.chartPricePick === prev.chartPricePick) return prev;
     current = next;
     try {
         if (typeof localStorage !== 'undefined') localStorage.setItem(MOBILE_DEVICE_SETTINGS_KEY, JSON.stringify(next));

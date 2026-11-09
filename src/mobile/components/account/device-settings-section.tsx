@@ -8,6 +8,7 @@
 //   支援時顯示目前狀態（持有中、背景已釋放、系統暫停、失敗原因）。
 // - 介面觸覺回饋（Android）：lib/ui-settings 的 uiHaptics（設計規格 §5.3、§7.8）；滑塊到達門檻、長按、步進撞界時短震。
 //   iOS 或不支援 navigator.vibrate 時停用並說明（與成交震動同一判斷；motion/haptics 另在 iOS 一律不執行）。
+// - 圖表長按選價下單：lib/mobile-device-settings 的 chartPricePick（預設關）；交易頁圖表即時套用（components/trade-chart.tsx）。
 
 import { useState, type ReactNode } from 'react';
 import { setSoundEnabled, soundEnabled } from '../../../lib/sounds';
@@ -118,6 +119,18 @@ export function DeviceSettingsSection() {
                     onChange={(next) => setMobileDeviceSettings({ wakeLock: next })}
                     label='螢幕常亮'
                     testId='device-wake'
+                />
+            </SettingRow>
+            <SettingRow
+                label='圖表長按選價下單'
+                hint='開啟後長按交易圖表選價位，放開浮出「以此價買進／賣出」，點了才開下單面板；關閉時長按只看價格。'
+                testId='device-chart-pick-row'
+            >
+                <Switch
+                    checked={device.chartPricePick}
+                    onChange={(next) => setMobileDeviceSettings({ chartPricePick: next })}
+                    label='圖表長按選價下單'
+                    testId='device-chart-pick'
                 />
             </SettingRow>
             <p className={styles.deviceOnly}>以上設定只對本裝置有效，不會同步到其他裝置。</p>
