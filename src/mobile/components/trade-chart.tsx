@@ -540,7 +540,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         /** 追蹤或輕點的那一分鐘（買賣力圖例以時間對照）；null＝顯示當日累計 */
         let crossTime: number | null = null;
         // 走勢副圖：分時買賣力（flowS）、大單／小單買賣力（bsS）
-        const flowAllowed = isLine && lineFlowSupported(ct.security_type);
+        const flowAllowed = isLine && lineFlowSupported(ct);
         let flowS: { buy: ISeriesApi<SeriesType>; sell: ISeriesApi<SeriesType>; net: ISeriesApi<SeriesType> } | null = null;
         let bsS: { big: ISeriesApi<SeriesType>; small: ISeriesApi<SeriesType> } | null = null;
         let flowHandle: { get: () => LineFlowSnapshot; release: () => void } | null = null;
@@ -1840,7 +1840,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
                     <button type='button' className={cs.fsTradeButton.sell} onClick={() => openTicket({ code, action: 'Sell', source: 'button' })} data-testid='chart-fs-sell'>賣 出</button>
                 </div>
             )}
-            <IndicatorSheet open={sheetOpen} onClose={() => setSheetOpen(false)} lineMode={isLine} lineFlowSupported={lineFlowSupported(secType)} />
+            <IndicatorSheet open={sheetOpen} onClose={() => setSheetOpen(false)} lineMode={isLine} lineFlowSupported={lineFlowSupported(contract)} />
         </div>
     );
 }

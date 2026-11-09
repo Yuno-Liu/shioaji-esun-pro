@@ -125,8 +125,9 @@ describe('§4.3／§4.4／§4.9 數值', () => {
 });
 
 describe('§4.8 對比實算（以 theme.css.ts 色值重算）', () => {
-    // danger＝紅、success＝綠；up／down 依配色在紅綠之間翻轉，因此紅、綠、accent 三色涵蓋四種主題的所有實心填色
-    const FILLS = ['red', 'green', 'accent'] as const;
+    // up／down 依配色在紅綠之間翻轉；success＝綠；danger 自上游 #393 起是獨立的朱紅（不再等於漲跌紅），也要單獨驗。
+    // 紅、綠、accent、danger 四色涵蓋四種主題的所有實心填色
+    const FILLS = ['red', 'green', 'accent', 'danger'] as const;
 
     it.each(MODES)('%s：白字／實心填色＋inkStrong ≥ 4.5、＋inkLarge ≥ 3（大字）', mode => {
         const p = palette(mode);

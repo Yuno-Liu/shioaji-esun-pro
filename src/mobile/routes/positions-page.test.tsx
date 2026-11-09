@@ -298,6 +298,8 @@ describe('純函式', () => {
         const wrt = { ...stk2330, code: '030392', security_type: 'WRT', name: '030392', reference: 0, limit_up: 0, limit_down: 0, day_trade: '' } as ContractInfo;
         expect(closePlanFor(stockPos({ code: '030392', quantity: 2000 }), wrt)).toEqual({ kind: 'stock', account: stockAcc, contract: wrt, action: 'Sell', shares: 2000 });
         expect(closePlanFor(stockPos({ code: '030392', quantity: 1500 }), wrt)).toBe(POSITIONS_TEXT.warrantOddLot);
+        // SDK 1.7 以前權證可能標成 STK：同樣先說明權證沒有零股（lib isWarrantContract，上游 #394）
+        expect(closePlanFor(stockPos({ code: '030392', quantity: 1500 }), { ...wrt, security_type: 'STK' } as ContractInfo)).toBe(POSITIONS_TEXT.warrantOddLot);
         expect(closePlanFor(stockPos(), { ...stk2330, security_type: 'IND' } as ContractInfo)).toBe(POSITIONS_TEXT.contractMismatch);
         expect(closePlanFor(stockPos(), txf)).toBe(POSITIONS_TEXT.contractMismatch);
     });

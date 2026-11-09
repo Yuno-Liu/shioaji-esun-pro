@@ -93,6 +93,29 @@ git diff $(git merge-base HEAD upstream/main) -- <檔案> | grep -c '^[+-][^+-]'
 
 ## 同步紀錄
 
+### 2026-11-10（上游 8 個提交，Sinotrade #393 朱紅錯誤色、#394 權證閃電下單）
+
+4 個衝突檔，解法已由 rerere 記錄，細節見合併提交 156f09a0。原則照舊：上游修改完整保留，再補回 fork 的玉山掛鉤與信用交易修正。
+
+- **`src/lib/trade.ts`**：`placeStockExitByShares` 保留 fork 的信用了結檢查：只允許融券買進或融資賣出，信用部位不可零股。權證零股改用上游的 `isWarrantContract`，並加上上游的外國標的權證市價檢查。
+- **`src/lib/shioaji.ts`**：`placeStockOrder` 改為 `warrantOrderProblem ?? stockOrderProblem`。註解保留 fork 的語意：借券類買進才擋，融券買進就是回補，照常送出。權證規則在玉山路由之前，所以玉山的權證委託同樣受保護。
+- **`src/components/order-ticket.tsx`**：兩處送單前檢查串成 `warrantOrderProblem ?? esunStockLegProblem ?? stockOrderProblem`，並保留 fork 的 `creditLabel`。
+- **`src/components/flash-order.tsx`**：
+  - 買賣鈕提示依序為 `warrantMarketBlock`、原本的封鎖、fork 的回補／了結警告。
+  - 買鈕保留上游的鎖頭圖示與 fork 的 `{buyCover}`。
+  - 持倉列同時保留上游的外國標的權證橫幅，以及 fork 依 cond 分組的持倉（`posGroups`）。
+- **手機版跟上的調整**：
+  - **權證判斷**：持倉頁平倉的權證零股檢查與 `lineFlowSupported` 改用上游的 `isWarrantContract`。SDK 1.7 以前權證可能標成 STK，此時改看代號；原本的 `isWarrant(security_type)` 判斷不到這種權證。`lineFlowSupported` 改為接收合約，兩個呼叫端都已改，並補上被標成 STK 的權證測試。
+  - **配色**：#393 起 `danger` 是獨立的朱紅，不再等於漲跌紅。手機的對比實算測試原本假設「danger＝紅」，已把 `danger` 加入實心填色的驗證；疊上 inkStrong／inkLarge 後白字對比在深色與淺色模式都合格。手機用 `vars.color.danger` 的 40 處自動改為朱紅，「已鎖單」膠囊與確認面板的實心底都有疊墨，所以不需要改用 `dangerSolid`。
+- **首屏**：手機首屏 JS 223,999 → 224,668 bytes，增加的部分全來自上游共用 chunk（`src` +544、`theme.css` +134），超出 ≤219 KiB。目標因此放寬為 ≤220 KiB（225,280），見 mobile-design.md §13。
+- **fork CI 的時鐘相依測試**（與上游無關）：這次 PR 的 fork-ci 在台北 00:05 執行，`TestMutationContractWithRealSdk.test_unlisted_or_uncertain_sdk_errors_stay_unknown` 失敗（得到 503 ESUN_SESSION_EXPIRED，預期 504 ESUN_OUTCOME_UNKNOWN）。原因：測試的 session 在今日 00:05 寬限之前登入，被換日規則視為前一天的 session，解析錯誤使它失效。已比照 `TestSessionExpiryAndAutoRelogin`，把該類別的台北時鐘固定在 10:00。驗證：時鐘設在 00:00 會重現同一個失敗；在台北 00:01 的模擬時鐘下，全部 221 項橋接測試都通過，沒有其他測試依賴午夜時段。
+- **檢查**：
+  - `tsc -b` 通過。
+  - vitest 共 543 個檔案、8,257 項通過，另有 1 個檔案、2 項略過；這是合併後、手機調整前的結果，調整後受影響的測試另已重跑。
+  - `python -m unittest server.test_esun_trade_server` 與 `deploy` 測試通過。
+  - `docker compose config -q` 通過；三個映像都建置成功。
+  - README 仍只有開頭一段 fork 區塊。
+
 ### 2026-11-09（上游 6 個提交，Sinotrade #384／#370：切換環境後自動重啟套用新設定）
 
 沒有衝突，熱點 `hud-header.tsx` 的 3 行掛載也自動合併。`SHIOAJI_VERSION` 仍為 v1.7.11，套件與 lockfile 都沒變。

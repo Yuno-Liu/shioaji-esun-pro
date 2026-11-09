@@ -9,6 +9,7 @@ import { isMainWindow } from './main-window-commands';
 import { remainingWorkingOrderQuantity } from './working-order-quantity';
 import { noteMutationIntent } from './mutation-intent';
 import { isOddLot, ODD_LOT_NO_PRICE_UPDATE, stockOrderProblem } from './odd-lot';
+import { warrantOrderProblem } from './warrant-rules';
 import { futuresOrderProblem } from './order-conditions';
 import { markConfirmedCancellation, observeTradeMutation } from './trade-mutations';
 import { createCancelBatch, readMark, sharedAuthoritativeTrades, verifyCancellation, type CancelBatchMember } from './cancel-verification';
@@ -875,7 +876,9 @@ export function placeStockOrder(
 ) {
     // 零股不支援的組合（融資券／當沖／市價／IOC／超過 999 股）與整股信用規則
     // （借券類買進、不可當沖的當沖先賣）一律在送出前擋下（#204）；融券買進＝回補照送
-    const problem = stockOrderProblem({ ...order, day_trade: (contract as { day_trade?: string }).day_trade });
+    // 權證：沒有零股、只能現股、外國標的不收市價（docs/qa/warrant-rules.md）
+    const problem = warrantOrderProblem(contract, order)
+        ?? stockOrderProblem({ ...order, day_trade: (contract as { day_trade?: string }).day_trade });
     if (problem) return Promise.reject(Object.assign(new Error(problem), { mutationNotStarted: true as const }));
     const selected = account ?? accountFor('S');
     if (selected && isEsunAccount(selected)) return placeEsunStockOrder(contract, order, selected, opts);

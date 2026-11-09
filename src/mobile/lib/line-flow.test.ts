@@ -167,8 +167,12 @@ describe('line-flow 純函式', () => {
     });
 
     it('只提供股票＋ETF', () => {
-        expect(lineFlowSupported('STK')).toBe(true);
-        for (const t of ['WRT', 'IND', 'FUT', 'OPT', undefined, null]) expect(lineFlowSupported(t)).toBe(false);
+        expect(lineFlowSupported({ security_type: 'STK', code: '2330' })).toBe(true);
+        expect(lineFlowSupported({ security_type: 'STK', code: '0050' })).toBe(true);
+        // SDK 1.7 以前權證可能標成 STK：以代號編碼區間判斷（lib isWarrantContract，上游 #394）
+        expect(lineFlowSupported({ security_type: 'STK', code: '030392' })).toBe(false);
+        for (const t of ['WRT', 'IND', 'FUT', 'OPT', undefined, null]) expect(lineFlowSupported({ security_type: t, code: '2330' })).toBe(false);
+        expect(lineFlowSupported(null)).toBe(false);
     });
 });
 

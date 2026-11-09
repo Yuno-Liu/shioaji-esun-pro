@@ -1,6 +1,7 @@
-import { contractMarket, isWarrant } from './contract-market';
+import { contractMarket, isWarrantContract } from './contract-market';
 import { esunQuickOrderProblem } from './esun/dispatch';
 import { isEsunAccount } from './esun/order-mapping';
+import { warrantMarketOrderBlock, warrantOrderProblem } from './warrant-rules';
 import { canTrade } from './account-tradable';
 import { createAccountQuery } from './account-query';
 import { remainingWorkingOrderQuantity } from './working-order-quantity';
@@ -235,7 +236,12 @@ export async function placeQuickOrder(
         if (problem) throw mutationNotStartedError(problem);
     } else {
         if (opts?.futuresPriceType === 'MKP') throw mutationNotStartedError('範圍市價（MKP）只適用期貨');
-        const problem = stockOrderProblem({
+        const problem = warrantOrderProblem(contract, {
+            price_type: price === null ? 'MKT' : 'LMT',
+            order_lot: opts?.orderLot ?? 'Common',
+            order_cond: orderCond,
+            daytrade_short: daytradeShort,
+        }) ?? stockOrderProblem({
             quantity,
             price_type: price === null ? 'MKT' : 'LMT',
             order_type: price === null ? 'IOC' : (opts?.orderType ?? 'ROD'),
@@ -399,7 +405,10 @@ export async function placeStockExitByShares(
         throw mutationNotStartedError(`信用了結只允許融券買進或融資賣出（${action}＋${orderCond} 不是了結），未送出委託`);
     }
     if (orderCond && odd) throw mutationNotStartedError('信用部位只能整張了結；零股不能以融資券條件送出，未送出委託');
-    if (odd && isWarrant(contract.security_type)) throw mutationNotStartedError('權證沒有零股，未滿一張的部分無法平倉，尚未送出任何分單');
+    if (odd && isWarrantContract(contract)) throw mutationNotStartedError('權證沒有零股，未滿一張的部分無法平倉，尚未送出任何分單');
+    // 整張走市價：外國標的權證無漲跌幅、交易所不收市價，也沒有漲跌停價可當限價
+    const warrantMarket = lots > 0 ? warrantMarketOrderBlock(contract) : null;
+    if (warrantMarket) throw mutationNotStartedError(`${warrantMarket}（請在下單面板以限價平倉），尚未送出任何分單`);
     const limitPrice = action === 'Sell' ? contract.limit_down : contract.limit_up;
     if (odd && (!Number.isFinite(limitPrice) || !limitPrice || limitPrice <= 0)) throw mutationNotStartedError('零股需要有效漲跌停價，尚未送出任何分單');
     // 拆單前先做一次合併的手動確認（整張市價＋零股限價兩腳只問一次，
