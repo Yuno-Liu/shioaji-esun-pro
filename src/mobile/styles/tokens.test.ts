@@ -225,6 +225,41 @@ describe('§4.8 對比實算（以 theme.css.ts 色值重算）', () => {
     });
 });
 
+describe('漲停／跌停實心底（報價列、交易頁主價、產業成分股；§7.2）', () => {
+    // up／down 依配色翻轉：台灣 up＝紅、down＝綠；國際 up＝綠、down＝紅（theme.css.ts makeTokens）
+    const SCHEMES = { tw: { up: 'red', down: 'green' }, intl: { up: 'green', down: 'red' } } as const;
+
+    it.each(MODES.flatMap(mode => (['tw', 'intl'] as const).map(scheme => [mode, scheme] as const)))(
+        '%s-%s：白字「漲停／跌停」小標與價格／up、down＋inkStrong ≥ 4.5',
+        (mode, scheme) => {
+            const p = palette(mode);
+            const ink = THEME_ALPHA[mode].inkStrong;
+            for (const dir of ['up', 'down'] as const) {
+                const ratio = contrast(WHITE, over(BLACK, ink, hex(p(SCHEMES[scheme][dir]))));
+                expect(ratio, `${mode}-${scheme} ${dir}=${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(4.5);
+            }
+        },
+    );
+
+    it('漲停／跌停底一律用 fill.<up|down>.strong（小字 inkStrong），不用 large、不自訂漲跌 hex', () => {
+        // 報價列與成分股列用 watchlist.css 的 limitPrice（組合 fill.*.strong＋::before 小標），交易頁主價直接用 fill[limit].strong
+        const css = readFileSync(join(stylesDir, 'watchlist.css.ts'), 'utf8');
+        expect(css).toMatch(/up: style\(\[fill\.up\.strong, limitTag\('漲停'\)\]\)/);
+        expect(css).toMatch(/down: style\(\[fill\.down\.strong, limitTag\('跌停'\)\]\)/);
+        const uses: [string, RegExp][] = [
+            ['components/quote-row.tsx', /styles\.limitPrice\[limit\]/],
+            ['components/sector/sector-members.tsx', /limitPrice\[limit\]/],
+            ['routes/trade-page.tsx', /fill\[limit\]\.strong/],
+        ];
+        for (const [f, re] of uses) {
+            const src = readFileSync(join(mobileDir, f), 'utf8');
+            expect(src, f).toMatch(re);
+            expect(src, f).not.toMatch(/fill\[limit\]\.large|fill\.(up|down)\.large/);
+            expect(/#(?:f23645|16b389|d6213a|0a8a66)/i.test(src), f).toBe(false);
+        }
+    });
+});
+
 describe('§10 S7／§12 靜態檢查', () => {
     const OWN_FILES = ['tokens.ts', 'metrics.ts', 'theme-vars.css.ts', 'material.css.ts', 'typography.css.ts', 'primitives.css.ts', 'controls.css.ts'];
     const FORBIDDEN: [string, RegExp][] = [

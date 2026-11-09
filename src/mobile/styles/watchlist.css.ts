@@ -11,6 +11,7 @@
 //   只動畫 opacity（按壓、骨架、跳價閃爍皆由共用元件處理）與拖曳排序的 transform（lib/watch-reorder.ts 寫入）。
 import { globalStyle, style, styleVariants } from '@vanilla-extract/css';
 import { vars } from '../../theme.css';
+import { fill } from './primitives.css';
 import { sj } from './theme-vars.css';
 import { ELEVATION, LOW_DPR, MORE_CONTRAST, RADIUS, SAFE_LEFT, SAFE_RIGHT, SIZE, SPACE, TOUCH_MIN } from './tokens';
 import { NUM, NUMERIC, TEXT } from './typography.css';
@@ -555,6 +556,25 @@ export const rowPriceLarge = style({
     fontSize: '1.0625rem',
     lineHeight: 1.25,
 });
+
+/**
+ * 漲停／跌停的成交價（報價列、產業成分股列）：實心 up／down 底＋白字（primitives fill.*.strong＝inkStrong，§4.8 ≥4.5:1），
+ * 價格前以 ::before 放「漲停／跌停」小標（白字 caption）。文字放在 CSS（不佔首屏 JS）；無障礙名稱由列按鈕的 aria-label 提供。
+ * fill 的 ::after 是按壓加深，::before 未被使用。
+ */
+const limitTag = (text: string) => ({
+    selectors: {
+        '&::before': {
+            content: `"${text}"`,
+            ...TEXT.caption,
+            marginRight: '0.1875rem',
+        },
+    },
+});
+export const limitPrice = {
+    up: style([fill.up.strong, limitTag('漲停')]),
+    down: style([fill.down.strong, limitTag('跌停')]),
+};
 
 /** 自選列第二行（漲跌 漲跌幅／總量）：純文字 numSm，字距略開 */
 export const rowChange = style({

@@ -106,7 +106,7 @@ vi.mock('../lib/hash-router', async importOriginal => ({ ...(await importOrigina
 
 import { SEARCH_DEBOUNCE_MS } from '../hooks/use-product-search';
 import { setMotionClockForTest } from '../motion/spring';
-import { pressable, pressableRow } from '../styles/primitives.css';
+import { fill, pressable, pressableRow } from '../styles/primitives.css';
 import { SIZE } from '../styles/tokens';
 import * as tradeStyles from '../styles/trade.css';
 import * as tradeInfoStyles from '../styles/trade-info.css';
@@ -299,21 +299,34 @@ describe('TradePage', () => {
         expect(view!.root.findAllByProps({ 'data-testid': 'trade-daytrade' })).toHaveLength(0);
     });
 
-    it('成交價等於漲停／跌停價時顯示標籤；參考價不判斷', async () => {
+    it('成交價等於漲停／跌停價時顯示標籤，主價改實心 up／down 底（inkStrong）；參考價不判斷', async () => {
+        const lastPrice = () => view!.root.findAll(n => typeof n.type === 'string' && typeof n.props.className === 'string' && n.props.className.includes(tradeStyles.lastPrice))[0]!;
         m.useQuote.mockReturnValue({ tick: { code: '2330', close: '1175', price_chg: '105', total_volume: 1 } });
         await render();
         expect(text(byId('trade-limit'))).toBe('漲停');
+        expect(lastPrice().props.className).toContain(fill.up.strong);
+        expect(lastPrice().props.className).not.toContain(tradeStyles.dirText.up);
+        expect(lastPrice().props['data-limit']).toBe('up');
         await act(async () => view?.unmount());
 
         m.useQuote.mockReturnValue({ tick: { code: '2330', close: '963', price_chg: '-107', total_volume: 1 } });
         await render();
         expect(text(byId('trade-limit'))).toBe('跌停');
+        expect(lastPrice().props.className).toContain(fill.down.strong);
+        await act(async () => view?.unmount());
+
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '1170', price_chg: '100', total_volume: 1 } });
+        await render();
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-limit' })).toHaveLength(0);
+        expect(lastPrice().props.className).toContain(tradeStyles.dirText.up);
+        expect(lastPrice().props['data-limit']).toBeUndefined();
         await act(async () => view?.unmount());
 
         m.useQuote.mockReturnValue(undefined);
         m.useContract.mockReturnValue({ ...stock, reference: 1175 });
         await render();
         expect(view!.root.findAllByProps({ 'data-testid': 'trade-limit' })).toHaveLength(0);
+        expect(lastPrice().props.className).not.toContain(fill.up.strong);
     });
 
     it('非「可當沖」的當沖狀態以文字放資訊列，不顯示徽章', async () => {

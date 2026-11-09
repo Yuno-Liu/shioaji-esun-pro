@@ -16,9 +16,11 @@
 // - 資金流向自開啟本頁起累計（離開本頁的時段不計入）；已量到流向時，收盤後仍顯示今日量到的流向（並標示已收盤）；
 //   沒有量測（盤後才開啟、週末、尚無即時資料）時流向顯示「—」並說明原因，漲跌與成交值仍以建底快照顯示。
 // 請求（每次進入本頁）：群組指標訂閱 4 筆（2 指數 × 2 投影；離開時退訂 4 筆）；建底 ≤2 筆／session（已建底 0 筆）。
+// 產業說明面板：每次開啟（且不在冷卻中）成分股排行訂閱 1 筆、關閉退訂 1 筆（components/sector/sector-members.tsx）；
+//   成分股名稱只為可見列查合約（每代碼 session 1 次）。
 // 手動重試：每按一次，建底失敗的指數建底 1 筆；訂閱失敗的投影各 subscribe 1 筆（離開時與原本的一起只退訂 1 筆）。
 // 版面：PageHeader、Segmented（市場、排序）、GroupedSection（摘要、產業列）、BottomSheet（產業說明）；
-// 產業列只開說明面板，不呼叫任何下單、改單、刪單函式（§10 S1）。
+// 產業列只開說明面板，成分股列只關面板並開交易頁，不呼叫任何下單、改單、刪單函式（§10 S1）。
 
 import { Factory } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
@@ -315,6 +317,7 @@ export function SectorPage({ header }: { header?: ReactNode } = {}) {
                 status={view.status}
                 weight={selectedRow ? view.weights?.get(selectedRow.category) : undefined}
                 dataTime={view.dataTime}
+                live={holding}
                 onClose={() => setSelected(null)}
             />
         </div>

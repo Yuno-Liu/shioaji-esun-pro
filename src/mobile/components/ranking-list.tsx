@@ -589,6 +589,7 @@ const RankingRow = memo(function RankingRow({ rank, kind, item, index, tracker, 
             sparkReference={contract?.reference || (reference !== undefined && reference > 0 ? reference : undefined)}
             punished={punished}
             staticView={view}
+            quoteContract={cached}
             lead={<span className={styles.rankNo} aria-hidden='true' data-testid='ranking-rank'>{rank}</span>}
             metaExtra={<span className={styles.rankExtra} data-testid='ranking-extra'>{extra}</span>}
             ariaPrefix={`第 ${rank} 名 `}

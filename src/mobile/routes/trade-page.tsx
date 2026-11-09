@@ -61,7 +61,7 @@ import { orderLists } from '../lib/watch-list-order';
 import { useOptionalMobileWatchlist } from '../lib/watchlist-context';
 import * as controls from '../styles/controls.css';
 import * as layout from '../styles/layout.css';
-import { focusRing, pressable } from '../styles/primitives.css';
+import { fill, focusRing, pressable } from '../styles/primitives.css';
 import { SIZE } from '../styles/tokens';
 import * as styles from '../styles/trade.css';
 import { GroupedSection } from '../ui/grouped';
@@ -440,7 +440,8 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef, i
                         {contract && isStock && contract.day_trade === 'Yes' && <span className={styles.badge} data-testid='trade-daytrade'>可當沖</span>}
                     </div>
                     <div className={styles.priceRow} data-testid='trade-price'>
-                        <span className={`${styles.lastPrice} ${styles.dirText[chg?.dir ?? 'flat']}`}>
+                        {/* 漲停／跌停：主價改實心 up／down 底＋白字（同報價列；inkStrong，§4.8），旁邊仍有「漲停／跌停」徽章 */}
+                        <span className={`${styles.lastPrice} ${limit ? fill[limit].strong : styles.dirText[chg?.dir ?? 'flat']}`} data-limit={limit ?? undefined}>
                             <span ref={flashRef} className={flash.overlay} aria-hidden='true' />
                             {priceText}
                         </span>

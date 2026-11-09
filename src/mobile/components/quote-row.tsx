@@ -9,6 +9,9 @@
 // - 快速下單鍵（<prefix>-row-ticket）是列按鈕的兄弟節點，只呼叫 onTicket（呼叫端只開下單面板，設計規格 §10 S1）。
 // - testid 以 testPrefix 開頭（自選 'watch'、排行 'ranking'、持倉 'holding'），自選列的 testid 與改版前相同。
 // - 本檔不 import 行情 hook：自選以 probe 傳入行情探針（WatchQuoteProbe），排行是快照資料、不訂閱。
+// - 漲停／跌停（lib/limit-hit.ts）：真實成交價等於 quoteContract 的漲跌停價時，成交價格改實心 up／down 底（inkStrong）＋白字，
+//   價格前有「漲停／跌停」小標（styles/watchlist.css limitPrice 的 ::before），並寫進列按鈕的無障礙名稱；
+//   試撮、指數、沒有漲跌停（排行未解析合約）時不標示。
 
 import { ArrowLeftRight } from 'lucide-react';
 import { Suspense, useCallback, useEffect, useRef, useState, type ComponentType, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
@@ -20,6 +23,7 @@ import { fmtPct, fmtPrice } from '../../lib/utils/format';
 import { fmtCompactInt } from '../lib/num-format';
 import { useMediaQuery } from '../hooks/use-media-query';
 import { loadWatchSparkline } from '../lib/deferred-modules';
+import { quoteLimit } from '../lib/limit-hit';
 import { useWatchSparklineEnabled } from '../lib/watch-prefs';
 import { haptic } from '../motion/haptics';
 import { pressableRow } from '../styles/primitives.css';
@@ -210,7 +214,7 @@ export function useVisibilityTracker(): VisibilityTracker | null {
     return tracker;
 }
 
-function useRowVisible(ref: { current: Element | null }, tracker: VisibilityTracker | null, fallbackVisible: boolean): boolean {
+export function useRowVisible(ref: { current: Element | null }, tracker: VisibilityTracker | null, fallbackVisible: boolean): boolean {
     const [visible, setVisible] = useState(false);
     useEffect(() => {
         if (!tracker) return;
@@ -312,7 +316,8 @@ export interface QuoteRowProps {
     punished: boolean;
     /** 固定的行情（排行：快照資料、不訂閱）；未給時以 quoteContract＋snapshot＋即時行情推算 */
     staticView?: RowQuoteView;
-    quoteContract?: Pick<ContractInfo, 'reference'> & Partial<Pick<ContractInfo, 'security_type'>>;
+    /** 行情推算與漲跌停判斷用的合約（staticView 時只用來判斷漲跌停） */
+    quoteContract?: Pick<ContractInfo, 'reference'> & Partial<Pick<ContractInfo, 'security_type' | 'limit_up' | 'limit_down'>>;
     snapshot?: Snapshot;
     /** 可見時掛載的行情探針（自選：WatchQuoteProbe）；行情交給列自行節流重繪 */
     probe?: ComponentType<{ code: string; onQuote: (q: PriceQuoteState | undefined) => void }>;
@@ -394,8 +399,9 @@ export function QuoteRow({
     // 總量沒有方向；數值缺少時也不著色
     const changeTone: RowQuoteView['dir'] = metric === 'vol' || changeText === '—' ? 'flat' : view.dir;
     const range = dayRangePosition(view);
+    const limit = quoteLimit(quoteContract, view.close, view.simtrade);
     const rangePct = range === null ? 0 : Math.round(range * 100);
-    const ariaLabel = `${ariaPrefix}${code} ${name}${tag ? ` ${MARKET_FULL[tag]}` : ''}，${view.simtrade ? `${SIM_LABEL} ` : ''}${priceText}，${DIR_TEXT[view.dir]} ${chgText} ${pctText}`.trim()
+    const ariaLabel = `${ariaPrefix}${code} ${name}${tag ? ` ${MARKET_FULL[tag]}` : ''}，${view.simtrade ? `${SIM_LABEL} ` : ''}${limit ? `${DIR_TEXT[limit]}停 ` : ''}${priceText}，${DIR_TEXT[view.dir]} ${chgText} ${pctText}`.trim()
         + (volText ? `，總量 ${volText}` : '')
         + (range === null ? '' : `，今日最低 ${fmtPrice(view.low!)} 最高 ${fmtPrice(view.high!)}，現價位於區間 ${rangePct}%`)
         + (punished ? `，${PUNISH_LABEL}股` : '')
@@ -456,7 +462,7 @@ export function QuoteRow({
                     </span>
                 </span>
                 <span className={styles.priceCell}>
-                    <span className={`${styles.rowPrice} ${styles.rowPriceLarge} ${flashStyles.host} ${styles.tone[view.dir]}`}>
+                    <span className={`${styles.rowPrice} ${styles.rowPriceLarge} ${flashStyles.host} ${limit ? styles.limitPrice[limit] : styles.tone[view.dir]}`}>
                         <span ref={flashRef} className={flashStyles.overlay} aria-hidden='true' />
                         <span data-testid={t('price')}>{priceText}</span>
                     </span>

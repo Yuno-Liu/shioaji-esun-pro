@@ -41,6 +41,48 @@ afterEach(async () => {
     vi.unstubAllGlobals();
 });
 
+describe('QuoteRow：漲停／跌停（§7.2）', () => {
+    const limits = { reference: 1000, security_type: 'STK' as const, limit_up: 1100, limit_down: 900 };
+    const priceBox = (p = 'ranking') => all(`${p}-price`)[0]!.parent!;
+
+    it('成交價等於漲停：價格格改實心 up 底＋白字與「漲停」小標（limitPrice.up）、無障礙名稱含漲停', async () => {
+        await render({ quoteContract: limits });
+        expect(priceBox().props.className).toContain(wlStyles.limitPrice.up);
+        expect(priceBox().props.className).not.toContain(wlStyles.tone.up);
+        expect(all('ranking-row-button')[0]!.props['aria-label']).toBe('2330 台積電 上市，漲停 1,100，漲 ▲100.00 +10.00%，總量 4.6萬');
+        // 第二行仍是漲跌色文字
+        expect(all('ranking-change')[0]!.props.className).toContain(wlStyles.tone.up);
+    });
+
+    it('跌停：實心 down 底＋「跌停」；容差內的浮點值也算', async () => {
+        await render({ quoteContract: limits, staticView: { close: 900.0000001, chg: -100, pct: -10, dir: 'down', simtrade: false } });
+        expect(priceBox().props.className).toContain(wlStyles.limitPrice.down);
+        expect(all('ranking-row-button')[0]!.props['aria-label']).toContain('，跌停 900，');
+    });
+
+    it('自選即時行情：快照收盤在漲停時標示，試撮價在漲停時不標示', async () => {
+        await render({ testPrefix: 'watch', staticView: undefined, quoteContract: limits, snapshot: { close: 1100 } as never });
+        expect(priceBox('watch').props.className).toContain(wlStyles.limitPrice.up);
+        expect(all('watch-row-button')[0]!.props['aria-label']).toContain('，漲停 1,100，');
+        await act(async () => view!.unmount());
+        await render({ quoteContract: limits, staticView: { close: 1100, chg: 100, pct: 10, dir: 'up', simtrade: true } });
+        expect(priceBox().props.className).not.toContain(wlStyles.limitPrice.up);
+        expect(priceBox().props.className).toContain(wlStyles.tone.up);
+        expect(all('ranking-row-button')[0]!.props['aria-label']).not.toContain('漲停');
+    });
+
+    it('沒有漲跌停（排行未解析合約、漲跌停 0）、指數、未到漲跌停：不標示', async () => {
+        for (const quoteContract of [undefined, { reference: 0 }, { ...limits, limit_up: 0, limit_down: 0 }, { ...limits, security_type: 'IND' as const }]) {
+            await render({ quoteContract });
+            expect(priceBox().props.className).not.toContain(wlStyles.limitPrice.up);
+            expect(priceBox().props.className).toContain(wlStyles.tone.up);
+            await act(async () => view!.unmount());
+        }
+        await render({ quoteContract: limits, staticView: { close: 1095, chg: 95, pct: 9.5, dir: 'up', simtrade: false } });
+        expect(priceBox().props.className).not.toContain(wlStyles.limitPrice.up);
+    });
+});
+
 describe('QuoteRow', () => {
     it('testid 以前綴開頭；固定行情顯示價格與「漲跌 漲跌幅」並依漲跌著色', async () => {
         await render();
