@@ -241,11 +241,15 @@ describe('漲停／跌停實心底（報價列、交易頁主價、產業成分�
         },
     );
 
-    it('漲停／跌停底一律用 fill.<up|down>.strong（小字 inkStrong），不用 large、不自訂漲跌 hex', () => {
-        // 報價列與成分股列用 watchlist.css 的 limitPrice（組合 fill.*.strong＋::before 小標），交易頁主價直接用 fill[limit].strong
+    it('漲停／跌停底一律是 up／down＋inkStrong（小字），不用 inkLarge、不自訂漲跌 hex', () => {
+        // 報價列與成分股列用 watchlist.css 的 limitPrice（up／down 底＋inkLayer.strong＋白字＋::before 小標），交易頁主價直接用 fill[limit].strong
         const css = readFileSync(join(stylesDir, 'watchlist.css.ts'), 'utf8');
-        expect(css).toMatch(/up: style\(\[fill\.up\.strong, limitTag\('漲停'\)\]\)/);
-        expect(css).toMatch(/down: style\(\[fill\.down\.strong, limitTag\('跌停'\)\]\)/);
+        const block = css.slice(css.indexOf('const limitFill'), css.indexOf('export const limitPrice'));
+        expect(block).toMatch(/backgroundImage: inkLayer\.strong/);
+        expect(block).not.toMatch(/inkLayer\.large/);
+        expect(block).toMatch(/color: '#ffffff'/);
+        expect(css).toMatch(/up: limitFill\(vars\.color\.up, '漲停'\)/);
+        expect(css).toMatch(/down: limitFill\(vars\.color\.down, '跌停'\)/);
         const uses: [string, RegExp][] = [
             ['components/quote-row.tsx', /styles\.limitPrice\[limit\]/],
             ['components/sector/sector-members.tsx', /limitPrice\[limit\]/],
