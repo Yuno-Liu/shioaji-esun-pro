@@ -251,8 +251,9 @@ describe('漲停／跌停實心底（報價列、交易頁主價、產業成分�
         expect(css).toMatch(/up: limitFill\(vars\.color\.up, '漲停'\)/);
         expect(css).toMatch(/down: limitFill\(vars\.color\.down, '跌停'\)/);
         // 窄螢幕＋字級「大」只在排行列隱藏 ::before 小標（實心底保留）；自選、持倉不受影響
-        expect(css).toMatch(/globalStyle\(`html\[data-sj-font-scale="1\.3"\] \[data-testid="ranking-row"\] \.\$\{c\}::before`/);
-        expect(css).toMatch(/'\(max-width: 400px\)': \{ display: 'none' \}/);
+        expect(css).toContain(`const NARROW_RANKING = 'html[data-sj-font-scale="1.3"] [data-testid="ranking-row"]';`);
+        expect(css).toContain("globalStyle(`${NARROW_RANKING} ${c}::before`, narrowOnly({ display: 'none' }));");
+        expect(css).toContain("'@media': { '(max-width: 400px)': rule }");
         const uses: [string, RegExp][] = [
             ['components/quote-row.tsx', /styles\.limitPrice\[limit\]/],
             ['components/sector/sector-members.tsx', /limitPrice\[limit\]/],

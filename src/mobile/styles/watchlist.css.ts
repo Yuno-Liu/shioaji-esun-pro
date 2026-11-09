@@ -579,15 +579,6 @@ export const limitPrice = {
     down: limitFill(vars.color.down, '跌停'),
 };
 
-// 窄螢幕（≤400px，同 quote-row NARROW_WATCH_QUERY）＋字級「大」的排行列：列尾多一顆星號，小標會把名稱擠成「台…」。
-// 只在這個版面隱藏 ::before 小標（保留實心底；列的無障礙名稱仍含「漲停／跌停」），名稱至少留約 3 個字。
-// 以排行列的 data-testid 選取（自選、持倉不受影響），避免為此在首屏 QuoteRow 多傳 class（首屏 JS 0 bytes）。
-for (const c of [limitPrice.up, limitPrice.down]) {
-    globalStyle(`html[data-sj-font-scale="1.3"] [data-testid="ranking-row"] .${c}::before`, {
-        '@media': { '(max-width: 400px)': { display: 'none' } },
-    });
-}
-
 /** 自選列第二行（漲跌 漲跌幅／總量）：純文字 numSm，字距略開 */
 export const rowChange = style({
     ...NUM.numSm,
@@ -600,6 +591,19 @@ export const rowChange = style({
 // 編輯模式（列首移除鍵或多選勾選圈＋列尾「⋯」＋握把）比一般列少約 44px：窄螢幕＋大字時漲跌與漲跌幅放不下就換成兩行，
 // 不讓靠右的數字往左溢出、蓋到代碼（價格欄 minWidth 0）。一般列不變。
 globalStyle(`${rowHasLeading} ${rowChange}`, { whiteSpace: 'normal' });
+
+// 窄螢幕（≤400px，同 quote-row NARROW_WATCH_QUERY）＋字級「大」的排行列：列尾多一顆星號，名稱欄只剩代碼列的最小寬度，
+// 漲停小標或較長的「漲跌 漲跌幅」會把名稱擠成「台…」。只在這個版面（自選、持倉不受影響）：
+// - 隱藏 ::before 小標（保留實心底；列的無障礙名稱仍含「漲停／跌停」）；
+// - 名稱欄最小 4.5rem（名次＋約 3 個字），「漲跌 漲跌幅」放不下時換成兩行（同編輯模式列的規則）。
+// 以排行列的 data-testid 選取，避免為此在首屏 QuoteRow 多傳 class（純 CSS，首屏 JS 0 bytes）。
+const NARROW_RANKING = 'html[data-sj-font-scale="1.3"] [data-testid="ranking-row"]';
+const narrowOnly = (rule: Record<string, string>) => ({ '@media': { '(max-width: 400px)': rule } });
+for (const c of [limitPrice.up, limitPrice.down]) {
+    globalStyle(`${NARROW_RANKING} ${c}::before`, narrowOnly({ display: 'none' }));
+}
+globalStyle(`${NARROW_RANKING} ${rowName}`, narrowOnly({ minWidth: '4.5rem' }));
+globalStyle(`${NARROW_RANKING} ${rowChange}`, narrowOnly({ whiteSpace: 'normal' }));
 
 /** 迷你走勢 canvas（px 固定，不隨字級；字級「大」時縮窄讓出名稱欄） */
 export const spark = style({
