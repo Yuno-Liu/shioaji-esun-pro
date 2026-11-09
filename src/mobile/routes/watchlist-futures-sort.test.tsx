@@ -92,7 +92,8 @@ let view: ReactTestRenderer | undefined;
 const all = (id: string): ReactTestInstance[] => view!.root.findAll(n => n.props['data-testid'] === id && typeof n.type === 'string');
 const textOf = (node: ReactTestInstance): string => node.children.map(c => (typeof c === 'string' ? c : textOf(c))).join('');
 const press = (id: string) => act(async () => { all(id)[0]!.props.onClick(); });
-const settle = async () => { for (let i = 0; i < 6; i++) await act(async () => { await Promise.resolve(); }); };
+// 等延遲載入的 chunk（watch-sort 等）真的載完：單獨執行某一項測試時，第一次 import 比整檔執行時慢
+const settle = async () => { for (let i = 0; i < 6; i++) await act(async () => { await vi.dynamicImportSettled(); await Promise.resolve(); }); };
 const render = async () => {
     await act(async () => { view = create(createElement(WatchlistProvider, null, createElement(WatchlistPage))); });
     await settle();
@@ -270,5 +271,29 @@ describe('自己的清單排序', () => {
         await settle();
         expect(rowCodes()).toEqual(['TXFR1', '2330', '0050', '2317', '2454']);
         expect(m.fetchSnapshots.mock.calls.length).toBe(before);
+    });
+
+    it('換清單：關掉長按面板；新清單的排序結果交回前不沿用上一張清單的順序，也不會少列', async () => {
+        localStorage.setItem('sj-mobile-watch-sort-v1', JSON.stringify({ a: { key: 'price', dir: 'desc' }, b: { key: 'price', dir: 'desc' } }));
+        resetWatchlistSegmentForTest();
+        await render();
+        expect(rowCodes()).toEqual(['TXFR1', '2330', '0050', '2317']);
+        await act(async () => {
+            all('watch-row-button').find(n => n.props['aria-label'].startsWith('2330'))!.props.onContextMenu({ preventDefault: vi.fn() });
+        });
+        const actionsOpen = () => view!.root.findAll(n => n.type === BottomSheet && n.props.testId === 'watch-actions').some(n => n.props.open);
+        expect(actionsOpen()).toBe(true);
+
+        // 清單 b 的排序快照一直沒回來：排序鍵還沒交回 b 的順序
+        m.fetchSnapshots.mockImplementation(() => new Promise(() => undefined));
+        await press('watch-list-tab-b');
+        expect(m.wl.setActiveList).toHaveBeenCalledWith('b');
+        m.wl = { ...m.wl, activeListId: 'b', items: [{ contract: contract('2603', '長榮') }, { contract: contract('2330', '台積電') }, { contract: contract('2412', '中華電') }] };
+        await act(async () => { view!.update(createElement(WatchlistProvider, null, createElement(WatchlistPage))); });
+        await settle();
+
+        expect(actionsOpen()).toBe(false);
+        // 上一張清單的順序（只含 2330）不得讓 2603、2412 消失
+        expect([...rowCodes()].sort()).toEqual(['2330', '2412', '2603']);
     });
 });

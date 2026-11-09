@@ -625,11 +625,15 @@ export function WatchlistPage() {
     }, [otherSegment, fixed, wl.activeListId, wl.serverLists.length, orderKey]);
 
     const structureBusy = wl.structureBusy || listBusy;
-    // 排序後的顯示順序（編輯模式一律伺服器順序）；排序鍵在清單內容改變時同步交回新順序
+    // 排序後的顯示順序（編輯模式一律伺服器順序）；排序鍵在清單內容改變時同步交回新順序。
+    // 不在 order 裡的列（排序結果還沒交回、或剛加入的商品）接在最後，任何時候都不會少列。
     const shown = useMemo(() => {
         if (!order || editing) return wl.items;
         const byCode = new Map(wl.items.map(i => [i.contract.code, i]));
-        return order.flatMap(c => byCode.get(c) ?? []);
+        const sorted = order.flatMap(c => byCode.get(c) ?? []);
+        if (sorted.length === wl.items.length) return sorted;
+        const listed = new Set(order);
+        return [...sorted, ...wl.items.filter(i => !listed.has(i.contract.code))];
     }, [order, editing, wl.items]);
 
     return (
@@ -659,6 +663,11 @@ export function WatchlistPage() {
                                 value={fixed ?? wl.activeListId}
                                 onChange={id => {
                                     const f = FIXED_TABS.some(t => t.value === id) ? id as FuturesListId : null;
+                                    // 換清單：清掉上一張清單的排序順序與長按面板（新清單的排序鍵會交回自己的順序）
+                                    if (id !== (fixed ?? wl.activeListId)) {
+                                        setOrder(null);
+                                        setActionCode(null);
+                                    }
                                     setFixed(lastFixed = f);
                                     if (!f && id !== wl.activeListId) wl.setActiveList(id);
                                 }}
