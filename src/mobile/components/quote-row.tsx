@@ -294,8 +294,8 @@ export function TicketButton({ code, name, onTicket, testId }: { code: string; n
 // 列
 
 export interface QuoteRowProps {
-    /** testid 前綴：自選 'watch'、排行 'ranking'、持倉分段 'holding' */
-    testPrefix: 'watch' | 'ranking' | 'holding';
+    /** testid 前綴：自選 'watch'、排行 'ranking'、持倉分段 'holding'、固定清單股期近月／遠月 'futures' */
+    testPrefix: 'watch' | 'ranking' | 'holding' | 'futures';
     code: string;
     name: string;
     tag: MarketTag | null;

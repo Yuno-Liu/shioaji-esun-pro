@@ -71,6 +71,7 @@ vi.mock('../../lib/trade', () => {
 
 import { OrderConfirmCancelled } from '../../lib/trade';
 import { notStarted } from './errors';
+import { buildFuturesLists } from './futures-lists';
 import { ESUN_FUTURES_MESSAGE, submitMobileOrder, type MobileOrderGuards } from './mobile-order';
 import type { MobileOrderInput } from './mobile-order-types';
 
@@ -345,6 +346,22 @@ describe('submitMobileOrder — 送出', () => {
         expect(req).toMatchObject({ action: 'Sell', unit: '口', price: 22850, note: '限價 ROD・倉別 自動・送往 永豐 模擬環境' });
         expect(req).not.toHaveProperty('priceLabel');
         expect(m.placeStock).not.toHaveBeenCalled();
+    });
+
+    it('自選固定清單「股期近月」的列：確認面板與送單都是實際月份合約（CDFK6，不是 CDFR1）', async () => {
+        const meta = { security_type: 'FUT', exchange: 'TAIFEX', spec_kind: 'stock_fut', underlying_kind: 'S', underlying_code: '2330', root: 'CDF', multiplier: 2000, reference: 2133, limit_up: 2346, limit_down: 1920, last_trading_date: '2099-12-31' };
+        const { near } = buildFuturesLists([
+            { ...meta, code: 'CDFR1', name: '台積電期貨 近月', target_code: 'CDFK6' },
+            { ...meta, code: 'CDFK6', name: '台積電期貨 202611', target_code: null },
+        ] as unknown as ContractInfo[], '2026-11-09');
+        const contract = near[0]!.contract;
+        const base = futuresInput(sinoFutures);
+        await submitMobileOrder({ ...base, contract } as MobileOrderInput, guards);
+        const [req] = m.confirm.mock.calls[0] as unknown as [Record<string, unknown>];
+        expect(req).toMatchObject({ code: 'CDFK6', name: '台積電期貨 202611' });
+        const [sent] = m.placeFutures.mock.calls[0] as unknown as [ContractInfo];
+        expect(sent.code).toBe('CDFK6');
+        expect(sent.target_code).toBeNull();
     });
 
     it('期權確認內容與實際送出一致：範圍市價（priceLabel）、實際效期（FOK 不寫成 IOC）、倉別', async () => {
