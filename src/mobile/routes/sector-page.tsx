@@ -19,6 +19,9 @@
 // 產業說明面板：每次開啟（且不在冷卻中）成分股排行訂閱 1 筆、關閉退訂 1 筆（components/sector/sector-members.tsx）；
 //   成分股名稱只為可見列查合約（每代碼 session 1 次）。
 // 手動重試：每按一次，建底失敗的指數建底 1 筆；訂閱失敗的投影各 subscribe 1 筆（離開時與原本的一起只退訂 1 筆）。
+// 排序（使用者要求「市場-產業流向新增排序功能」；components/sector/sector-model.ts）：資金流向（預設，由淨流入到淨流出）｜
+//   近5分｜漲跌幅｜成交值，再點目前的選項＝反向（選中的段顯示 ↓／↑）；沒有資料的列不論方向都在最後；偏好存在這台裝置。
+//   只排序頁面上已有的資料：0 個請求。
 // 版面：PageHeader、Segmented（市場、排序）、GroupedSection（摘要、產業列）、BottomSheet（產業說明）；
 // 產業列只開說明面板，成分股列只關面板並開交易頁，不呼叫任何下單、改單、刪單函式（§10 S1）。
 
@@ -45,16 +48,21 @@ import {
     fmtSectorPct,
     MARKET_INDEX,
     MARKET_LABEL,
+    nextSectorSort,
+    readSectorSort,
     SECTOR_MARKETS,
-    SECTOR_SORTS,
-    sortSectorRows,
+    SECTOR_SORT_OPTIONS,
+    sectorSortDirText,
+    sortSectorRowsBy,
     toneOf,
     topFlows,
     visibleFlow,
     type FlowStatus,
     type SectorMarket,
     type SectorRow,
-    type SectorSort,
+    type SectorSortKey,
+    type SectorSortPref,
+    writeSectorSort,
 } from '../components/sector/sector-model';
 import * as s from '../styles/sector.css';
 import { EmptyState } from '../ui/empty-state';
@@ -108,7 +116,21 @@ function useIcStoreTick(ms: number): number {
 }
 
 const MARKET_ITEMS = SECTOR_MARKETS.map(m => ({ value: m, label: MARKET_LABEL[m], testId: `sector-market-${m}` }));
-const SORT_ITEMS = SECTOR_SORTS.map(o => ({ ...o, testId: `sector-sort-${o.value}` }));
+
+/** 排序段：選中的段加 ↓／↑；無障礙名稱含可見文字、目前方向與再點一次的方向 */
+function sortItems(pref: SectorSortPref) {
+    return SECTOR_SORT_OPTIONS.map(o => {
+        const active = o.value === pref.key;
+        return {
+            value: o.value,
+            label: active ? `${o.label} ${pref.dir === 'desc' ? '↓' : '↑'}` : o.label,
+            ariaLabel: active
+                ? `${o.label} ${pref.dir === 'desc' ? '↓' : '↑'}，目前${sectorSortDirText(pref)}；再點一次改為${sectorSortDirText(nextSectorSort(pref, o.value))}`
+                : `${o.label}，依${o.label}排序`,
+            testId: `sector-sort-${o.value}`,
+        };
+    });
+}
 
 function FlowBar({ net, max }: { net: number; max: number }) {
     const ratio = max > 0 ? Math.abs(net) / max : 0;
@@ -199,7 +221,12 @@ export function SectorPage({ header }: { header?: ReactNode } = {}) {
     }, []);
     const tick = useIcStoreTick(SECTOR_REFRESH_MS);
     const [market, setMarket] = useState<SectorMarket>('twse');
-    const [sort, setSort] = useState<SectorSort>('inflow');
+    const [sort, setSort] = useState<SectorSortPref>(readSectorSort);
+    const chooseSort = (key: SectorSortKey) => {
+        const next = nextSectorSort(sort, key);
+        setSort(next);
+        writeSectorSort(next);
+    };
     const [selected, setSelected] = useState<IcKey | null>(null);
     const index = MARKET_INDEX[market];
 
@@ -225,7 +252,7 @@ export function SectorPage({ header }: { header?: ReactNode } = {}) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [index, revision, tick]);
 
-    const sorted = useMemo(() => sortSectorRows(view.rows, sort, view.status), [view, sort]);
+    const sorted = useMemo(() => sortSectorRowsBy(view.rows, sort, view.status), [view, sort]);
     const tops = useMemo(() => topFlows(view.rows, view.status), [view]);
     const selectedRow = selected ? view.rows.find(r => r.key === selected) ?? null : null;
 
@@ -274,7 +301,7 @@ export function SectorPage({ header }: { header?: ReactNode } = {}) {
                     </div>
                 </GroupedSection>
                 <div className={s.inset}>
-                    <Segmented<SectorSort> items={SORT_ITEMS} value={sort} onChange={v => setSort(v)} semantics='toggle' ariaLabel='排序' variant='scroll' testId='sector-sort' />
+                    <Segmented<SectorSortKey> items={sortItems(sort)} value={sort.key} onChange={chooseSort} semantics='toggle' ariaLabel='排序（再點一次反向）' variant='scroll' testId='sector-sort' />
                 </div>
                 <GroupedSection header={`${MARKET_LABEL[market]} ${view.rows.length} 個產業`} testId='sector-list'>
                     {sorted.map(row => (

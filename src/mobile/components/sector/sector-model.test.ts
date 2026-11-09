@@ -1,5 +1,5 @@
 // 產業流向分頁的純資料邏輯：列組成、流向狀態、五種排序（null 排最後）、流入／流出前 3、格式。
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SESSION_SLOTS, type GroupFlow } from '../../../lib/chain-flow';
 import {
     buildSectorRows,
@@ -8,8 +8,14 @@ import {
     fmtCalculatedAt,
     fmtSectorMoney,
     fmtSectorPct,
+    DEFAULT_SECTOR_SORT,
     gainRank,
+    nextSectorSort,
+    readSectorSort,
+    SECTOR_SORT_STORAGE_KEY,
     sortSectorRows,
+    sortSectorRowsBy,
+    writeSectorSort,
     topFlows,
     toneOf,
     visibleFlow,
@@ -72,6 +78,8 @@ describe('flowStatusOf', () => {
     });
 });
 
+afterEach(() => vi.unstubAllGlobals());
+
 describe('sortSectorRows／topFlows', () => {
     const mk = (category: string, pct: number | null, amount: number | null, net: number | null): SectorRow => ({
         key: `IX0001:${category}`,
@@ -111,6 +119,42 @@ describe('sortSectorRows／topFlows', () => {
     it('漲幅名次只算有漲跌的產業', () => {
         expect(gainRank(rows, 'IX0001:a')).toEqual({ rank: 2, of: 4 });
         expect(gainRank(rows, 'IX0001:c')).toBeNull();
+    });
+
+    it('使用者排序：預設資金流向由流入到流出＝原本的預設；反向時沒有資料的仍在最後', () => {
+        const by = (key: Parameters<typeof nextSectorSort>[1], dir: 'asc' | 'desc', status: Parameters<typeof sortSectorRows>[2] = 'live') =>
+            sortSectorRowsBy(rows, { key, dir }, status).map(r => r.category);
+        expect(DEFAULT_SECTOR_SORT).toEqual({ key: 'flow', dir: 'desc' });
+        expect(by('flow', 'desc')).toEqual(order('inflow'));
+        expect(by('flow', 'asc')).toEqual(order('outflow'));
+        expect(by('pct', 'desc')).toEqual(order('gain'));
+        expect(by('pct', 'asc')).toEqual(order('loss'));
+        expect(by('amount', 'desc')).toEqual(['b', 'c', 'a', 'e', 'd']);
+        expect(by('amount', 'asc')).toEqual(['e', 'a', 'c', 'b', 'd']);
+        // 近 5 分：flow5 全為 0 → 同值依成交值；沒有流向的 c 在最後
+        expect(by('flow5', 'desc')).toEqual(['b', 'a', 'e', 'd', 'c']);
+        expect(by('flow5', 'asc')).toEqual(['b', 'a', 'e', 'd', 'c']);
+        // 流向不可用：兩個方向都依成交值
+        expect(by('flow', 'asc', 'closed')).toEqual(order('amount'));
+    });
+
+    it('點目前的選項反向、其他選項由大到小；偏好讀寫（格式不對用預設）', () => {
+        expect(nextSectorSort(DEFAULT_SECTOR_SORT, 'flow')).toEqual({ key: 'flow', dir: 'asc' });
+        expect(nextSectorSort({ key: 'flow', dir: 'asc' }, 'flow')).toEqual({ key: 'flow', dir: 'desc' });
+        expect(nextSectorSort({ key: 'flow', dir: 'asc' }, 'amount')).toEqual({ key: 'amount', dir: 'desc' });
+        const data = new Map<string, string>();
+        vi.stubGlobal('localStorage', { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v); } });
+        expect(readSectorSort()).toEqual(DEFAULT_SECTOR_SORT);
+        writeSectorSort({ key: 'amount', dir: 'asc' });
+        expect(readSectorSort()).toEqual({ key: 'amount', dir: 'asc' });
+        localStorage.setItem(SECTOR_SORT_STORAGE_KEY, '{bad');
+        expect(readSectorSort()).toEqual(DEFAULT_SECTOR_SORT);
+        localStorage.setItem(SECTOR_SORT_STORAGE_KEY, JSON.stringify({ key: 'inflow', dir: 'desc' }));
+        expect(readSectorSort()).toEqual(DEFAULT_SECTOR_SORT);
+        // 儲存空間不可用：讀用預設、寫不拋錯
+        vi.stubGlobal('localStorage', { getItem: () => { throw new Error('denied'); }, setItem: () => { throw new Error('denied'); } });
+        expect(readSectorSort()).toEqual(DEFAULT_SECTOR_SORT);
+        expect(() => writeSectorSort({ key: 'pct', dir: 'desc' })).not.toThrow();
     });
 });
 
