@@ -1173,6 +1173,16 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 讀取：切到自訂或改了起日／迄日就是新的區間 key，回到「按「查詢」讀取」，按「查詢」前 0 個請求；送出的 begin／end 就是畫面上的起訖日。
 - 頻率：所選帳戶含玉山時，所有已實現損益查詢（不分區間）共用滑動視窗「任意 60 秒最多 4 次」（`PNL_ESUN_QUERIES_PER_MIN`；`lib/account-on-demand` 的 gate `{ name, max, windowMs }`）；滿了「查詢」停用並顯示到最舊一次滑出視窗的剩餘秒數（與冷卻倒數取大者），玉山說明改為「玉山已實現損益最長查詢 180 天，每分鐘最多查詢 4 次。」。依據：bridge 的 `profit_loss_limiter` 限 10 次／分，只在快取未命中時取額度（`_cached_query`：single-flight 填充鎖之後、快取鍵＝日期區間、TTL 10 秒）；每次查詢發出 2 個同區間 GET `/esun/portfolio/profit-loss`（列表＋彙總），通常只占 1 個額度、最壞 2 個，4 次 ≤ 8 < 10，留空間給同一個 bridge 上的桌面版。只有永豐帳戶時不套用視窗，維持原本「同一區間＋帳戶 30 秒不重查」。
 
+**交易環境（玉山模擬／正式切換）**（2026-11-09，使用者要求「手機板切換模擬/正式讓手機板也可以設定切換」；以程式碼為準）：
+
+- 位置：帳戶 › 連線，「玉山重新連線」之後（`components/account/env-switch-section.tsx`）。永豐列唯讀（`/api/v1/info` 的 simulation），附說明「改 .env 的 SJ_PRODUCTION 後執行 docker compose up -d 重新啟動；手機與桌面都只顯示、不能切換」。玉山列顯示目前環境（切換中、未連線、環境未確認另有文字）；下方兩個選項列沿用帳戶切換面板的列樣式＋環境膠囊：目前環境打勾、停用；沒有設定檔的選項停用並寫「未提供 esun-config.*.ini（不可選）」；共同的擋下原因寫在選項下方。
+- 確認面板：切正式＝danger InlineNote「正式環境的委託是真實下單，會動用真實資金與庫存。」＋SlideToConfirm（danger），沒有可直接切換的按鈕；切模擬＝主要按鈕「確定切換至模擬環境」（風險降低的方向、不會動用真實資金，仍是「點選項 → 面板內按確定」兩步，與 §10 S2 只把滑動留給真錢動作一致；桌面切模擬甚至不需確認）。切換中面板不可關閉（dismissible false、取消停用、Esc 無效）。開啟面板時重新讀一次 bridge health：bridge 停止時 lib 仍保留舊的 health，不重讀會被當成已連線；讀取中與讀不到時停用。
+- 擋下條件（`lib/esun-env-switch.ts` 的 `esunSwitchBlock`，依序）：切換進行中（模組層旗標或 `getSnapshot().switching`）、重新連線進行中、正在確認 bridge、bridge 未連線／停止、登入熔斷鎖定、`health.ok` 為假、目標設定檔不存在、已是目前環境、下單面板開啟（`getMobileUi().ticket`）、委託操作面板開啟（`orderAction`）、委託確認進行中（`getPendingOrderConfirm()`）、多選出清進行中（`isBatchExitActive()`）、刪改單送出中（訂閱 lib `onTradeMutation` 的 begin／settled，含同源其他分頁；120 秒未 settled 視為結束）。新單送出中下單面板不可關閉，所以由「下單面板開啟」涵蓋。面板內即時顯示原因；滑動或按確定的當下 `runEsunEnvSwitch` 再判斷一次，被擋下時不送出並通知原因。
+- 送出與之後（同桌面 `header-env-menu.tsx` 的 runEsunSwitch）：只呼叫 `esunTradeService.switchEnvironment(target)`；成功後 `invalidateAllQueries()`、`refreshTradingStateForModeChange()`，通知「環境切換：已切換玉山證券至○○環境（設定檔）」並關閉面板；失敗通知「環境切換失敗」＋bridge 錯誤，面板保留並顯示錯誤。玉山帳戶換成新環境的帳戶（模擬帳戶 broker_id 帶 `-SIM`）與選取帳戶的對應由 esunTradeService（`replaceExternalAccountsForBroker`）處理，與桌面同一條路徑。交易額度、玉山帳務概覽、已實現損益、交割款的快取鍵都含 broker_id 或環境，切換後讀新鍵，不會顯示另一個環境的資料；玉山估算剩餘隨帳戶與交易狀態重算。模組層防連點：同時只送一次。切換中「玉山重新連線」停用（「玉山環境切換中，完成後才能重新連線。」）。
+- 狀態列帳戶切換面板底部改為「永豐模擬／正式由伺服器部署決定，只能顯示；玉山可在帳戶 › 連線切換。」＋［玉山模擬／正式切換］：關閉面板、跳到帳戶頁本區塊並聚焦（`lib/account-jump.ts`，作法同今日額度跳轉）；本身不切換環境，也沒有第二個切換介面。
+- 瀏覽器假資料實測（360 寬、字級 1.3）：模擬 → 正式（點把手一下不送出；滑動後切換中面板不可關閉）→ 狀態列、持倉頁、委託頁變正式、選取帳戶 8840-SIM → 8840；切回模擬時 bridge 回登入失敗，面板顯示錯誤、環境不變；再按確定切回模擬；bridge 停止、登入鎖定、bridge 異常、正式設定檔不存在都停用並說明；委託請求 0。
+- 體積：首屏 gzip 223,248 → 223,420（+172 B：約 99 B 是延遲 chunk 引用首屏既有符號的匯出綁定，約 73 B 是狀態列連結）；帳戶頁 chunk +2.8 KB。
+
 ### 7.9 市場（`#/market`、`#/market/signals`，`routes/market-page.tsx`）
 
 第 1 期把底部「產業」分頁改為「市場」（以程式碼為準）：
@@ -1299,6 +1309,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 | 走勢副圖指標（分時買賣力、大單／小單的開關與門檻） | 只改本機設定與讀取當日逐筆（唯讀），不呼叫送單函式、不開下單面板；副圖內長按不選價 | `indicator-sheet.test.tsx`、`trade-chart.test.tsx`、`line-flow.test.ts` |
 | 排序群組的多選刪除群組（選取、勾選、取消、刪除、返回、確定刪除） | 只刪除自選清單（lib `deleteWatchlist`、hook `deleteCurrentList`），不呼叫送單、改單、刪單，也不開 `openTicket`／`openOrderAction` | `watchlist-group-delete.test.tsx`、`watch-group-delete.test.tsx` |
 | 持倉選取模式（選取、勾選、全選、取消、開關預覽） | 滑動前不送單、不開下單面板與委託面板；送出只在預覽滑動後經 `runBatchExit` → `executeClose`（S10） | `positions-page.test.tsx` |
+| 帳戶 › 連線「交易環境」（選項、確認面板、滑動、確定、取消）與狀態列［玉山模擬／正式切換］ | 只呼叫 `esunTradeService.switchEnvironment()` 與切換後的 `invalidateAllQueries`／`refreshTradingStateForModeChange`；不呼叫永豐或玉山的送單、改單、刪單，也不開下單或委託面板 | `env-switch-section.test.tsx`、`account-switch-env-link.test.tsx` |
 | 通知中心（狀態列鈴、面板、［全部清除］兩段、SheetLoadError 重試） | 只開唯讀面板與清除記憶體通知紀錄 | `status-bar-notices.test.tsx`、`notice-center-sheet.test.tsx` |
 | 漲停／跌停標示（報價列、交易頁主價）、盤中異動名稱查詢、產業說明面板成分股（排序、點列） | 只改顯示；名稱只讀合約（`ensureContract`）；成分股只 retain／release 群組內排行投影，點列只關面板並 `navigate` 到交易頁 | `quote-row.test.tsx`、`trade-page.test.tsx`、`market-signals.test.tsx`、`sector-page.test.tsx`（S1） |
 | 已實現損益自訂區間（期間膠囊、起日／迄日、查詢） | 只改起訖日（模組層）或發出唯讀損益查詢（`fetchProfitLoss`／`fetchProfitLossSummary`），不呼叫送單、改單、刪單，也不開下單或委託面板 | `account-page.test.tsx`、`account-pnl.test.ts`、`account-on-demand.test.ts` |
@@ -1566,6 +1577,7 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
       - 執行中切到背景再回來：應停止剩餘（畫面在背景或重新同步過），送出中的那一筆照常完成。
       - 360 寬、字級「大」時選取模式的版面（勾選鍵、底部工具列換行、組標頭「全選」）；最後一列能否捲到工具列上方。
       - VoiceOver／TalkBack 如何朗讀 role=checkbox 的按鈕與 `aria-checked="mixed"`；「全選」放在 GroupedSection 標頭內。
+    - 玉山環境切換（2026-11-09）：假資料實測正確（§7.8）。待實機確認：真實 bridge 切換所需時間（前端逾時 30 秒）與切換期間其他頁面的畫面；切換後下單面板路由徽章、持倉、委託在真實 bridge 上的更新時機；正式設定檔登入失敗時的錯誤文字；同時在桌面與手機切換時（bridge 回 409）的訊息。
     - 交易圖表輕點：iOS／Android 上輕點與長按的區分（450ms、10px），與捲動、平移的衝突；資訊列在 360 寬、字級「大」時的換行。
     - 圖表長按選價下單設定（預設關）：假資料實測（360 寬字級 1.3，直向與橫向全螢幕、走勢與 K 線）關閉時長按 0 次選價列、0 個下單面板、0 個委託請求，放開後資訊列釘在該根（拖動後釘在放開處），開啟時四種組合都浮出選價列；iOS／Android 實機上長按放開後資訊列是否穩定釘住（程式庫追蹤模式在觸控放開時清十字線，由 crosshairMove 放回）待確認。
     - 自選頁「持倉」分段：假資料實測（390 寬字級小、360 寬字級 1.3：合併 2330 永豐＋玉山為「等 2 筆」、融資、融券、零股、期貨、選擇權都列出，0 額外請求、0 委託）。待實機確認：標記換行後的列高；同一檔多空並存時只看得到第一筆的方向（明細在持倉頁）；快速下單用目前選取的帳戶；合約解析失敗的代碼沒有名稱與下單鍵。

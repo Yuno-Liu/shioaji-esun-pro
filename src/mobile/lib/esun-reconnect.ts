@@ -1,9 +1,9 @@
 // src/mobile/lib/esun-reconnect.ts — 手機玉山「一般重新連線」（規格 §2.5、§6.7、§9.1、Phase 2）
 //
-// - 只呼叫 esunTradeService.reconnect()：絕不帶 force、不切換環境（強制重試與環境切換只在桌面處理，§12）。
+// - 只呼叫 esunTradeService.reconnect()：絕不帶 force、不切換環境（強制重試只在桌面處理，§12；環境切換見 esun-env-switch.ts）。
 // - 60 秒冷卻在模組層：不論成功或失敗，從按下確認起算；帳戶頁重新掛載仍有效（玉山登入 10 次／分、300 次／日、
 //   密碼錯 3 次鎖帳，server/esun_trade_server.py）。
-// - 進行中、冷卻中、bridge 未連線、登入熔斷鎖定（loginLocked）時一律不送出。
+// - 進行中、玉山環境切換中、冷卻中、bridge 未連線、登入熔斷鎖定（loginLocked）時一律不送出。
 // - 結果通知用語比照桌面 src/components/header-env-menu.tsx 的 runEsunReconnect：
 //   失敗「玉山重新連線失敗」＋錯誤內容；成功「玉山重新連線」＋「已重新登入玉山證券（模擬環境／正式環境）」。
 //   成功後 invalidateAllQueries()（與桌面相同）；委託權威重讀由 trading-state 的 session 代次 hook 負責，不在此重複。
@@ -21,7 +21,7 @@ export const ESUN_RECONNECT_WARNING = '密碼錯誤 3 次會被玉山鎖帳，�
 /** 重新連線成功但讀不到 health 時的重讀排程（毫秒；比照桌面 ESUN_HEALTH_RECHECK_DELAYS） */
 export const ESUN_HEALTH_RECHECK_DELAYS = [2_000, 4_000, 8_000, 16_000, 30_000] as const;
 
-export type EsunReconnectBlock = 'running' | 'cooldown' | 'no-bridge' | 'locked' | 'not-needed';
+export type EsunReconnectBlock = 'running' | 'switching' | 'cooldown' | 'no-bridge' | 'locked' | 'not-needed';
 
 interface ReconnectState {
     running: boolean;
@@ -67,6 +67,8 @@ export function esunSessionLost(h: EsunBridgeHealth | null | undefined): boolean
 /** 不能重新連線的原因（依優先順序）；null＝可以 */
 export function esunReconnectBlock(health: EsunBridgeHealth | null | undefined, now: number = Date.now(), s: ReconnectState = state): EsunReconnectBlock | null {
     if (s.running) return 'running';
+    // 玉山環境切換進行中（帳戶 › 連線的環境切換）：bridge 會回 ESUN_SESSION_BUSY，先擋下
+    if (esunTradeService.getSnapshot().switching) return 'switching';
     if (!health) return 'no-bridge';
     if (health.loginLocked) return 'locked';
     if (esunReconnectCooldownSec(now, s) > 0) return 'cooldown';

@@ -4,6 +4,7 @@
 // - 每列：券商、帳號（遮蔽模式用 privacyAccountLabel）、環境徽章；canTrade() 為 false 時標示「不可交易（未簽署）」且不可選。
 // - 選取呼叫 selectAccount(account)（src/lib/account-store.ts）。
 // - 下單面板開啟或確認進行中時不允許切換（避免路由變更；即使切換，captureDisplayedRoute() 也會擋下）。
+// - 底部說明的「帳戶 › 連線」連結跳到帳戶頁交易環境區塊（玉山模擬／正式切換；lib/account-jump.ts），本面板不切換環境。
 
 import { Check, TriangleAlert } from 'lucide-react';
 import { useSyncExternalStore } from 'react';
@@ -16,7 +17,9 @@ import { orderRouteOf, routeEnvText } from '../../lib/order-route';
 import { usePrivacyMode } from '../../lib/privacy';
 import { useServerInfo } from '../../lib/server-info-store';
 import type { Account } from '../../lib/types/portfolio';
+import { jumpToAccountSection } from '../lib/account-jump';
 import { useMobileUi } from '../lib/mobile-store';
+import * as controls from '../styles/controls.css';
 import * as routeStyles from '../styles/route-badge.css';
 import * as styles from '../styles/status-bar.css';
 import { BottomSheet } from './bottom-sheet';
@@ -96,7 +99,12 @@ export function AccountSwitchSheet({ open, onClose }: { open: boolean; onClose: 
                     </section>
                 );
             })}
-            <p className={styles.note}>模擬／正式由伺服器部署決定；玉山環境切換請使用桌面版。</p>
+            <p className={styles.note}>永豐模擬／正式由伺服器部署決定，只能顯示；玉山可在帳戶 › 連線切換。</p>
+            <div className={styles.sheetActions}>
+                <button type='button' className={controls.button.neutral} data-testid='account-env-link' onClick={() => { onClose(); jumpToAccountSection('account-env-switch'); }}>
+                    玉山模擬／正式切換
+                </button>
+            </div>
         </BottomSheet>
     );
 }

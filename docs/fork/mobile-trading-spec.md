@@ -146,7 +146,7 @@
 | 項目 | 判定 | 依據 | 說明 |
 |---|---|---|---|
 | 永豐模擬／正式切換 | ❌ | 由部署的 `SJ_PRODUCTION` 決定（`docker-compose.yml:55`） | 手機只顯示目前環境 |
-| 玉山模擬／正式切換 | ❌ 手機不提供 | API 存在（`POST /esun/auth/environment`） | 只讀徽章；切換請用桌面 |
+| 玉山模擬／正式切換 | ✅ 已提供（2026-11-09，使用者要求） | `POST /esun/auth/environment`，經 `esunTradeService.switchEnvironment()`（同桌面頂欄） | 帳戶 › 連線「交易環境」：切正式須滑動確認並警示真實下單，切模擬按鈕確認；bridge 未連線／停止／異常／登入鎖定、切換或重新連線中、設定檔不存在、下單／委託操作／確認面板開啟、多選出清、刪改單送出中一律擋下並說明（mobile-design.md §7.8）。本列取代 R7、§8、§12 的「手機不提供玉山環境切換」 |
 | 玉山重新連線（非強制） | ⚠️ P1 | `POST /esun/auth/reconnect`；登入 10 次／分、300 次／日、密碼錯 3 次鎖帳（`server/esun_trade_server.py:11-26`） | 60 秒冷卻 |
 | 伺服器端風控總開關 | ❌ 不存在 | 風控只存在各瀏覽器 localStorage（`src/lib/risk.ts:20`） | 手機風控設定與桌面不同步，需明示 |
 
@@ -732,6 +732,7 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 | 連線 | 永豐串流狀態、最後心跳時間（`getLastHeartbeat()`）、連線世代；玉山 bridge：登入、環境、`sessionExpired`、`wsConnected`、回報串流狀態（`getEsunStreamStatus()`） | `src/lib/stream.ts:157,909`、`EsunBridgeHealth`（`src/lib/esun/adapter.ts:29-55`） |
 | 伺服器 | 版本（`/api/v1/info`）、模擬／正式、憑證剩餘天數、每日流量 | `fetchInfo()`、`fetchHealth()`、`/api/v1/auth/usage` |
 | 玉山重新連線（P1） | 只提供一般重新連線（不提供 force），60 秒冷卻，按下前提醒「密碼錯誤 3 次會鎖帳」 | `esunTradeService.reconnect()` |
+| 交易環境 | 永豐模擬／正式唯讀（改 `.env` 的 `SJ_PRODUCTION` 後 `docker compose up -d`）；玉山模擬／正式切換（§2.5），環境切換中停用玉山重新連線 | `useServerInfo().simulation`；`useEsunEnvironment()`、`esunTradeService.switchEnvironment()` |
 | 風控 | 一鍵鎖單、單筆上限、當日虧損上限；「手動下單確認」顯示為**鎖定開啟** | `useRiskSettings()`、`setRiskSettings()` |
 | 顯示 | 深／淺色、台灣（紅漲綠跌）／國際配色、字級、遮蔽金額 | `useThemeSettings()`、`usePrivacyMoney()` |
 | 診斷 | secure context、Web Locks、BroadcastChannel、User Agent、建置版本 `__SHIOAJI_BUILD_VERSION__` | — |

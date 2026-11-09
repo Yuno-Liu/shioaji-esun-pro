@@ -1,6 +1,6 @@
-// src/mobile/components/account/connection-card.tsx — 帳戶頁「連線」：永豐串流、玉山 bridge 狀態與重新連線（規格 §6.7）
+// src/mobile/components/account/connection-card.tsx — 帳戶頁「連線」：永豐串流、玉山 bridge 狀態與重新連線、交易環境（規格 §6.7）
 //
-// 玉山重新連線（EsunReconnectSection）由另一個任務實作，這裡只負責掛在玉山 bridge 狀態區塊內。
+// 玉山重新連線（EsunReconnectSection）掛在玉山 bridge 狀態區塊內；交易環境（EnvSwitchSection：永豐唯讀、玉山模擬／正式切換）緊接其後。
 
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { useStreamStatus } from '../../../hooks/use-stream';
@@ -10,6 +10,7 @@ import { getLastHeartbeat, streamConnectionEpoch, type StreamStatus } from '../.
 import { formatClock } from '../../lib/account-format';
 import * as styles from '../../styles/account.css';
 import { Card, Item, useNow, type Tone } from './account-ui';
+import { EnvSwitchSection } from './env-switch-section';
 import { EsunReconnectSection } from './esun-reconnect-section';
 
 /** 伺服器資訊與玉山 health 的手動重新檢查冷卻 */
@@ -92,6 +93,7 @@ export function ConnectionCard() {
                 </div>
                 <EsunReconnectSection />
             </div>
+            <EnvSwitchSection />
         </Card>
     );
 }

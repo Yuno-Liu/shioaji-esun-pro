@@ -42,6 +42,7 @@ function envStatus(h: EsunBridgeHealth): { text: string; tone: Tone } {
 function blockText(block: EsunReconnectBlock, h: EsunBridgeHealth | null, cooldownSec: number): string {
     switch (block) {
         case 'running': return '重新連線中…';
+        case 'switching': return '玉山環境切換中，完成後才能重新連線。';
         case 'no-bridge': return '玉山 bridge 未連線，無法重新連線。';
         case 'locked':
             return `登入熔斷鎖定中${h?.loginLockReason ? `（${h.loginLockReason}）` : ''}。手機不提供強制重試，請到桌面版確認設定後處理。`;
