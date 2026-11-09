@@ -264,3 +264,39 @@ export const sheetNote = style({
     ...TEXT.footnote,
     color: vars.color.mutedForeground,
 });
+
+// ---- 說明面板的成分股列（成交值前 10 檔；點列開交易頁） ----
+// 列沿用產業列 row 的按壓與焦點；名稱 headline、代碼 mutedForeground；成交價漲跌色，漲停／跌停時改實心 up／down 底＋白字
+// （primitives fill.*.strong，§4.8 ≥4.5:1）並加「漲停／跌停」小標（watchlist.css limitTag）。
+
+export const memberTitle = style({
+    display: 'flex',
+    alignItems: 'baseline',
+    gap: SPACE.s1_5,
+    flex: '1 1 auto',
+    minWidth: 0,
+});
+
+export const memberCode = style({
+    flex: '0 0 auto',
+    ...TEXT.subhead,
+    ...NUMERIC,
+    color: vars.color.mutedForeground,
+});
+
+export const memberPrice = style({
+    flex: '0 0 auto',
+    padding: '0 0.25rem',
+    margin: '0 -0.25rem',
+    borderRadius: '4px',
+    whiteSpace: 'nowrap',
+    ...NUM.numMd,
+    ...NUMERIC,
+});
+
+export const memberEmpty = style({
+    margin: 0,
+    padding: `${SPACE.s3} ${SPACE.s4}`,
+    ...TEXT.footnote,
+    color: vars.color.mutedForeground,
+});

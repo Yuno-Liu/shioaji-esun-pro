@@ -4,9 +4,10 @@
 // - 篩選只送差異，並存 localStorage。
 // - 部分失敗：顯示覆蓋率與錯誤，時間經過不重送；［重試］只重送失敗的鍵。
 // - 列：最新在前、最多 100 列；時間、名稱＋代碼、訊號文字、價格／漲跌；試撮徽章；遺漏提示。
-// - 名稱只讀記憶體：任何數量的訊號都不發合約查詢（apiGet 0 次）；名稱目錄每次顯示呼叫 1 次 ensureEquityNamesFresh。
+// - 名稱：先讀記憶體（合約快取、名稱目錄；目錄每次顯示呼叫 1 次 ensureEquityNamesFresh）；仍沒有名稱的「可見」列才向永豐
+//   查一次合約（每代碼 session 1 次、同時 ≤2、失敗不重試、不可見時取消未開始的查詢）；名稱到達後列顯示「名稱 代碼」。
 // - S1：按遍所有按鈕，openTicket／openOrderAction 與 lib 送單、改單、刪單 0 次；點列只 navigate 到交易頁。
-import { createElement } from 'react';
+import { createElement, type ReactElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -85,8 +86,25 @@ async function settle(ms = 0) {
 
 async function mount() {
     const { MarketSignals } = await import('./market-signals');
-    await act(async () => { view = create(createElement(MarketSignals)); });
+    // 列按鈕的 ref 給一個帶代碼的假節點，假 IntersectionObserver 依代碼切換可見度
+    const createNodeMock = (el: ReactElement) => ({ code: (el.props as Record<string, unknown>)['data-code'] });
+    await act(async () => { view = create(createElement(MarketSignals), { createNodeMock }); });
     await settle(600);
+}
+
+/** 假 IntersectionObserver：記錄觀察中的節點，show/hide 依代碼送出可見度 */
+class FakeIO {
+    static current: FakeIO | null = null;
+    readonly els = new Set<{ code?: string }>();
+    constructor(readonly cb: (entries: { target: unknown; isIntersecting: boolean }[]) => void) { FakeIO.current = this; }
+    observe(el: { code?: string }) { this.els.add(el); }
+    unobserve(el: { code?: string }) { this.els.delete(el); }
+    disconnect() { this.els.clear(); }
+}
+async function visibility(codes: string[], visible: boolean) {
+    const io = FakeIO.current!;
+    await act(async () => { io.cb([...io.els].filter(e => codes.includes(String(e.code))).map(target => ({ target, isIntersecting: visible }))); });
+    await settle();
 }
 
 async function unmount() {
@@ -294,7 +312,37 @@ describe('清單', () => {
         expect(rows[1]!.props['aria-label']).toContain('成交價 1050');
     });
 
-    it('最多 100 列；任何數量的不同代碼都不發合約查詢', async () => {
+    it('最多 100 列；沒有名稱的列只在可見時查一次合約（每代碼 1 次、同時 ≤2、失敗與重複出現都不再查）', async () => {
+        vi.stubGlobal('IntersectionObserver', FakeIO);
+        // 合約 GET 先掛起，由 drain() 依序放行：觀察同時進行中的查詢數
+        const held: (() => void)[] = [];
+        let maxHeld = 0;
+        const failing = new Set(['3170']);
+        m.get.mockImplementation((path: string) => new Promise((resolve, reject) => {
+            const hit = /\/api\/v1\/data\/contracts\/(\w+)(\/info)?\?/.exec(path);
+            held.push(() => {
+                if (!hit || failing.has(hit[1]!)) reject(new Error('404 Not Found'));
+                else if (!hit[2]) resolve({ code: hit[1], security_type: 'STK', exchange: 'TSE', target_code: null });
+                else resolve({ code: hit[1], security_type: 'STK', exchange: 'TSE', target_code: null, name: `名${hit[1]}`, reference: 100, limit_up: 110, limit_down: 90 });
+            });
+            maxHeld = Math.max(maxHeld, held.length);
+        }));
+        const drain = async () => {
+            while (held.length > 0) {
+                // 合約查詢是 base → info 兩段 GET 再寫入快取：在 act 內多讓出幾次微任務，讓快取更新在 act 內送達
+                await act(async () => {
+                    held.shift()!();
+                    for (let i = 0; i < 20; i++) await Promise.resolve();
+                });
+                await settle();
+            }
+        };
+        const lookups = () => m.get.mock.calls.map(([path]) => String(path)).filter(p => /\/contracts\/\w+\?/.test(p)).map(p => /contracts\/(\w+)/.exec(p)![1]);
+        const nameOf = (code: string) => {
+            const row = byTestId('signal-row').find(r => r.props['data-code'] === code)!;
+            return textOf(row.findAll(n => n.props['data-testid'] === 'signal-row-name')[0]!);
+        };
+
         await mount();
         await act(async () => {
             for (let i = 0; i < 180; i++) m.handlers.get('scanner')?.(scanner(String(3000 + i)));
@@ -302,7 +350,48 @@ describe('清單', () => {
         await settle(600);
         expect(byTestId('signal-row')).toHaveLength(100);
         expect(byTestId('signal-row')[0]!.props['data-code']).toBe('3179');
+        // 還沒有任何列可見：0 個合約查詢
         expect(m.get).not.toHaveBeenCalled();
+
+        // 5 列可見：同時最多 2 個查詢，其餘排隊；名稱到達前只顯示代碼
+        await visibility(['3179', '3178', '3177', '3176', '3175'], true);
+        expect(lookups()).toEqual(['3179', '3178']);
+        expect(nameOf('3179')).toBe('3179');
+        await drain();
+        expect(maxHeld).toBeLessThanOrEqual(2);
+        expect(lookups().sort()).toEqual(['3175', '3176', '3177', '3178', '3179']);
+        // 名稱到達：「名稱 代碼」
+        expect(nameOf('3179')).toBe('名3179');
+        const row = byTestId('signal-row').find(r => r.props['data-code'] === '3179')!;
+        expect(textOf(row)).toContain('名31793179');
+        expect(row.props['aria-label']).toContain('名3179 3179');
+
+        // 排隊中就變不可見：取消，不查；之後再可見才查（仍只 1 次）
+        await visibility(['3174', '3173', '3172'], true);
+        expect(lookups().slice(5)).toEqual(['3174', '3173']);
+        await visibility(['3172'], false);
+        await drain();
+        expect(lookups()).not.toContain('3172');
+        await visibility(['3172'], true);
+        await drain();
+        expect(lookups().filter(c => c === '3172')).toHaveLength(1);
+
+        // 查詢失敗：只顯示代碼，不可見再可見、或再收到同代碼的訊號都不重查
+        await visibility(['3170'], true);
+        await drain();
+        expect(lookups().filter(c => c === '3170')).toHaveLength(1);
+        expect(nameOf('3170')).toBe('3170');
+        await visibility(['3170'], false);
+        await visibility(['3170'], true);
+        await emit(scanner('3170'));
+        await emit(scanner('3179'));
+        await visibility(['3170', '3179'], true);
+        await drain();
+        expect(lookups().filter(c => c === '3170')).toHaveLength(1);
+        expect(lookups().filter(c => c === '3179')).toHaveLength(1);
+        expect(maxHeld).toBeLessThanOrEqual(2);
+        // 只有合約 GET；POST 只有 scanner 訂閱
+        expect(m.get.mock.calls.every(([path]) => String(path).startsWith('/api/v1/data/contracts/'))).toBe(true);
         expect(m.post.mock.calls.every(([path]) => String(path).startsWith('/api/v1/stream/'))).toBe(true);
         expect(m.ensureNames).toHaveBeenCalledTimes(1);
     });

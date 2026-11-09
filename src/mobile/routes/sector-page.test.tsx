@@ -5,7 +5,10 @@
 // - 盤中串流：流向自開啟本頁起累計，顯示近 5 分／累計淨流入、摘要前 3 與淨流入橫條；排序五種。
 // - 跨過收盤：收到 market_phase closed 的事件後，盤中已量到的流向仍顯示，並標示已收盤。
 // - 429：降級顯示、不重試（時間經過、重新進入都不再查詢）、不提供重試鍵；一般錯誤提供重試（只重查、不多送訂閱）。
-// - S1：頁面與說明面板所有按鈕都不呼叫 lib 的送單、改單、刪單函式，請求只有群組指標的訂閱與建底。
+// - 說明面板的成分股：開啟時 retain 群組內成交值排行 1 條（subscribe 1）、關閉 release（unsubscribe 1），不重新建底；
+//   預設成交值排序、可切漲跌幅；名稱與漲跌停只為可見列查合約（每代碼 1 次）；漲停列實心底＋小標；點列關面板並開交易頁；
+//   建底錯誤冷卻中開啟面板不 retain。
+// - S1：頁面與說明面板所有按鈕都不呼叫 lib 的送單、改單、刪單函式，POST 只有群組指標（含成分股排行）的訂閱與建底。
 import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +16,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const DATE = '2026-11-06';
 
 type Group = { cat: string; name: string; pct: number; amount: number; ppm?: number };
+type Member = { code: string; cat: string; price: number; ref: number; amount: number };
+
+// 上市半導體（24）成分股：2330 收在漲停 1100（合約 limit_up 1100）；金融（28）一檔
+const MEMBERS: Member[] = [
+    { code: '2303', cat: '24', price: 45.5, ref: 46, amount: 5e9 },
+    { code: '2330', cat: '24', price: 1100, ref: 1000, amount: 9e10 },
+    { code: '2454', cat: '24', price: 1200, ref: 1180, amount: 2e10 },
+    { code: '2881', cat: '28', price: 80, ref: 80, amount: 1e9 },
+];
+const LIMITS: Record<string, [number, number, string]> = {
+    2303: [50.6, 41.4, '聯電'],
+    2330: [1100, 900, '台積電'],
+    2454: [1295, 1065, '聯發科'],
+    2881: [88, 72, '富邦金'],
+};
 
 const TWSE: Group[] = [
     { cat: '24', name: '半導體業', pct: 1.5, amount: 3e11, ppm: 400_000 },
@@ -35,7 +53,21 @@ function snapshot(code: string, phase: string, time: string, groups: Group[]) {
         refresh_state: 'ready',
         simtrade: false,
         total_amount: 0,
-        entries: [],
+        entries: (code === 'IX0001' ? MEMBERS : []).map(e => ({
+            contract: { code: e.code },
+            category: e.cat,
+            price: String(e.price),
+            reference: String(e.ref),
+            price_chg: String(e.price - e.ref),
+            pct_chg: ((e.price - e.ref) / e.ref * 100).toFixed(2),
+            points: '0',
+            reference_weight_ppm: 50_000,
+            total_amount: e.amount,
+            amount_share_bps: 0,
+            price_source: 'regular',
+            trading_status: 'active',
+            data_status: 'live',
+        })),
         groups: groups.map(g => ({
             category: g.cat,
             name: g.name,
@@ -61,6 +93,8 @@ const m = vi.hoisted(() => ({
     },
     handlers: new Map<string, (raw: string) => void>(),
     post: vi.fn(),
+    get: vi.fn(),
+    navigate: vi.fn(),
     send: {
         placeStockOrder: vi.fn(),
         placeFuturesOrder: vi.fn(),
@@ -76,13 +110,15 @@ const m = vi.hoisted(() => ({
     openOrderAction: vi.fn(),
 }));
 
-vi.mock('../../lib/api', () => ({ apiPost: m.post, apiGet: vi.fn(), apiPut: vi.fn(), apiDelete: vi.fn() }));
+vi.mock('../../lib/api', () => ({ apiPost: m.post, apiGet: m.get, apiPut: vi.fn(), apiDelete: vi.fn() }));
+vi.mock('../lib/hash-router', async importOriginal => ({ ...(await importOriginal<Record<string, unknown>>()), navigate: m.navigate }));
 vi.mock('../../lib/stream', () => ({
     registerSubscription: vi.fn(),
     unregisterSubscription: vi.fn(),
     registerSubscriptionRaw: vi.fn(),
     registerCapabilitySubscription: vi.fn(),
     unregisterCapabilitySubscription: vi.fn(),
+    registerCodeAlias: vi.fn(),
     onStreamEvent: (type: string, handler: (raw: string) => void) => {
         m.handlers.set(type, handler);
         return () => m.handlers.delete(type);
@@ -157,6 +193,16 @@ beforeEach(() => {
         return { success: true, message: '' };
     });
     m.bootstrap = closedSnapshots;
+    // 合約查詢（成分股名稱與漲跌停）：base → info
+    m.get.mockReset();
+    m.get.mockImplementation(async (path: string) => {
+        const hit = /\/api\/v1\/data\/contracts\/(\w+)(\/info)?\?/.exec(path);
+        const info = hit ? LIMITS[hit[1]!] : undefined;
+        if (!hit || !info) throw new Error('404 Not Found');
+        const base = { code: hit[1], security_type: 'STK', exchange: 'TSE', target_code: null };
+        return hit[2] ? { ...base, name: info[2], reference: 0, limit_up: info[0], limit_down: info[1] } : base;
+    });
+    m.navigate.mockReset();
     for (const f of Object.values(m.send)) f.mockReset();
     m.openTicket.mockReset();
     m.openOrderAction.mockReset();
@@ -524,7 +570,7 @@ describe('S1：產業頁不送單', () => {
         await mount();
         await act(async () => byTestId('sector-row')[0]!.props.onClick());
         expect(byTestId('sector-detail-sheet')).toHaveLength(1);
-        expect(textOf(one('sector-detail-sheet'))).toContain('成分股明細');
+        expect(byTestId('sector-member').length).toBeGreaterThan(0);
         const buttons = () => view!.root.findAll(n => n.type === 'button');
         const count = buttons().length;
         expect(count).toBeGreaterThan(8);
@@ -538,5 +584,123 @@ describe('S1：產業頁不送單', () => {
         expect(m.openOrderAction).not.toHaveBeenCalled();
         const allowed = /^\/api\/v1\/(data\/index_components|stream\/(un)?subscribe\/index_components)$/;
         for (const [path] of m.post.mock.calls) expect(String(path)).toMatch(allowed);
+        // GET 只有合約查詢；點成分股只導覽到交易頁
+        for (const [path] of m.get.mock.calls) expect(String(path)).toMatch(/^\/api\/v1\/data\/contracts\//);
+        for (const [route] of m.navigate.mock.calls) expect(route).toMatchObject({ name: 'trade' });
+    });
+});
+
+describe('說明面板：成分股（群組內成交值排行）', () => {
+    const rankingCalls = (calls: unknown[][]) => calls.filter(c => JSON.stringify(c[1]).includes('"ranking"'));
+    const memberCodes = () => byTestId('sector-member').map(r => r.props['data-code'] as string);
+    const member = (code: string) => byTestId('sector-member').find(r => r.props['data-code'] === code)!;
+    const inMember = (code: string, id: string) => member(code).findAll(n => typeof n.type === 'string' && n.props['data-testid'] === id);
+    const openSemi = () => act(async () => byTestId('sector-row').find(r => r.props['data-key'] === 'IX0001:24')!.props.onClick());
+    const closeSheet = () => act(async () => view!.root.findAll(n => typeof n.type !== 'string' && n.props.testId === 'sector-detail-sheet')[0]!.props.onClose());
+    const lookups = () => m.get.mock.calls.map(([p]) => String(p)).filter(p => /\/contracts\/\w+\?/.test(p));
+
+    it('開啟時 retain 1 條（subscribe 1、不重新建底），關閉 release（unsubscribe 1）；再開啟再訂閱 1', async () => {
+        await mount();
+        expect(subscribes()).toHaveLength(4);
+        expect(bootstraps()).toHaveLength(2);
+        await openSemi();
+        await settle();
+        expect(subscribes()).toHaveLength(5);
+        const sub = rankingCalls(subscribes());
+        expect(sub).toHaveLength(1);
+        expect(JSON.stringify(sub[0]![1])).toContain('IX0001');
+        expect(JSON.stringify(sub[0]![1])).toContain('"group":"24"');
+        expect(JSON.stringify(sub[0]![1])).toContain('"limit":10');
+        expect(bootstraps()).toHaveLength(2);
+        expect(unsubscribes()).toHaveLength(0);
+        // 建底快照立即投出初始列（同類別 3 檔，預設成交值由大到小）
+        expect(memberCodes()).toEqual(['2330', '2454', '2303']);
+        expect(textOf(one('sector-members'))).toContain('成交值前 10 檔');
+
+        await closeSheet();
+        await settle();
+        expect(byTestId('sector-member')).toHaveLength(0);
+        expect(rankingCalls(unsubscribes())).toHaveLength(1);
+        expect(unsubscribes()).toHaveLength(1);
+
+        await openSemi();
+        await settle();
+        expect(rankingCalls(subscribes())).toHaveLength(2);
+        expect(bootstraps()).toHaveLength(2);
+        // 離開本頁：群組指標 4 筆＋成分股 1 筆
+        await unmount();
+        expect(rankingCalls(unsubscribes())).toHaveLength(2);
+        expect(unsubscribes()).toHaveLength(6);
+    });
+
+    it('排序：預設成交值，切到漲跌幅只重排同一批、不送請求', async () => {
+        await mount();
+        await openSemi();
+        await settle();
+        expect(one('sector-members-sort-amount').props['aria-pressed']).toBe(true);
+        await press('sector-members-sort-pct');
+        expect(one('sector-members-sort-pct').props['aria-pressed']).toBe(true);
+        expect(memberCodes()).toEqual(['2330', '2454', '2303']);
+        expect(inMember('2303', 'sector-member-change').map(textOf)).toEqual(['-0.50 -1.09%']);
+        await press('sector-members-sort-amount');
+        expect(memberCodes()).toEqual(['2330', '2454', '2303']);
+        expect(rankingCalls(subscribes())).toHaveLength(1);
+    });
+
+    it('名稱與漲跌停：每代碼查一次合約；「名稱 代碼」；漲停列實心 up 底＋「漲停」小標（limitPrice）與無障礙名稱', async () => {
+        const { limitPrice } = await import('../styles/watchlist.css');
+        await mount();
+        await openSemi();
+        await settle();
+        // 沒有 IntersectionObserver 時前 20 列視為可見（本產業 3 檔）：每代碼 1 次 base GET
+        expect(lookups().map(p => /contracts\/(\w+)/.exec(p)![1]).sort()).toEqual(['2303', '2330', '2454']);
+        expect(textOf(inMember('2330', 'sector-member-name')[0]!)).toBe('台積電');
+        expect(textOf(member('2330'))).toContain('台積電2330');
+        const price = inMember('2330', 'sector-member-price')[0]!;
+        expect(price.props.className).toContain(limitPrice.up);
+        expect(price.props['data-limit']).toBe('up');
+        expect(member('2330').props['aria-label']).toContain('台積電 2330，漲停 1,100，');
+        expect(inMember('2454', 'sector-member-price')[0]!.props['data-limit']).toBeUndefined();
+        expect(inMember('2454', 'sector-member-price')[0]!.props.className).not.toContain(limitPrice.up);
+        // 關閉再開啟：已查過的代碼不再查
+        await closeSheet();
+        await openSemi();
+        await settle();
+        expect(lookups()).toHaveLength(3);
+    });
+
+    it('點成分股：關閉面板並開交易頁；不開下單面板、不送單', async () => {
+        await mount();
+        await openSemi();
+        await settle();
+        await act(async () => member('2454').props.onClick());
+        await settle();
+        expect(m.navigate).toHaveBeenCalledWith({ name: 'trade', code: '2454' });
+        expect(byTestId('sector-member')).toHaveLength(0);
+        expect(rankingCalls(unsubscribes())).toHaveLength(1);
+        expect(m.openTicket).not.toHaveBeenCalled();
+        expect(m.openOrderAction).not.toHaveBeenCalled();
+        for (const f of Object.values(m.send)) expect(f).not.toHaveBeenCalled();
+    });
+
+    it('建底錯誤冷卻中開啟面板：不 retain（不訂閱、不重新建底），顯示暫無資料', async () => {
+        m.bootstrap = code => {
+            if (code === 'IX0001') throw new Error('400 bad request');
+            return closedSnapshots(code);
+        };
+        await mount();
+        await unmount();
+        vi.setSystemTime(Date.now() + 30_000);
+        await mount();
+        expect(byTestId('sector-paused')).toHaveLength(1);
+        const subs = subscribes().length;
+        const boots = bootstraps().length;
+        await press('sector-market-tpex');
+        await act(async () => byTestId('sector-row')[0]!.props.onClick());
+        await settle();
+        expect(byTestId('sector-detail-sheet')).toHaveLength(1);
+        expect(subscribes()).toHaveLength(subs);
+        expect(bootstraps()).toHaveLength(boots);
+        expect(textOf(one('sector-members-empty'))).toBe('暫無成分股資料。');
     });
 });

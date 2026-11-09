@@ -4,7 +4,7 @@
 // SIGNAL_EXCHANGES（桌面元件不匯入手機版，這裡複製常數，語意必須一致）。
 // - 篩選只到「規則家族」（漲跌停、急漲跌、爆量、狀態）＋市場（上市、上櫃）；預設同桌面：急漲跌、上市＋上櫃。
 // - 篩選存 localStorage（讀寫都包 try/catch，失敗時本次仍生效、下次回預設）。
-// - 名稱：只讀已在記憶體的資料，不為訊號發出逐檔查詢（見 signalName）。
+// - 名稱：signalName 只讀已在記憶體的資料；仍沒有名稱的可見列由 market-signals.tsx 經 lib/contract-names 查一次合約。
 
 import { getCachedContract } from '../../../lib/contracts-cache';
 import { etfNameForLive } from '../../../lib/etf-runtime-catalog';
@@ -206,7 +206,7 @@ function cleanName(name: unknown, code: string): string | null {
 }
 
 /**
- * 訊號列的名稱：只讀記憶體中已有的資料，不為訊號發出任何逐檔查詢。
+ * 訊號列的名稱：只讀記憶體中已有的資料（本函式不發請求；可見列的合約查詢在 market-signals.tsx）。
  *   1. 全域合約快取（自選、交易頁、持倉解析過的合約）；
  *   2. ETF 名稱目錄（lib 內建快照；本頁不觸發更新）；
  *   3. 上市櫃公司名稱目錄（lib/stock-runtime-catalog；本頁顯示時呼叫 ensureEquityNamesFresh，lib 自行合併與節流）。

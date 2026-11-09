@@ -1,12 +1,14 @@
 // src/mobile/components/sector/sector-detail-sheet.tsx — 產業說明面板（產業流向分頁點列開啟）
 //
-// 只顯示既有資料即可取得的資訊（0 個額外請求）：
+// 群組指標與流向只用既有資料（0 個額外請求）：
 // - 群組指標：加權漲跌、成交值、成分檔數；占本市場產業成交值合計、漲幅名次（由同一份群組指標算出）。
 // - 建底快照的參考權重（getIcBootstrapGroupWeights，建底已取得、不另查）。
 // - 本頁記錄的資金流向：近 5 分淨流入／成交值、累計淨流入／量到的成交值、每分鐘累計淨流入走勢。
-// 成分股明細需要群組內排行的額外訂閱（桌面「產業全景」的下鑽），手機版不做，面板上說明。
+// 成分股（components/sector/sector-members.tsx，放在「今日」之後、資金流向之前）：面板開啟期間 retain 群組內成交值排行 1 條（同桌面「產業全景」下鑽），
+//   關閉即 release；名稱只為可見列查合約。點成分股只關閉面板並開交易頁。
 // 面板內沒有任何下單、改單、刪單入口（§10 S1）。
 
+import { navigate } from '../../lib/hash-router';
 import { BottomSheet } from '../bottom-sheet';
 import { GroupedSection, ValueRow } from '../../ui/grouped';
 import * as s from '../../styles/sector.css';
@@ -14,6 +16,7 @@ import {
     fmtSectorMoney,
     fmtSectorPct,
     gainRank,
+    MARKET_INDEX,
     MARKET_LABEL,
     toneOf,
     visibleFlow,
@@ -21,8 +24,7 @@ import {
     type SectorMarket,
     type SectorRow,
 } from './sector-model';
-
-export const SECTOR_NO_MEMBERS_NOTE = '成分股明細需要另外的即時訂閱（桌面版「產業全景」提供），手機版暫不提供。';
+import { SectorMembers } from './sector-members';
 
 const FLOW_ESTIMATE_NOTE = '每分鐘成交值增量依該分鐘加權漲跌方向計為流入或流出（估算）。';
 const FLOW_FOOTER: Record<FlowStatus, string> = {
@@ -65,10 +67,12 @@ export interface SectorDetailSheetProps {
     /** 參考權重（佔指數 %）；建底尚未完成時 undefined */
     weight: number | undefined;
     dataTime: string | null;
+    /** 產業頁正在 retain（不在建底錯誤冷卻中）：成分股才 retain；false 時只顯示已快取的成分股 */
+    live: boolean;
     onClose(): void;
 }
 
-export function SectorDetailSheet({ row, rows, market, status, weight, dataTime, onClose }: SectorDetailSheetProps) {
+export function SectorDetailSheet({ row, rows, market, status, weight, dataTime, live, onClose }: SectorDetailSheetProps) {
     const flow = row ? visibleFlow(row, status) : null;
     const rank = row ? gainRank(rows, row.key) : null;
     const dash = '—';
@@ -88,6 +92,15 @@ export function SectorDetailSheet({ row, rows, market, status, weight, dataTime,
                         <ValueRow label='成分檔數' value={row.count > 0 ? `${row.count} 檔` : dash} testId='sector-detail-count' />
                         <ValueRow label='指數權重（參考）' value={weight === undefined ? dash : `${weight.toFixed(2)}%`} testId='sector-detail-weight' />
                     </GroupedSection>
+                    <SectorMembers
+                        index={MARKET_INDEX[market]}
+                        group={row.category}
+                        enabled={live}
+                        onPick={code => {
+                            onClose();
+                            navigate({ name: 'trade', code });
+                        }}
+                    />
                     <GroupedSection
                         header='資金流向（自開啟本頁起累計）'
                         footer={FLOW_FOOTER[status]}
@@ -98,10 +111,7 @@ export function SectorDetailSheet({ row, rows, market, status, weight, dataTime,
                         <ValueRow label='累計量到的成交值' value={flow ? fmtSectorMoney(flow.turnover) : dash} testId='sector-detail-turnover' />
                         {flow ? <FlowSpark series={flow.series} /> : null}
                     </GroupedSection>
-                    <p className={s.sheetNote}>
-                        {dataTime ? `資料時間 ${dataTime}。` : ''}
-                        {SECTOR_NO_MEMBERS_NOTE}
-                    </p>
+                    {dataTime ? <p className={s.sheetNote}>資料時間 {dataTime}。</p> : null}
                 </div>
             ) : null}
         </BottomSheet>

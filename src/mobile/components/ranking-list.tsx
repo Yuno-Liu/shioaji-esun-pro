@@ -33,6 +33,7 @@ import type { ContractInfo } from '../../lib/types/contract';
 import type { ScannerItem, ScannerType } from '../../lib/types/market';
 import { fmtPrice } from '../../lib/utils/format';
 import { fmtCompactInt } from '../lib/num-format';
+import type { LimitState } from '../lib/limit-hit';
 import { openTicket } from '../lib/mobile-store';
 import { requestSparkContract } from '../lib/ranking-spark-contracts';
 import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
@@ -515,6 +516,16 @@ export function rankingExtraText(kind: RankingKind, item: ScannerItem): string {
     return `量 ${Number.isFinite(vol) && vol >= 0 ? fmtCompactInt(vol) : '—'}`;
 }
 
+/**
+ * scanner change_type 的漲跌停：1＝漲停、5＝跌停（2 漲、3 平、4 跌）。2026-11-09 以正式 sidecar 唯讀 POST /api/v1/data/scanner 確認：
+ * 漲幅前 30 的 +10.00% 全為 1；−10.00%／−9.95%／−9.92%／−9.87%（跳動取整後的跌停）為 5；−9.62% 為 4。
+ * 排行是快照資料，以它為準（0 個請求、不需要合約快取）。
+ */
+export function rankingLimit(changeType: unknown): LimitState | null {
+    const t = Number(changeType);
+    return t === 1 ? 'up' : t === 5 ? 'down' : null;
+}
+
 /** 排行的快照行情（不訂閱即時）：漲跌與漲跌幅由伺服器的漲跌與成交價推算 */
 export function rankingView(item: ScannerItem): RowQuoteView {
     const close = Number(item.close);
@@ -530,6 +541,7 @@ export function rankingView(item: ScannerItem): RowQuoteView {
         // 日內區間小條（與自選相同）：scanner 已帶今日最高、最低
         high: Number(item.high) > 0 ? Number(item.high) : undefined,
         low: Number(item.low) > 0 ? Number(item.low) : undefined,
+        limit: rankingLimit(item.change_type),
     };
 }
 

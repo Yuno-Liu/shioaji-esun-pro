@@ -6,25 +6,30 @@
 //   因此清單一律以 snapshot.version 為重算訊號、每次產生新陣列；畫面最多每 500ms 重算一次。
 // - 訂閱：每個「規則 × 市場」一個鍵（components/market/signal-subscriptions.ts）。只在本分段掛載（市場分頁＋盤中異動）且文件在前景時持有；
 //   篩選改變只送差異；離開或退到背景全部退訂；失敗不自動重試，只提供［重試］。
-// - 名稱：只讀記憶體中的合約快取與名稱目錄（signal-model.ts 的 signalName），不為訊號逐檔查詢；
-//   顯示時呼叫 1 次 ensureEquityNamesFresh()（lib 合併、60 分鐘內不重抓、失敗 30 秒後才可能再抓，且只在下次呼叫時）。
+// - 名稱：先讀記憶體中的合約快取與名稱目錄（signal-model.ts 的 signalName）；顯示時呼叫 1 次 ensureEquityNamesFresh()
+//   （lib 合併、60 分鐘內不重抓、失敗 30 秒後才可能再抓，且只在下次呼叫時）。部署環境沒有 /metadata 路由時目錄讀不到，
+//   因此仍沒有名稱的「可見」列（整段共用一個 IntersectionObserver，quote-row 的 useVisibilityTracker）以
+//   lib/contract-names 向永豐查一次合約：每個代碼本 session 最多 1 次、同時 ≤2、失敗不重試、不可見時取消未開始的查詢；
+//   不讀外部網站。名稱到達前列只顯示代碼，之後顯示「名稱 代碼」。
 // 請求（每次進入本分段或回到前景）：scanner subscribe 每鍵 1 次（預設 4 規則 × 2 市場＝8；全選 13 × 2＝26）；
-//   離開或退到背景時對成功的鍵各 unsubscribe 1 次；公司名稱目錄 GET ≤3（與搜尋共用，60 分鐘內 0）。
+//   離開或退到背景時對成功的鍵各 unsubscribe 1 次；公司名稱目錄 GET ≤3（與搜尋共用，60 分鐘內 0）；
+//   合約查詢 ≤「出現在可見範圍、且沒有名稱的不同代碼數」（session 內每代碼 1 次）。
 // 點列只呼叫 navigate({ name: 'trade', code })：沒有下單鍵、不呼叫 openTicket／openOrderAction（§10 S1）；沒有聲音或震動。
 
 import { Activity } from 'lucide-react';
-import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { getMarketPulseSnapshot, retainMarketPulseStreams, subscribeMarketPulse } from '../../../lib/market-pulse';
 import { subscribeEtfNames } from '../../../lib/etf-runtime-catalog';
 import { ensureEquityNamesFresh, subscribeEquityNames } from '../../../lib/stock-runtime-catalog';
 import type { ScannerSignalEvent } from '../../../lib/types/market';
-import { instrumentText } from '../../lib/contract-names';
+import { instrumentText, useVisibleRowName } from '../../lib/contract-names';
 import { navigate } from '../../lib/hash-router';
 import * as ms from '../../styles/market-signals.css';
 import { Chip } from '../../ui/chip';
 import { EmptyState } from '../../ui/empty-state';
 import { GroupedSection } from '../../ui/grouped';
 import { InlineNote } from '../../ui/inline-note';
+import { FALLBACK_VISIBLE_ROWS, useVisibilityTracker, type VisibilityTracker } from '../quote-row';
 import {
     EXCHANGE_LABELS,
     FAMILY_LABELS,
@@ -111,9 +116,11 @@ export function coverageText(c: SignalCoverage): string {
     return `已訂閱 ${c.ok}/${c.total}`;
 }
 
-function SignalRow({ signal }: { signal: ScannerSignalEvent }) {
+function SignalRow({ signal, index, tracker }: { signal: ScannerSignalEvent; index: number; tracker: VisibilityTracker | null }) {
     const code = signal.quote.code;
-    const name = signalName(code, signal.exchange);
+    const ref = useRef<HTMLButtonElement | null>(null);
+    // 記憶體中的名稱優先；沒有時只為可見列向永豐查一次合約（lib/contract-names）
+    const name = useVisibleRowName(ref, tracker, index < FALLBACK_VISIBLE_ROWS, code, signalName(code, signal.exchange));
     const quote = signalQuote(signal);
     const label = RULE_LABELS[signal.scanner] ?? String(signal.scanner);
     const detail = signalDetail(signal.scanner, signal.extra);
@@ -131,7 +138,7 @@ function SignalRow({ signal }: { signal: ScannerSignalEvent }) {
         '開啟交易頁',
     ].filter(Boolean).join('，');
     return (
-        <button type='button' className={ms.row} aria-label={aria} data-testid='signal-row' data-code={code} onClick={() => navigate({ name: 'trade', code })}>
+        <button ref={ref} type='button' className={ms.row} aria-label={aria} data-testid='signal-row' data-code={code} onClick={() => navigate({ name: 'trade', code })}>
             <span className={ms.rowTop}>
                 <span className={ms.rowTitle}>
                     <span className={ms.rowName} data-testid='signal-row-name'>{name ?? code}</span>
@@ -177,6 +184,7 @@ export function MarketSignals() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     const rows = useMemo(() => visibleSignals(getMarketPulseSnapshot().signals, filters), [version, filters, namesVersion]);
     const gap = getMarketPulseSnapshot().gap;
+    const tracker = useVisibilityTracker();
 
     let list;
     if (keys.length === 0) {
@@ -186,7 +194,7 @@ export function MarketSignals() {
     } else {
         list = (
             <GroupedSection header={`最新 ${rows.length} 筆（新的在上）・點一下開啟交易頁`} testId='signal-list'>
-                {rows.map(signal => <SignalRow key={signalRowKey(signal)} signal={signal} />)}
+                {rows.map((signal, i) => <SignalRow key={signalRowKey(signal)} signal={signal} index={i} tracker={tracker} />)}
             </GroupedSection>
         );
     }

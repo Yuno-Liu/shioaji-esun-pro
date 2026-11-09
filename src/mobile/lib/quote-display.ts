@@ -13,6 +13,7 @@
 
 import { marketTime } from '../../lib/display-book';
 import type { Snapshot } from '../../lib/types/market';
+import { quoteLimit, type LimitState } from './limit-hit';
 
 export type QuoteSource = 'tick' | 'index' | 'snapshot' | 'reference' | 'none';
 
@@ -221,12 +222,9 @@ export function toneVsReference(price: number | null | undefined, reference: num
     return price > reference ? 'up' : price < reference ? 'down' : 'flat';
 }
 
-/** 成交價是否鎖在漲停／跌停（漲跌停 ≤ 0 視為沒有） */
-export function limitHit(price: number | null, limitUp: number | undefined, limitDown: number | undefined): 'up' | 'down' | null {
-    if (price === null || !Number.isFinite(price) || price <= 0) return null;
-    if (limitUp && limitUp > 0 && Math.abs(price - limitUp) < 1e-6) return 'up';
-    if (limitDown && limitDown > 0 && Math.abs(price - limitDown) < 1e-6) return 'down';
-    return null;
+/** 成交價是否鎖在漲停／跌停（漲跌停 ≤ 0 視為沒有；差距小於半個最小跳動視為相等，見 lib/limit-hit.ts） */
+export function limitHit(price: number | null | undefined, limitUp: unknown, limitDown: unknown): LimitState | null {
+    return quoteLimit({ limit_up: limitUp, limit_down: limitDown }, price);
 }
 
 // ---- 比例條（五檔買賣總量、內外盤） ----
