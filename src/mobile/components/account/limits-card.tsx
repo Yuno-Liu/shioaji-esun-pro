@@ -1,14 +1,15 @@
 // src/mobile/components/account/limits-card.tsx — 帳戶頁頂部「今日剩餘交易額度」（規格 Phase 2；比照桌面 LimitsSection）
 //
-// 主值：永豐＝現股今日剩餘（可用），已用與總額度有資料時一併顯示；玉山＝現股額度上限（標示「上限」，
-// 說明玉山不提供已用／剩餘額度）。下方仍列現股／融資／融券 可用／上限（玉山只列上限）。規則見 today-limits.tsx。
+// 主值：永豐＝現股今日剩餘（可用），已用與總額度有資料時一併顯示；玉山＝現股「估算剩餘」（標示「估算」，
+// 下方「上限 L；今日買進 已成交 A＋未成交 B」，並說明玉山只提供上限、估算依本 App 今日買進委託、可能與券商不同）。
+// 下方仍列現股／融資／融券 可用／上限（玉山只列上限）。規則見 today-limits.tsx 與 lib/esun-limit-estimate.ts。
 // 依目前帳戶的市場：只有證券帳戶有交易額度；沒有證券帳戶而選了期貨帳戶時說明期貨沒有每日交易額度。
 // 持倉頁摘要的額度列以 openTodayLimits() 跳來時，掛載後捲到本卡並聚焦（不發請求）；
 // 在殼層 ScrollRestorer 還原捲動位置之後才捲動（見 useFocusOnArrival）。
 //
 // 資料：共用 useTradingLimits（模組層快取 60 秒、手動重新整理最短間隔 TRADING_LIMITS_MIN_REFRESH_MS）。
 // 交易日 08:30–15:00 才有值；模擬環境回全 0 → limitsLookEmpty 時顯示「—」並說明，不顯示「可用 $0」。
-// 玉山（limitsAreCapsOnly）只提供額度上限：只顯示「上限」，不顯示可用／剩餘（lib 會把缺的可用補成上限）。
+// 玉山（limitsAreCapsOnly）只提供額度上限：不顯示 lib 補成上限的可用；剩餘只以「估算剩餘」顯示（useEsunLimitEstimate，不另發查詢）。
 // 「重新整理」冷卻＝最後一次「實際發出」查詢後 TRADING_LIMITS_MIN_REFRESH_MS（同 hook 的 attemptedAt）：
 //   看到 loading 由 false 變 true 就記為發出時間；按下後 hook 沒有發出（仍在最短間隔內）就不進入倒數，改顯示說明。
 //   冷卻期間才每秒重繪。
@@ -23,7 +24,9 @@ import {
     TRADING_LIMITS_MIN_REFRESH_MS,
     useTradingLimits,
 } from '../../hooks/use-trading-limits';
+import { useEsunLimitEstimate } from '../../hooks/use-esun-limit-estimate';
 import { formatClock, formatTwd } from '../../lib/account-format';
+import { ESUN_ESTIMATE_TEXT, esunBreakdownText, esunEstimateFlags } from '../../lib/esun-limit-estimate';
 import { useOrderRoute } from '../route-badge';
 import * as styles from '../../styles/account.css';
 import { brokerName, Card, Item, RefreshButton } from './account-ui';
@@ -31,7 +34,7 @@ import { consumeTodayLimitsFocus, TODAY_LIMITS_ID, TODAY_LIMITS_TEXT, todayLimit
 
 export const LIMITS_TEXT = {
     throttled: `剛查詢過，查詢間隔至少 ${TRADING_LIMITS_MIN_REFRESH_MS / 1000} 秒，請稍候再按。`,
-    capsOnly: '玉山只提供額度上限，未提供可用／剩餘額度，也不提供已用額度；額度及信用權限另見「玉山帳務概覽」。',
+    capsOnly: `${ESUN_ESTIMATE_TEXT.note}融資、融券只列上限；額度及信用權限另見「玉山帳務概覽」。`,
 } as const;
 
 /** 最後一次觀察到「實際發出」查詢的時間（loading false→true）；帳戶切換時重設 */
@@ -68,6 +71,7 @@ function useFocusOnArrival() {
 export function LimitsCard() {
     const { selectedStock: stock, selectedFutures: futures } = useAccounts();
     const limits = useTradingLimits(stock);
+    const estimate = useEsunLimitEstimate(stock, limits.data);
     const route = useOrderRoute(stock);
     const privMoney = usePrivacyMoney();
     const accountKey = stock ? `${stock.broker_id}:${stock.account_id}` : '';
@@ -91,7 +95,8 @@ export function LimitsCard() {
     const data = limits.data;
     const capsOnly = limitsAreCapsOnly(stock);
     const term = (name: string) => (capsOnly ? `${name} 上限` : `${name} 可用／上限`);
-    const today = todayLimitView(limits, capsOnly);
+    const today = todayLimitView(limits, capsOnly, estimate);
+    const flags = today.estimate ? esunEstimateFlags(today.estimate) : [];
     useFocusOnArrival();
     const onRefresh = () => {
         if (!stock) return;
@@ -102,7 +107,7 @@ export function LimitsCard() {
 
     return (
         <Card
-            title={stock ? `${capsOnly ? TODAY_LIMITS_TEXT.capsTitle : TODAY_LIMITS_TEXT.title}（${brokerName(stock)}）` : TODAY_LIMITS_TEXT.title}
+            title={stock ? `${capsOnly && !today.estimate && today.status === 'ok' ? TODAY_LIMITS_TEXT.capsTitle : TODAY_LIMITS_TEXT.title}（${brokerName(stock)}）` : TODAY_LIMITS_TEXT.title}
             testId='account-limits'
             id={TODAY_LIMITS_ID}
         >
@@ -113,10 +118,16 @@ export function LimitsCard() {
                     {today.status === 'ok' && (
                         <div className={styles.limitsHero} data-testid='limits-today'>
                             <span className={styles.limitsHeroLabel}>
-                                {capsOnly ? '現股' : '現股今日剩餘（可用）'}
-                                {capsOnly && <span className={styles.badge}>上限</span>}
+                                {today.estimate ? `現股 ${ESUN_ESTIMATE_TEXT.label}` : capsOnly ? '現股' : '現股今日剩餘（可用）'}
+                                {capsOnly && <span className={styles.badge}>{today.estimate ? '估算' : '上限'}</span>}
                             </span>
                             <span className={styles.limitsHeroValue} data-testid='limits-today-value'>{today.primary === null ? '—' : money(today.primary)}</span>
+                            {today.estimate && (
+                                <span className={styles.limitsHeroSub} data-testid='limits-today-sub'>{esunBreakdownText(today.estimate, money)}</span>
+                            )}
+                            {flags.length > 0 && (
+                                <span className={styles.limitsHeroSub} data-testid='limits-estimate-flags'>{flags.join('；')}</span>
+                            )}
                             {!capsOnly && (today.used !== null || today.total !== null) && (
                                 <span className={styles.limitsHeroSub} data-testid='limits-today-sub'>
                                     {[today.used !== null ? `已用 ${money(today.used)}` : '', today.total !== null ? `總額度 ${money(today.total)}` : ''].filter(Boolean).join(' · ')}

@@ -486,7 +486,8 @@ describe('AccountPage trading limits', () => {
         expect(v).toContain('融券 上限$300,000');
         expect(v).not.toContain('可用');
         expect(v).not.toContain(' / ');
-        expect(textOf(byTestId('limits-caps-only'))).toContain('未提供可用／剩餘額度');
+        expect(textOf(byTestId('limits-caps-only'))).toContain('玉山只提供額度上限');
+        expect(textOf(byTestId('limits-caps-only'))).toContain('融資、融券只列上限');
     });
 
     // X3 F4:F7：冷卻與 hook 的 TRADING_LIMITS_MIN_REFRESH_MS（以發出時間計）一致
@@ -960,21 +961,66 @@ describe('AccountPage today trading limit card', () => {
         expect(m.fetchTradingLimits).toHaveBeenCalledTimes(1);
     });
 
-    it('玉山: shows only the cap labelled 上限 and explains that used / remaining are not provided', async () => {
+    it('玉山: shows 估算剩餘 (cap − today buys, filled + pending) with the breakdown and the note; no extra query', async () => {
         m.accounts = { accounts: [esunStock, fut], selectedStock: esunStock, selectedFutures: fut, loaded: true, loadError: false };
         m.fetchTradingLimits.mockResolvedValue({
             trading_limit: 2000000, trading_used: 0, trading_available: 2000000, margin_limit: 0, margin_used: 0, margin_available: 0, short_limit: 0, short_used: 0, short_available: 0,
         });
+        const acct = { broker_id: 'ESUN', account_id: '0011223', account_type: 'S' };
+        const row = (id: string, action: string, status: string, qty: number, deal: number, cancel: number, price: number, lot = 'Common', deals: unknown[] = []) => ({
+            account: esunStock,
+            contract: { code: '2884', security_type: 'STK', exchange: 'TSE', target_code: null },
+            order: { id, seqno: id, ordno: id, action, price, quantity: qty, price_type: 'LMT', order_lot: lot, account: acct },
+            status: { id, status, status_code: '', order_quantity: qty, deal_quantity: deal, cancel_quantity: cancel, modified_price: 0, msg: '', deals },
+        });
+        m.trading = {
+            ...m.trading,
+            queries: { orders: { updatedAt: 1, needsReconcile: false } },
+            trades: [
+                // 部分成交後刪單：只計已成交 1 張 × 30 = 30,000
+                row('A', 'Buy', 'Cancelled', 3, 1, 2, 30, 'Common', [{ seq: '1', price: 30, quantity: 1, ts: 0 }]),
+                // 盤中零股 500 股 × 40 未成交 = 20,000
+                row('B', 'Buy', 'Submitted', 500, 0, 0, 40, 'IntradayOdd'),
+                // 賣出不計
+                row('C', 'Sell', 'Submitted', 5, 0, 0, 30),
+            ],
+        };
         await render();
-        expect(byTestId('account-limits').props['aria-label']).toBe('今日交易額度上限（玉山）');
+        expect(byTestId('account-limits').props['aria-label']).toBe('今日剩餘交易額度（玉山）');
         const hero = textOf(byTestId('limits-today'));
-        expect(hero).toContain('上限');
-        expect(hero).toContain('$2,000,000');
+        expect(hero).toContain('現股 估算剩餘');
+        expect(hero).toContain('估算');
         expect(hero).not.toContain('可用');
-        expect(hero).not.toContain('剩餘');
         expect(hero).not.toContain('已用');
-        expect(allByTestId('limits-today-sub')).toHaveLength(0);
-        expect(textOf(byTestId('limits-caps-only'))).toContain('不提供已用額度');
+        expect(textOf(byTestId('limits-today-value'))).toBe('$1,950,000');
+        expect(textOf(byTestId('limits-today-sub'))).toBe('上限 $2,000,000；今日買進 已成交 $30,000＋未成交 $20,000');
+        expect(allByTestId('limits-estimate-flags')).toHaveLength(0);
+        expect(textOf(byTestId('limits-caps-only'))).toContain('可能與券商數字不同');
+        expect(m.fetchTradingLimits).toHaveBeenCalledTimes(1);
+        // S1：估算只讀既有委託資料，不送、不改、不刪任何委託
+        for (const f of Object.values(m.send)) expect(f).not.toHaveBeenCalled();
+    });
+
+    it('玉山: masks the estimate and flags unknown-outcome orders', async () => {
+        m.privMoney = true;
+        m.accounts = { accounts: [esunStock, fut], selectedStock: esunStock, selectedFutures: fut, loaded: true, loadError: false };
+        m.fetchTradingLimits.mockResolvedValue({
+            trading_limit: 2000000, trading_used: 0, trading_available: 2000000, margin_limit: 0, margin_used: 0, margin_available: 0, short_limit: 0, short_used: 0, short_available: 0,
+        });
+        m.trading = {
+            ...m.trading,
+            queries: { orders: { updatedAt: 1, needsReconcile: true } },
+            trades: [{
+                account: esunStock,
+                contract: { code: '2884', security_type: 'STK', exchange: 'TSE', target_code: null },
+                order: { id: 'U', seqno: 'U', ordno: '', action: 'Buy', price: 30, quantity: 1, price_type: 'LMT', order_lot: 'Common' },
+                status: { id: 'U', status: 'PendingSubmit', status_code: '', order_quantity: 1, deal_quantity: 0, cancel_quantity: 0, modified_price: 0, msg: '', deals: [] },
+            }],
+        };
+        await render();
+        expect(textOf(byTestId('limits-today-value'))).toBe('•••••');
+        expect(textOf(byTestId('limits-today-sub'))).toBe('上限 •••••；今日買進 已成交 •••••＋未成交 •••••');
+        expect(textOf(byTestId('limits-estimate-flags'))).toBe('含 1 筆結果未知的委託（以未成交計）；委託待對帳，估算可能不完整');
     });
 
     it('no data (simulation / outside hours): no main value, explains instead of $0', async () => {

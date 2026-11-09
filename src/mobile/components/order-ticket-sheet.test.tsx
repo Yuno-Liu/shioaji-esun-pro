@@ -27,6 +27,7 @@ const h = vi.hoisted(() => {
         esunBrokers: new Set<string>(),
         positions: [] as unknown[],
         positionsLoaded: true,
+        trades: [] as unknown[],
         limits: { data: null, error: null, loading: false, updatedAt: null } as { data: unknown; error: string | null; loading: boolean; updatedAt: number | null },
         limitsAccount: undefined as unknown,
         ladder: null as Record<string, unknown> | null,
@@ -43,6 +44,7 @@ const m = vi.hoisted(() => ({
 vi.mock('../../lib/contracts-cache', () => ({
     useContract: (code: string | null) => (code && (h.contract as { code: string } | null)?.code === code ? h.contract : undefined),
     ensureContract: () => Promise.resolve(h.contract),
+    getCachedContract: (code: string) => ((h.contract as { code: string } | null)?.code === code ? h.contract : undefined),
 }));
 vi.mock('../../hooks/use-stream', () => ({
     useQuote: (code: string | null, opts?: { oddLot?: boolean }) => (code ? (opts?.oddLot ? h.oddQuote : h.quote) : undefined),
@@ -82,7 +84,7 @@ vi.mock('./route-badge', () => ({
 vi.mock('./account-switch-sheet', () => ({ mobileAccountLabel: (a: Account) => `${a.broker_id}-${a.account_id}` }));
 // 持倉與委託（信用提醒、五檔的「我的委託」標示）：測試直接決定內容
 vi.mock('../../lib/trading-state', () => ({
-    useTradingState: () => ({ trades: [], positions: h.positions, queries: { positions: { updatedAt: h.positionsLoaded ? 1 : null } } }),
+    useTradingState: () => ({ trades: h.trades, positions: h.positions, queries: { positions: { updatedAt: h.positionsLoaded ? 1 : null }, orders: { updatedAt: 1, needsReconcile: false } } }),
 }));
 // 交易額度：只替換讀取的 hook，availableLimitFor／limitsLookEmpty 用真的
 vi.mock('../../lib/shioaji', () => ({ fetchTradingLimits: vi.fn() }));
@@ -195,6 +197,7 @@ beforeEach(() => {
     h.live = true;
     h.route = { esun: false, broker: '永豐', simulation: true };
     h.privMoney = false;
+    h.trades = [];
     h.esunBrokers.clear();
     h.captured = { S: h.stockAccount, F: h.futuresAccount };
     h.selected = { S: h.stockAccount, F: h.futuresAccount };
@@ -965,20 +968,49 @@ describe('OrderTicketSheet — 額度顯示（T5 了結單、F4:F1 玉山只有�
         expect(limit).toContain('123,000 元');
     });
 
-    it('玉山帳戶只顯示額度上限並註明不提供剩餘額度，不稱剩餘或可用；永豐照舊', async () => {
+    it('玉山帳戶現股顯示估算剩餘（上限 − 今日買進，市價買進以漲停價估、賣出不計），信用只顯示上限；不送單', async () => {
         const esun = { ...h.stockAccount, broker_id: '8840-SIM' };
         h.esunBrokers.add('8840-SIM');
         h.captured.S = esun;
         h.selected.S = esun;
         // lib 對玉山把可用補成等於上限
         h.limits = { data: stockLimits({ trading_available: 500_000 }), error: null, loading: false, updatedAt: 1 };
+        const trade = (id: string, action: 'Buy' | 'Sell', priceType: 'LMT' | 'MKT', price: number) => ({
+            account: esun,
+            contract: { code: '2330', security_type: 'STK', exchange: 'TSE', target_code: null },
+            order: { id, seqno: id, ordno: id, action, price, quantity: 1, price_type: priceType, order_lot: 'Common', account: esun },
+            status: { id, status: 'Submitted', status_code: '', order_quantity: 1, deal_quantity: 0, cancel_quantity: 0, modified_price: 0, msg: '', deals: [] },
+        });
+        // 市價買進 1 張：以合約漲停價 110 估 → 110,000；賣出不計
+        h.trades = [trade('B1', 'Buy', 'MKT', 0), trade('S1', 'Sell', 'LMT', 100)];
         await open({ code: '2330', action: 'Buy' });
         const limit = text(one('ticket-limit'));
-        expect(limit).toContain('交易額度上限');
-        expect(limit).toContain('500,000 元');
-        expect(limit).toContain('玉山不提供剩餘額度');
-        expect(limit).not.toContain('剩餘交易額度');
+        expect(limit).toContain('估算剩餘額度');
+        expect(limit).toContain('390,000 元');
+        expect(limit).toContain('上限 500,000 元；今日買進 已成交 0 元＋未成交 110,000 元');
+        expect(limit).toContain('估算，玉山只提供上限');
         expect(limit).not.toContain('可用');
+        // 融資：仍只顯示上限
+        await act(async () => { closeTicket(); });
+        await open({ code: '2330', action: 'Buy', cond: 'MarginTrading' });
+        const margin = text(one('ticket-limit'));
+        expect(margin).toContain('融資額度上限');
+        expect(margin).toContain('玉山不提供剩餘額度');
+        expect(margin).not.toContain('估算');
+        expect(m.submit).not.toHaveBeenCalled();
+    });
+
+    it('玉山估算遮蔽金額', async () => {
+        const esun = { ...h.stockAccount, broker_id: '8840-SIM' };
+        h.esunBrokers.add('8840-SIM');
+        h.captured.S = esun;
+        h.selected.S = esun;
+        h.privMoney = true;
+        h.limits = { data: stockLimits({ trading_available: 500_000 }), error: null, loading: false, updatedAt: 1 };
+        await open({ code: '2330', action: 'Buy' });
+        const limit = text(one('ticket-limit'));
+        expect(limit).toContain('估算剩餘額度');
+        expect(limit).not.toMatch(/\d{3},\d{3}/);
     });
 });
 
