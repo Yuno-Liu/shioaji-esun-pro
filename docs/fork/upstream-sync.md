@@ -93,6 +93,27 @@ git diff $(git merge-base HEAD upstream/main) -- <檔案> | grep -c '^[+-][^+-]'
 
 ## 同步紀錄
 
+### 2026-11-09（上游 6 個提交，Sinotrade #384／#370：切換環境後自動重啟套用新設定）
+
+沒有衝突，熱點 `hud-header.tsx` 的 3 行掛載也自動合併。`SHIOAJI_VERSION` 仍為 v1.7.11，套件與 lockfile 都沒變。
+
+- **上游內容**：桌面 App（Tauri）的伺服器管理在切換帳號或模擬／正式環境時，會先停掉舊伺服器，選定設定檔後再自動重啟。
+  - 實作在 `server-actions.ts` 的 `timedSwitch` 與 `validateProfileSettings`。
+  - 頂欄以 `server-env-notice` 顯示切換中或待處理的提示。
+  - 這需要原生程式控制伺服器程序，Docker 網頁版與手機版無法使用。
+- **網頁版影響**：頂欄新增 `WebServerHint`（`!isTauri`）。
+  - 串流斷線時顯示「伺服器未連線；切換模擬／正式環境後，請重新啟動 Shioaji server」，連線恢復後消失。
+  - Docker 部署切換永豐環境的方式不變：改 `.env` 的 `SJ_PRODUCTION`，再執行 `docker compose up -d`。
+- **手機版**：程式沒有修改。
+  - 首屏 JS 由 223,299 增加到 223,501 bytes（+202）。原因是上游 `server-actions.ts` 的新程式被打包進首屏共用的 `trading-state` chunk，手機並沒有使用。
+  - 仍在 ≤219 KiB（224,256）以內。
+- **檢查結果**：
+  - `tsc -b` 通過。
+  - vitest 共 533 個檔案、8,060 項通過，另有 1 個檔案、2 項略過。
+  - `python -m unittest server.test_esun_trade_server` 與 `deploy` 的測試都通過。
+  - `docker compose config -q` 通過；三個映像（esun-bridge、shioaji、runner）都建置成功。
+  - 沒有新的 `/api` 路徑或建置期檔案。README 仍只有開頭一段 fork 區塊。
+
 ### 2026-11-06（上游 65 個提交，Shioaji 1.7.10 → 1.7.11）
 
 11 個衝突檔，解法已由 rerere 記錄；細節見合併提交 568df3af 的訊息。
