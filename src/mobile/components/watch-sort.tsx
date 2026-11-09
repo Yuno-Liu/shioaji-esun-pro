@@ -6,6 +6,8 @@
 // - 股價類排序：開啟清單（或選了這個排序）時取一次批次快照當排序依據，表頭第二行顯示「排序依據 HH:MM:SS」與［⟳］
 //   （最短間隔 SORT_MIN_INTERVAL_MS；讀取中、間隔內停用）。之後即時行情只更新列上的數字，不會重排。
 //   讀取失敗：第二行顯示「排序資料讀取失敗」，［⟳］可重試；列維持基準順序。
+// - 「持倉」分段（components/holdings-list.tsx）也用本元件：listId 'pos:holdings'，manualLabel「持倉順序」，項目 id 為合併鍵；
+//   合約尚未解析的項目（resolved false）不送進排序依據的快照請求。
 // - 固定清單（股期近月／遠月）把自己的排序依據（開啟時取的那一次快照，也是列的快照備援）傳進 basis，不另外請求。
 // - 安全：本元件與選項面板只改顯示順序與本裝置偏好，不呼叫任何下單、改單、刪單，也不開下單面板（設計規格 §10 S1）。
 
@@ -70,7 +72,8 @@ export function useSortBasis(listId: string, items: readonly SortItem[], active:
 
     const refresh = useCallback(() => {
         const cached = getSortBasis(listId);
-        const contracts = itemsRef.current.map(i => i.contract);
+        // 尚未解析的合約（resolved false）不送出：沒有交易所等欄位，股價類排序視為沒有資料
+        const contracts = itemsRef.current.filter(i => i.resolved !== false).map(i => i.contract);
         if (inflight.current || !contracts.length || (cached && Date.now() - cached.at < SORT_MIN_INTERVAL_MS)) return;
         inflight.current = true;
         setLoading(true);
@@ -115,14 +118,21 @@ export interface WatchSortProps {
     onOrder: (codes: string[] | null) => void;
     /** 固定清單自己的排序依據（未給時本元件在股價類排序時自己取） */
     basis?: SortBasis;
+    /** 「自訂順序」那一項的名稱與說明（持倉分段：「持倉順序」） */
+    manualLabel?: string;
+    manualText?: string;
+    /** 選項面板底部說明（未給時用自選清單的說明） */
+    footer?: string;
 }
+
+const WATCH_SORT_FOOTER = '排序只改變這台裝置上的顯示順序，不會改動自選清單本身的順序；股價類排序依按下時的價格，之後不會自動重排。';
 
 /** 換清單時整個重新建立（偏好、排序依據都依清單 id） */
 export function WatchSort(props: WatchSortProps) {
     return <WatchSortInner key={props.listId} {...props} />;
 }
 
-function WatchSortInner({ listId, fixed = false, items, onOrder, basis }: WatchSortProps) {
+function WatchSortInner({ listId, fixed = false, items, onOrder, basis, manualLabel, manualText, footer = WATCH_SORT_FOOTER }: WatchSortProps) {
     const [pref, setPref] = useState<SortPref>(() => readSortPref(listId, fixed));
     const [open, setOpen] = useState(false);
     const price = isPriceKey(pref.key);
@@ -142,13 +152,15 @@ function WatchSortInner({ listId, fixed = false, items, onOrder, basis }: WatchS
     };
 
     const Arrow = ARROW_ICON[pref.dir];
-    const label = SORT_LABEL[pref.key];
+    const labelOf = (key: SortKey) => (key === 'manual' && manualLabel ? manualLabel : SORT_LABEL[key]);
+    const dirText = (p: SortPref) => sortDirText(p, manualText);
+    const label = labelOf(pref.key);
     return (
         <>
             <button
                 type='button'
                 className={`${styles.sortButton} ${pressable} ${focusRing}`}
-                aria-label={`排序：${label}，${sortDirText(pref)}；點按變更`}
+                aria-label={`排序：${label}，${dirText(pref)}；點按變更`}
                 aria-haspopup='dialog'
                 onClick={() => setOpen(true)}
                 data-testid='watch-sort'
@@ -176,15 +188,15 @@ function WatchSortInner({ listId, fixed = false, items, onOrder, basis }: WatchS
             )}
             <BottomSheet open={open} onClose={() => setOpen(false)} title='排序' testId='watch-sort-sheet'>
                 <div className={styles.sheetBody}>
-                    <GroupedSection footer='排序只改變這台裝置上的顯示順序，不會改動自選清單本身的順序；股價類排序依按下時的價格，之後不會自動重排。'>
+                    <GroupedSection footer={footer}>
                         {sortKeys(fixed).map(key => {
                             const active = key === pref.key;
                             const nextDir = active && key !== 'manual' ? nextSortPref(pref, key) : null;
                             return (
                                 <ListRow
                                     key={key}
-                                    title={SORT_LABEL[key]}
-                                    subtitle={active ? `目前：${sortDirText(pref)}${nextDir ? `；再點一次改為${sortDirText(nextDir)}` : ''}` : undefined}
+                                    title={labelOf(key)}
+                                    subtitle={active ? `目前：${dirText(pref)}${nextDir ? `；再點一次改為${dirText(nextDir)}` : ''}` : undefined}
                                     trailing={active ? <Check className={styles.optionCheck} aria-hidden='true' focusable='false' /> : undefined}
                                     onClick={() => choose(key)}
                                     testId={`watch-sort-option-${key}`}

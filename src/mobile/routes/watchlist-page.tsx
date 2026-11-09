@@ -14,7 +14,8 @@
 //   第一次要求開啟時才掛載；載入失敗以底部面板「載入失敗」＋［重試］顯示。
 // - 試撮（tick.simtrade）：比照桌面，代碼旁加「試撮」徽章，不當成真實成交顯示。
 // - 分段「自選｜排行｜持倉」（§13 Phase 3）：排行見 components/ranking-list.tsx（延遲載入），只在「排行」分段掛載時讀取；
-//   「持倉」見 components/holdings-list.tsx（延遲載入；依 useTradingState().positions 自動列出，沒有任何編輯入口，不另外讀取）；
+//   「持倉」見 components/holdings-list.tsx（延遲載入；依 useTradingState().positions 自動列出，沒有任何編輯入口，不另外讀取；
+//   表頭有檢視排序鍵，股價類排序時 1 個批次快照）；
 //   「排行」分段不掛載自選列，自選列的行情訂閱隨之釋放。分段選擇在模組層保留（切換分頁再回來不變）。
 // - 版面（設計規格 §7.2，依使用者參考圖改版）：PageHeader（搜尋）；Segmented tabs（自選｜排行）；
 //   清單列：清單分頁（Segmented scroll 變體，選中的自動捲進可見範圍；順序依這台裝置的群組順序，

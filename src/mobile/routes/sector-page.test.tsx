@@ -179,6 +179,13 @@ function icEvent(code: string, metric: 'amount' | 'weighted_performance', time: 
     });
 }
 
+class MemoryStorage {
+    data = new Map<string, string>();
+    getItem(k: string) { return this.data.get(k) ?? null; }
+    setItem(k: string, v: string) { this.data.set(k, v); }
+    removeItem(k: string) { this.data.delete(k); }
+}
+
 const closedSnapshots = (code: string) => snapshot(code, 'closed', '13:30:00', code === 'IX0043' ? TPEX : TWSE);
 
 beforeEach(() => {
@@ -187,6 +194,7 @@ beforeEach(() => {
     vi.setSystemTime(new Date(`${DATE}T10:00:40+08:00`));
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     m.handlers.clear();
+    vi.stubGlobal('localStorage', new MemoryStorage());
     m.post.mockReset();
     m.post.mockImplementation(async (path: string, body?: { contract?: { code?: string } }) => {
         if (path === '/api/v1/data/index_components') return m.bootstrap(body?.contract?.code ?? '');
@@ -272,18 +280,47 @@ describe('盤後／無即時資料', () => {
         expect(semi.props['aria-label']).toContain('資金流向 —');
     });
 
-    it('排序：漲幅、跌幅、成交值；流向不可用時資金流入／流出依成交值排列', async () => {
+    it('排序：選項對應列上的數字；再點一次反向；流向不可用時資金流向（沒有資料）依成交值排列', async () => {
         await mount();
+        const labels = () => one('sector-sort').findAll(n => n.type === 'button').map(textOf);
+        // 預設：資金流向由淨流入到淨流出（原本的預設「資金流入」）
+        expect(labels()).toEqual(['資金流向 ↓', '近5分', '漲跌幅', '成交值']);
+        expect(one('sector-sort-flow').props['aria-pressed']).toBe(true);
+        expect(one('sector-sort-flow').props['aria-label']).toBe('資金流向 ↓，目前由淨流入到淨流出；再點一次改為由淨流出到淨流入');
         expect(rowNames()).toEqual(['半導體業', '電子零組件業', '金融保險業']);
-        await press('sector-sort-gain');
+        await press('sector-sort-pct');
         expect(rowNames()).toEqual(['半導體業', '電子零組件業', '金融保險業']);
-        expect(one('sector-sort-gain').props['aria-pressed']).toBe(true);
-        await press('sector-sort-loss');
+        expect(one('sector-sort-pct').props['aria-pressed']).toBe(true);
+        expect(labels()).toEqual(['資金流向', '近5分', '漲跌幅 ↓', '成交值']);
+        await press('sector-sort-pct');
         expect(rowNames()).toEqual(['金融保險業', '電子零組件業', '半導體業']);
+        expect(labels()).toEqual(['資金流向', '近5分', '漲跌幅 ↑', '成交值']);
         await press('sector-sort-amount');
         expect(rowNames()).toEqual(['半導體業', '電子零組件業', '金融保險業']);
-        await press('sector-sort-outflow');
+        await press('sector-sort-amount');
+        expect(rowNames()).toEqual(['金融保險業', '電子零組件業', '半導體業']);
+        // 流向不可用：資金流向、近5分都沒有資料 → 不論方向依成交值大到小
+        await press('sector-sort-flow5');
         expect(rowNames()).toEqual(['半導體業', '電子零組件業', '金融保險業']);
+        await press('sector-sort-flow5');
+        expect(rowNames()).toEqual(['半導體業', '電子零組件業', '金融保險業']);
+        // 排序不發請求
+        expect(m.post.mock.calls.filter(([p]) => !/index_components/.test(String(p)))).toHaveLength(0);
+    });
+
+    it('排序偏好存在這台裝置：重新進入本頁沿用；儲存內容不對時用預設', async () => {
+        await mount();
+        await press('sector-sort-pct');
+        await press('sector-sort-pct');
+        expect(JSON.parse(localStorage.getItem('sj-mobile-sector-sort-v1')!)).toEqual({ key: 'pct', dir: 'asc' });
+        await unmount();
+        await mount();
+        expect(one('sector-sort-pct').props['aria-pressed']).toBe(true);
+        expect(rowNames()).toEqual(['金融保險業', '電子零組件業', '半導體業']);
+        await unmount();
+        localStorage.setItem('sj-mobile-sector-sort-v1', JSON.stringify({ key: 'gain', dir: 'up' }));
+        await mount();
+        expect(one('sector-sort-flow').props['aria-pressed']).toBe(true);
     });
 });
 
@@ -314,10 +351,12 @@ describe('盤中串流：流向自開啟本頁起累計', () => {
         expect(textOf(one('sector-top-outflow'))).toContain('金融保險業');
         expect(byTestId('sector-flow-bar')).toHaveLength(3);
 
-        // 預設依資金流入；流出最多的排第一
+        // 預設依資金流向（淨流入多的在前）；再點一次反向：淨流出最多的排第一
         expect(rowNames()).toEqual(['半導體業', '電子零組件業', '金融保險業']);
-        await press('sector-sort-outflow');
+        await press('sector-sort-flow');
         expect(rowNames()).toEqual(['金融保險業', '電子零組件業', '半導體業']);
+        await press('sector-sort-flow5');
+        expect(rowNames()).toEqual(['半導體業', '電子零組件業', '金融保險業']);
 
         // 說明面板：完整數值
         await act(async () => byTestId('sector-row').find(r => r.props['data-key'] === 'IX0001:24')!.props.onClick());

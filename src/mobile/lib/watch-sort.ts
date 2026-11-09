@@ -52,9 +52,9 @@ export function nextSortPref(current: SortPref, key: SortKey): SortPref {
     return { key, dir: defaultDir(key) };
 }
 
-/** 方向文字（無障礙名稱與選項說明） */
-export function sortDirText(pref: SortPref): string {
-    if (pref.key === 'manual') return '與桌面相同的清單順序';
+/** 方向文字（無障礙名稱與選項說明）；manualText 為「自訂順序」那一項的說明（持倉分段：持倉頁的順序） */
+export function sortDirText(pref: SortPref, manualText = '與桌面相同的清單順序'): string {
+    if (pref.key === 'manual') return manualText;
     if (pref.key === 'code') return pref.dir === 'asc' ? '由小到大' : '由大到小';
     return pref.dir === 'asc' ? '由低到高' : '由高到低';
 }
@@ -98,6 +98,10 @@ export interface SortValues {
 
 export interface SortItem {
     contract: ContractBase;
+    /** 列的識別（sortCodes 回傳的值）；未給時用 contract.code。持倉分段用「商品類別＋代碼」合併鍵 */
+    id?: string;
+    /** false：合約尚未解析（只有代碼），不放進排序依據的快照請求，股價類排序視為沒有資料 */
+    resolved?: boolean;
     /** 固定清單：標的股票代號（股票代號排序用） */
     under?: string;
     /** 固定清單：乘數（同一標的一般 2000 在小型 100 前） */
@@ -127,7 +131,7 @@ export function sortValuesOf(s: Snapshot | undefined): SortValues {
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
- * 依偏好排出代碼順序；自訂順序回傳 null（照伺服器順序）。
+ * 依偏好排出代碼順序（項目有 id 時回傳 id）；自訂順序回傳 null（照伺服器順序）。
  * 股價類：沒有資料的列不論方向都在最後；同值、都沒有資料時依 items 的順序（穩定）。
  */
 export function sortCodes(items: readonly SortItem[], pref: SortPref, snapshots?: ReadonlyMap<string, Snapshot>): string[] | null {
@@ -148,7 +152,7 @@ export function sortCodes(items: readonly SortItem[], pref: SortPref, snapshots?
         }
         return sign * (a.v - b.v) || a.index - b.index;
     });
-    return rows.map(r => r.item.contract.code);
+    return rows.map(r => r.item.id ?? r.item.contract.code);
 }
 
 // ---------------------------------------------------------------------------
