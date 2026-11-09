@@ -58,7 +58,8 @@ import { instrumentText } from '../lib/contract-names';
 import { isNotStarted } from '../lib/errors';
 import { openOrderAction } from '../lib/mobile-store';
 import { collectDealRows, dealTotals, quantitiesText, type DealRow } from '../lib/order-fills';
-import { assertNoEnvSwitch } from '../lib/trading-activity';
+import { assertNoEnvSwitch, beginOrderDispatch } from '../lib/trading-activity';
+import { getAccountState } from '../../lib/account-store';
 import * as styles from '../styles/orders.css';
 import { Chip } from '../ui/chip';
 import { EmptyState } from '../ui/empty-state';
@@ -539,9 +540,16 @@ function CancelAllSheet({ open, working, onClose }: { open: boolean; working: Tr
         setBusy(true);
         setFeedback(null);
         try {
-            // 結果摘要（確認取消／未確認／未送出筆數）由 cancelAllOrders() 自行 notify
-            assertNoEnvSwitch(); // 玉山環境切換中不送（lib 的全部刪單沒有 beforeSend）
-            await cancelAllOrders();
+            // 結果摘要（確認取消／未確認／未送出筆數）由 cancelAllOrders() 自行 notify。
+            // 全部刪單涵蓋所有可交易帳戶（先讀委託再刪，lib 沒有 beforeSend）：有玉山帳戶時，玉山環境切換中整批不送；
+            // 讀取＋刪單整段計入「委託送出中」，環境切換因此不會在中間開始
+            for (const account of getAccountState().accounts) assertNoEnvSwitch(account);
+            const release = beginOrderDispatch();
+            try {
+                await cancelAllOrders();
+            } finally {
+                release();
+            }
             onClose();
         } catch (err) {
             notify({ kind: 'err', ...mutationErrorNotice(err, '全部刪單') });
@@ -656,12 +664,20 @@ function BatchCancelSheet({ open, targets, onBusyChange, onSent, onClose }: Batc
         setFeedback(null);
         setProgress({ done: 0, total: batch.length });
         try {
-            assertNoEnvSwitch();
-            const settled = await cancelOrders(
-                batch.map(t => t.order.id),
-                () => setProgress(p => (p ? { done: p.done + 1, total: p.total } : p)),
-                assertNoEnvSwitch, // 玉山環境切換中：每筆送出前都不送
-            );
+            // 玉山環境切換中：批次含玉山委託時整批不送（每筆送出前再檢查一次）；只有永豐委託照常。整段計入「委託送出中」
+            const gate = () => { for (const t of batch) assertNoEnvSwitch(tradeAccountOf(t)); };
+            gate();
+            const release = beginOrderDispatch();
+            let settled: PromiseSettledResult<Trade>[];
+            try {
+                settled = await cancelOrders(
+                    batch.map(t => t.order.id),
+                    () => setProgress(p => (p ? { done: p.done + 1, total: p.total } : p)),
+                    gate,
+                );
+            } finally {
+                release();
+            }
             const summary = cancellationSummary(settled);
             notify({ title: '批次刪單結果', ...summary });
             setResults({ items: batch.map((t, i) => batchCancelItemResult(t, settled[i] ?? { status: 'rejected', reason: new Error('沒有回應') })), summary: summary.body });

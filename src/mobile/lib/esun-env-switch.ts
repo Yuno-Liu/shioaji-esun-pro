@@ -20,7 +20,8 @@ import { invalidateAllQueries } from '../../hooks/use-query';
 import { esunTradeService, type EsunBridgeHealth, type EsunEnvironment, type EsunSwitchResult } from '../../lib/esun';
 import { getPendingOrderConfirm } from '../../lib/order-confirm';
 import { notify } from '../../lib/trade';
-import { refreshTradingStateForModeChange } from '../../lib/trading-state';
+import { isEsunAccount } from '../../lib/esun/order-mapping';
+import { getTradingState, refreshTradingStateForModeChange, type TradingState } from '../../lib/trading-state';
 import { isBatchExitActive } from './batch-exit-auth';
 import { ESUN_HEALTH_RECHECK_DELAYS, getEsunReconnectState } from './esun-reconnect';
 import { getMobileUi } from './mobile-store';
@@ -52,7 +53,9 @@ export type EsunSwitchBlock =
     | 'confirm'
     | 'batch'
     | 'dispatch'
-    | 'mutation';
+    | 'mutation'
+    | 'remote-switch'
+    | 'reconcile';
 
 export function getEsunEnvSwitching(): EsunEnvironment | null {
     return getEnvSwitch()?.target ?? null;
@@ -78,6 +81,7 @@ export function esunSwitchBlock(target: EsunEnvironment, probe?: BridgeProbe, no
     if (probe === 'checking') return 'checking';
     const health = esunTradeService.getBridgeHealth();
     if (!health || probe === 'down') return 'no-bridge';
+    if (bridgeSwitching(health)) return 'remote-switch';
     if (health.loginLocked) return 'locked';
     if (health.ok === false) return 'unhealthy';
     if (!esunTradeService.isEnvironmentAvailable(target)) return 'unavailable';
@@ -90,7 +94,28 @@ export function esunSwitchBlock(target: EsunEnvironment, probe?: BridgeProbe, no
     if (isBatchExitActive()) return 'batch';
     if (orderDispatchInFlight()) return 'dispatch';
     if (tradeMutationInFlight(now)) return 'mutation';
+    if (esunReconcilePending()) return 'reconcile';
     return null;
+}
+
+/** bridge 的 /esun/health envSwitchInProgress（另一個裝置或分頁正在切換；舊版 bridge 沒有這個欄位＝false） */
+export function bridgeSwitching(health: EsunBridgeHealth | null | undefined): boolean {
+    return (health as { envSwitchInProgress?: unknown } | null | undefined)?.envSwitchInProgress === true;
+}
+
+/**
+ * 有牽涉玉山的待對帳：委託或持倉 needsReconcile，且原因訊息是玉山的（玉山／bridge 開頭的訊息，src/lib/esun/dispatch.ts），
+ * 或有「刪改單結果待確認」且交易狀態裡有玉山委託（原因沒有帳戶資訊，保守視為牽涉玉山）。
+ * 換環境後舊環境的玉山帳戶就讀不到，這些結果再也無法核對，所以先擋下切換。
+ */
+export function esunReconcilePending(state: Pick<TradingState, 'queries' | 'trades'> = getTradingState()): boolean {
+    for (const scope of ['orders', 'positions'] as const) {
+        const q = state.queries?.[scope];
+        if (!q?.needsReconcile) continue;
+        if (/玉山|bridge/.test(q.error ?? '')) return true;
+        if (q.reasons.includes('mutation-outcome') && (state.trades ?? []).some(t => isEsunAccount(t.account))) return true;
+    }
+    return false;
 }
 
 /** 擋下原因的說明文字 */
@@ -113,6 +138,8 @@ export function esunSwitchBlockText(block: EsunSwitchBlock, target: EsunEnvironm
         case 'batch': return '多選出清進行中，完成或停止後才能切換環境。';
         case 'dispatch': return '委託送出中（下單或平倉），請等待結果再切換環境。';
         case 'mutation': return '刪單／改單送出中，請等待結果再切換環境。';
+        case 'remote-switch': return '另一個裝置或分頁正在切換玉山環境，請等它完成。';
+        case 'reconcile': return '玉山委託或持倉有待對帳的項目，請先到委託頁按「更新」核對完成再切換環境（切換後就讀不到原環境的帳戶）。';
     }
 }
 
@@ -132,17 +159,22 @@ export function isAmbiguousSwitchError(message: string): boolean {
 
 const wait = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-/** 以 health 確認實際結果：看到目標環境＝switched；讀得到但一直不是＝failed；一直讀不到＝unknown（definite 時視為 failed） */
+/**
+ * 以 health 確認實際結果：看到目標環境＝switched；讀得到、是原環境且 bridge 沒有在切換（envSwitchInProgress 為假）＝failed；
+ * 最後一次讀到時 bridge 仍在切換、或一直讀不到＝unknown（definite＝bridge 明確拒絕了這次請求：沒看到目標環境就是 failed）。
+ */
 async function verifySwitch(target: EsunEnvironment, delays: readonly number[], definite: boolean): Promise<EsunSwitchOutcome> {
-    let seen = false;
+    let last: 'none' | 'switching' | 'old' = 'none';
     for (const delay of delays) {
         if (delay > 0) await wait(delay);
         const health = await esunTradeService.refreshHealth().catch(() => null);
         if (!health) continue;
-        seen = true;
         if (health.environment === target) return 'switched';
+        last = bridgeSwitching(health) ? 'switching' : 'old';
     }
-    return seen || definite ? 'failed' : 'unknown';
+    // bridge 明確拒絕了這次請求（409 忙碌、設定檔不存在、登入失敗…）：這次一定沒有切換
+    if (definite || last === 'old') return 'failed';
+    return 'unknown';
 }
 
 /** 成功之後（同桌面）：每一步各自包住，丟錯也不會把成功回報成失敗 */

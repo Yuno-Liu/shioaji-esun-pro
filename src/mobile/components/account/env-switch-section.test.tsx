@@ -34,6 +34,7 @@ const m = vi.hoisted(() => {
         notify: vi.fn(),
         invalidate: vi.fn(),
         refreshMode: vi.fn(async () => undefined),
+        trading: null as unknown as { queries: Record<'orders' | 'positions', { needsReconcile: boolean; reasons: string[]; error: string | null }>; trades: { account: { broker_id: string } }[] },
         // S1：任何委託函式都不得被呼叫
         orderFns: {
             placeStockOrder: vi.fn(), placeFuturesOrder: vi.fn(), cancelOrder: vi.fn(), cancelOrders: vi.fn(),
@@ -73,7 +74,11 @@ vi.mock('../../../lib/trade-mutations', () => ({
 }));
 vi.mock('../../../lib/trade', () => ({ notify: m.notify }));
 vi.mock('../../../hooks/use-query', () => ({ invalidateAllQueries: m.invalidate }));
-vi.mock('../../../lib/trading-state', () => ({ refreshTradingStateForModeChange: m.refreshMode }));
+vi.mock('../../../lib/trading-state', () => ({
+    refreshTradingStateForModeChange: m.refreshMode,
+    getTradingState: () => m.trading,
+    subscribeTradingState: () => () => undefined,
+}));
 vi.mock('../../../lib/server-info-store', () => ({ useServerInfo: () => m.info }));
 vi.mock('../../../lib/shioaji', () => m.orderFns);
 vi.mock('../slide-to-confirm', async (importOriginal) => {
@@ -93,7 +98,7 @@ import { setBatchExit } from '../../lib/batch-exit-auth';
 import { runEsunEnvSwitch } from '../../lib/esun-env-switch';
 import { resetEsunReconnectForTest } from '../../lib/esun-reconnect';
 import { closeOrderAction, closeTicket, getMobileUi, openOrderAction, openTicket, resetMobileUiForTest } from '../../lib/mobile-store';
-import { beginOrderDispatch, getEnvSwitch, resetTradingActivityForTest } from '../../lib/trading-activity';
+import { beginOrderDispatch, envSwitchBlocks, getEnvSwitch, resetTradingActivityForTest } from '../../lib/trading-activity';
 import { BottomSheet } from '../bottom-sheet';
 import { SlideToConfirm } from '../slide-to-confirm';
 import { EnvSwitchSection } from './env-switch-section';
@@ -133,6 +138,10 @@ beforeEach(() => {
     m.configProfiles = m.profiles();
     m.info = { simulation: true };
     m.pendingConfirm = null;
+    m.trading = {
+        queries: { orders: { needsReconcile: false, reasons: [], error: null }, positions: { needsReconcile: false, reasons: [], error: null } },
+        trades: [],
+    };
     m.switchEnvironment.mockReset();
     m.switchEnvironment.mockImplementation(async (t: Env) => {
         m.env = t;
@@ -303,6 +312,14 @@ describe('EnvSwitchSection — blocking conditions', () => {
         ['batch exit running', () => { setBatchExit(true); }, '多選出清進行中'],
         ['cancel / modify in flight', () => { m.mutationListener!({ token: 'k1', phase: 'begin', tradeId: 'T1', base: '' }); }, '刪單／改單送出中'],
         ['order or close dispatch in flight (平倉)', () => { beginOrderDispatch(); }, '委託送出中（下單或平倉）'],
+        ['another device is switching (health envSwitchInProgress)', () => { m.health = { ...HEALTH, envSwitchInProgress: true }; }, '另一個裝置或分頁正在切換'],
+        ['E.SUN reconciliation pending (玉山 message)', () => {
+            m.trading.queries.orders = { needsReconcile: true, reasons: ['disconnect'], error: '玉山回報串流中斷，期間可能漏收委託／成交回報；重新連線後請確認' };
+        }, '待對帳'],
+        ['mutation outcome pending with E.SUN orders', () => {
+            m.trading.queries.orders = { needsReconcile: true, reasons: ['mutation-outcome'], error: '刪單／改單結果待確認；請手動更新委託，不要自動重送' };
+            m.trading.trades = [{ account: { broker_id: '8840-SIM' } }];
+        }, '待對帳'],
     ];
 
     it.each(cases)('%s: the option is disabled with the reason', async (_name, apply, reason) => {
@@ -401,8 +418,9 @@ describe('EnvSwitchSection — lost response / timeout (MEDIUM-2)', () => {
         expect(getEnvSwitch()).toEqual({ target: 'PRODUCTION', phase: 'checking' });
         expect(sheet().props.dismissible).toBe(false);
         expect(one('env-switch-cancel').props.disabled).toBe(true);
-        openTicket({ code: '2330' });
-        expect(getMobileUi().ticket).toBeNull();
+        // 只擋玉山：玉山帳戶的送單被擋，永豐照常
+        expect(envSwitchBlocks({ broker_id: '8840' })).toBe(true);
+        expect(envSwitchBlocks({ broker_id: '9A95' })).toBe(false);
         expect(m.notify).not.toHaveBeenCalled();
         m.health = { ...HEALTH, environment: 'PRODUCTION' }; // bridge 其實已切換
         await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
@@ -502,13 +520,47 @@ describe('EnvSwitchSection — route change during a switch (CRITICAL-1)', () =>
         await act(async () => view!.unmount()); // 系統返回手勢：帳戶頁卸載
         view = undefined;
         expect(getEnvSwitch()).toEqual({ target: 'PRODUCTION', phase: 'switching' });
+        expect(envSwitchBlocks({ broker_id: '8840-SIM' })).toBe(true); // 玉山送單閘門仍在
+        expect(envSwitchBlocks({ broker_id: '9A95' })).toBe(false); // 永豐照常
         openTicket({ code: '2330' });
-        openOrderAction('T1');
-        expect(getMobileUi().ticket).toBeNull();
-        expect(getMobileUi().orderAction).toBeNull();
+        expect(getMobileUi().ticket).not.toBeNull(); // 面板可開（玉山帳戶在面板內由 ticketProblem 擋下）
         await act(async () => { resolve({ ok: true, environment: 'PRODUCTION', entry: 'e', bridgeUpdated: true }); });
         expect(getEnvSwitch()).toBeNull();
         expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ok', title: '環境切換' }));
         expectNoOrders();
+    });
+});
+
+describe('EnvSwitchSection — round 3', () => {
+    it('SinoPac-only reconciliation does not block the E.SUN switch', async () => {
+        m.trading.queries.orders = { needsReconcile: true, reasons: ['mutation-outcome'], error: '刪單／改單結果待確認；請手動更新委託，不要自動重送' };
+        m.trading.trades = [{ account: { broker_id: '9A95' } }];
+        await mount();
+        expect(one('env-option-production').props.disabled).toBe(false);
+    });
+
+    it('2b: while health reports envSwitchInProgress the result is never "failed"; failed only once the bridge is idle on the old env', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const TIMEOUT = '玉山環境切換失敗：玉山下單服務 (esun-bridge) 回應逾時（30 秒）';
+        m.switchEnvironment.mockImplementation(async () => {
+            m.health = { ...HEALTH, envSwitchInProgress: true }; // 前端逾時時 bridge 仍在切換（登入中）
+            return { ok: false, environment: 'SIMULATION', entry: 'e', bridgeUpdated: false, error: TIMEOUT };
+        });
+        await mount();
+        await click('env-option-production');
+        await act(async () => { slide()!.props.onConfirm(); });
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+        const call = m.notify.mock.calls.at(-1)![0];
+        expect(call).toMatchObject({ kind: 'err', title: '環境切換結果未知' });
+        expect(getEnvSwitch()).toBeNull();
+        // 同樣逾時，但 bridge 已不在切換、仍是原環境 → 失敗
+        m.notify.mockReset();
+        m.health = { ...HEALTH, envSwitchInProgress: false };
+        m.switchEnvironment.mockResolvedValue({ ok: false, environment: 'SIMULATION', entry: 'e', bridgeUpdated: false, error: TIMEOUT });
+        await click('env-switch-cancel');
+        await click('env-option-production');
+        await act(async () => { slide()!.props.onConfirm(); });
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+        expect(m.notify.mock.calls.at(-1)![0]).toMatchObject({ kind: 'err', title: '環境切換失敗' });
     });
 });

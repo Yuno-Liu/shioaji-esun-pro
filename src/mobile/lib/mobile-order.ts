@@ -75,8 +75,8 @@ export function assertDayTradeStillAllowed(contract: Pick<ContractInfo, 'code' |
  * - reject 其他錯誤：結果未知，禁止自動重送（規格 R6、§7.2）。
  */
 export async function submitMobileOrder(input: MobileOrderInput, guards: MobileOrderGuards): Promise<Trade> {
-    // 玉山環境切換中不送（確認前與 beforeDispatch 各檢查一次）；送出流程期間計入「委託送出中」，環境切換因此擋下
-    assertNoEnvSwitch();
+    // 玉山環境切換中不送玉山帳戶（確認前、確認後與 beforeDispatch 各檢查一次；永豐照常）；送出流程期間計入「委託送出中」，環境切換因此擋下
+    assertNoEnvSwitch(input.displayedAccount);
     const release = beginOrderDispatch();
     try {
         return await submitGuarded(input, guards);
@@ -156,7 +156,7 @@ async function submitGuarded(input: MobileOrderInput, guards: MobileOrderGuards)
         accountLabel: accountConfirmLabel(orderAccount),
     }, { serverMode: sameServerMode });
     if (!approved) throw new OrderConfirmCancelled();
-    assertNoEnvSwitch();
+    assertNoEnvSwitch(orderAccount);
     // 7) 確認後重驗（確認可能停留很久）
     if (!sameServerMode()) throw notStarted(SERVER_MODE_CHANGED_MESSAGE);
     if (!isSelectedAccountUnchanged(orderAccount)) throw notStarted(ACCOUNT_CHANGED_MESSAGE);
@@ -164,7 +164,7 @@ async function submitGuarded(input: MobileOrderInput, guards: MobileOrderGuards)
     // 8) beforeDispatch：HTTP 送出前最後一刻同步重驗，丟出就不送（每一項都是 mutationNotStarted）
     const dispatch = {
         beforeDispatch: () => {
-            assertNoEnvSwitch();
+            assertNoEnvSwitch(orderAccount);
             guards.assertResumeReady();
             assertTradingLive();
             assertRiskAllowed();

@@ -267,27 +267,31 @@ export function esunExitLegsProblem(
     return null;
 }
 
-/** 送出前（lib 的 beforeSend）同步檢查 ResumeGate；不允許時丟出 mutationNotStarted 錯誤 */
-export function closeBeforeSend(): void {
-    assertNoEnvSwitch();
+/**
+ * 送出前（lib 的 beforeSend）同步檢查：玉山環境切換中不送玉山帳戶（帳戶不明時視同玉山）、ResumeGate；
+ * 不允許時丟出 mutationNotStarted 錯誤
+ */
+export function closeBeforeSend(account?: Pick<Account, 'broker_id'> | null): void {
+    assertNoEnvSwitch(account);
     assertResumeReady({ allowStale: getResumeGate().staleAcknowledged });
 }
 
 /** 依平倉方式呼叫 src/lib（lib 內部會開確認面板，確認只出現一次） */
 export async function executeClose(plan: ClosePlan): Promise<void> {
-    // 玉山環境切換中不送；平倉流程（含 lib 確認面板）期間計入「委託送出中」，環境切換因此擋下
-    assertNoEnvSwitch();
+    // 玉山環境切換中不送玉山帳戶（永豐照常）；平倉流程（含 lib 確認面板）期間計入「委託送出中」，環境切換因此擋下
+    assertNoEnvSwitch(plan.account);
     const release = beginOrderDispatch();
+    const beforeSend = () => closeBeforeSend(plan.account);
     try {
         if (plan.kind === 'stock') {
-            await placeStockExitByShares(plan.contract, plan.action, plan.shares, plan.account, { orderCond: plan.orderCond, beforeSend: closeBeforeSend });
+            await placeStockExitByShares(plan.contract, plan.action, plan.shares, plan.account, { orderCond: plan.orderCond, beforeSend });
             return;
         }
         await placeQuickOrder(plan.contract, plan.action, null, plan.lots, {
             account: plan.account,
             ocType: 'Cover',
             source: 'manual',
-            beforeSend: closeBeforeSend,
+            beforeSend,
         });
     } finally {
         release();
@@ -908,7 +912,7 @@ function CloseSheet({ position, gate, gateProblem, busy, feedback, privMoney, on
                             {maskMoney(positionQtyText(position), privMoney)}
                             {typeof plan !== 'string' && ` → 市價${closeActionText(plan)}`}
                         </p>
-                        {position.account && <p className={styles.sheetRoute}><RouteBadge account={position.account} size='lg' /></p>}
+                        {position.account && <p className={styles.sheetRoute}><RouteBadge account={position.account} size='lg' row /></p>}
                     </GroupedSection>
                 )}
                 <GroupedSection>

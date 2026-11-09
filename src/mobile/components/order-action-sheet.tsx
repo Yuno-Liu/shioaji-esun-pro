@@ -57,7 +57,7 @@ import { InlineNote } from '../ui/inline-note';
 import { Stepper } from '../ui/stepper';
 import { mobileAccountLabel } from './account-switch-sheet';
 import { BottomSheet, SheetFooter } from './bottom-sheet';
-import { routeBadgeText, useOrderRoute } from './route-badge';
+import { routeBadgeText, useRowRoute } from './route-badge';
 import { SlideToConfirm } from './slide-to-confirm';
 
 // ---- 共用規則（委託頁 routes/orders-page.tsx 也使用）----
@@ -279,7 +279,8 @@ export function TradeInstrument({ trade, testId = 'order-instrument' }: { trade:
 export function OrderLines({ trade, meta }: { trade: Trade; meta: EsunOrderMeta | null }) {
     const priv = usePrivacyMode();
     const account = tradeAccountOf(trade);
-    const route = useOrderRoute(account);
+    // 該筆委託帳戶自己的環境（切換後殘留的舊環境委託不標成目前環境）
+    const route = useRowRoute(account);
     const remaining = remainingWorkingOrderQuantity(trade);
     const unit = orderUnitOf(trade);
     const sideText = trade.order.action === 'Buy' ? '買' : '賣';
@@ -365,7 +366,7 @@ interface MutationRunner {
     run: <T>(verb: Verb, call: () => Promise<T>, onOk: (value: T) => void, opts: { gated: boolean }) => Promise<void>;
 }
 
-function useMutationRunner(onBusyChange: (busy: boolean) => void): MutationRunner {
+function useMutationRunner(onBusyChange: (busy: boolean) => void, account: TradeAccount | null): MutationRunner {
     const [busy, setBusy] = useState(false);
     const [resetKey, setResetKey] = useState(0);
     const [feedback, setFeedback] = useState<string | null>(null);
@@ -382,9 +383,9 @@ function useMutationRunner(onBusyChange: (busy: boolean) => void): MutationRunne
     const run: MutationRunner['run'] = async (verb, call, onOk, opts) => {
         if (busyRef.current) return;
         setFeedback(null);
-        // 玉山環境切換中：改價、減量、刪單一律不送（含不受 ResumeGate 限制的刪單）
+        // 玉山環境切換中：玉山委託的改價、減量、刪單一律不送（含不受 ResumeGate 限制的刪單）；永豐照常
         try {
-            assertNoEnvSwitch();
+            assertNoEnvSwitch(account);
         } catch (err) {
             notSent(err);
             return;
@@ -444,7 +445,7 @@ function ActionBody({ kind, trade, working, onBusyChange }: { kind: OrderActionK
     const meta = useEsunOrderMeta(trade);
     const live = useTradingLive();
     const gate = useResumeGate();
-    const runner = useMutationRunner(onBusyChange);
+    const runner = useMutationRunner(onBusyChange, tradeAccountOf(trade));
     const avail = orderActionAvailability(trade, meta);
     const gateReason = mutationGateReason(live, gate);
     const { busy } = runner;
@@ -696,7 +697,7 @@ function CancelForm({ trade, working, runner, onBack }: { trade: Trade; working:
                     resetKey={runner.resetKey}
                     onConfirm={() => {
                         // 刪單不受 ResumeGate、LIVE 與風控鎖限制（降低風險的動作）
-                        void runner.run('刪單', () => cancelOrder(tradeId, { beforeSend: assertNoEnvSwitch }), (result: Trade) => {
+                        void runner.run('刪單', () => cancelOrder(tradeId, { beforeSend: () => assertNoEnvSwitch(tradeAccountOf(trade)) }), (result: Trade) => {
                             notify({ title: '刪單結果', ...cancellationSummary([{ status: 'fulfilled', value: result }]) });
                         }, { gated: false });
                     }}

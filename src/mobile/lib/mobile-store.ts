@@ -65,7 +65,7 @@ export interface MobileUiState {
     ticket: TicketRequest | null;
     /** 委託操作面板：null＝關閉 */
     orderAction: OrderActionRequest | null;
-    /** 玉山環境切換中（含結果確認中）；null＝沒有。切換中不開下單／委託操作面板，根層 EnvSwitchOverlay 蓋住畫面 */
+    /** 玉山環境切換中（含結果確認中）；null＝沒有。只擋玉山帳戶的送單（lib/trading-activity.ts），永豐照常；殼層顯示 EnvSwitchOverlay */
     envSwitch: EnvSwitchState | null;
 }
 
@@ -131,8 +131,6 @@ export function openTicket(req: {
     cond?: TicketCond;
     daytradeShort?: boolean;
 }): void {
-    // 玉山環境切換中（含結果確認中）不開下單面板（lib/trading-activity.ts）
-    if (state.envSwitch !== null) return;
     const ticket: TicketRequest = {
         code: req.code,
         action: req.action ?? null,
@@ -152,7 +150,6 @@ export function closeTicket(): void {
 }
 
 export function openOrderAction(tradeId: string, kind: OrderActionKind = 'menu'): void {
-    if (state.envSwitch !== null) return; // 玉山環境切換中不開委託操作面板
     set({ orderAction: { tradeId, kind, seq: ++seq } });
 }
 

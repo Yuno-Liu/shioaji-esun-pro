@@ -561,6 +561,7 @@ describe('submitMobileOrder — 玉山環境切換（CRITICAL-1／CRITICAL-2）'
     });
 
     it('確認期間開始切換（含結果確認中）：確認後重驗擋下', async () => {
+        h.captured = { S: esunStock, F: sinoFutures };
         m.confirm.mockImplementation(async () => { setEnvSwitch({ target: 'SIMULATION', phase: 'checking' }); return true; });
         const err = await rejection(submitMobileOrder(stockInput(esunStock), guards));
         expect(err).toMatchObject({ message: ENV_SWITCH_NOT_SENT, mutationNotStarted: true });
@@ -568,6 +569,7 @@ describe('submitMobileOrder — 玉山環境切換（CRITICAL-1／CRITICAL-2）'
     });
 
     it('beforeDispatch（HTTP 送出前最後一刻）也擋', async () => {
+        h.captured = { S: esunStock, F: sinoFutures };
         m.placeStock.mockImplementation(async (...args: unknown[]) => {
             const dispatch = args[3] as { beforeDispatch: () => void };
             setEnvSwitch(PRODUCTION);
@@ -576,6 +578,13 @@ describe('submitMobileOrder — 玉山環境切換（CRITICAL-1／CRITICAL-2）'
         });
         const err = await rejection(submitMobileOrder(stockInput(esunStock), guards));
         expect(err).toMatchObject({ message: ENV_SWITCH_NOT_SENT, mutationNotStarted: true });
+    });
+
+    it('round 3 (2a): 永豐帳戶的新單在玉山切換中照常送出', async () => {
+        setEnvSwitch(PRODUCTION);
+        await submitMobileOrder(stockInput(sinoStock), guards);
+        expect(m.confirm).toHaveBeenCalledTimes(1);
+        expect(m.placeStock).toHaveBeenCalledTimes(1);
     });
 
     it('送出流程期間計入「委託送出中」（環境切換據此擋下），結束或失敗都歸零', async () => {

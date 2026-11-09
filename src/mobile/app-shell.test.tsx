@@ -23,7 +23,13 @@ const m = vi.hoisted(() => ({
 }));
 
 vi.mock('../lib/stream', () => ({ ensureStream: () => undefined }));
-vi.mock('../lib/trading-state', () => ({ useTradingState: () => m.trading }));
+vi.mock('../lib/trading-state', () => ({
+    useTradingState: () => m.trading,
+    // lib/esun-env-switch（根層面板測試以真的 runEsunEnvSwitch 驅動）
+    getTradingState: () => ({ queries: {}, trades: [] }),
+    subscribeTradingState: () => () => undefined,
+    refreshTradingStateForModeChange: async () => undefined,
+}));
 vi.mock('../lib/working-order-quantity', () => ({ remainingWorkingOrderQuantity: (t: { remaining: number }) => t.remaining }));
 vi.mock('./components/status-bar', () => ({ StatusBar: () => createElement('div', { 'data-testid': 'mock-status-bar' }) }));
 vi.mock('./components/toast-host', () => ({ ToastHost: () => createElement('div', { 'data-testid': 'mock-toast-host' }) }));
@@ -82,7 +88,7 @@ vi.mock('./lib/watchlist-context', () => ({ WatchlistProvider: ({ children }: { 
 import { MobileShell, tabAriaLabel } from './app';
 import { registerSheet, resetSheetStackForTest } from './lib/sheet-stack';
 import { getMobileUi, openOrderAction, openTicket, resetMobileUiForTest } from './lib/mobile-store';
-import { resetTradingActivityForTest, setEnvSwitch } from './lib/trading-activity';
+import { resetTradingActivityForTest } from './lib/trading-activity';
 import { navigate } from './lib/hash-router';
 
 /** 假的 DOM 元素：讓殼層把它當成真實節點（instanceof HTMLElement）而啟用 portal 與背景隔離 */
@@ -398,7 +404,7 @@ describe('切換分頁：舊頁 portal 不殘留', () => {
     });
 });
 
-describe('玉山環境切換中：根層面板（CRITICAL-1）', () => {
+describe('玉山環境切換中：根層面板（CRITICAL-1；round 3 以真的 runEsunEnvSwitch 驅動）', () => {
     const goTo = async (hash: string) => {
         await act(async () => {
             (location as { hash: string }).hash = hash;
@@ -406,16 +412,36 @@ describe('玉山環境切換中：根層面板（CRITICAL-1）', () => {
         });
         await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     };
+    const HEALTH = { ok: true, configured: true, problems: [], environment: 'SIMULATION', account: null, loggedIn: true, loginError: null, loginLocked: false };
+    let answer!: (v: unknown) => void;
+    // window 在 beforeEach 才 stub：lib 模組在那之後才動態載入
+    let esunTradeService!: typeof import('../lib/esun').esunTradeService;
+    let runEsunEnvSwitch!: typeof import('./lib/esun-env-switch').runEsunEnvSwitch;
+    beforeEach(async () => {
+        ({ esunTradeService } = await import('../lib/esun'));
+        ({ runEsunEnvSwitch } = await import('./lib/esun-env-switch'));
+        // useSyncExternalStore 需要穩定的快照物件
+        const SNAPSHOT = { ...esunTradeService.getSnapshot(), environment: 'SIMULATION', environmentKnown: true, switching: false } as ReturnType<typeof esunTradeService.getSnapshot>;
+        vi.spyOn(esunTradeService, 'getSnapshot').mockReturnValue(SNAPSHOT);
+        vi.spyOn(esunTradeService, 'getBridgeHealth').mockReturnValue(HEALTH as never);
+        vi.spyOn(esunTradeService, 'refreshHealth').mockResolvedValue(HEALTH as never);
+        vi.spyOn(esunTradeService, 'isEnvironmentAvailable').mockReturnValue(true);
+        vi.spyOn(esunTradeService, 'isReconnecting').mockReturnValue(false);
+        vi.spyOn(esunTradeService, 'switchEnvironment').mockImplementation(() => new Promise(r => { answer = r as (v: unknown) => void; }) as never);
+    });
     afterEach(() => { resetTradingActivityForTest(); });
+    const settleImport = async () => {
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+        await act(async () => { await vi.dynamicImportSettled(); });
+    };
 
-    it('換頁（返回手勢、改 hash）不會移除面板；不可關閉；切換中不開下單與委託操作面板', async () => {
+    it('switching: modal overlay survives route changes and is non-dismissible; closes when the bridge answers', async () => {
         (location as { hash: string }).hash = '#/account';
         await mount();
         expect(byTestId('env-switch-overlay-open')).toHaveLength(0);
-        await act(async () => { setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' }); });
-        // 面板模組延遲載入（帳戶頁 chunk 已帶著它）：等 import 完成
-        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-        await act(async () => { await vi.dynamicImportSettled(); });
+        let run!: Promise<unknown>;
+        await act(async () => { run = runEsunEnvSwitch('PRODUCTION', 'ok', [10]); });
+        await settleImport();
         expect(byTestId('env-switch-overlay-open')).toHaveLength(1);
         expect(one('env-switch-overlay-open').props['data-dismissible']).toBe('false');
         expect(one('env-switch-overlay-open').props['data-layer']).toBe('confirm');
@@ -423,18 +449,25 @@ describe('玉山環境切換中：根層面板（CRITICAL-1）', () => {
             await goTo(hash);
             expect(byTestId('env-switch-overlay-open')).toHaveLength(1);
         }
-        openTicket({ code: '2330', action: 'Buy' });
-        openOrderAction('T1', 'cancel');
-        expect(getMobileUi().ticket).toBeNull();
-        expect(getMobileUi().orderAction).toBeNull();
-        // 回應逾時後的結果確認中：仍顯示、仍擋
-        await act(async () => { setEnvSwitch({ target: 'PRODUCTION', phase: 'checking' }); });
-        expect(one('env-switch-overlay-open').props['data-title']).toBe('環境切換結果確認中');
-        openTicket({ code: '2330' });
-        expect(getMobileUi().ticket).toBeNull();
-        await act(async () => { setEnvSwitch(null); });
+        await act(async () => { answer({ ok: true, environment: 'PRODUCTION', entry: 'e', bridgeUpdated: true }); await run; });
         expect(byTestId('env-switch-overlay-open')).toHaveLength(0);
-        await act(async () => { openTicket({ code: '2330' }); });
-        expect(getMobileUi().ticket).not.toBeNull();
+        expect(byTestId('env-switch-banner')).toHaveLength(0);
+    });
+
+    it('checking (lost response): non-blocking banner instead of the modal, also across a route change; gone when settled', async () => {
+        (location as { hash: string }).hash = '#/account';
+        await mount();
+        let run!: Promise<unknown>;
+        await act(async () => { run = runEsunEnvSwitch('PRODUCTION', 'ok', [10]); });
+        await settleImport();
+        expect(byTestId('env-switch-overlay-open')).toHaveLength(1);
+        await act(async () => { answer({ ok: false, environment: 'SIMULATION', entry: 'e', bridgeUpdated: false, error: '玉山環境切換失敗：玉山下單服務 (esun-bridge) 回應逾時（30 秒）' }); });
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+        expect(byTestId('env-switch-overlay-open')).toHaveLength(0); // 不再蓋住畫面（永豐照常）
+        expect(byTestId('env-switch-banner')).toHaveLength(1);
+        await goTo('#/orders');
+        expect(byTestId('env-switch-banner')).toHaveLength(1);
+        await act(async () => { await vi.advanceTimersByTimeAsync(10); await run; });
+        expect(byTestId('env-switch-banner')).toHaveLength(0);
     });
 });

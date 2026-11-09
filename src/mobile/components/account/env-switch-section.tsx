@@ -13,6 +13,7 @@ import { useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react'
 import { esunTradeService, useEsunEnvironment, type EsunEnvironment } from '../../../lib/esun';
 import { subscribeOrderConfirm } from '../../../lib/order-confirm';
 import { useServerInfo } from '../../../lib/server-info-store';
+import { subscribeTradingState } from '../../../lib/trading-state';
 import { onAccountJump, takeAccountJump } from '../../lib/account-jump';
 import { subscribeBatchExit } from '../../lib/batch-exit-auth';
 import {
@@ -56,6 +57,7 @@ function useSwitchSources(): void {
             subscribeOrderConfirm(rerender),
             subscribeBatchExit(rerender),
             subscribeEsunSwitchSources(rerender),
+            subscribeTradingState(rerender), // 待對帳（esunReconcilePending）
         ];
         return () => stops.forEach(stop => stop());
     }, []);

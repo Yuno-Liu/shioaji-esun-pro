@@ -4,7 +4,8 @@
 // 這裡傳入 hook 取得的即時環境，環境改變時重新渲染。用語差異：確認備註寫「模擬環境」，徽章寫「模擬」。
 // 出現位置：下單面板頂端、確認面板、委託列。環境未確認時下單面板的「預覽」必須停用（useOrderRoute 回傳 simulation === undefined）。
 
-import { esunEnvironmentOfAccount, useEsunEnvironment } from '../../lib/esun';
+import { useEsunEnvironment } from '../../lib/esun';
+import { esunEnvironmentOfAccount } from '../../lib/esun/order-mapping';
 import { orderRouteOf, routeEnvText, type OrderRoute } from '../../lib/order-route';
 import { useServerInfo } from '../../lib/server-info-store';
 import type { Account } from '../../lib/types/portfolio';

@@ -25,6 +25,7 @@ import { getMobileUi, openOrderAction, openTicket, resetMobileUiForTest } from '
 import {
     assertNoEnvSwitch,
     beginOrderDispatch,
+    envSwitchBlocks,
     ENV_SWITCH_NOT_SENT,
     orderDispatchInFlight,
     resetTradingActivityForTest,
@@ -66,19 +67,26 @@ describe('trading-activity', () => {
         expect(orderDispatchInFlight()).toBe(false);
     });
 
-    it('CRITICAL-1: while switching (or checking) nothing is sent and no ticket / action sheet opens', () => {
-        expect(() => assertNoEnvSwitch()).not.toThrow();
+    it('round 3 (2a): while switching (or checking) only E.SUN is refused; SinoPac passes; unknown account counts as E.SUN', () => {
+        const ESUN = { broker_id: '8840-SIM' };
+        const SINO = { broker_id: '9A95' };
+        expect(() => assertNoEnvSwitch(ESUN)).not.toThrow();
         setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
-        expect(() => assertNoEnvSwitch()).toThrow(ENV_SWITCH_NOT_SENT);
-        try { assertNoEnvSwitch(); } catch (err) { expect(err).toMatchObject({ mutationNotStarted: true }); }
+        expect(() => assertNoEnvSwitch(ESUN)).toThrow(ENV_SWITCH_NOT_SENT);
+        expect(() => assertNoEnvSwitch({ broker_id: '8840' })).toThrow(ENV_SWITCH_NOT_SENT);
+        expect(() => assertNoEnvSwitch(null)).toThrow(ENV_SWITCH_NOT_SENT);
+        try { assertNoEnvSwitch(ESUN); } catch (err) { expect(err).toMatchObject({ mutationNotStarted: true }); }
+        expect(() => assertNoEnvSwitch(SINO)).not.toThrow();
+        expect(envSwitchBlocks(SINO)).toBe(false);
+        // 面板照常可開（玉山帳戶在下單面板內由 ticketProblem 擋下）
         openTicket({ code: '2330', action: 'Buy' });
         openOrderAction('T1', 'cancel');
-        expect(getMobileUi().ticket).toBeNull();
-        expect(getMobileUi().orderAction).toBeNull();
-        setEnvSwitch({ target: 'PRODUCTION', phase: 'checking' });
-        expect(() => assertNoEnvSwitch()).toThrow(ENV_SWITCH_NOT_SENT);
-        setEnvSwitch(null);
-        openTicket({ code: '2330' });
         expect(getMobileUi().ticket).not.toBeNull();
+        expect(getMobileUi().orderAction).not.toBeNull();
+        setEnvSwitch({ target: 'PRODUCTION', phase: 'checking' });
+        expect(() => assertNoEnvSwitch(ESUN)).toThrow(ENV_SWITCH_NOT_SENT);
+        expect(() => assertNoEnvSwitch(SINO)).not.toThrow();
+        setEnvSwitch(null);
+        expect(() => assertNoEnvSwitch(ESUN)).not.toThrow();
     });
 });

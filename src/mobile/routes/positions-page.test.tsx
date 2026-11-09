@@ -243,9 +243,10 @@ afterEach(async () => {
     vi.unstubAllGlobals();
 });
 
-describe('平倉與玉山環境切換（CRITICAL-1／CRITICAL-2）', () => {
+describe('平倉與玉山環境切換（CRITICAL-1／CRITICAL-2；round 3 只擋玉山）', () => {
     afterEach(() => { resetTradingActivityForTest(); });
     const plan = () => closePlanFor(stockPos(), stk2330) as ClosePlan;
+    const esunPlan = () => ({ ...plan(), account: { ...plan().account, broker_id: '8840-SIM' } }) as ClosePlan;
 
     it('單筆平倉送出中（含 lib 確認）計入「委託送出中」，環境切換據此擋下；結束或失敗歸零', async () => {
         let resolve!: (v: unknown) => void;
@@ -260,21 +261,25 @@ describe('平倉與玉山環境切換（CRITICAL-1／CRITICAL-2）', () => {
         expect(orderDispatchInFlight()).toBe(false);
     });
 
-    it('切換中：平倉不送（未送出），beforeSend（closeBeforeSend）也擋', async () => {
+    it('切換中：玉山帳戶的平倉不送（未送出），beforeSend 也擋；永豐帳戶照常', async () => {
         setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
-        await expect(executeClose(plan())).rejects.toMatchObject({ message: ENV_SWITCH_NOT_SENT, mutationNotStarted: true });
+        await expect(executeClose(esunPlan())).rejects.toMatchObject({ message: ENV_SWITCH_NOT_SENT, mutationNotStarted: true });
         expect(m.placeStockExitByShares).not.toHaveBeenCalled();
-        expect(m.placeQuickOrder).not.toHaveBeenCalled();
-        expect(() => closeBeforeSend()).toThrow(ENV_SWITCH_NOT_SENT);
-        expect(m.assertResumeReady).not.toHaveBeenCalled();
+        expect(() => closeBeforeSend()).toThrow(ENV_SWITCH_NOT_SENT); // 帳戶不明＝視同玉山
+        expect(() => closeBeforeSend({ broker_id: '8840' })).toThrow(ENV_SWITCH_NOT_SENT);
+        // 永豐：照常送出，beforeSend 不擋
+        await executeClose(plan());
+        expect(m.placeStockExitByShares).toHaveBeenCalledTimes(1);
+        const beforeSend = (m.placeStockExitByShares.mock.calls[0] as unknown[])[4] as { beforeSend: () => void };
+        expect(() => beforeSend.beforeSend()).not.toThrow();
         resetTradingActivityForTest();
-        // 送出時才開始切換：lib 呼叫的 beforeSend 丟出未送出
+        // 玉山：送出時才開始切換 → lib 呼叫的 beforeSend 丟出未送出
         m.placeStockExitByShares.mockImplementation(async (...args: unknown[]) => {
             setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
             (args[4] as { beforeSend: () => void }).beforeSend();
             return [];
         });
-        await expect(executeClose(plan())).rejects.toMatchObject({ mutationNotStarted: true });
+        await expect(executeClose(esunPlan())).rejects.toMatchObject({ mutationNotStarted: true });
     });
 });
 
