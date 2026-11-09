@@ -6,10 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({ esunEnvironment: 'simulation', sinopacSimulation: true as boolean | undefined }));
 
+// route-badge.tsx 的 esunEnvironmentOfAccount 取自 lib/esun/order-mapping（真實實作，依帳戶鍵 -SIM 判定），這裡只換掉即時環境
 vi.mock('../../lib/esun', () => ({
     useEsunEnvironment: () => ({ environment: m.esunEnvironment }),
-    esunEnvironmentOfAccount: (a?: { broker_id: string } | null) =>
-        (a?.broker_id.startsWith('8840') ? (a.broker_id.endsWith('-SIM') ? 'SIMULATION' : 'PRODUCTION') : null),
 }));
 vi.mock('../../lib/server-info-store', () => ({ useServerInfo: () => ({ simulation: m.sinopacSimulation }) }));
 vi.mock('../../lib/order-route', () => ({
