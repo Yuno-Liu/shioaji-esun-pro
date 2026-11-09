@@ -7,6 +7,8 @@
 //   正式環境下緣 2px danger。
 // - 連線燈號：useStreamStatus() 與 ResumeGate。ResumeGate 非 ready 時優先顯示（同步中／資料過期／未恢復）。
 //   點擊展開連線詳情；stale-data 時詳情面板提供 ResumeGateNote（勾選「我了解委託／持倉資料可能過期」＋「重試同步」）。
+//   串流中斷過且尚未回到 LIVE 時，詳情面板顯示「伺服器未連線」提示（ServerDownHint；黏著判斷在常駐的 StatusBar 追蹤，
+//   面板關閉時不 render 子元件）。狀態列本身不加任何文字。
 // - 券商＋環境＋帳戶：依目前商品的市場槽位（股票 selectedStock／期權 selectedFutures；該槽位未選擇時
 //   顯示「未選擇證券帳戶」／「未選擇期貨帳戶」，不借用另一個市場的帳戶）；商品未知時才先看證券、再看期貨；
 //   環境實心小膠囊：「正式」danger、「模擬」accent、「環境未確認」amber。點擊開啟帳戶切換面板。
@@ -32,6 +34,7 @@ import { useResumeGate } from '../hooks/use-resume-gate';
 import type { ResumeGateState } from '../lib/resume-gate';
 import type { ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import { loadNoticeCenterSheet } from '../lib/deferred-modules';
+import { trackServerLost } from '../lib/server-down-hint';
 import { useMobileUi } from '../lib/mobile-store';
 import * as controls from '../styles/controls.css';
 import { fill, srOnly } from '../styles/primitives.css';
@@ -43,6 +46,7 @@ import { BottomSheet } from './bottom-sheet';
 import { ResumeGateNote } from './resume-gate-note';
 import { ModuleErrorBoundary, retryableLazy, SheetLoadError } from './route-error-boundary';
 import { routeTone, useOrderRoute } from './route-badge';
+import { ServerDownHint } from './server-down-hint';
 import { SlideToConfirm } from './slide-to-confirm';
 
 /**
@@ -101,7 +105,7 @@ function formatTime(ms: number): string {
     return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function ConnectionDetails({ open, onClose, stream, gate }: { open: boolean; onClose: () => void; stream: StreamStatus; gate: ResumeGateSnapshot }) {
+function ConnectionDetails({ open, onClose, stream, gate, serverLost }: { open: boolean; onClose: () => void; stream: StreamStatus; gate: ResumeGateSnapshot; serverLost: boolean }) {
     const resume = gate.state;
     const message = gate.message;
     return (
@@ -120,6 +124,7 @@ function ConnectionDetails({ open, onClose, stream, gate }: { open: boolean; onC
             </dl>
             {message && <p className={styles.note}>{message}</p>}
             <div className={styles.sheetActions}>
+                {serverLost && <ServerDownHint testId='connection-server-down' />}
                 <ResumeGateNote gate={gate} showReason={false} testId='connection-stale' />
                 {resume === 'failed' && (
                     <button type='button' className={controls.button.primary} onClick={() => location.reload()}>重新整理頁面</button>
@@ -205,6 +210,7 @@ export function StatusBar() {
     const route = useOrderRoute(account);
     const tone = routeTone(route);
     const light = connectionLight(stream, resume.state);
+    const serverLost = trackServerLost(stream);
     const announce = useStatusAnnouncements(risk.locked, light.label);
     const close = () => {
         if (sheet === 'notice') setSeenAt(Date.now());
@@ -290,7 +296,7 @@ export function StatusBar() {
                 <span className={srOnly} aria-live='polite' data-testid='status-lock-live'>{announce.lockText}</span>
                 <span className={srOnly} aria-live='polite' data-testid='status-connection-live'>{announce.connectionText}</span>
             </header>
-            <ConnectionDetails open={sheet === 'connection'} onClose={close} stream={stream} gate={resume} />
+            <ConnectionDetails open={sheet === 'connection'} onClose={close} stream={stream} gate={resume} serverLost={serverLost} />
             <AccountSwitchSheet open={sheet === 'account'} onClose={close} />
             <RiskUnlockSheet open={sheet === 'unlock'} onClose={close} />
             {seenAt > 0 && (

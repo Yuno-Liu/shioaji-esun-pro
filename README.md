@@ -262,6 +262,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8080/e
 | curl 回 `000`、連線被直接關閉 | Host 不在白名單（nginx 444），檢查 `WEB_SERVER_NAMES` 並重建容器 |
 | `/esun/` 回 421 | 手機或區網主機名沒有加入 `WEB_SERVER_NAMES` |
 | 手機只顯示「需要 HTTPS」 | 用了 HTTP 網址，改用 TLS 前端的 `https://` 網址 |
+| 手機顯示「伺服器未連線」 | 若剛改 `SJ_PRODUCTION` 請執行 `docker compose up -d`；否則用 `docker compose ps` 檢查服務與網路 |
 | `/esun/health` 顯示 `loginLocked` | 密碼或憑證錯誤造成熔斷；修正後用上面的 reconnect 指令 |
 
 更多指令見 [esun.md「常用管理與排錯指令」](docs/fork/esun.md#常用管理與排錯指令)。

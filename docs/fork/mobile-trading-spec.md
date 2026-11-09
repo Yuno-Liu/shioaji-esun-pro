@@ -733,6 +733,7 @@ export function workingOrderLines(orderableCode: string, trades: readonly Accoun
 | 伺服器 | 版本（`/api/v1/info`）、模擬／正式、憑證剩餘天數、每日流量 | `fetchInfo()`、`fetchHealth()`、`/api/v1/auth/usage` |
 | 玉山重新連線（P1） | 只提供一般重新連線（不提供 force），60 秒冷卻，按下前提醒「密碼錯誤 3 次會鎖帳」 | `esunTradeService.reconnect()` |
 | 交易環境 | 永豐模擬／正式唯讀（改 `.env` 的 `SJ_PRODUCTION` 後 `docker compose up -d`）；玉山模擬／正式切換（§2.5），環境切換中停用玉山重新連線 | `useServerInfo().simulation`；`useEsunEnvironment()`、`esunTradeService.switchEnvironment()` |
+| 伺服器未連線提示 | 永豐串流中斷過且未回 LIVE 時，連線卡與狀態列連線面板提示「伺服器未連線」，剛改 `SJ_PRODUCTION` 請 `docker compose up -d`（同上游 #384 的黏著判斷） | `useStreamStatus()`；`src/mobile/lib/server-down-hint.ts` |
 | 風控 | 一鍵鎖單、單筆上限、當日虧損上限；「手動下單確認」顯示為**鎖定開啟** | `useRiskSettings()`、`setRiskSettings()` |
 | 顯示 | 深／淺色、台灣（紅漲綠跌）／國際配色、字級、遮蔽金額 | `useThemeSettings()`、`usePrivacyMoney()` |
 | 診斷 | secure context、Web Locks、BroadcastChannel、User Agent、建置版本 `__SHIOAJI_BUILD_VERSION__` | — |

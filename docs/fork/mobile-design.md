@@ -521,6 +521,7 @@ backdrop  data-testid=`${testId}-backdrop`（退場中 `${testId}-closing-backdr
 - 中：路由膠囊（flex 1、可省略號截斷）＝`永豐`＋環境實心小膠囊（正式：danger＋inkStrong 白字；模擬：accent＋inkStrong 白字；未確認：amber 實心黑字）＋` · `＋帳號（`mobileAccountLabel`）＋ChevronDown 14px；沒有帳戶時 amber 1px 框＋foreground「未選擇證券帳戶」。
 - 右：未鎖＝LockOpen 16px＋「風控」（mutedForeground，對 panel 5.41）；已鎖＝danger 實心膠囊（inkStrong）＋Lock＋白字「已鎖單」。視覺隱藏的 `aria-live="polite"` 在鎖單狀態**改變**時宣告「已鎖單（只對本裝置有效）」／「已解除鎖單」；連線狀態維持 2 秒以上才宣告。
 - 三段點擊區各 ≥ TOUCH_MIN；行為不變（連線詳情、帳戶切換、未鎖立即鎖、已鎖開解除鎖單面板）。
+- 伺服器未連線提示（2026-11-09，移植上游 #384 的 `WebServerHint`）：連線詳情面板在動作區最上方顯示 warn InlineNote（role=status）「**伺服器未連線。**」＋「若剛切換永豐模擬／正式（改 .env 的 SJ_PRODUCTION），請在伺服器執行 docker compose up -d 重新啟動 Shioaji server；其他情況請確認伺服器與網路。」。黏著判斷同上游：串流 down 出現、重連中（connecting／stale）維持、LIVE 才消失，從未 down 過的 connecting 不顯示；判斷與文字在 `lib/server-down-hint.ts`（模組層共用，帳戶 › 連線同一份），由常駐的 StatusBar 追蹤（面板關閉時不 render 子元件）。狀態列本身不加任何文字；不發請求、沒有按鈕（S1）。
 - RouteBadge：樣式移到新檔 `styles/route-badge.css.ts`（`controls.css.ts` 的舊 `routeBadge`／`routeBadgeLarge` 已在 B4 刪除）；外框膠囊（borderBright）＋foreground「送往 永豐 」＋環境實心小膠囊；可見文字串接後仍為 `routeBadgeText` 的「送往 {券商} {環境}」。
 
 ### 6.6 殼層：ShellSlot、TabBar、捲動記憶、HTML 屬性（`app.tsx`、`styles/layout.css.ts`）
@@ -1184,6 +1185,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 狀態列帳戶切換面板底部改為「永豐模擬／正式由伺服器部署決定，只能顯示；玉山可在帳戶 › 連線切換。」＋［玉山模擬／正式切換］：關閉面板、跳到帳戶頁本區塊並聚焦（`lib/account-jump.ts`，作法同今日額度跳轉）；本身不切換環境，也沒有第二個切換介面。
 - 瀏覽器假資料實測（360 寬、字級 1.3）：模擬 → 正式（點把手一下不送出；滑動後切換中面板不可關閉）→ 狀態列、持倉頁、委託頁變正式、選取帳戶 8840-SIM → 8840；切回模擬時 bridge 回登入失敗，面板顯示錯誤、環境不變；再按確定切回模擬；bridge 停止、登入鎖定、bridge 異常、正式設定檔不存在都停用並說明；委託請求 0。
 - 體積：首屏 gzip 223,496（main 42fad7de）→ 223,713（+217 B：mobile-store 的切換狀態、刪改單追蹤、狀態列連結與匯出綁定）；根層面板（含橫幅樣式）與 `trading-activity` 是延遲 chunk，帳戶頁 chunk 約 +3.1 KB。曾試過把面板與閘門模組放進首屏：rolldown 會把 mobile-store 另切成共用 chunk，首屏多約 1.1 KB 超出預算，因此改為延遲載入面板。
+- 伺服器未連線提示（2026-11-09，移植上游 #384）：帳戶 › 連線的永豐區塊（連線世代下方）在串流中斷過且尚未回到 LIVE 時顯示與狀態列連線面板相同的 warn InlineNote（`components/server-down-hint.tsx`，判斷共用 `lib/server-down-hint.ts` 的模組層狀態：狀態列先看到 down、之後才開帳戶頁且重連中，也會顯示）。用語與上方永豐唯讀說明一致（改 .env 的 SJ_PRODUCTION → docker compose up -d）；不發請求、沒有按鈕（S1）。首屏 gzip 223,639 → 223,962（+323 B，文字與 InlineNote 包裝都在首屏的狀態列）。
 
 ### 7.9 市場（`#/market`、`#/market/signals`，`routes/market-page.tsx`）
 
