@@ -28,6 +28,7 @@ import {
     type EsunSwitchBlock,
 } from '../../lib/esun-env-switch';
 import { useEsunReconnectState } from '../../lib/esun-reconnect';
+import { useTradingActivity } from '../../lib/trading-activity';
 import { subscribeMobileUi } from '../../lib/mobile-store';
 import * as styles from '../../styles/account.css';
 import * as controls from '../../styles/controls.css';
@@ -172,7 +173,6 @@ function EnvSwitchSheet({ target, onClose }: { target: EsunEnvironment | null; o
     const last = useRef<EsunEnvironment>('SIMULATION');
     if (target) last.current = target;
     const t = target ?? last.current;
-    const switching = useEsunEnvSwitching();
     const [probe, setProbe] = useState<BridgeProbe>('checking');
     const [error, setError] = useState<string | null>(null);
     const [resetKey, setResetKey] = useState(0);
@@ -201,7 +201,10 @@ function EnvSwitchSheet({ target, onClose }: { target: EsunEnvironment | null; o
     }, [open, t]);
 
     const block = esunSwitchBlock(t, probe);
-    const running = switching !== null;
+    // 只有等待 bridge 回應時不可關閉；回應逾時後的結果確認（checking）由殼層橫幅顯示，面板可以關閉
+    const phase = useTradingActivity().envSwitch?.phase ?? null;
+    const running = phase === 'switching';
+    const checking = phase === 'checking';
     const reason = block && block !== 'running' ? esunSwitchBlockText(block, t) : null;
     const prod = t === 'PRODUCTION';
     const file = esunTradeService.getConfigProfiles()[t]?.fileName;
@@ -243,6 +246,11 @@ function EnvSwitchSheet({ target, onClose }: { target: EsunEnvironment | null; o
                 {prod ? '' : '，不會動用真實資金'}。永豐不受影響。這個動作不會送出任何委託。
             </p>
             {running && <InlineNote tone='info' role='status' testId='env-switch-running'>玉山環境切換中，請稍候…</InlineNote>}
+            {checking && (
+                <InlineNote tone='info' role='status' testId='env-switch-checking'>
+                    bridge 沒有及時回應，正在確認是否已切換；可以關閉這個面板，結果會另外通知。
+                </InlineNote>
+            )}
             {error && <InlineNote tone='danger' role='alert' testId='env-switch-error'>{error}</InlineNote>}
             <SheetFooter>
                 <div className={sb.sheetActions}>
@@ -266,7 +274,7 @@ function EnvSwitchSheet({ target, onClose }: { target: EsunEnvironment | null; o
                                 onClick={() => { void confirm(); }}
                                 data-testid='env-switch-confirm'
                             >
-                                {running ? '切換中…' : '確定切換至模擬環境'}
+                                {running || checking ? '切換中…' : '確定切換至模擬環境'}
                             </button>
                             {reason && <p className={sb.note} id='env-switch-reason' data-testid='env-switch-reason'>{reason}</p>}
                         </>

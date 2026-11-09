@@ -78,7 +78,7 @@ import { SlideToConfirm } from '../components/slide-to-confirm';
 import { getMobileUi, resetMobileUiForTest } from '../lib/mobile-store';
 import { setResumeGateForTest } from '../lib/resume-gate-runtime';
 import { orderDispatchInFlight, resetTradingActivityForTest, setEnvSwitch } from '../lib/trading-activity';
-import { ORDERS_REFRESH_COOLDOWN_MS, OrdersPage, resetOrdersRefreshCooldownForTest } from './orders-page';
+import { BULK_ENV_SWITCH_NOT_SENT, ORDERS_REFRESH_COOLDOWN_MS, OrdersPage, resetOrdersRefreshCooldownForTest } from './orders-page';
 
 const sinopac = { account_type: 'S', broker_id: '9A95', account_id: '0123456', signed: true, person_id: '', username: '' };
 const esun = { account_type: 'S', broker_id: '8840', account_id: '0099887', signed: true, person_id: '', username: '' };
@@ -383,7 +383,9 @@ describe('OrdersPage — 全部刪單', () => {
         await press(byTestId('orders-cancel-all')[0]!);
         await confirmSlide('cancel-all-slide');
         expect(m.cancelAll).toHaveBeenCalledTimes(1);
-        expect(text(byTestId('cancel-all-feedback')[0]!)).toContain('玉山環境切換中');
+        // round 4：整批不送（含永豐）的專用文字，不是「這筆玉山委託沒有送出（永豐不受影響）」
+        expect(text(byTestId('cancel-all-feedback')[0]!)).toContain(BULK_ENV_SWITCH_NOT_SENT);
+        expect(text(byTestId('cancel-all-feedback')[0]!)).not.toContain('永豐不受影響');
         // 只有永豐帳戶：照常
         m.storeAccounts = [{ broker_id: '9A95' }];
         m.cancelAll.mockResolvedValue(2);
@@ -710,12 +712,13 @@ describe('OrdersPage — 勾選批次刪單', () => {
         await confirmSlide('batch-cancel-slide');
         expect(m.cancelOrders).not.toHaveBeenCalled();
         expect(m.cancelOrder).not.toHaveBeenCalled();
-        expect(text(byTestId('batch-cancel-feedback')[0]!)).toContain('玉山環境切換中');
+        expect(text(byTestId('batch-cancel-feedback')[0]!)).toContain(BULK_ENV_SWITCH_NOT_SENT);
+        expect(text(byTestId('batch-cancel-feedback')[0]!)).not.toContain('永豐不受影響');
         // 送出時才開始切換：lib 每筆送出前呼叫的 beforeSend 擋下
         resetTradingActivityForTest();
         m.cancelOrders.mockImplementation(async (_ids: string[], _onSettled: unknown, beforeSend: () => void) => {
             setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
-            expect(() => beforeSend()).toThrow('玉山環境切換中');
+            expect(() => beforeSend()).toThrow(BULK_ENV_SWITCH_NOT_SENT);
             return [{ status: 'fulfilled', value: cancelled('o2', esun) }, { status: 'fulfilled', value: cancelled('o1') }];
         });
         await confirmSlide('batch-cancel-slide');

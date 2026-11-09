@@ -55,7 +55,8 @@ export type EsunSwitchBlock =
     | 'dispatch'
     | 'mutation'
     | 'remote-switch'
-    | 'reconcile';
+    | 'reconcile'
+    | 'esun-stream-down';
 
 export function getEsunEnvSwitching(): EsunEnvironment | null {
     return getEnvSwitch()?.target ?? null;
@@ -94,7 +95,8 @@ export function esunSwitchBlock(target: EsunEnvironment, probe?: BridgeProbe, no
     if (isBatchExitActive()) return 'batch';
     if (orderDispatchInFlight()) return 'dispatch';
     if (tradeMutationInFlight(now)) return 'mutation';
-    if (esunReconcilePending()) return 'reconcile';
+    const reconcile = esunReconcileBlock();
+    if (reconcile) return reconcile;
     return null;
 }
 
@@ -109,13 +111,33 @@ export function bridgeSwitching(health: EsunBridgeHealth | null | undefined): bo
  * 換環境後舊環境的玉山帳戶就讀不到，這些結果再也無法核對，所以先擋下切換。
  */
 export function esunReconcilePending(state: Pick<TradingState, 'queries' | 'trades'> = getTradingState()): boolean {
+    return esunReconcileBlock(state) !== null;
+}
+
+/** 玉山回報串流中斷的待對帳訊息（src/lib/esun/dispatch.ts 的 ESUN_DOWN_MESSAGE 開頭） */
+const ESUN_STREAM_DOWN = '玉山回報串流中斷';
+
+/**
+ * esunReconcilePending 的原因：只有玉山回報串流中斷（disconnect）時是 'esun-stream-down'（仍擋，但說明恢復連線即可），
+ * 其他牽涉玉山的待對帳是 'reconcile'。沒有帳戶的委託列視同玉山（與送單閘門相同的保守規則）。
+ */
+export function esunReconcileBlock(state: Pick<TradingState, 'queries' | 'trades'> = getTradingState()): 'reconcile' | 'esun-stream-down' | null {
+    let involved = false;
+    let onlyStreamDown = true;
     for (const scope of ['orders', 'positions'] as const) {
         const q = state.queries?.[scope];
         if (!q?.needsReconcile) continue;
-        if (/玉山|bridge/.test(q.error ?? '')) return true;
-        if (q.reasons.includes('mutation-outcome') && (state.trades ?? []).some(t => isEsunAccount(t.account))) return true;
+        const error = q.error ?? '';
+        const esunText = /玉山|bridge/.test(error);
+        const esunOutcome = q.reasons.includes('mutation-outcome') && (state.trades ?? []).some(t => !t.account || isEsunAccount(t.account));
+        if (!esunText && !esunOutcome) continue;
+        involved = true;
+        // 原因只有斷線，且訊息是玉山回報串流中斷（訊息本身含「；」，不能以分隔號切開判斷）
+        const streamOnly = q.reasons.every(r => r === 'disconnect') && error.startsWith(ESUN_STREAM_DOWN);
+        if (!streamOnly) onlyStreamDown = false;
     }
-    return false;
+    if (!involved) return null;
+    return onlyStreamDown ? 'esun-stream-down' : 'reconcile';
 }
 
 /** 擋下原因的說明文字 */
@@ -138,6 +160,7 @@ export function esunSwitchBlockText(block: EsunSwitchBlock, target: EsunEnvironm
         case 'batch': return '多選出清進行中，完成或停止後才能切換環境。';
         case 'dispatch': return '委託送出中（下單或平倉），請等待結果再切換環境。';
         case 'mutation': return '刪單／改單送出中，請等待結果再切換環境。';
+        case 'esun-stream-down': return '玉山回報串流中斷，恢復連線（或按『重新檢查玉山』）後才能切換。';
         case 'remote-switch': return '另一個裝置或分頁正在切換玉山環境，請等它完成。';
         case 'reconcile': return '玉山委託或持倉有待對帳的項目，請先到委託頁按「更新」核對完成再切換環境（切換後就讀不到原環境的帳戶）。';
     }

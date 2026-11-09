@@ -314,7 +314,7 @@ describe('EnvSwitchSection — blocking conditions', () => {
         ['order or close dispatch in flight (平倉)', () => { beginOrderDispatch(); }, '委託送出中（下單或平倉）'],
         ['another device is switching (health envSwitchInProgress)', () => { m.health = { ...HEALTH, envSwitchInProgress: true }; }, '另一個裝置或分頁正在切換'],
         ['E.SUN reconciliation pending (玉山 message)', () => {
-            m.trading.queries.orders = { needsReconcile: true, reasons: ['disconnect'], error: '玉山回報串流中斷，期間可能漏收委託／成交回報；重新連線後請確認' };
+            m.trading.queries.orders = { needsReconcile: true, reasons: ['snapshot-boundary'], error: '玉山 bridge 未能重讀委託，快取可能缺少部分成交／取消；請按更新確認' };
         }, '待對帳'],
         ['mutation outcome pending with E.SUN orders', () => {
             m.trading.queries.orders = { needsReconcile: true, reasons: ['mutation-outcome'], error: '刪單／改單結果待確認；請手動更新委託，不要自動重送' };
@@ -413,11 +413,15 @@ describe('EnvSwitchSection — lost response / timeout (MEDIUM-2)', () => {
         await act(async () => { slide()!.props.onConfirm(); });
     }
 
-    it('keeps every gate and the non-dismissible sheet while checking; bridge did switch → reported as switched', async () => {
+    it('keeps the E.SUN gates while checking (sheet becomes dismissible, root banner shows status); bridge did switch → reported as switched', async () => {
         await slideToProduction();
         expect(getEnvSwitch()).toEqual({ target: 'PRODUCTION', phase: 'checking' });
-        expect(sheet().props.dismissible).toBe(false);
-        expect(one('env-switch-cancel').props.disabled).toBe(true);
+        // round 4：結果確認中面板可關閉（殼層橫幅顯示狀態），滑塊仍停用
+        expect(sheet().props.dismissible).toBe(true);
+        expect(one('env-switch-cancel').props.disabled).toBe(false);
+        expect(find('env-switch-checking')).toHaveLength(1);
+        expect(find('env-switch-running')).toHaveLength(0);
+        expect(slide()!.props.disabled).toBe(true);
         // 只擋玉山：玉山帳戶的送單被擋，永豐照常
         expect(envSwitchBlocks({ broker_id: '8840' })).toBe(true);
         expect(envSwitchBlocks({ broker_id: '9A95' })).toBe(false);
@@ -562,5 +566,44 @@ describe('EnvSwitchSection — round 3', () => {
         await act(async () => { slide()!.props.onConfirm(); });
         await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
         expect(m.notify.mock.calls.at(-1)![0]).toMatchObject({ kind: 'err', title: '環境切換失敗' });
+    });
+});
+
+describe('EnvSwitchSection — round 4', () => {
+    it('3: closing the sheet during checking keeps the gate; the result is still notified', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        m.switchEnvironment.mockResolvedValue({ ok: false, environment: 'SIMULATION', entry: 'e', bridgeUpdated: false, error: '玉山環境切換失敗：玉山下單服務 (esun-bridge) 回應逾時（30 秒）' });
+        await mount();
+        await click('env-option-production');
+        await act(async () => { slide()!.props.onConfirm(); });
+        expect(getEnvSwitch()?.phase).toBe('checking');
+        await click('env-switch-cancel');
+        expect(sheet().props.open).toBe(false);
+        expect(envSwitchBlocks({ broker_id: '8840' })).toBe(true); // 閘門不因關面板而放開
+        m.health = { ...HEALTH, environment: 'PRODUCTION' };
+        await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+        expect(getEnvSwitch()).toBeNull();
+        expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ok', title: '環境切換' }));
+    });
+
+    it('4: trades with no account count as E.SUN for the pending-result reconcile block', async () => {
+        m.trading.queries.orders = { needsReconcile: true, reasons: ['mutation-outcome'], error: '刪單／改單結果待確認；請手動更新委託，不要自動重送' };
+        m.trading.trades = [{ account: undefined as never }];
+        await mount();
+        expect(one('env-option-production').props.disabled).toBe(true);
+        expect(text(one('env-switch-block'))).toContain('待對帳');
+    });
+
+    it('4: only the E.SUN report-stream disconnect → still blocked, with the stream reason', async () => {
+        const DOWN = '玉山回報串流中斷，期間可能漏收委託／成交回報；重新連線後請確認';
+        m.trading.queries.orders = { needsReconcile: true, reasons: ['disconnect'], error: DOWN };
+        m.trading.queries.positions = { needsReconcile: true, reasons: ['disconnect'], error: DOWN };
+        await mount();
+        expect(one('env-option-production').props.disabled).toBe(true);
+        expect(text(one('env-switch-block'))).toContain('玉山回報串流中斷，恢復連線（或按『重新檢查玉山』）後才能切換');
+        // 另有其他待對帳原因：一般的待對帳說明
+        m.trading.queries.orders = { needsReconcile: true, reasons: ['disconnect', 'snapshot-boundary'], error: `${DOWN}；玉山 bridge 未能重讀委託` };
+        await emitService();
+        expect(text(one('env-switch-block'))).toContain('待對帳');
     });
 });
