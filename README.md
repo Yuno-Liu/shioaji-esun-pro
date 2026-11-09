@@ -190,7 +190,8 @@ tailscale serve status    # 確認 https://<機器>.<tailnet>.ts.net 已轉到 1
 | 手動下單確認 | 帳戶 › 風控 | 鎖定開啟、無法關閉；新單一律經確認面板，不看這個設定 | 手機啟動時會把 `sj-pro-risk` 的 `confirmManualOrders` 設回開啟，同一瀏覽器的桌面版也會跟著開啟 |
 | 交易成本 | 帳戶 › 交易成本 | 手續費折數、融資年利率、借券費率（用於損益估算） | 與桌面共用（`sj-pro-trading-cost-v1`） |
 | 帳號切換 | 帳戶 › 帳號，或頂端狀態列 | 選擇證券、期貨帳戶；不可交易（未簽署）的帳戶不可選；下單或確認進行中不能切換 | 與桌面共用（`sj-pro-accounts-selected`） |
-| 玉山重新連線 | 帳戶 › 連線 | 登入失效時重新登入（先確認，60 秒冷卻）；玉山測試／正式環境只能在桌面頂欄切換 | 不儲存 |
+| 玉山重新連線 | 帳戶 › 連線 | 登入失效時重新登入（先確認，60 秒冷卻）；玉山環境切換中不能按 | 不儲存 |
+| 玉山環境切換 | 帳戶 › 連線 › 交易環境，或狀態列帳戶面板的［玉山模擬／正式切換］ | 模擬／正式（bridge 要有對應設定檔）；切正式要滑動確認，切模擬按確定；bridge 未連線、下單或確認面板開著、多選出清或刪改單進行中時不能切換 | 玉山 bridge（整台主機共用，桌面同步） |
 | 自選列右側指標 | 自選 › 表頭切換鍵 | 漲跌幅／總量 | 本裝置（`sj-mobile-watch-metric`） |
 | 自選群組順序 | 自選 › 編輯 › 排序群組 | 伺服器的自選清單沒有順序，順序只存在這台裝置 | 本裝置（`sj-mobile-watch-list-order-v1`） |
 | 自選清單排序 | 自選 › 表頭排序鍵（含「持倉」分段） | 自訂順序（自己的清單預設；「持倉」分段為持倉順序）／股票代號（股期清單預設）／股價／漲幅%／漲跌，再點一次反向；只改顯示順序，不寫回自選清單、不改持倉 | 本裝置（`sj-mobile-watch-sort-v1`，依清單分別記住；持倉為 `pos:holdings`） |
@@ -234,7 +235,7 @@ docker compose up -d --build shioaji-pro-web shioaji-server
 | 券商 | 模擬／測試 | 正式 | 如何切換 |
 | --- | --- | --- | --- |
 | 永豐 | `SJ_PRODUCTION=false`（預設） | `SJ_PRODUCTION=true`，並設定 `SJ_CA_PATH`、`SJ_CA_PASSWD` | 改 `.env` 後 `docker compose up -d`；UI 只顯示，不能切換 |
-| 玉山 | `esun-config.simulation.ini` | `esun-config.production.ini` | 兩份都提供時，在桌面頂欄「券商／帳號／環境」選單切換（切正式需確認）；手機只顯示 |
+| 玉山 | `esun-config.simulation.ini` | `esun-config.production.ini` | 兩份都提供時，在桌面頂欄「券商／帳號／環境」選單或手機「帳戶 › 連線 › 交易環境」切換（切正式需確認） |
 
 兩家的環境彼此獨立。`.env.docker.example` 的預設搭配是永豐模擬（取得即時行情）＋玉山負責股票下單。單一 `esun-config.ini` 由 `[Core] Entry` 判定環境，見 [context-esun.md](docs/fork/context-esun.md)。
 
@@ -261,6 +262,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8080/e
 | curl 回 `000`、連線被直接關閉 | Host 不在白名單（nginx 444），檢查 `WEB_SERVER_NAMES` 並重建容器 |
 | `/esun/` 回 421 | 手機或區網主機名沒有加入 `WEB_SERVER_NAMES` |
 | 手機只顯示「需要 HTTPS」 | 用了 HTTP 網址，改用 TLS 前端的 `https://` 網址 |
+| 手機顯示「伺服器未連線」 | 若剛改 `SJ_PRODUCTION` 請執行 `docker compose up -d`；否則用 `docker compose ps` 檢查服務與網路 |
 | `/esun/health` 顯示 `loginLocked` | 密碼或憑證錯誤造成熔斷；修正後用上面的 reconnect 指令 |
 
 更多指令見 [esun.md「常用管理與排錯指令」](docs/fork/esun.md#常用管理與排錯指令)。

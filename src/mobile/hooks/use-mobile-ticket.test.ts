@@ -145,6 +145,15 @@ describe('ticketProblem（§6.3 驗證順序）', () => {
         expect(ticketProblem(check({ contract: futures, account: undefined, fields: fields({ priceText: '22800' }) }))).toBe(TICKET_TEXT.noFuturesAccount);
     });
 
+    it('round 3 (2a): E.SUN switching blocks only E.SUN stock accounts', () => {
+        m.esunBrokers.add('ESUN');
+        const esunS = { ...stockAccount, broker_id: 'ESUN' };
+        expect(ticketProblem(check({ account: esunS, selected: esunS, esunSwitching: true }))).toBe(TICKET_TEXT.esunSwitching);
+        expect(ticketProblem(check({ esunSwitching: true }))).toBeNull(); // 永豐照常
+        expect(ticketProblem(check({ account: esunS, selected: esunS, esunSwitching: false }))).not.toBe(TICKET_TEXT.esunSwitching);
+        m.esunBrokers.delete('ESUN');
+    });
+
     it('validates quantity, odd-lot rules and futures conditions', () => {
         expect(ticketProblem(check({ fields: fields({ quantity: 0 }) }))).toBe(TICKET_TEXT.quantity);
         expect(ticketProblem(check({ fields: fields({ orderLot: 'IntradayOdd', priceType: 'MKT', orderType: 'IOC' }) }))).toMatch(/零股/);

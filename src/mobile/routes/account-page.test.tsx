@@ -132,6 +132,8 @@ vi.mock('../components/route-badge', () => ({ RouteBadge: () => null, useOrderRo
 vi.mock('../components/account/trading-cost-section', () => ({ TradingCostSection: () => createElement('div', { 'data-testid': 'stub-trading-cost' }) }));
 vi.mock('../components/account/device-settings-section', () => ({ DeviceSettingsSection: () => createElement('div', { 'data-testid': 'stub-device-settings' }) }));
 vi.mock('../components/account/esun-reconnect-section', () => ({ EsunReconnectSection: () => createElement('div', { 'data-testid': 'stub-esun-reconnect' }) }));
+// 交易環境（玉山模擬／正式切換）有自己的測試（env-switch-section.test.tsx）：這裡只驗證掛在連線卡內
+vi.mock('../components/account/env-switch-section', () => ({ EnvSwitchSection: () => createElement('div', { 'data-testid': 'stub-env-switch' }) }));
 
 import { loadTradingLimits, resetTradingLimitsForTest, TRADING_LIMITS_MIN_REFRESH_MS } from '../hooks/use-trading-limits';
 import { resetOnDemandForTest } from '../lib/account-on-demand';
@@ -327,6 +329,7 @@ describe('AccountPage layout', () => {
         expect(at('stub-device-settings')).toBeLessThan(at('account-diagnostics'));
         // 玉山重新連線在連線卡的玉山 bridge 區塊內
         expect(byTestId('conn-esun-block').findAll(n => n.props['data-testid'] === 'stub-esun-reconnect')).toHaveLength(1);
+        expect(byTestId('account-connection').findAll(n => n.props['data-testid'] === 'stub-env-switch')).toHaveLength(1);
         expect(text()).not.toContain('即將提供');
         expect(allByTestId('account-coming-soon')).toHaveLength(0);
     });

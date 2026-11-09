@@ -109,6 +109,7 @@ import { getMobileUi, openTicket, type TicketCond, type TicketLot } from '../lib
 import { readPositionsView, writePositionsView, type PositionsView } from '../lib/positions-view';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { assertResumeReady, getResumeGate, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
+import { assertNoEnvSwitch, beginOrderDispatch } from '../lib/trading-activity';
 import * as controls from '../styles/controls.css';
 import { srOnly } from '../styles/primitives.css';
 import * as styles from '../styles/positions.css';
@@ -266,23 +267,35 @@ export function esunExitLegsProblem(
     return null;
 }
 
-/** 送出前（lib 的 beforeSend）同步檢查 ResumeGate；不允許時丟出 mutationNotStarted 錯誤 */
-export function closeBeforeSend(): void {
+/**
+ * 送出前（lib 的 beforeSend）同步檢查：玉山環境切換中不送玉山帳戶（帳戶不明時視同玉山）、ResumeGate；
+ * 不允許時丟出 mutationNotStarted 錯誤
+ */
+export function closeBeforeSend(account?: Pick<Account, 'broker_id'> | null): void {
+    assertNoEnvSwitch(account);
     assertResumeReady({ allowStale: getResumeGate().staleAcknowledged });
 }
 
 /** 依平倉方式呼叫 src/lib（lib 內部會開確認面板，確認只出現一次） */
 export async function executeClose(plan: ClosePlan): Promise<void> {
-    if (plan.kind === 'stock') {
-        await placeStockExitByShares(plan.contract, plan.action, plan.shares, plan.account, { orderCond: plan.orderCond, beforeSend: closeBeforeSend });
-        return;
+    // 玉山環境切換中不送玉山帳戶（永豐照常）；平倉流程（含 lib 確認面板）期間計入「委託送出中」，環境切換因此擋下
+    assertNoEnvSwitch(plan.account);
+    const release = beginOrderDispatch();
+    const beforeSend = () => closeBeforeSend(plan.account);
+    try {
+        if (plan.kind === 'stock') {
+            await placeStockExitByShares(plan.contract, plan.action, plan.shares, plan.account, { orderCond: plan.orderCond, beforeSend });
+            return;
+        }
+        await placeQuickOrder(plan.contract, plan.action, null, plan.lots, {
+            account: plan.account,
+            ocType: 'Cover',
+            source: 'manual',
+            beforeSend,
+        });
+    } finally {
+        release();
     }
-    await placeQuickOrder(plan.contract, plan.action, null, plan.lots, {
-        account: plan.account,
-        ocType: 'Cover',
-        source: 'manual',
-        beforeSend: closeBeforeSend,
-    });
 }
 
 // ---- 多選市價出清（§7.7、§10 S10）----
@@ -616,7 +629,7 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
             </div>}
             {sel?.reason && <p className={styles.selectReason} data-testid='position-select-reason'>{sel.reason}</p>}
             <div className={styles.rowMeta}>
-                <RouteBadge account={p.account} />
+                <RouteBadge account={p.account} row />
                 {p.account && <span>{mobileAccountLabel(p.account, priv)}</span>}
                 {stock
                     ? <span className={styles.brokerPnl} data-testid='position-broker-pnl'>{PNL_TEXT.brokerLabel} {maskMoney(fmtSigned(p.pnl, 0), privMoney)}</span>
@@ -899,7 +912,7 @@ function CloseSheet({ position, gate, gateProblem, busy, feedback, privMoney, on
                             {maskMoney(positionQtyText(position), privMoney)}
                             {typeof plan !== 'string' && ` → 市價${closeActionText(plan)}`}
                         </p>
-                        {position.account && <p className={styles.sheetRoute}><RouteBadge account={position.account} size='lg' /></p>}
+                        {position.account && <p className={styles.sheetRoute}><RouteBadge account={position.account} size='lg' row /></p>}
                     </GroupedSection>
                 )}
                 <GroupedSection>

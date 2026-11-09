@@ -676,6 +676,7 @@ class TestFullHttpIntegration(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(health["ok"])
         self.assertTrue(health["loggedIn"])
+        self.assertFalse(health["envSwitchInProgress"])
 
         accounts, status = self._get("/esun/accounts")
         self.assertEqual(status, 200)
@@ -686,6 +687,31 @@ class TestFullHttpIntegration(unittest.TestCase):
         ca_expire, status = self._get("/esun/ca_expiretime")
         self.assertEqual(status, 200)
         self.assertEqual(ca_expire["ca_expiretime"], "2027/12/31")
+
+    def test_mutation_http_refused_not_sent_inside_switch_swap_window(self):
+        env = {"expected_environment": "SIMULATION", "expected_account": "1234567"}
+        order = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0,
+                             "apCode": "1", "priceFlag": "0", "bsFlag": "R"}, **env}
+        placed_before = len(self.mock_sdk.placed_orders)
+        with self.bridge._mutations_cond:
+            self.bridge._env_switch_in_progress = True
+        try:
+            for path, body in (("/esun/orders/place", order), ("/esun/orders/cancel", {"order_no": "O0001", **env})):
+                res, code = self._post(path, body)
+                self.assertEqual(code, 409)
+                self.assertEqual((res["ok"], res["outcome"], res["code"]), (False, "not_sent", "ESUN_SWITCH_IN_PROGRESS"))
+                self.assertIn("環境切換中", res["error"])
+                self.assertEqual(self.bridge._mutations_in_flight, 0)  # refused before it was counted
+        finally:
+            with self.bridge._mutations_cond:
+                self.bridge._env_switch_in_progress = False
+        self.assertEqual(len(self.mock_sdk.placed_orders), placed_before)
+        # outside the window the same request is counted and released again (begin/end balanced)
+        res, code = self._post("/esun/orders/place", order)
+        self.assertEqual(code, 200)
+        self.assertEqual(res["outcome"], "accepted")
+        self.assertTrue(_wait_until(lambda: self.bridge._mutations_in_flight == 0))
+        self.assertGreater(self.bridge._last_mutation_end, 0)
 
     def test_order_lifecycle_http(self):
         # Contract change (§4): every mutation carries expected_environment (+ optional
@@ -883,6 +909,8 @@ class TestFullHttpIntegration(unittest.TestCase):
         resp.close()
 
     def test_switch_environment_http(self):
+        # earlier tests in this class answered order mutations: skip the post-mutation quiet period
+        self.bridge._last_mutation_end = 0.0
         # 1. Verify GET /esun/config-profiles returns both profiles
         profiles_data, status = self._get("/esun/config-profiles")
         self.assertEqual(status, 200)
@@ -1459,6 +1487,9 @@ def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.02) -> bool
     return predicate()
 
 
+_QUIET_ORDER = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1", "priceFlag": "0", "bsFlag": "R"}
+
+
 class _BridgeCase(unittest.TestCase):
     """Per-test temp config dir + persistent state dir + passwords."""
 
@@ -1690,6 +1721,221 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         worker.join(5)
         self.assertEqual(results[0][1], 200)
         self.assertEqual(bridge.environment, "PRODUCTION")
+
+    def test_switch_refused_while_order_mutation_in_flight_and_during_quiet_period(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        original = bridge.session
+        self.assertIsNone(bridge.try_begin_request_mutation())  # an order request is being handled
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual((status, res["code"]), (409, "ESUN_MUTATIONS_IN_FLIGHT"))
+        self.assertFalse(res["ok"])
+        self.assertIn("委託處理中", res["error"])
+        self.assertEqual(res["environment"], "SIMULATION")
+        self.assertIs(bridge.session, original)
+        self.assertEqual(factory.login_calls, 1)  # no login attempt
+        bridge.end_mutation()
+        # a counted request that never reached the SDK does not start the quiet period
+        self.assertEqual(bridge._last_mutation_end, 0.0)
+        # a mutation that reached the SDK does: refused right after it answered (post-cancel read, second leg of a close)
+        placed, code = bridge.place_order({"payload": _QUIET_ORDER, "expected_environment": "SIMULATION"})
+        self.assertEqual((code, placed["outcome"]), (200, "accepted"))
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual((status, res["code"]), (409, "ESUN_RECENT_MUTATION"))
+        self.assertGreaterEqual(res["retryAfter"], 1)
+        self.assertEqual(factory.login_calls, 1)
+        bridge.mutation_quiet_seconds = 0.2
+        time.sleep(0.3)
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 200)
+        self.assertEqual(bridge.environment, "PRODUCTION")
+        self.assertFalse(bridge._env_switch_in_progress)
+
+    def test_refused_mutations_do_not_start_the_quiet_period(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        bridge = self.make_bridge(sim, RecordingFactory())
+        # environment mismatch (prelude) and switch-in-progress (prelude / HTTP layer): not sent, no quiet period
+        res, status = bridge.place_order({"payload": _QUIET_ORDER, "expected_environment": "PRODUCTION"})
+        self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ENV_MISMATCH", "not_sent"))
+        with bridge._mutations_cond:
+            bridge._env_switch_in_progress = True
+        res, status = bridge.place_order({"payload": _QUIET_ORDER, "expected_environment": "SIMULATION"})
+        self.assertEqual((status, res["code"]), (409, "ESUN_SWITCH_IN_PROGRESS"))
+        self.assertEqual(bridge.try_begin_request_mutation(), "switching")
+        with bridge._mutations_cond:
+            bridge._env_switch_in_progress = False
+        self.assertEqual(bridge._last_mutation_end, 0.0)  # neither refusal started the quiet period
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 200)
+
+    def test_swap_window_ends_before_the_old_websocket_is_closed(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        seen = []
+        holder = {}
+
+        class RecordingCloseSDK(MockSDK):
+            def close_websocket(self):
+                seen.append(holder["bridge"]._env_switch_in_progress)
+                super().close_websocket()
+
+        factory = RecordingFactory(mock_cls=RecordingCloseSDK)
+        bridge = self.make_bridge(sim, factory)
+        holder["bridge"] = bridge
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 200)
+        self.assertTrue(seen)  # the old session's WebSocket was closed...
+        self.assertFalse(any(seen))  # ...after the swap window ended
+
+    def _slow_switch_bridge(self, mock_cls_extra=None):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowLoginSDK(MockSDK):
+            logout_calls = 0
+
+            def login(self):
+                super().login()
+                if self.config.get("Core", "Entry") == ESUN_PRODUCTION_ENTRY:
+                    entered.set()
+                    release.wait(5)
+
+            def logout(self):
+                type(self).logout_calls += 1
+
+        factory = RecordingFactory(mock_cls=SlowLoginSDK)
+        bridge = self.make_bridge(sim, factory)
+        bridge.mutation_quiet_seconds = 0.1
+        results = []
+        worker = threading.Thread(target=lambda: results.append(bridge.switch_environment_with_status("PRODUCTION")))
+        return bridge, factory, entered, release, results, worker, SlowLoginSDK
+
+    def test_mutations_keep_working_on_old_session_during_a_slow_login(self):
+        bridge, factory, entered, release, results, worker, _ = self._slow_switch_bridge()
+        old = bridge.session
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertTrue(bridge.get_health()["envSwitchInProgress"])
+            # HTTP layer counts the request; the prelude hands out the still-installed old session
+            self.assertIsNone(bridge.try_begin_request_mutation())
+            session, refusal = bridge._mutation_prelude({"expected_environment": "SIMULATION"})
+            self.assertIsNone(refusal)
+            self.assertIs(session, old)
+            bridge.end_mutation()
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertEqual(results[0][1], 200)  # swap waited for the quiet period, then installed
+        self.assertEqual(bridge.environment, "PRODUCTION")
+        self.assertFalse(bridge.get_health()["envSwitchInProgress"])
+
+    def test_mutations_refused_only_inside_the_swap_window(self):
+        bridge, factory, entered, release, results, worker, _ = self._slow_switch_bridge()
+        old = bridge.session
+        self.assertIsNone(bridge.try_begin_request_mutation())  # in flight before the switch starts...
+        bridge.end_mutation()
+        bridge.mutation_quiet_seconds = 0.0
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertIsNone(bridge.try_begin_request_mutation())  # ...and one during the login (allowed)
+            release.set()
+            # login done: the swap window is claimed and waits for that request to drain
+            self.assertTrue(_wait_until(lambda: bridge._env_switch_in_progress))
+            self.assertEqual(bridge.try_begin_request_mutation(), "switching")
+            res, status = bridge.place_order({"payload": {"stockNo": "2330"}, "expected_environment": "SIMULATION"})
+            self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_SWITCH_IN_PROGRESS", "not_sent"))
+            self.assertIs(bridge.session, old)  # not swapped while the request is in flight
+            self.assertEqual(old.sdk.placed_orders, [])
+            bridge.end_mutation()
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertEqual(results[0][1], 200)
+        self.assertEqual(bridge.environment, "PRODUCTION")
+        self.assertFalse(bridge._env_switch_in_progress)
+        self.assertIsNone(bridge.try_begin_request_mutation())  # accepted again after the swap
+        bridge.end_mutation()
+
+    def test_swap_drain_timeout_abandons_new_session_with_409(self):
+        bridge, factory, entered, release, results, worker, sdk_cls = self._slow_switch_bridge()
+        old = bridge.session
+        bridge.switch_drain_seconds = 0.3
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertIsNone(bridge.try_begin_request_mutation())  # never finishes within the drain wait
+            release.set()
+            worker.join(5)
+        finally:
+            release.set()
+        res, status = results[0]
+        self.assertEqual((status, res["code"]), (409, "ESUN_MUTATIONS_IN_FLIGHT"))
+        self.assertIn("維持原環境", res["error"])
+        self.assertIs(bridge.session, old)
+        self.assertEqual(bridge.environment, "SIMULATION")
+        self.assertTrue(bridge.logged_in)
+        self.assertEqual(sdk_cls.logout_calls, 0)  # never logged out (SDK logout may affect the installed session)
+        abandoned = factory.instances[-1]
+        self.assertIsNot(abandoned, old.sdk)
+        self.assertEqual(abandoned.ws_connect_calls, 0)  # never installed: no WebSocket was started for it
+        self.assertEqual(old.sdk.ws_close_calls, 0)  # the installed session's WebSocket was left alone
+        self.assertFalse(bridge._env_switch_in_progress)
+        self.assertFalse(bridge.get_health()["envSwitchInProgress"])
+        bridge.end_mutation()
+
+    def test_switch_flag_cleared_on_every_exit_path(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+
+        def cleared():
+            self.assertFalse(bridge._env_switch_in_progress)
+            self.assertFalse(bridge._env_switch_running)
+            self.assertFalse(bridge.get_health()["envSwitchInProgress"])
+            self.assertTrue(bridge._session_change_lock.acquire(blocking=False))
+            bridge._session_change_lock.release()
+
+        res, status = bridge.switch_environment_with_status("SIMULATION")  # unchanged
+        self.assertEqual(status, 200)
+        cleared()
+        # 429: login guard
+        bridge.reconnect_limiter.timestamps = [time.monotonic()] * 10
+        self.assertEqual(bridge.switch_environment_with_status("PRODUCTION")[1], 429)
+        cleared()
+        bridge.reconnect_limiter.timestamps = []
+        # 502: login failed
+        factory.login_fail_msg = "error sending request: connection reset"
+        self.assertEqual(bridge.switch_environment_with_status("PRODUCTION")[1], 502)
+        cleared()
+        factory.login_fail_msg = None
+        # 503: incomplete configuration
+        real_prepare = bridge._prepare_login_config
+        bridge._prepare_login_config = lambda path, target: (None, "缺少 [Api] Key")
+        self.assertEqual(bridge.switch_environment_with_status("PRODUCTION")[1], 503)
+        cleared()
+
+        # exception
+        def boom(path, target):
+            raise RuntimeError("boom")
+
+        bridge._prepare_login_config = boom
+        with self.assertRaises(RuntimeError):
+            bridge.switch_environment_with_status("PRODUCTION")
+        cleared()
+        bridge._prepare_login_config = real_prepare
+        # 400: no such profile
+        os.remove(os.path.join(self.dir, "esun-config.production.ini"))
+        self.assertEqual(bridge.switch_environment_with_status("PRODUCTION")[1], 400)
+        cleared()
+        self.assertIsNone(bridge.try_begin_request_mutation())
+        bridge.end_mutation()
 
     def test_accounts_mask_person_id_and_come_from_session(self):
         sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88407654321")

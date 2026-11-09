@@ -38,6 +38,7 @@ vi.mock('../../lib/privacy', () => ({ usePrivacyMode: () => false }));
 vi.mock('../../lib/tick-bands', () => ({ bandTickFor: () => undefined, prefetchTickBands: () => undefined }));
 vi.mock('./route-badge', () => ({
     useOrderRoute: (a: { broker_id: string } | null) => (a ? { esun: false, broker: '永豐', simulation: false } : null),
+    useRowRoute: (a: { broker_id: string } | null) => (a ? { esun: false, broker: '永豐', simulation: false } : null),
     routeBadgeText: (r: { broker: string } | null) => (r ? `送往 ${r.broker} 正式` : '未選擇下單帳戶'),
 }));
 vi.mock('./account-switch-sheet', () => ({ mobileAccountLabel: (a: { broker_id: string }) => `${a.broker_id}-***56` }));
@@ -46,6 +47,7 @@ import type { AccountedTrade } from '../../lib/types/order';
 import { notStarted } from '../lib/errors';
 import { closeOrderAction, getMobileUi, openOrderAction, resetMobileUiForTest } from '../lib/mobile-store';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
+import { resetTradingActivityForTest, setEnvSwitch } from '../lib/trading-activity';
 import { ListRow } from '../ui/grouped';
 import { BottomSheet, SheetFooter } from './bottom-sheet';
 import {
@@ -324,8 +326,40 @@ describe('OrderActionSheet — 刪單', () => {
         expect(slide()!.props.disabled).toBe(false);
         expect(slide()!.props.tone).toBe('danger');
         await confirm();
-        expect(m.cancelOrder).toHaveBeenCalledWith('o1');
+        expect(m.cancelOrder).toHaveBeenCalledWith('o1', { beforeSend: expect.any(Function) });
         expect(m.assertLive).not.toHaveBeenCalled();
+    });
+
+    it('玉山環境切換中：玉山委託的刪單不送（未送出），lib 送出前的 beforeSend 也擋；永豐委託照常（round 3 2a）', async () => {
+        h.trades = [trade('e1', { account: esun }), trade('o1')];
+        await open('e1', 'cancel');
+        setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+        await confirm();
+        expect(m.cancelOrder).not.toHaveBeenCalled();
+        expect(text(byTestId('order-action-feedback')[0]!)).toContain('玉山環境切換中，這筆玉山委託沒有送出');
+        // 滑動時還沒切換、lib 送出前才開始切換：beforeSend 丟出未送出
+        resetTradingActivityForTest();
+        m.cancelOrder.mockImplementation(async (_id: string, opts?: { beforeSend?: () => void }) => {
+            setEnvSwitch({ target: 'PRODUCTION', phase: 'checking' });
+            opts?.beforeSend?.();
+            return trade('e1', { account: esun });
+        });
+        await confirm();
+        expect(m.cancelOrder).toHaveBeenCalledTimes(1);
+        expect(text(byTestId('order-action-feedback')[0]!)).toContain('玉山環境切換中');
+        // 永豐委託：切換中照常刪單
+        m.cancelOrder.mockReset();
+        m.cancelOrder.mockImplementation(async (_id: string, opts?: { beforeSend?: () => void }) => {
+            opts?.beforeSend?.();
+            return trade('o1', { status: { status: 'Cancelled', cancel_quantity: 5 } });
+        });
+        await act(async () => { closeOrderAction(); });
+        await open('o1', 'cancel');
+        await confirm();
+        expect(m.cancelOrder).toHaveBeenCalledTimes(1);
+        expect(m.cancelOrder.mock.calls[0]![0]).toBe('o1');
+        expect(byTestId('order-action-feedback')).toHaveLength(0);
+        resetTradingActivityForTest();
     });
 
     it('shows 此委託已不在未成交 and disables actions when the order fills while open', async () => {

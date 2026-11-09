@@ -44,6 +44,7 @@ import { submitMobileOrder } from '../lib/mobile-order';
 import type { MobileOrderInput } from '../lib/mobile-order-types';
 import { closeTicket, getMobileUi, type TicketCond, type TicketLot, type TicketRequest } from '../lib/mobile-store';
 import { acknowledgeStaleData, assertResumeReady, getResumeGate, retryResume, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
+import { useTradingActivity } from '../lib/trading-activity';
 import { SheetPresenceContext } from '../ui/sheet-context';
 import { useResumeGate } from './use-resume-gate';
 
@@ -82,6 +83,7 @@ export const NOT_SENT_TITLE = '委託未送出';
 
 export const TICKET_TEXT = {
     unsupported: '這個商品無法下單',
+    esunSwitching: '玉山環境切換中，暫時不能送出玉山委託（永豐不受影響）',
     noAction: '請選擇買進或賣出',
     noStockAccount: '沒有可交易的證券帳戶，請先到「帳戶」頁選擇',
     noFuturesAccount: '沒有可交易的永豐期貨帳戶（玉山證券不支援期貨交易）',
@@ -341,6 +343,8 @@ export interface TicketCheck {
     gate: Pick<ResumeGateSnapshot, 'state' | 'staleAcknowledged' | 'message'>;
     /** RouteBadge 的環境：true 模擬、false 正式、undefined 未確認 */
     routeSimulation: boolean | undefined;
+    /** 玉山環境切換中（lib/trading-activity.ts；只擋玉山帳戶） */
+    esunSwitching?: boolean;
 }
 
 /** 即時驗證（規格 §6.3 的 1～7 順序）；回傳第一個原因，全部通過回 null */
@@ -355,6 +359,7 @@ export function ticketProblem(c: TicketCheck): string | null {
     if (account.account_type !== (isFutures ? 'F' : 'S')) return TICKET_TEXT.marketMismatch;
     if (!canTrade(account)) return TICKET_TEXT.notTradable;
     if (!accountMatches(c.selected, account)) return TICKET_TEXT.accountChanged;
+    if (c.esunSwitching && isEsunAccount(account)) return TICKET_TEXT.esunSwitching;
     // 2) 數量與風控（鎖單、單筆上限、當日虧損上限）
     if (!Number.isSafeInteger(fields.quantity) || fields.quantity < 1) return TICKET_TEXT.quantity;
     const blocked = checkOrderAllowed(fields.quantity, isFutures ? undefined : fields.orderLot);
@@ -533,6 +538,7 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
 
     const priceStale = fields.priceType === 'LMT' && fields.priceText !== '' && priceSeq !== gate.resumeSeq;
 
+    const activity = useTradingActivity();
     const problem = ticketProblem({
         contract,
         account,
@@ -542,6 +548,7 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         tradingLive,
         gate,
         routeSimulation: route?.simulation,
+        esunSwitching: activity.envSwitch !== null,
     });
 
     const [busy, setBusy] = useState(false);

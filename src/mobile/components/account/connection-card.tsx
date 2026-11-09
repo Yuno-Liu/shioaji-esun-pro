@@ -1,6 +1,7 @@
-// src/mobile/components/account/connection-card.tsx — 帳戶頁「連線」：永豐串流、玉山 bridge 狀態與重新連線（規格 §6.7）
+// src/mobile/components/account/connection-card.tsx — 帳戶頁「連線」：永豐串流、玉山 bridge 狀態與重新連線、交易環境（規格 §6.7）
 //
-// 玉山重新連線（EsunReconnectSection）由另一個任務實作，這裡只負責掛在玉山 bridge 狀態區塊內。
+// 玉山重新連線（EsunReconnectSection）掛在玉山 bridge 狀態區塊內；交易環境（EnvSwitchSection：永豐唯讀、玉山模擬／正式切換）緊接其後。
+// 永豐串流中斷過且尚未回到 LIVE 時，永豐區塊下方顯示「伺服器未連線」提示（ServerDownHint；與狀態列面板共用 lib/server-down-hint.ts）。
 
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { useStreamStatus } from '../../../hooks/use-stream';
@@ -8,8 +9,11 @@ import { esunTradeService, type EsunBridgeHealth } from '../../../lib/esun';
 import { getEsunStreamStatus } from '../../../lib/esun/stream';
 import { getLastHeartbeat, streamConnectionEpoch, type StreamStatus } from '../../../lib/stream';
 import { formatClock } from '../../lib/account-format';
+import { trackServerLost } from '../../lib/server-down-hint';
 import * as styles from '../../styles/account.css';
+import { ServerDownHint } from '../server-down-hint';
 import { Card, Item, useNow, type Tone } from './account-ui';
+import { EnvSwitchSection } from './env-switch-section';
 import { EsunReconnectSection } from './esun-reconnect-section';
 
 /** 伺服器資訊與玉山 health 的手動重新檢查冷卻 */
@@ -54,6 +58,7 @@ function useEsunHealth(): { health: EsunBridgeHealth | null; recheck: () => void
 
 export function ConnectionCard() {
     const stream = useStreamStatus();
+    const serverLost = trackServerLost(stream);
     const now = useNow(CONNECTION_REFRESH_MS);
     const esun = useEsunHealth();
     const heartbeat = getLastHeartbeat();
@@ -69,6 +74,7 @@ export function ConnectionCard() {
                 <Item term='最後心跳'>{formatClock(heartbeat)}{ago !== null ? `（${ago} 秒前）` : ''}</Item>
                 <Item term='連線世代'>{streamConnectionEpoch()}</Item>
             </dl>
+            {serverLost && <ServerDownHint testId='conn-server-down' />}
             <h3 className={styles.subTitle}>玉山 bridge</h3>
             <div data-testid='conn-esun-block'>
                 {!h ? (
@@ -92,6 +98,7 @@ export function ConnectionCard() {
                 </div>
                 <EsunReconnectSection />
             </div>
+            <EnvSwitchSection />
         </Card>
     );
 }

@@ -2,6 +2,7 @@
 // - B7：目前商品市場已知時只顯示對應槽位的帳戶（股票 selectedStock、期權 selectedFutures），未選擇時顯示「未選擇證券／期貨帳戶」；
 //   商品未知時才先證券後期貨。
 // - A-1：連線面板在 stale-data 時提供勾選「我了解委託／持倉資料可能過期」（acknowledgeStaleData）與「重試同步」（retryResume）。
+// - 伺服器未連線提示（上游 #384）：面板關閉時中斷也會記住；重連中維持、LIVE 消失；狀態列本身不加文字；提示不含按鈕（S1）。
 // 以 vi.mock 隔離 src/lib。
 import { createElement } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
@@ -16,6 +17,7 @@ const m = vi.hoisted(() => ({
     },
     acknowledgeStaleData: vi.fn(),
     retryResume: vi.fn(),
+    stream: 'live' as 'live' | 'connecting' | 'down' | 'stale',
 }));
 
 vi.mock('../../lib/account-store', () => ({ useAccounts: () => m.accounts }));
@@ -31,7 +33,7 @@ vi.mock('../../lib/trade', () => ({
     subscribeNoticeLog: () => () => undefined,
 }));
 vi.mock('../../lib/privacy', () => ({ usePrivacyMode: () => false }));
-vi.mock('../../hooks/use-stream', () => ({ useStreamStatus: () => 'live' }));
+vi.mock('../../hooks/use-stream', () => ({ useStreamStatus: () => m.stream }));
 vi.mock('../hooks/use-resume-gate', () => ({ useResumeGate: () => m.gate }));
 vi.mock('../lib/resume-gate-runtime', () => ({
     acknowledgeStaleData: () => {
@@ -74,6 +76,7 @@ beforeEach(() => {
     m.gate = { state: 'ready', since: 0, checks: null, staleAcknowledged: false, resumeSeq: 0, message: null };
     m.acknowledgeStaleData.mockReset();
     m.retryResume.mockReset();
+    m.stream = 'live';
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
@@ -141,5 +144,36 @@ describe('A-1：連線面板 stale-data 可勾選了解並重試', () => {
         await render();
         await act(async () => { one('status-connection').props.onClick(); });
         expect(all('connection-stale-ack')).toHaveLength(0);
+    });
+});
+
+describe('伺服器未連線提示（連線狀態面板）', () => {
+    const hint = () => all('connection-server-down');
+
+    it('面板關閉時 down → 開啟時 connecting 仍顯示；LIVE 後消失；狀態列本身不加提示文字；提示內沒有按鈕（S1）', async () => {
+        await render();
+        m.stream = 'down';
+        await rerender();
+        expect(textOf(one('status-connection'))).not.toContain('伺服器未連線');
+        m.stream = 'connecting';
+        await rerender();
+        await act(async () => { one('status-connection').props.onClick(); });
+        expect(hint()).toHaveLength(1);
+        expect(hint()[0]!.props.role).toBe('status');
+        const text = textOf(hint()[0]!);
+        expect(text).toContain('伺服器未連線。');
+        expect(text).toContain('docker compose up -d');
+        expect(hint()[0]!.findAll(n => n.type === 'button' || n.type === 'a')).toHaveLength(0);
+        m.stream = 'live';
+        await rerender();
+        expect(hint()).toHaveLength(0);
+    });
+
+    it('從未中斷過的 connecting 不顯示', async () => {
+        m.stream = 'connecting';
+        await render();
+        await act(async () => { one('status-connection').props.onClick(); });
+        expect(all('connection-sheet')).toHaveLength(1);
+        expect(hint()).toHaveLength(0);
     });
 });

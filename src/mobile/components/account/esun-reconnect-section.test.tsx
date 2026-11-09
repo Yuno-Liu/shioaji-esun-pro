@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const m = vi.hoisted(() => ({
     accounts: [] as { broker_id: string; account_id: string; account_type: string }[],
     health: null as Record<string, unknown> | null,
+    switching: false,
     reconnect: vi.fn(),
     refreshHealth: vi.fn(async () => null as unknown),
     notify: vi.fn(),
@@ -18,6 +19,7 @@ vi.mock('../../../lib/esun', () => ({
     esunTradeService: {
         subscribe: () => () => undefined,
         getBridgeHealth: () => m.health,
+        getSnapshot: () => ({ switching: m.switching }),
         reconnect: m.reconnect,
         refreshHealth: m.refreshHealth,
     },
@@ -52,6 +54,7 @@ beforeEach(() => {
     resetEsunReconnectForTest();
     m.accounts = [ESUN];
     m.health = { ...LOST };
+    m.switching = false;
     m.reconnect.mockReset();
     m.reconnect.mockResolvedValue({ ok: true, health: { ...LOST, loggedIn: true, sessionExpired: false, loginError: null }, environment: 'SIMULATION' });
     m.refreshHealth.mockReset();
@@ -156,6 +159,13 @@ describe('EsunReconnectSection', () => {
         await mount();
         expect(one('esun-reconnect').props.disabled).toBe(true);
         expect(text(one('esun-reconnect-block'))).toContain('bridge 未連線');
+    });
+
+    it('E.SUN environment switch in progress: disabled with the reason', async () => {
+        m.switching = true;
+        await mount();
+        expect(one('esun-reconnect').props.disabled).toBe(true);
+        expect(text(one('esun-reconnect-block'))).toContain('環境切換中');
     });
 
     it('disables the button while the request is in flight', async () => {

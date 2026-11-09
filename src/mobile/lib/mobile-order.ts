@@ -23,6 +23,7 @@ import { assertTradingLive, OrderConfirmCancelled } from '../../lib/trade';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Trade } from '../../lib/types/order';
 import { notStarted } from './errors';
+import { assertNoEnvSwitch, beginOrderDispatch } from './trading-activity';
 import type { MobileOrderInput } from './mobile-order-types';
 
 /** 期權選了玉山帳戶（規格 R8）：確認前就拒絕，不出現確認面板 */
@@ -74,6 +75,17 @@ export function assertDayTradeStillAllowed(contract: Pick<ContractInfo, 'code' |
  * - reject 其他錯誤：結果未知，禁止自動重送（規格 R6、§7.2）。
  */
 export async function submitMobileOrder(input: MobileOrderInput, guards: MobileOrderGuards): Promise<Trade> {
+    // 玉山環境切換中不送玉山帳戶（確認前、確認後與 beforeDispatch 各檢查一次；永豐照常）；送出流程期間計入「委託送出中」，環境切換因此擋下
+    assertNoEnvSwitch(input.displayedAccount);
+    const release = beginOrderDispatch();
+    try {
+        return await submitGuarded(input, guards);
+    } finally {
+        release();
+    }
+}
+
+async function submitGuarded(input: MobileOrderInput, guards: MobileOrderGuards): Promise<Trade> {
     const market = input.isFutures ? 'F' : 'S';
     // 確認面板顯示與送出都取自同一份委託內容
     const order = input.isFutures ? input.futuresOrder : input.stockOrder;
@@ -144,6 +156,7 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
         accountLabel: accountConfirmLabel(orderAccount),
     }, { serverMode: sameServerMode });
     if (!approved) throw new OrderConfirmCancelled();
+    assertNoEnvSwitch(orderAccount);
     // 7) 確認後重驗（確認可能停留很久）
     if (!sameServerMode()) throw notStarted(SERVER_MODE_CHANGED_MESSAGE);
     if (!isSelectedAccountUnchanged(orderAccount)) throw notStarted(ACCOUNT_CHANGED_MESSAGE);
@@ -151,6 +164,7 @@ export async function submitMobileOrder(input: MobileOrderInput, guards: MobileO
     // 8) beforeDispatch：HTTP 送出前最後一刻同步重驗，丟出就不送（每一項都是 mutationNotStarted）
     const dispatch = {
         beforeDispatch: () => {
+            assertNoEnvSwitch(orderAccount);
             guards.assertResumeReady();
             assertTradingLive();
             assertRiskAllowed();

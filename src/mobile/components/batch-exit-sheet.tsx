@@ -19,7 +19,7 @@ import * as styles from '../styles/batch-exit.css';
 import { GroupedSection } from '../ui/grouped';
 import { InlineNote } from '../ui/inline-note';
 import { BottomSheet, SheetFooter } from './bottom-sheet';
-import { routeTone, type RouteTone } from './route-badge';
+import { routeTone, rowRoute, type RouteTone } from './route-badge';
 import { SlideToConfirm } from './slide-to-confirm';
 
 export interface BatchViewItem {
@@ -91,8 +91,8 @@ export const BATCH_STATUS_TEXT: Record<BatchItemStatus, string> = {
 export function BatchExitSheet({ phase, groups, states, blockReason, note, stopRequested, summary, onConfirm, onStop, onClose }: BatchExitSheetProps) {
     const esun = useEsunEnvironment();
     const info = useServerInfo();
-    // 與 RouteBadge（useOrderRoute → routeTone）相同的算法；環境改變時重新渲染
-    const routes = groups.map(g => orderRouteOf(g.account, { esunEnvironment: esun.environment, sinopacSimulation: info?.simulation }));
+    // 與持倉列 RouteBadge row（useOrderRoute → rowRoute → routeTone）相同的算法：玉山以該組帳戶自己的環境（-SIM）判斷；環境改變時重新渲染
+    const routes = groups.map(g => rowRoute(orderRouteOf(g.account, { esunEnvironment: esun.environment, sinopacSimulation: info?.simulation }), g.account)!);
     const tones = routes.map(routeTone);
     const count = groups.reduce((n, g) => n + g.items.length, 0);
     const running = phase === 'running';

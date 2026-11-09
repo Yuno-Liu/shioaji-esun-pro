@@ -53,6 +53,7 @@ vi.mock('../../lib/privacy', () => ({
 vi.mock('../../lib/tick-bands', () => ({ bandTickFor: () => undefined, prefetchTickBands: () => undefined }));
 vi.mock('../components/route-badge', () => ({
     useOrderRoute: () => ({ esun: false, broker: '永豐', simulation: true }),
+    useRowRoute: () => ({ esun: false, broker: '永豐', simulation: true }),
     routeBadgeText: () => '送往 永豐 模擬',
 }));
 vi.mock('../components/account-switch-sheet', () => ({ mobileAccountLabel: (a: { broker_id: string }) => `${a.broker_id}-***` }));

@@ -43,7 +43,7 @@ import {
     TradeInstrument,
     useTradeName,
 } from './order-action-sheet';
-import { routeBadgeText, useOrderRoute } from './route-badge';
+import { routeBadgeText, useRowRoute } from './route-badge';
 
 export const ORDER_DETAIL_TEXT = {
     notFound: '找不到這筆委託，請到委託頁按「更新」後再試',
@@ -83,7 +83,7 @@ function DetailBody({ trade, working, onClose }: { trade: Trade; working: boolea
     const meta = useEsunOrderMeta(trade);
     const priv = usePrivacyMode();
     const account = tradeAccountOf(trade);
-    const route = useOrderRoute(account);
+    const route = useRowRoute(account); // 該筆委託帳戶自己的環境
     const unit = orderUnitOf(trade);
     const progress = fillProgress(trade);
     const remaining = remainingWorkingOrderQuantity(trade);

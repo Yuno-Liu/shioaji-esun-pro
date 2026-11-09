@@ -50,6 +50,12 @@ export interface OrderActionRequest {
     seq: number;
 }
 
+/** 玉山環境切換狀態（lib/esun-env-switch.ts 設定；switching＝等待 bridge 回應，checking＝回應逾時或遺失後以 health 確認結果） */
+export interface EnvSwitchState {
+    target: 'SIMULATION' | 'PRODUCTION';
+    phase: 'switching' | 'checking';
+}
+
 export interface MobileUiState {
     /** 目前商品（交易分頁顯示的商品）；null＝尚未選擇 */
     currentCode: string | null;
@@ -59,6 +65,8 @@ export interface MobileUiState {
     ticket: TicketRequest | null;
     /** 委託操作面板：null＝關閉 */
     orderAction: OrderActionRequest | null;
+    /** 玉山環境切換中（含結果確認中）；null＝沒有。只擋玉山帳戶的送單（lib/trading-activity.ts），永豐照常；殼層顯示 EnvSwitchOverlay */
+    envSwitch: EnvSwitchState | null;
 }
 
 const CODE_KEY = 'sj-mobile-current-code';
@@ -72,7 +80,7 @@ function loadCode(): string | null {
     }
 }
 
-let state: MobileUiState = { currentCode: loadCode(), activeTab: 'watchlist', ticket: null, orderAction: null };
+let state: MobileUiState = { currentCode: loadCode(), activeTab: 'watchlist', ticket: null, orderAction: null, envSwitch: null };
 let seq = 0;
 const listeners = new Set<() => void>();
 
@@ -150,7 +158,12 @@ export function closeOrderAction(): void {
 }
 
 /** 測試用：重設為初始狀態 */
+/** 由 lib/esun-env-switch.ts 設定（開始、進入結果確認、結束）；送單閘門見 lib/trading-activity.ts */
+export function setEnvSwitch(next: EnvSwitchState | null): void {
+    if (next !== state.envSwitch) set({ envSwitch: next });
+}
+
 export function resetMobileUiForTest(): void {
-    state = { currentCode: null, activeTab: 'watchlist', ticket: null, orderAction: null };
+    state = { currentCode: null, activeTab: 'watchlist', ticket: null, orderAction: null, envSwitch: null };
     listeners.forEach(l => l());
 }

@@ -27,6 +27,7 @@ vi.mock('../../lib/privacy', () => ({ usePrivacyMode: () => false }));
 vi.mock('../../lib/tick-bands', () => ({ bandTickFor: () => undefined, prefetchTickBands: () => undefined }));
 vi.mock('./route-badge', () => ({
     useOrderRoute: (a: { broker_id: string } | null) => (a ? { broker: a.broker_id.startsWith('884') ? '玉山' : '永豐' } : null),
+    useRowRoute: (a: { broker_id: string } | null) => (a ? { broker: a.broker_id.startsWith('884') ? '玉山' : '永豐' } : null),
     routeBadgeText: (r: { broker: string } | null) => (r ? `送往 ${r.broker} 模擬` : '未選擇下單帳戶'),
 }));
 vi.mock('./account-switch-sheet', () => ({ mobileAccountLabel: (a: { broker_id: string }) => `${a.broker_id}-***56` }));

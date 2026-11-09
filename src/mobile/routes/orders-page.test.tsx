@@ -23,7 +23,13 @@ const m = vi.hoisted(() => ({
     cancelOrders: vi.fn(),
     updatePrice: vi.fn(),
     updateQty: vi.fn(),
+    /** lib/account-store getAccountState().accounts（全部刪單的玉山判斷） */
+    storeAccounts: [] as { broker_id: string }[],
 }));
+vi.mock('../../lib/account-store', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../../lib/account-store')>();
+    return { ...actual, getAccountState: () => ({ ...actual.getAccountState(), accounts: m.storeAccounts }) };
+});
 
 vi.mock('../../lib/trading-state', () => ({
     useTradingState: () => h.state,
@@ -58,6 +64,7 @@ vi.mock('../../lib/privacy', () => ({
 vi.mock('../../lib/tick-bands', () => ({ bandTickFor: () => undefined, prefetchTickBands: () => undefined }));
 vi.mock('../components/route-badge', () => ({
     useOrderRoute: (a: { broker_id: string } | null) => (a ? { esun: a.broker_id.startsWith('884'), broker: a.broker_id.startsWith('884') ? '玉山' : '永豐', simulation: true } : null),
+    useRowRoute: (a: { broker_id: string } | null) => (a ? { esun: a.broker_id.startsWith('884'), broker: a.broker_id.startsWith('884') ? '玉山' : '永豐', simulation: true } : null),
     routeBadgeText: (r: { broker: string } | null) => (r ? `送往 ${r.broker} 模擬` : '未選擇下單帳戶'),
 }));
 vi.mock('../components/account-switch-sheet', () => ({
@@ -70,7 +77,8 @@ import { OrderActionSheet } from '../components/order-action-sheet';
 import { SlideToConfirm } from '../components/slide-to-confirm';
 import { getMobileUi, resetMobileUiForTest } from '../lib/mobile-store';
 import { setResumeGateForTest } from '../lib/resume-gate-runtime';
-import { ORDERS_REFRESH_COOLDOWN_MS, OrdersPage, resetOrdersRefreshCooldownForTest } from './orders-page';
+import { orderDispatchInFlight, resetTradingActivityForTest, setEnvSwitch } from '../lib/trading-activity';
+import { BULK_ENV_SWITCH_NOT_SENT, ORDERS_REFRESH_COOLDOWN_MS, OrdersPage, resetOrdersRefreshCooldownForTest } from './orders-page';
 
 const sinopac = { account_type: 'S', broker_id: '9A95', account_id: '0123456', signed: true, person_id: '', username: '' };
 const esun = { account_type: 'S', broker_id: '8840', account_id: '0099887', signed: true, person_id: '', username: '' };
@@ -267,7 +275,7 @@ describe('OrdersPage — 委託操作', () => {
         expect(m.cancelOrder).not.toHaveBeenCalled();
         await confirmSlide('order-action-slide');
         expect(m.cancelOrder).toHaveBeenCalledTimes(1);
-        expect(m.cancelOrder).toHaveBeenCalledWith('o1');
+        expect(m.cancelOrder).toHaveBeenCalledWith('o1', { beforeSend: expect.any(Function) });
         const notice = m.notify.mock.calls.at(-1)![0];
         expect(notice.kind).toBe('err');
         expect(notice.title).toBe('刪單失敗或結果未知');
@@ -303,7 +311,7 @@ describe('OrdersPage — 委託操作', () => {
         await press(rowButton('o1', 'order-cancel-button')!);
         expect(slide('order-action-slide')!.props.disabled).toBe(false);
         await confirmSlide('order-action-slide');
-        expect(m.cancelOrder).toHaveBeenCalledWith('o1');
+        expect(m.cancelOrder).toHaveBeenCalledWith('o1', { beforeSend: expect.any(Function) });
         expect(m.assertLive).not.toHaveBeenCalled();
         expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ title: '刪單結果', kind: 'ok' }));
         expect(getMobileUi().orderAction).toBeNull();
@@ -358,6 +366,35 @@ describe('OrdersPage — S1：列上 Chip 只開委託操作面板', () => {
 });
 
 describe('OrdersPage — 全部刪單', () => {
+    it('round 3: 全部刪單（先讀委託再刪）整段計入「委託送出中」；有玉山帳戶時玉山切換中不送，只有永豐時照常', async () => {
+        let resolve!: (v: unknown) => void;
+        m.cancelAll.mockImplementation(() => new Promise(r => { resolve = r; }));
+        setState([trade('o1'), trade('o2')]);
+        await render();
+        await press(byTestId('orders-cancel-all')[0]!);
+        await confirmSlide('cancel-all-slide');
+        expect(m.cancelAll).toHaveBeenCalledTimes(1);
+        expect(orderDispatchInFlight()).toBe(true); // 讀取＋刪單期間
+        await act(async () => { resolve(2); });
+        expect(orderDispatchInFlight()).toBe(false);
+        // 有玉山帳戶：切換中整批不送
+        m.storeAccounts = [{ broker_id: '9A95' }, { broker_id: '8840-SIM' }];
+        setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+        await press(byTestId('orders-cancel-all')[0]!);
+        await confirmSlide('cancel-all-slide');
+        expect(m.cancelAll).toHaveBeenCalledTimes(1);
+        // round 4：整批不送（含永豐）的專用文字，不是「這筆玉山委託沒有送出（永豐不受影響）」
+        expect(text(byTestId('cancel-all-feedback')[0]!)).toContain(BULK_ENV_SWITCH_NOT_SENT);
+        expect(text(byTestId('cancel-all-feedback')[0]!)).not.toContain('永豐不受影響');
+        // 只有永豐帳戶：照常
+        m.storeAccounts = [{ broker_id: '9A95' }];
+        m.cancelAll.mockResolvedValue(2);
+        await confirmSlide('cancel-all-slide');
+        expect(m.cancelAll).toHaveBeenCalledTimes(2);
+        m.storeAccounts = [];
+        resetTradingActivityForTest();
+    });
+
     it('requires a slide confirmation listing the count and accounts before calling cancelAllOrders', async () => {
         m.cancelAll.mockResolvedValue(3);
         setState([trade('o1'), trade('o2'), trade('o3', { account: esun }), trade('o4', { status: { status: 'Filled', deal_quantity: 5 } })]);
@@ -664,6 +701,48 @@ describe('OrdersPage — 勾選批次刪單', () => {
         expect(byTestId('order-select')).toHaveLength(0);
         await press(byTestId('batch-cancel-close')[0]!);
         expect(byTestId('batch-cancel-sheet')).toHaveLength(0);
+    });
+
+    it('玉山環境切換中：含玉山委託的批次刪單不送（未送出），每筆 beforeSend 也擋；只有永豐委託照常（round 3 2a）', async () => {
+        setState([trade('o1'), trade('o2', { account: esun })]);
+        await render();
+        await selectRows('o1', 'o2');
+        await press(byTestId('orders-cancel-selected')[0]!);
+        setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+        await confirmSlide('batch-cancel-slide');
+        expect(m.cancelOrders).not.toHaveBeenCalled();
+        expect(m.cancelOrder).not.toHaveBeenCalled();
+        expect(text(byTestId('batch-cancel-feedback')[0]!)).toContain(BULK_ENV_SWITCH_NOT_SENT);
+        expect(text(byTestId('batch-cancel-feedback')[0]!)).not.toContain('永豐不受影響');
+        // 送出時才開始切換：lib 每筆送出前呼叫的 beforeSend 擋下
+        resetTradingActivityForTest();
+        m.cancelOrders.mockImplementation(async (_ids: string[], _onSettled: unknown, beforeSend: () => void) => {
+            setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+            expect(() => beforeSend()).toThrow(BULK_ENV_SWITCH_NOT_SENT);
+            return [{ status: 'fulfilled', value: cancelled('o2', esun) }, { status: 'fulfilled', value: cancelled('o1') }];
+        });
+        await confirmSlide('batch-cancel-slide');
+        expect(m.cancelOrders).toHaveBeenCalledTimes(1);
+        resetTradingActivityForTest();
+    });
+
+    it('永豐委託的批次刪單在玉山切換中照常送出；送出期間計入「委託送出中」（round 3 item 3）', async () => {
+        let resolve!: (v: unknown) => void;
+        m.cancelOrders.mockImplementation((_ids: string[], _onSettled: unknown, beforeSend: () => void) => {
+            beforeSend(); // 永豐：不丟
+            return new Promise(r => { resolve = r; });
+        });
+        setState([trade('o1'), trade('o2')]);
+        await render();
+        await selectRows('o1', 'o2');
+        await press(byTestId('orders-cancel-selected')[0]!);
+        setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+        await confirmSlide('batch-cancel-slide');
+        expect(m.cancelOrders).toHaveBeenCalledTimes(1);
+        expect(orderDispatchInFlight()).toBe(true);
+        await act(async () => { resolve([{ status: 'fulfilled', value: cancelled('o2') }, { status: 'fulfilled', value: cancelled('o1') }]); });
+        expect(orderDispatchInFlight()).toBe(false);
+        resetTradingActivityForTest();
     });
 
     it('summarizes partial failures with mutationErrorNotice wording and never resends', async () => {

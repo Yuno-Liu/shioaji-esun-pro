@@ -7,7 +7,7 @@
 // - 殼層結構、插槽、捲動記憶、html 屬性與背景隔離見設計規格 §6.6；main 與其祖先不得有 transform／filter／
 //   backdrop-filter／will-change／contain:paint（保護 fixed 全螢幕圖表）。
 
-import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType, type RefObject } from 'react';
 import { Activity, Briefcase, ChartCandlestick, ClipboardList, Star, UserRound, type LucideIcon } from 'lucide-react';
 import { useTradingState } from '../lib/trading-state';
 import { ensureStream } from '../lib/stream';
@@ -26,6 +26,8 @@ import { formatRoute, isCanonicalHash, lastMarketSegment, navigate, parseHash, u
 import { constrainedNetwork, currentConnection, schedulePrefetchSequence } from './lib/idle-prefetch';
 import { closeOrderAction, closeTicket, setActiveTab, setCurrentCode, useMobileUi } from './lib/mobile-store';
 import { startResumeGate } from './lib/resume-gate-runtime';
+// 刪改單送出中追蹤：開機就訂閱（玉山環境切換據此擋下；不等帳戶頁 chunk）
+import './lib/trade-mutation-tracker';
 import { createScrollMemory, ScrollRestorer, useScrollNavigation, useScrollRecorder } from './lib/scroll-memory';
 import type { SecureContextDiagnostics } from './lib/secure-context';
 import { useSheetStack } from './lib/sheet-stack';
@@ -48,6 +50,11 @@ const loadPositionsPage = () => import('./routes/positions-page');
 const loadAccountPage = () => import('./routes/account-page');
 const loadTicketSheet = () => import('./components/order-ticket-sheet');
 const loadActionSheet = () => import('./components/order-action-sheet');
+// 玉山環境切換中的根層面板：切換只能從帳戶頁發起，帳戶頁 chunk 已靜態匯入同一個模組，所以這裡幾乎立即可用；
+// 載入失敗時不渲染（送單路徑另有 assertNoEnvSwitch 閘門，面板只是畫面上的防護），不讓殼層掉進錯誤邊界
+const EnvSwitchOverlay = lazy<ComponentType>(() => import('./components/env-switch-overlay')
+    .then(m => ({ default: m.EnvSwitchOverlay }))
+    .catch(() => ({ default: () => null })));
 
 // retryableLazy：載入失敗後按［重試］會換一個新的 lazy 重新 import（React.lazy 會永久快取失敗的 promise）
 const TradePage = retryableLazy(() => loadTradePage().then(m => m.TradePage), 'TradePage');
@@ -283,6 +290,7 @@ export function MobileShell() {
     const route = useHashRoute();
     const routeKey = formatRoute(route);
     const ui = useMobileUi();
+    const envSwitchMounted = useMountedOnce(ui.envSwitch !== null);
     const ticketMounted = useMountedOnce(ui.ticket !== null);
     const actionMounted = useMountedOnce(ui.orderAction !== null);
 
@@ -380,6 +388,8 @@ export function MobileShell() {
                             </Suspense>
                         </ModuleErrorBoundary>
                         <OrderConfirmSheet />
+                        {/* 玉山環境切換中：不隨路由卸載、不可關閉（lib/trading-activity.ts）；第一次切換時才掛載，之後保持掛載 */}
+                        {envSwitchMounted && <Suspense fallback={null}><EnvSwitchOverlay /></Suspense>}
                         {/* 面板 portal 目標：在 .shell 內（繼承 --sj-* 與 data-sheet-open），不在任何 inert 容器內 */}
                         <div ref={sheetRootRef} id='sj-sheet-root' className={layout.sheetRoot} />
                     </div>

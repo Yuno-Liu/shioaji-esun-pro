@@ -1993,6 +1993,11 @@ FAILED_ACK_RECHECK_MARGIN_SECONDS = 0.1  # past the keep window of a row the sna
 SHUTDOWN_MUTATION_GRACE_SECONDS = 8.0  # SIGTERM: in-flight order mutations may finish (< compose grace)
 ORDER_MUTATION_REFRESH_MAX_WAIT_SECONDS = 2.0  # a mutation's completing query must start within this
 ORDER_MUTATION_REFRESH_BUDGET_SECONDS = 8.0  # a mutation waits for a shared query until arrival + this
+# Environment switch vs order mutations: a switch is refused this long after the last mutation response
+# (a client's post-cancel confirmation read, the second leg of a close), and waits at most
+# SWITCH_SWAP_DRAIN_SECONDS for in-flight mutations / the quiet period before swapping sessions.
+MUTATION_QUIET_SECONDS = 10.0
+SWITCH_SWAP_DRAIN_SECONDS = 15.0
 MUTATION_SEND_DEADLINE_SECONDS = 10.0  # no SDK mutation call this long after arrival (client gives up at 15 s)
 CACHE_FILL_WAIT_SECONDS = 20.0
 WS_SILENCE_SECONDS = 90.0
@@ -2830,6 +2835,16 @@ class EsunTradeBridge:
         self._drained: bool | None = None
         self._mutations_cond = threading.Condition()  # guards _mutations_in_flight + the shutdown flag
         self._mutations_in_flight = 0
+        # Environment switch swap window (guarded by _mutations_cond): set only after the new login
+        # succeeded, until the new session is installed. Mutations keep working on the old session during
+        # the (unbounded) network login; no mutation may start inside the swap window, and the swap waits
+        # for in-flight mutations to drain, so no mutation straddles the swap.
+        self._env_switch_in_progress = False
+        # Whole switch (session lock held by a switch, login included): /esun/health envSwitchInProgress
+        self._env_switch_running = False
+        self._last_mutation_end = 0.0  # monotonic; last SDK mutation call answered; 0 = none yet
+        self.mutation_quiet_seconds = MUTATION_QUIET_SECONDS
+        self.switch_drain_seconds = SWITCH_SWAP_DRAIN_SECONDS
         self._generation_seq = session_generation_base()
 
         cfg, _, env = load_config(selected_path)
@@ -2980,10 +2995,74 @@ class EsunTradeBridge:
             self._mutations_in_flight += 1
             return True
 
+    def try_begin_request_mutation(self) -> str | None:
+        """
+        try_begin_mutation for a whole HTTP mutation request, also refused while an environment switch
+        swaps the session. Returns None when counted, else the refusal reason ("shutdown" / "switching").
+        Checked and counted under _mutations_cond, atomically with the switch's own check.
+        """
+        with self._mutations_cond:
+            if self._shutdown_event.is_set():
+                return "shutdown"
+            if self._env_switch_in_progress:
+                return "switching"
+            self._mutations_in_flight += 1
+            return None
+
+    @staticmethod
+    def _switch_in_progress_refusal() -> tuple[dict, int]:
+        return not_sent(409, "ESUN_SWITCH_IN_PROGRESS", "玉山環境切換中，委託未送出：請等切換完成、確認環境後再送出")
+
     def end_mutation(self) -> None:
         with self._mutations_cond:
             self._mutations_in_flight -= 1
             self._mutations_cond.notify_all()
+
+    def _note_sdk_mutation_answered(self) -> None:
+        """Starts the post-mutation quiet period: only for requests that actually reached the SDK
+        (refusals before it -- switching, environment mismatch, expired session, rate limits -- do not)."""
+        with self._mutations_cond:
+            self._last_mutation_end = time.monotonic()
+            self._mutations_cond.notify_all()
+
+    def _mutation_quiet_left(self) -> float:
+        """Seconds left in the post-mutation quiet period (caller holds _mutations_cond)."""
+        if not self._last_mutation_end:
+            return 0.0
+        return max(0.0, self._last_mutation_end + self.mutation_quiet_seconds - time.monotonic())
+
+    def _end_swap_window(self) -> None:
+        """The new session is published: mutations may start again (they get the new session)."""
+        with self._mutations_cond:
+            self._env_switch_in_progress = False
+            self._mutations_cond.notify_all()
+
+    def _claim_swap_window(self) -> str | None:
+        """
+        Called by a switch after its login succeeded, right before installing the new session: marks
+        the swap window (new mutation requests are refused, not sent) and waits, at most
+        switch_drain_seconds, until no mutation is in flight and the quiet period has passed.
+        Returns None when the swap may proceed, else the error (the caller abandons the new session).
+        The switch clears the mark on every exit path.
+        """
+        deadline = time.monotonic() + self.switch_drain_seconds
+        with self._mutations_cond:
+            self._env_switch_in_progress = True
+            while True:
+                in_flight = self._mutations_in_flight
+                quiet_left = self._mutation_quiet_left()
+                if in_flight == 0 and quiet_left <= 0:
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # end the swap window first; the abandoned client is then just dropped
+                    self._env_switch_in_progress = False
+                    self._mutations_cond.notify_all()
+                    return (
+                        f"玉山委託處理中（{in_flight} 筆）或剛完成，等待 {self.switch_drain_seconds:.0f} 秒後仍未結束，"
+                        "已放棄這次環境切換、維持原環境；請等委託結果回來後再試"
+                    )
+                self._mutations_cond.wait(min(remaining, quiet_left) if in_flight == 0 else remaining)
 
     def _wait_for_mutations(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -3159,12 +3238,21 @@ class EsunTradeBridge:
         return kind
 
     def _perform_login(
-        self, prepared: _PreparedLogin, reason: str, *, auto: bool = False
+        self, prepared: _PreparedLogin, reason: str, *, auto: bool = False, before_install: any = None,
+        after_swap: any = None,
     ) -> tuple[bool, str | None, str | None]:
         """
         Network login with a fresh SDK client; on success installs a new session snapshot.
         Returns (ok, error message, failure kind): the kind travels with the result (never through
         shared state read after the session-change lock is released).
+        before_install (optional): called after a successful login, before installing; a returned error
+        string abandons the new client -> (False, error, "swap_refused"). The abandoned client is simply
+        dropped: it never started a WebSocket (that happens in _install_session) and logout() is never
+        called (the SDK's logout may have process-wide effects on the still-installed session).
+        after_swap (optional): called by _install_session right after the session pointer was swapped,
+        before the old WebSocket is closed and the new one started.
+        client.login() takes no timeout (the SDK offers none), so a hung login holds the session lock; the
+        old session stays installed and keeps serving mutations meanwhile.
         """
         try:
             apply_headless_keyring_patches()
@@ -3219,13 +3307,17 @@ class EsunTradeBridge:
             login_monotonic=time.monotonic(),
             login_started_at=login_started_at,
         )
+        if before_install is not None:
+            refused = before_install()
+            if refused:
+                return False, refused, "swap_refused"  # dropped: no WebSocket, no logout (see docstring)
         self.login_error = None
         self.login_state.clear_credential_lock()
-        self._install_session(session, reason)
+        self._install_session(session, reason, after_swap)
         logger.info(f"玉山證券登入成功（{session.environment}，{reason}，generation {generation}）")
         return True, None, None
 
-    def _install_session(self, session: EsunSession, reason: str) -> None:
+    def _install_session(self, session: EsunSession, reason: str, after_swap: any = None) -> None:
         """Atomically publishes a new session: caches are reset, the old WebSocket is stopped."""
         with self._state_lock:
             old_session = self._session
@@ -3236,6 +3328,8 @@ class EsunTradeBridge:
                 cache.reset(session.generation)
             self.order_book_cache.reset(session.generation)
             self.last_orders_refresh_time = 0.0
+        if after_swap is not None:
+            after_swap()  # e.g. an environment switch ends its swap window before the WebSocket work
         self._relogin_wake.set()  # a waiting automatic re-login of the replaced session ends now
         self._stop_websocket(old_runtime, old_session)
         self._start_websocket(session)
@@ -4241,6 +4335,9 @@ class EsunTradeBridge:
             },
             "loginLocked": lock["locked"],
             "loginLockReason": lock_reason,
+            # an environment switch holds the session lock (login + swap); clients must not conclude
+            # "not switched" from the old environment while this is true
+            "envSwitchInProgress": self._env_switch_running,
             "loginError": self._session_expired_login_error(expiry) if expiry else self.login_error,
             "certInfo": {"ca_expiretime": expire} if expire else None,
             "machineTime": None,
@@ -4332,6 +4429,7 @@ class EsunTradeBridge:
 
         if not self._session_change_lock.acquire(blocking=False):
             return self._switch_response(False, error="另一個登入或環境切換作業進行中", code="ESUN_SESSION_BUSY"), 409
+        self._env_switch_running = True
         try:
             session = self._session
             discovery = discover_esun_config_profiles(self.base_dir, session.config_path)
@@ -4346,6 +4444,25 @@ class EsunTradeBridge:
                 self._publish_session_event("switch_failed", ok=False, error=error)
                 return self._switch_response(False, discovery, error=error, code="ESUN_PROFILE_UNAVAILABLE"), 400
 
+            # Do not even log in while a mutation is in flight or was just answered (the swap would have to
+            # wait for it anyway); mutations keep working on the current session during the login itself.
+            with self._mutations_cond:
+                in_flight = self._mutations_in_flight
+                quiet_left = self._mutation_quiet_left()
+            if in_flight:
+                return self._switch_response(
+                    False, discovery,
+                    error=f"玉山委託處理中（{in_flight} 筆），暫時不能切換環境；請等委託結果回來後再試",
+                    code="ESUN_MUTATIONS_IN_FLIGHT",
+                ), 409
+            if quiet_left > 0:
+                wait = int(quiet_left) + 1
+                return self._switch_response(
+                    False, discovery,
+                    error=f"剛有玉山委託送出或刪改，為了讓委託結果確認完成，請 {wait} 秒後再切換環境",
+                    code="ESUN_RECENT_MUTATION", extra={"retryAfter": wait},
+                ), 409
+
             prepared, err = self._prepare_login_config(profile_info.get("filePath"), target)
             if err:
                 self._publish_session_event("switch_failed", ok=False, error=err)
@@ -4358,7 +4475,12 @@ class EsunTradeBridge:
                 self._publish_session_event("switch_failed", ok=False, error=body["error"])
                 extra = {k: v for k, v in body.items() if k not in ("ok", "error", "code")}
                 return self._switch_response(False, discovery, error=body["error"], code=body["code"], extra=extra), status
-            ok, message, _ = self._perform_login(prepared, reason="switch")
+            ok, message, kind = self._perform_login(
+                prepared, reason="switch", before_install=self._claim_swap_window, after_swap=self._end_swap_window
+            )
+            if kind == "swap_refused":
+                self._publish_session_event("switch_failed", ok=False, error=message)
+                return self._switch_response(False, discovery, error=message, code="ESUN_MUTATIONS_IN_FLIGHT"), 409
             if not ok:
                 self._publish_session_event("switch_failed", ok=False, error=message)
                 return self._switch_response(
@@ -4369,6 +4491,11 @@ class EsunTradeBridge:
                 ), 502
             return self._switch_response(True), 200
         finally:
+            # every exit path (success, 4xx/5xx, exception) ends the swap window and the switch
+            with self._mutations_cond:
+                self._env_switch_in_progress = False
+                self._env_switch_running = False
+                self._mutations_cond.notify_all()
             self._session_change_lock.release()
 
     @staticmethod
@@ -4447,6 +4574,8 @@ class EsunTradeBridge:
             return None, not_sent(400, "ESUN_INVALID_JSON", "請求本文必須為 JSON 物件")
         if self.is_shutting_down():
             return None, self._shutting_down_refusal()
+        if self._env_switch_in_progress:  # the HTTP path is already refused before this (try_begin_request_mutation)
+            return None, self._switch_in_progress_refusal()
         session = self._session
         if not session.logged_in:
             return None, not_sent(503, "ESUN_NOT_LOGGED_IN", self._not_logged_in_message())
@@ -4533,7 +4662,10 @@ class EsunTradeBridge:
         if session.generation in self._expired_sessions:  # expired while the request was being prepared
             return self._session_expired_refusal(session)
         try:
-            result = call()
+            try:
+                result = call()
+            finally:
+                self._note_sdk_mutation_answered()
         except _PROPAGATED_BASE_EXCEPTIONS:
             raise
         except BaseException as e:
@@ -5730,9 +5862,15 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         if self._is_mutation_path():
-            # Tracked until the response is written, so a graceful shutdown waits for the answer.
-            if not self.bridge.try_begin_mutation():
+            # Tracked until the response is written, so a graceful shutdown waits for the answer
+            # and an environment switch cannot start meanwhile (nor this start during one).
+            refusal = self.bridge.try_begin_request_mutation()
+            if refusal == "shutdown":
                 self._send_error_json(503, "ESUN_SHUTTING_DOWN", "玉山 bridge 關閉中，委託未送出")
+                return
+            if refusal == "switching":
+                body, status = self.bridge._switch_in_progress_refusal()
+                self._send_json(status, body)
                 return
             try:
                 self._dispatch_post(path, body)
