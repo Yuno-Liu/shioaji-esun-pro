@@ -32,7 +32,7 @@ const m = vi.hoisted(() => {
         /** 玉山 bridge 環境 */
         esunEnv: 'SIMULATION',
         /** getMobileUi()：下單面板、委託操作面板（多選市價出清開始前檢查） */
-        ui: { ticket: null as unknown, orderAction: null as unknown },
+        ui: { ticket: null as unknown, orderAction: null as unknown } as { ticket: unknown; orderAction: unknown; envSwitch?: unknown },
         /** getRiskSettings()：手機一律開啟手動下單確認（start.ts 釘住）；多選市價出清每筆送出前檢查 */
         risk: { confirmManualOrders: true },
         placeStockExitByShares: vi.fn(),
@@ -148,7 +148,13 @@ vi.mock('../lib/resume-gate-runtime', () => ({
     },
 }));
 vi.mock('../lib/hash-router', () => ({ navigate: m.navigate }));
-vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, getMobileUi: () => m.ui }));
+vi.mock('../lib/mobile-store', () => ({
+    openTicket: m.openTicket,
+    getMobileUi: () => m.ui,
+    // lib/trading-activity（環境切換閘門）讀寫的欄位
+    setEnvSwitch: (v: unknown) => { m.ui = { ...m.ui, envSwitch: v }; },
+    subscribeMobileUi: () => () => undefined,
+}));
 vi.mock('../../lib/shioaji', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../../lib/shioaji')>()),
     fetchTradingLimits: m.fetchTradingLimits,
@@ -160,7 +166,8 @@ import { SlideToConfirm } from '../components/slide-to-confirm';
 import { BATCH_STOPPED, batchExitAbortReason, decideBatchConfirm, isBatchExitActive, setBatchExit } from '../lib/batch-exit-auth';
 import { resetTradingLimitsForTest } from '../hooks/use-trading-limits';
 import { POSITIONS_VIEW_KEY, readPositionsView } from '../lib/positions-view';
-import { addOnBlockReason, addOnPlanFor, batchGateProblem, batchLegs, batchSelectReason, closePlanFor, COMPACT_TEXT, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText } from './positions-page';
+import { addOnBlockReason, addOnPlanFor, batchGateProblem, batchLegs, batchSelectReason, closeBeforeSend, closePlanFor, COMPACT_TEXT, executeClose, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText, type ClosePlan } from './positions-page';
+import { ENV_SWITCH_NOT_SENT, orderDispatchInFlight, resetTradingActivityForTest, setEnvSwitch } from '../lib/trading-activity';
 
 const stockAcc = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '' };
 const stockAcc2 = { account_type: 'S', broker_id: 'ESUN1', account_id: '7777777', person_id: 'A', signed: true, username: '' };
@@ -234,6 +241,41 @@ afterEach(async () => {
     setBatchExit(false);
     vi.useRealTimers();
     vi.unstubAllGlobals();
+});
+
+describe('平倉與玉山環境切換（CRITICAL-1／CRITICAL-2）', () => {
+    afterEach(() => { resetTradingActivityForTest(); });
+    const plan = () => closePlanFor(stockPos(), stk2330) as ClosePlan;
+
+    it('單筆平倉送出中（含 lib 確認）計入「委託送出中」，環境切換據此擋下；結束或失敗歸零', async () => {
+        let resolve!: (v: unknown) => void;
+        m.placeStockExitByShares.mockReturnValue(new Promise(r => { resolve = r; }));
+        const p = executeClose(plan());
+        expect(orderDispatchInFlight()).toBe(true);
+        resolve([]);
+        await p;
+        expect(orderDispatchInFlight()).toBe(false);
+        m.placeStockExitByShares.mockRejectedValue(new Error('boom'));
+        await expect(executeClose(plan())).rejects.toThrow('boom');
+        expect(orderDispatchInFlight()).toBe(false);
+    });
+
+    it('切換中：平倉不送（未送出），beforeSend（closeBeforeSend）也擋', async () => {
+        setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+        await expect(executeClose(plan())).rejects.toMatchObject({ message: ENV_SWITCH_NOT_SENT, mutationNotStarted: true });
+        expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+        expect(m.placeQuickOrder).not.toHaveBeenCalled();
+        expect(() => closeBeforeSend()).toThrow(ENV_SWITCH_NOT_SENT);
+        expect(m.assertResumeReady).not.toHaveBeenCalled();
+        resetTradingActivityForTest();
+        // 送出時才開始切換：lib 呼叫的 beforeSend 丟出未送出
+        m.placeStockExitByShares.mockImplementation(async (...args: unknown[]) => {
+            setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+            (args[4] as { beforeSend: () => void }).beforeSend();
+            return [];
+        });
+        await expect(executeClose(plan())).rejects.toMatchObject({ mutationNotStarted: true });
+    });
 });
 
 describe('純函式', () => {

@@ -12,6 +12,7 @@ import { useSyncExternalStore } from 'react';
 import { invalidateAllQueries } from '../../hooks/use-query';
 import { esunTradeService, type EsunBridgeHealth, type EsunReconnectResult } from '../../lib/esun';
 import { notify } from '../../lib/trade';
+import { getEnvSwitch } from './trading-activity';
 
 export const ESUN_RECONNECT_COOLDOWN_MS = 60_000;
 
@@ -68,7 +69,7 @@ export function esunSessionLost(h: EsunBridgeHealth | null | undefined): boolean
 export function esunReconnectBlock(health: EsunBridgeHealth | null | undefined, now: number = Date.now(), s: ReconnectState = state): EsunReconnectBlock | null {
     if (s.running) return 'running';
     // 玉山環境切換進行中（帳戶 › 連線的環境切換）：bridge 會回 ESUN_SESSION_BUSY，先擋下
-    if (esunTradeService.getSnapshot().switching) return 'switching';
+    if (getEnvSwitch() !== null || esunTradeService.getSnapshot().switching) return 'switching';
     if (!health) return 'no-bridge';
     if (health.loginLocked) return 'locked';
     if (esunReconnectCooldownSec(now, s) > 0) return 'cooldown';

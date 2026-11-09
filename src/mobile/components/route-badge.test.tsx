@@ -6,7 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({ esunEnvironment: 'simulation', sinopacSimulation: true as boolean | undefined }));
 
-vi.mock('../../lib/esun', () => ({ useEsunEnvironment: () => ({ environment: m.esunEnvironment }) }));
+vi.mock('../../lib/esun', () => ({
+    useEsunEnvironment: () => ({ environment: m.esunEnvironment }),
+    esunEnvironmentOfAccount: (a?: { broker_id: string } | null) =>
+        (a?.broker_id.startsWith('8840') ? (a.broker_id.endsWith('-SIM') ? 'SIMULATION' : 'PRODUCTION') : null),
+}));
 vi.mock('../../lib/server-info-store', () => ({ useServerInfo: () => ({ simulation: m.sinopacSimulation }) }));
 vi.mock('../../lib/order-route', () => ({
     orderRouteOf: (a: { broker_id: string }, live: { sinopacSimulation: boolean | undefined }) =>
@@ -14,7 +18,7 @@ vi.mock('../../lib/order-route', () => ({
     routeEnvText: (s: boolean | undefined) => (s === true ? '模擬' : s === false ? '正式' : '環境未確認'),
 }));
 
-import { RouteBadge, routeBadgeText, routeTone } from './route-badge';
+import { RouteBadge, routeBadgeText, routeTone, rowRoute } from './route-badge';
 
 let view: ReactTestRenderer | undefined;
 const textOf = (node: ReactTestInstance): string => node.children.map(c => (typeof c === 'string' ? c : textOf(c))).join('');
@@ -25,6 +29,26 @@ afterEach(async () => {
     await act(async () => view?.unmount());
     view = undefined;
     vi.unstubAllGlobals();
+});
+
+describe('RouteBadge row（LOW-3：切換環境後殘留的舊環境列）', () => {
+    it('rowRoute：玉山以該列帳戶（-SIM）決定環境；永豐與沒有路由時不變', () => {
+        const live = { esun: true, broker: '玉山', simulation: false }; // 目前 bridge 是正式
+        expect(rowRoute(live, { broker_id: '8840-SIM' })).toEqual({ ...live, simulation: true });
+        expect(rowRoute({ ...live, simulation: true }, { broker_id: '8840' })).toEqual({ ...live, simulation: false });
+        const sino = { esun: false, broker: '永豐', simulation: true };
+        expect(rowRoute(sino, { broker_id: '9A95' })).toBe(sino);
+        expect(rowRoute(null, { broker_id: '8840-SIM' })).toBeNull();
+    });
+
+    it('RouteBadge row：模擬帳戶的殘留列在 bridge 已切到正式後仍標「模擬」；不帶 row 時顯示即時路由', async () => {
+        m.sinopacSimulation = false; // 替身的 orderRouteOf 以這個值當即時環境（＝正式）
+        await act(async () => { view = create(createElement(RouteBadge, { account: { broker_id: '8840-SIM' } as never, row: true })); });
+        expect(badge().props['data-env']).toBe('simulation');
+        expect(textOf(badge())).toBe('送往 永豐 模擬');
+        await act(async () => { view!.update(createElement(RouteBadge, { account: { broker_id: '8840-SIM' } as never })); });
+        expect(badge().props['data-env']).toBe('production');
+    });
 });
 
 describe('RouteBadge', () => {

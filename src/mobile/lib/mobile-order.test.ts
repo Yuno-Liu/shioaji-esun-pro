@@ -1,6 +1,6 @@
 // 手機新單流程（規格 §7.1、§14.1）：閘門順序、強制確認、確認後與 beforeDispatch 重驗、成功路徑的送單參數。
 // 以 vi.mock 隔離 src/lib，不打任何真實 API；玉山規則用真正的 validateEsunStockOrder（純函式）。
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Account } from '../../lib/types/portfolio';
 
@@ -74,6 +74,7 @@ import { notStarted } from './errors';
 import { buildFuturesLists } from './futures-lists';
 import { ESUN_FUTURES_MESSAGE, submitMobileOrder, type MobileOrderGuards } from './mobile-order';
 import type { MobileOrderInput } from './mobile-order-types';
+import { ENV_SWITCH_NOT_SENT, orderDispatchInFlight, resetTradingActivityForTest, setEnvSwitch } from './trading-activity';
 
 const sinoStock = { account_type: 'S', broker_id: '9A95', account_id: '0123456', signed: true, person_id: '', username: '' } as Account;
 const esunStock = { account_type: 'S', broker_id: '8840-SIM', account_id: '1123456', signed: true, person_id: '', username: '' } as Account;
@@ -543,5 +544,51 @@ describe('submitMobileOrder — 信用交易與現股當沖先賣（Phase 2）',
         h.cachedContract = { ...stock, day_trade: 'No' };
         await submitMobileOrder(creditInput({ action: 'Sell' }), guards);
         expect(m.placeStock).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('submitMobileOrder — 玉山環境切換（CRITICAL-1／CRITICAL-2）', () => {
+    afterEach(() => { resetTradingActivityForTest(); });
+    const PRODUCTION = { target: 'PRODUCTION', phase: 'switching' } as const;
+
+    it('切換中：確認前就擋（未送出），不開確認、不送單', async () => {
+        setEnvSwitch(PRODUCTION);
+        const err = await rejection(submitMobileOrder(stockInput(esunStock), guards));
+        expect(err).toMatchObject({ message: ENV_SWITCH_NOT_SENT, mutationNotStarted: true });
+        expect(m.confirm).not.toHaveBeenCalled();
+        noOrderSent();
+        expect(orderDispatchInFlight()).toBe(false);
+    });
+
+    it('確認期間開始切換（含結果確認中）：確認後重驗擋下', async () => {
+        m.confirm.mockImplementation(async () => { setEnvSwitch({ target: 'SIMULATION', phase: 'checking' }); return true; });
+        const err = await rejection(submitMobileOrder(stockInput(esunStock), guards));
+        expect(err).toMatchObject({ message: ENV_SWITCH_NOT_SENT, mutationNotStarted: true });
+        noOrderSent();
+    });
+
+    it('beforeDispatch（HTTP 送出前最後一刻）也擋', async () => {
+        m.placeStock.mockImplementation(async (...args: unknown[]) => {
+            const dispatch = args[3] as { beforeDispatch: () => void };
+            setEnvSwitch(PRODUCTION);
+            dispatch.beforeDispatch();
+            return { order: { id: 'never' } };
+        });
+        const err = await rejection(submitMobileOrder(stockInput(esunStock), guards));
+        expect(err).toMatchObject({ message: ENV_SWITCH_NOT_SENT, mutationNotStarted: true });
+    });
+
+    it('送出流程期間計入「委託送出中」（環境切換據此擋下），結束或失敗都歸零', async () => {
+        let resolve!: (v: unknown) => void;
+        m.placeStock.mockReturnValue(new Promise(r => { resolve = r; }));
+        const p = submitMobileOrder(stockInput(esunStock), guards);
+        await Promise.resolve();
+        expect(orderDispatchInFlight()).toBe(true);
+        resolve({ order: { id: 's1' } });
+        await p;
+        expect(orderDispatchInFlight()).toBe(false);
+        m.placeStock.mockRejectedValue(new Error('boom'));
+        await rejection(submitMobileOrder(stockInput(esunStock), guards));
+        expect(orderDispatchInFlight()).toBe(false);
     });
 });

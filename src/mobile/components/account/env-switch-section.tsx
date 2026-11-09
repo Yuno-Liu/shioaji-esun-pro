@@ -33,6 +33,8 @@ import * as controls from '../../styles/controls.css';
 import * as routeStyles from '../../styles/route-badge.css';
 import * as sb from '../../styles/status-bar.css';
 import { InlineNote } from '../../ui/inline-note';
+// 根層面板（app.tsx 延遲載入）的模組放進帳戶頁 chunk：開始切換時已在記憶體，面板立即出現
+import '../env-switch-overlay';
 import { BottomSheet, SheetFooter } from '../bottom-sheet';
 import { SlideToConfirm } from '../slide-to-confirm';
 import { Item, type Tone } from './account-ui';
@@ -179,7 +181,8 @@ function EnvSwitchSheet({ target, onClose }: { target: EsunEnvironment | null; o
         return () => { mounted.current = false; };
     }, []);
 
-    // 開啟時重新讀一次 health：bridge 停止時舊的 health 仍在，不能據以判斷「已連線」
+    // 開啟時重新讀一次 health：bridge 停止時舊的 health 仍在，不能據以判斷「已連線」。
+    // 關閉時就把探測結果與錯誤歸零：下次開啟的第一次渲染不會沿用上次的 'ok'（舊 health）
     useEffect(() => {
         if (!open) return undefined;
         let cancelled = false;
@@ -188,7 +191,11 @@ function EnvSwitchSheet({ target, onClose }: { target: EsunEnvironment | null; o
         void esunTradeService.refreshHealth().catch(() => null).then(h => {
             if (!cancelled) setProbe(h ? 'ok' : 'down');
         });
-        return () => { cancelled = true; };
+        return () => {
+            cancelled = true;
+            setProbe('checking');
+            setError(null);
+        };
     }, [open, t]);
 
     const block = esunSwitchBlock(t, probe);
@@ -205,7 +212,7 @@ function EnvSwitchSheet({ target, onClose }: { target: EsunEnvironment | null; o
             // runEsunEnvSwitch 在送出前再判斷一次全部擋下條件（含這次開啟面板時的 bridge 探測結果）
             const res = await runEsunEnvSwitch(t, probe);
             if (!mounted.current) return;
-            if (res?.ok) {
+            if (res?.outcome === 'switched') {
                 onClose();
                 return;
             }

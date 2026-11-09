@@ -52,12 +52,13 @@ import {
     type TradeAccount,
 } from '../components/order-action-sheet';
 import { OrderDetailSheet } from '../components/order-detail-sheet';
-import { routeBadgeText, useOrderRoute } from '../components/route-badge';
+import { routeBadgeText, useRowRoute } from '../components/route-badge';
 import { SlideToConfirm } from '../components/slide-to-confirm';
 import { instrumentText } from '../lib/contract-names';
 import { isNotStarted } from '../lib/errors';
 import { openOrderAction } from '../lib/mobile-store';
 import { collectDealRows, dealTotals, quantitiesText, type DealRow } from '../lib/order-fills';
+import { assertNoEnvSwitch } from '../lib/trading-activity';
 import * as styles from '../styles/orders.css';
 import { Chip } from '../ui/chip';
 import { EmptyState } from '../ui/empty-state';
@@ -496,7 +497,7 @@ function TradeName({ trade }: { trade: Trade }) {
 
 function AccountItem({ account, count }: { account: TradeAccount | null; count: number }) {
     const priv = usePrivacyMode();
-    const route = useOrderRoute(account);
+    const route = useRowRoute(account);
     return (
         <li className={styles.accountItem}>
             {account ? `${mobileAccountLabel(account, priv)}（${routeBadgeText(route)}）` : '帳戶未知'}：{fmtInt(count)} 筆
@@ -539,6 +540,7 @@ function CancelAllSheet({ open, working, onClose }: { open: boolean; working: Tr
         setFeedback(null);
         try {
             // 結果摘要（確認取消／未確認／未送出筆數）由 cancelAllOrders() 自行 notify
+            assertNoEnvSwitch(); // 玉山環境切換中不送（lib 的全部刪單沒有 beforeSend）
             await cancelAllOrders();
             onClose();
         } catch (err) {
@@ -654,9 +656,11 @@ function BatchCancelSheet({ open, targets, onBusyChange, onSent, onClose }: Batc
         setFeedback(null);
         setProgress({ done: 0, total: batch.length });
         try {
+            assertNoEnvSwitch();
             const settled = await cancelOrders(
                 batch.map(t => t.order.id),
                 () => setProgress(p => (p ? { done: p.done + 1, total: p.total } : p)),
+                assertNoEnvSwitch, // 玉山環境切換中：每筆送出前都不送
             );
             const summary = cancellationSummary(settled);
             notify({ title: '批次刪單結果', ...summary });

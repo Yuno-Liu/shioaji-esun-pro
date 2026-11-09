@@ -26,6 +26,8 @@ const m = vi.hoisted(() => {
         confirmListeners: new Set<() => void>(),
         serviceListeners: new Set<() => void>(),
         mutationListener: null as null | ((e: { token: string; phase: 'begin' | 'settled'; tradeId: string; base: string }) => void),
+        /** 每次渲染 SlideToConfirm 時的 disabled（觀察第一次渲染，act 會把中間狀態合併） */
+        slideDisabled: [] as boolean[],
         switchEnvironment: vi.fn(),
         refreshHealth: vi.fn(),
         reconnect: vi.fn(),
@@ -74,12 +76,24 @@ vi.mock('../../../hooks/use-query', () => ({ invalidateAllQueries: m.invalidate 
 vi.mock('../../../lib/trading-state', () => ({ refreshTradingStateForModeChange: m.refreshMode }));
 vi.mock('../../../lib/server-info-store', () => ({ useServerInfo: () => m.info }));
 vi.mock('../../../lib/shioaji', () => m.orderFns);
+vi.mock('../slide-to-confirm', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../slide-to-confirm')>();
+    const { createElement: h } = await import('react');
+    return {
+        ...actual,
+        SlideToConfirm: (p: Parameters<typeof actual.SlideToConfirm>[0]) => {
+            m.slideDisabled.push(!!p.disabled);
+            return h(actual.SlideToConfirm, p);
+        },
+    };
+});
 
 import { tradingLimitsKey } from '../../hooks/use-trading-limits';
 import { setBatchExit } from '../../lib/batch-exit-auth';
-import { resetEsunEnvSwitchForTest, runEsunEnvSwitch } from '../../lib/esun-env-switch';
+import { runEsunEnvSwitch } from '../../lib/esun-env-switch';
 import { resetEsunReconnectForTest } from '../../lib/esun-reconnect';
-import { closeOrderAction, closeTicket, openOrderAction, openTicket, resetMobileUiForTest } from '../../lib/mobile-store';
+import { closeOrderAction, closeTicket, getMobileUi, openOrderAction, openTicket, resetMobileUiForTest } from '../../lib/mobile-store';
+import { beginOrderDispatch, getEnvSwitch, resetTradingActivityForTest } from '../../lib/trading-activity';
 import { BottomSheet } from '../bottom-sheet';
 import { SlideToConfirm } from '../slide-to-confirm';
 import { EnvSwitchSection } from './env-switch-section';
@@ -106,7 +120,8 @@ function expectNoOrders() {
 
 beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
-    resetEsunEnvSwitchForTest();
+    resetTradingActivityForTest();
+    m.slideDisabled = [];
     resetEsunReconnectForTest();
     resetMobileUiForTest();
     setBatchExit(false);
@@ -126,15 +141,18 @@ beforeEach(() => {
     m.refreshHealth.mockReset();
     m.refreshHealth.mockImplementation(async () => m.health);
     m.reconnect.mockReset();
-    m.notify.mockClear();
-    m.invalidate.mockClear();
-    m.refreshMode.mockClear();
+    m.notify.mockReset();
+    m.invalidate.mockReset();
+    m.refreshMode.mockReset();
+    m.refreshMode.mockImplementation(async () => undefined);
     for (const fn of [...Object.values(m.orderFns), ...Object.values(m.esunOrderFns)]) fn.mockClear();
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
     view = undefined;
     setBatchExit(false);
+    resetTradingActivityForTest();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
 });
 
@@ -256,13 +274,18 @@ describe('EnvSwitchSection — to PRODUCTION (slide required)', () => {
         expectNoOrders();
     });
 
-    it('a thrown error is reported as a failure', async () => {
+    it('a thrown error is not a definite failure: health is re-read before reporting', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
         m.switchEnvironment.mockRejectedValue(new Error('network down'));
         await mount();
         await click('env-option-production');
         await act(async () => { slide()!.props.onConfirm(); });
-        expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: '環境切換失敗', body: 'network down' });
+        expect(getEnvSwitch()).toEqual({ target: 'PRODUCTION', phase: 'checking' });
+        expect(m.notify).not.toHaveBeenCalled();
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: '環境切換失敗', body: 'network down（已由 bridge 狀態確認仍為原環境）' });
         expect(text(one('env-switch-error'))).toContain('network down');
+        expect(getEnvSwitch()).toBeNull();
     });
 });
 
@@ -279,6 +302,7 @@ describe('EnvSwitchSection — blocking conditions', () => {
         ['order confirm pending', () => { m.pendingConfirm = { code: '2330' }; }, '委託確認進行中'],
         ['batch exit running', () => { setBatchExit(true); }, '多選出清進行中'],
         ['cancel / modify in flight', () => { m.mutationListener!({ token: 'k1', phase: 'begin', tradeId: 'T1', base: '' }); }, '刪單／改單送出中'],
+        ['order or close dispatch in flight (平倉)', () => { beginOrderDispatch(); }, '委託送出中（下單或平倉）'],
     ];
 
     it.each(cases)('%s: the option is disabled with the reason', async (_name, apply, reason) => {
@@ -359,5 +383,132 @@ describe('S1 and environment-keyed caches', () => {
 
     it('trading-limits cache keys differ between the simulation and production E.SUN account', () => {
         expect(tradingLimitsKey({ broker_id: '8840-SIM', account_id: '1234567' })).not.toBe(tradingLimitsKey({ broker_id: '8840', account_id: '1234567' }));
+    });
+});
+
+describe('EnvSwitchSection — lost response / timeout (MEDIUM-2)', () => {
+    const TIMEOUT = '玉山環境切換失敗：玉山下單服務 (esun-bridge) 回應逾時（30 秒）';
+    async function slideToProduction() {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        m.switchEnvironment.mockResolvedValue({ ok: false, environment: 'SIMULATION', entry: 'e', bridgeUpdated: false, error: TIMEOUT });
+        await mount();
+        await click('env-option-production');
+        await act(async () => { slide()!.props.onConfirm(); });
+    }
+
+    it('keeps every gate and the non-dismissible sheet while checking; bridge did switch → reported as switched', async () => {
+        await slideToProduction();
+        expect(getEnvSwitch()).toEqual({ target: 'PRODUCTION', phase: 'checking' });
+        expect(sheet().props.dismissible).toBe(false);
+        expect(one('env-switch-cancel').props.disabled).toBe(true);
+        openTicket({ code: '2330' });
+        expect(getMobileUi().ticket).toBeNull();
+        expect(m.notify).not.toHaveBeenCalled();
+        m.health = { ...HEALTH, environment: 'PRODUCTION' }; // bridge 其實已切換
+        await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+        expect(getEnvSwitch()).toBeNull();
+        expect(m.invalidate).toHaveBeenCalledTimes(1);
+        expect(m.refreshMode).toHaveBeenCalledTimes(1);
+        expect(m.notify).toHaveBeenCalledTimes(1);
+        expect(m.notify.mock.calls[0]![0]).toMatchObject({ kind: 'ok', title: '環境切換' });
+        expect(m.notify.mock.calls[0]![0].body).toContain('已由 bridge 狀態確認');
+        expect(sheet().props.open).toBe(false);
+        expectNoOrders();
+    });
+
+    it('bridge stays on the old environment for the whole recheck → failed (confirmed), then the gate opens', async () => {
+        await slideToProduction();
+        await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+        expect(getEnvSwitch()?.phase).toBe('checking'); // 還在確認，不提早宣告
+        expect(m.notify).not.toHaveBeenCalled();
+        await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+        expect(getEnvSwitch()).toBeNull();
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: '環境切換失敗', body: `${TIMEOUT}（已由 bridge 狀態確認仍為原環境）` });
+        expect(text(one('env-switch-error'))).toContain('仍為原環境');
+        expect(sheet().props.dismissible).toBe(true);
+        expect(m.invalidate).not.toHaveBeenCalled();
+    });
+
+    it('health never readable → unknown, tells the user to check 帳戶 › 連線', async () => {
+        await slideToProduction();
+        m.refreshHealth.mockResolvedValue(null);
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+        expect(getEnvSwitch()).toBeNull();
+        const call = m.notify.mock.calls.at(-1)![0];
+        expect(call).toMatchObject({ kind: 'err', title: '環境切換結果未知' });
+        expect(call.body).toContain('帳戶 › 連線');
+        expect(text(one('env-switch-error'))).toContain('無法確認');
+        expect(m.invalidate).not.toHaveBeenCalled();
+    });
+
+    it('bridge 409 (mutations in flight) is a definite failure shown with the bridge text, after one health check', async () => {
+        const busy = '玉山環境切換失敗：玉山委託處理中（1 筆），暫時不能切換環境；請等委託結果回來後再試';
+        m.switchEnvironment.mockResolvedValue({ ok: false, environment: 'SIMULATION', entry: 'e', bridgeUpdated: false, error: busy });
+        await mount();
+        await click('env-option-production');
+        const probes = m.refreshHealth.mock.calls.length;
+        await act(async () => { slide()!.props.onConfirm(); });
+        expect(m.refreshHealth.mock.calls.length).toBe(probes + 1);
+        expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: '環境切換失敗', body: busy });
+        expect(text(one('env-switch-error'))).toContain('委託處理中');
+        expect(getEnvSwitch()).toBeNull();
+    });
+});
+
+describe('EnvSwitchSection — LOW findings', () => {
+    it('LOW-1: reopening never renders with the previous probe result', async () => {
+        await mount();
+        await click('env-option-production');
+        await flush();
+        expect(slide()!.props.disabled).toBe(false);
+        await click('env-switch-cancel');
+        m.refreshHealth.mockReturnValue(new Promise(() => undefined));
+        m.slideDisabled = [];
+        await click('env-option-production');
+        expect(m.slideDisabled.length).toBeGreaterThan(0);
+        expect(m.slideDisabled.every(Boolean)).toBe(true); // 第一次渲染就停用（不沿用上次的 ok）
+        expect(slide()!.props.disabledReason).toContain('確認玉山 bridge 狀態');
+    });
+
+    it('LOW-2: a throw after a successful switch is not reported as 失敗', async () => {
+        m.invalidate.mockImplementationOnce(() => { throw new Error('listener boom'); });
+        m.refreshMode.mockImplementationOnce(() => { throw new Error('refresh boom'); });
+        await mount();
+        await click('env-option-production');
+        await act(async () => { slide()!.props.onConfirm(); });
+        expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ok', title: '環境切換' }));
+        expect(m.notify).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'err' }));
+        expect(sheet().props.open).toBe(false);
+        expect(m.switchEnvironment).toHaveBeenCalledTimes(1);
+    });
+
+    it('LOW-2: a throwing notify after success still closes as switched', async () => {
+        m.notify.mockImplementationOnce(() => { throw new Error('toast boom'); });
+        await mount();
+        await click('env-option-production');
+        await act(async () => { slide()!.props.onConfirm(); });
+        expect(sheet().props.open).toBe(false);
+        expect(find('env-switch-error')).toHaveLength(0);
+    });
+});
+
+describe('EnvSwitchSection — route change during a switch (CRITICAL-1)', () => {
+    it('unmounting the account page keeps the switch gate until the bridge answers', async () => {
+        let resolve!: (v: unknown) => void;
+        m.switchEnvironment.mockReturnValue(new Promise(r => { resolve = r; }));
+        await mount();
+        await click('env-option-production');
+        await act(async () => { slide()!.props.onConfirm(); });
+        await act(async () => view!.unmount()); // 系統返回手勢：帳戶頁卸載
+        view = undefined;
+        expect(getEnvSwitch()).toEqual({ target: 'PRODUCTION', phase: 'switching' });
+        openTicket({ code: '2330' });
+        openOrderAction('T1');
+        expect(getMobileUi().ticket).toBeNull();
+        expect(getMobileUi().orderAction).toBeNull();
+        await act(async () => { resolve({ ok: true, environment: 'PRODUCTION', entry: 'e', bridgeUpdated: true }); });
+        expect(getEnvSwitch()).toBeNull();
+        expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ok', title: '環境切換' }));
+        expectNoOrders();
     });
 });

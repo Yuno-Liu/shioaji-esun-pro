@@ -28,7 +28,17 @@ vi.mock('../lib/working-order-quantity', () => ({ remainingWorkingOrderQuantity:
 vi.mock('./components/status-bar', () => ({ StatusBar: () => createElement('div', { 'data-testid': 'mock-status-bar' }) }));
 vi.mock('./components/toast-host', () => ({ ToastHost: () => createElement('div', { 'data-testid': 'mock-toast-host' }) }));
 vi.mock('./components/order-confirm-sheet', () => ({ OrderConfirmSheet: () => createElement('div', { 'data-testid': 'mock-confirm-sheet' }) }));
-vi.mock('./components/bottom-sheet', () => ({ BottomSheet: () => null }));
+// 根層玉山環境切換面板（EnvSwitchOverlay）以標記節點呈現開啟狀態與可否關閉；其他面板不渲染
+vi.mock('./components/bottom-sheet', async () => {
+    const { createElement: h } = await import('react');
+    return {
+        BottomSheet: (p: { testId?: string; open: boolean; dismissible?: boolean; layer?: string; title?: string }) => (
+            p.testId === 'env-switch-overlay' && p.open
+                ? h('div', { 'data-testid': 'env-switch-overlay-open', 'data-dismissible': String(p.dismissible), 'data-layer': p.layer, 'data-title': p.title })
+                : null
+        ),
+    };
+});
 vi.mock('./components/order-ticket-sheet', () => ({ OrderTicketSheet: () => null }));
 vi.mock('./components/order-action-sheet', () => ({ OrderActionSheet: () => null }));
 vi.mock('./routes/watchlist-page', () => ({
@@ -71,7 +81,8 @@ vi.mock('./lib/watchlist-context', () => ({ WatchlistProvider: ({ children }: { 
 
 import { MobileShell, tabAriaLabel } from './app';
 import { registerSheet, resetSheetStackForTest } from './lib/sheet-stack';
-import { getMobileUi, resetMobileUiForTest } from './lib/mobile-store';
+import { getMobileUi, openOrderAction, openTicket, resetMobileUiForTest } from './lib/mobile-store';
+import { resetTradingActivityForTest, setEnvSwitch } from './lib/trading-activity';
 import { navigate } from './lib/hash-router';
 
 /** 假的 DOM 元素：讓殼層把它當成真實節點（instanceof HTMLElement）而啟用 portal 與背景隔離 */
@@ -384,5 +395,46 @@ describe('切換分頁：舊頁 portal 不殘留', () => {
         expect(byTestId('trade-page')[0]!.children).toEqual(['2317']);
         expect(getMobileUi().currentCode).toBe('2317');
         expect(m.tradeMounts).toBe(1);
+    });
+});
+
+describe('玉山環境切換中：根層面板（CRITICAL-1）', () => {
+    const goTo = async (hash: string) => {
+        await act(async () => {
+            (location as { hash: string }).hash = hash;
+            window.dispatchEvent(new Event('hashchange'));
+        });
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    };
+    afterEach(() => { resetTradingActivityForTest(); });
+
+    it('換頁（返回手勢、改 hash）不會移除面板；不可關閉；切換中不開下單與委託操作面板', async () => {
+        (location as { hash: string }).hash = '#/account';
+        await mount();
+        expect(byTestId('env-switch-overlay-open')).toHaveLength(0);
+        await act(async () => { setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' }); });
+        // 面板模組延遲載入（帳戶頁 chunk 已帶著它）：等 import 完成
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+        await act(async () => { await vi.dynamicImportSettled(); });
+        expect(byTestId('env-switch-overlay-open')).toHaveLength(1);
+        expect(one('env-switch-overlay-open').props['data-dismissible']).toBe('false');
+        expect(one('env-switch-overlay-open').props['data-layer']).toBe('confirm');
+        for (const hash of ['#/orders', '#/positions', '#/watchlist', '#/trade/2330']) {
+            await goTo(hash);
+            expect(byTestId('env-switch-overlay-open')).toHaveLength(1);
+        }
+        openTicket({ code: '2330', action: 'Buy' });
+        openOrderAction('T1', 'cancel');
+        expect(getMobileUi().ticket).toBeNull();
+        expect(getMobileUi().orderAction).toBeNull();
+        // 回應逾時後的結果確認中：仍顯示、仍擋
+        await act(async () => { setEnvSwitch({ target: 'PRODUCTION', phase: 'checking' }); });
+        expect(one('env-switch-overlay-open').props['data-title']).toBe('環境切換結果確認中');
+        openTicket({ code: '2330' });
+        expect(getMobileUi().ticket).toBeNull();
+        await act(async () => { setEnvSwitch(null); });
+        expect(byTestId('env-switch-overlay-open')).toHaveLength(0);
+        await act(async () => { openTicket({ code: '2330' }); });
+        expect(getMobileUi().ticket).not.toBeNull();
     });
 });

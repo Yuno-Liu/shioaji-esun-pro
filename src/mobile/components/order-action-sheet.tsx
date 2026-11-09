@@ -47,6 +47,7 @@ import { avgFillPrice, avgPriceDigits, fillProgress, orderBadges } from '../lib/
 import { closeOrderAction, useMobileUi, type OrderActionKind } from '../lib/mobile-store';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { acknowledgeStaleData, assertResumeReady, getResumeGate, retryResume, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
+import { assertNoEnvSwitch } from '../lib/trading-activity';
 import * as a from '../styles/order-action.css';
 import * as styles from '../styles/orders.css';
 import { focusRing, pressable } from '../styles/primitives.css';
@@ -381,6 +382,13 @@ function useMutationRunner(onBusyChange: (busy: boolean) => void): MutationRunne
     const run: MutationRunner['run'] = async (verb, call, onOk, opts) => {
         if (busyRef.current) return;
         setFeedback(null);
+        // 玉山環境切換中：改價、減量、刪單一律不送（含不受 ResumeGate 限制的刪單）
+        try {
+            assertNoEnvSwitch();
+        } catch (err) {
+            notSent(err);
+            return;
+        }
         if (opts.gated) {
             // 滑動完成後、呼叫 lib 前同步再檢查一次（期間可能切到背景或斷線）
             try {
@@ -688,7 +696,7 @@ function CancelForm({ trade, working, runner, onBack }: { trade: Trade; working:
                     resetKey={runner.resetKey}
                     onConfirm={() => {
                         // 刪單不受 ResumeGate、LIVE 與風控鎖限制（降低風險的動作）
-                        void runner.run('刪單', () => cancelOrder(tradeId), (result: Trade) => {
+                        void runner.run('刪單', () => cancelOrder(tradeId, { beforeSend: assertNoEnvSwitch }), (result: Trade) => {
                             notify({ title: '刪單結果', ...cancellationSummary([{ status: 'fulfilled', value: result }]) });
                         }, { gated: false });
                     }}

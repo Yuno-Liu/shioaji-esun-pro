@@ -46,6 +46,7 @@ import type { AccountedTrade } from '../../lib/types/order';
 import { notStarted } from '../lib/errors';
 import { closeOrderAction, getMobileUi, openOrderAction, resetMobileUiForTest } from '../lib/mobile-store';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
+import { assertNoEnvSwitch, resetTradingActivityForTest, setEnvSwitch } from '../lib/trading-activity';
 import { ListRow } from '../ui/grouped';
 import { BottomSheet, SheetFooter } from './bottom-sheet';
 import {
@@ -324,8 +325,35 @@ describe('OrderActionSheet — 刪單', () => {
         expect(slide()!.props.disabled).toBe(false);
         expect(slide()!.props.tone).toBe('danger');
         await confirm();
-        expect(m.cancelOrder).toHaveBeenCalledWith('o1');
+        expect(m.cancelOrder).toHaveBeenCalledWith('o1', { beforeSend: assertNoEnvSwitch });
         expect(m.assertLive).not.toHaveBeenCalled();
+    });
+
+    it('玉山環境切換中：刪單、改價都不送（未送出）；lib 送出前的 beforeSend 也擋（CRITICAL-1）', async () => {
+        await open('o1', 'cancel');
+        setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+        await confirm();
+        expect(m.cancelOrder).not.toHaveBeenCalled();
+        expect(text(byTestId('order-action-feedback')[0]!)).toContain('玉山環境切換中，這筆沒有送出');
+        // 滑動時還沒切換、lib 送出前才開始切換：beforeSend 丟出未送出
+        resetTradingActivityForTest();
+        m.cancelOrder.mockImplementation(async (_id: string, opts?: { beforeSend?: () => void }) => {
+            setEnvSwitch({ target: 'PRODUCTION', phase: 'switching' });
+            opts?.beforeSend?.();
+            return trade('o1');
+        });
+        await confirm();
+        expect(m.cancelOrder).toHaveBeenCalledTimes(1);
+        expect(text(byTestId('order-action-feedback')[0]!)).toContain('玉山環境切換中');
+        resetTradingActivityForTest();
+        // 改價
+        await act(async () => { closeOrderAction(); });
+        await open('o1', 'price');
+        setEnvSwitch({ target: 'SIMULATION', phase: 'checking' });
+        await confirm();
+        expect(m.updatePrice).not.toHaveBeenCalled();
+        expect(text(byTestId('order-action-feedback')[0]!)).toContain('玉山環境切換中');
+        resetTradingActivityForTest();
     });
 
     it('shows 此委託已不在未成交 and disables actions when the order fills while open', async () => {
