@@ -661,6 +661,17 @@ export const limitsLineNote = style({
     color: vars.color.mutedForeground,
 });
 
+/** 玉山估算明細（「上限 L；今日買進 已成交 A＋未成交 B」）：獨占一行、靠右，窄螢幕可換行 */
+export const limitsLineSub = style({
+    ...TEXT.footnote,
+    ...NUMERIC,
+    flexBasis: '100%',
+    paddingBottom: SPACE.s2,
+    color: vars.color.mutedForeground,
+    textAlign: 'right',
+    overflowWrap: 'anywhere',
+});
+
 // ---- 已實現損益 ----
 
 /** 自訂區間：起日／迄日兩欄；字級「大」改單欄（日期欄文字較長，不擠壓） */

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({ fetchTradingLimits: vi.fn() }));
 vi.mock('../../lib/shioaji', () => ({ fetchTradingLimits: m.fetchTradingLimits }));
+vi.mock('../../lib/trading-state', () => ({ useTradingState: () => ({ trades: [], queries: { orders: { updatedAt: null } } }) }));
 
 import {
     TRADING_LIMITS_MIN_REFRESH_MS,

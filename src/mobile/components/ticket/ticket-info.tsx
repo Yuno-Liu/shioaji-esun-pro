@@ -3,7 +3,9 @@
 // - 剩餘交易額度：只有證券帳戶（期貨帳戶不顯示）；useTradingLimits(account) 的快取與節流由 hook 處理，
 //   依信用條件取 現股 trading_available／融資 margin_available／融券 short_available。
 //   融資賣出（償還）、融券買進（回補）是了結單：不顯示信用剩餘額度，改說明不占融資／融券額度。
-//   玉山帳戶（limitsAreCapsOnly）只有額度上限：顯示「交易額度上限 X 元（玉山不提供剩餘額度）」，不可稱剩餘或可用。
+//   玉山帳戶（limitsAreCapsOnly）只有額度上限：現股顯示「估算剩餘額度 X 元」與「上限 L；今日買進 已成交 A＋未成交 B」
+//   （useEsunLimitEstimate，與帳戶頁額度卡、持倉頁一行同一個估算；不另發查詢）；融資／融券照舊只顯示「…額度上限 X 元
+//   （玉山不提供剩餘額度）」，不可稱剩餘或可用。
 //   模擬環境或非 08:30–15:00 時 lib 回全 0（limitsLookEmpty）→ 顯示「—」並說明，不顯示「剩餘 0 元」。
 // - 預估價金：沿用 use-mobile-ticket 的 estimateAmount（股票不含手續費與稅；期權為名目價值、不估保證金）。
 // - 交易成本：股票限價單才估（比照桌面 CostEstimate），重用 src/components/trade-cost-summary.tsx 的 tradeCostText
@@ -19,7 +21,9 @@ import { useTradingCostSettings } from '../../../lib/trading-cost-settings';
 import type { ContractInfo } from '../../../lib/types/contract';
 import type { Account } from '../../../lib/types/portfolio';
 import { parsePrice, sendsDaytradeShort, type TicketFields } from '../../hooks/use-mobile-ticket';
+import { useEsunLimitEstimate } from '../../hooks/use-esun-limit-estimate';
 import { availableLimitFor, limitsAreCapsOnly, limitsLookEmpty, useTradingLimits } from '../../hooks/use-trading-limits';
+import { ESUN_ESTIMATE_TEXT, esunBreakdownText, esunEstimateFlags } from '../../lib/esun-limit-estimate';
 import * as styles from '../../styles/order-ticket.css';
 
 export const LIMIT_TEXT = {
@@ -30,6 +34,8 @@ export const LIMIT_TEXT = {
     closingCredit: '了結信用部位不占融資／融券額度',
     /** 玉山只提供額度上限，沒有已用／剩餘（F4:F1） */
     capsOnly: '玉山不提供剩餘額度',
+    /** 玉山現股：估算剩餘的標籤 */
+    esunEstimate: `${ESUN_ESTIMATE_TEXT.label}額度`,
 } as const;
 
 const LIMIT_LABEL: Record<TicketFields['orderCond'], string> = {
@@ -80,6 +86,7 @@ export interface TicketInfoProps {
 export function TicketInfo({ contract, account, fields, isFutures, estimate }: TicketInfoProps) {
     const privMoney = usePrivacyMoney();
     const limits = useTradingLimits(isFutures ? null : account);
+    const esunEstimate = useEsunLimitEstimate(isFutures ? null : account, limits.data);
     const settings = useTradingCostSettings();
 
     const capsOnly = limitsAreCapsOnly(account);
@@ -92,6 +99,12 @@ export function TicketInfo({ contract, account, fields, isFutures, estimate }: T
             // 了結單：不顯示融資／融券剩餘（或上限），只說明不占額度
             limitLabel = CLOSING_LABEL[fields.orderCond];
             limitNote = LIMIT_TEXT.closingCredit;
+        } else if (capsOnly && fields.orderCond === 'Cash' && esunEstimate) {
+            // 玉山現股：估算剩餘（只扣今日買進）
+            const money = (v: number) => `${maskMoney(fmtAmount(v), privMoney)} 元`;
+            limitLabel = LIMIT_TEXT.esunEstimate;
+            limitValue = money(esunEstimate.remaining);
+            limitNote = [esunBreakdownText(esunEstimate, money), ...esunEstimateFlags(esunEstimate)].join('；') + `（${ESUN_ESTIMATE_TEXT.short}）`;
         } else if (limits.data && !limitsLookEmpty(limits.data)) {
             const v = limitValueFor(limits.data, fields.orderCond, capsOnly);
             limitValue = v === null ? '—' : `${maskMoney(fmtAmount(v), privMoney)} 元`;
