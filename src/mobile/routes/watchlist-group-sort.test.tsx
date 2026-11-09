@@ -146,9 +146,15 @@ const one = (id: string) => {
 const textOf = (n: ReactTestInstance): string => n.children.map(c => (typeof c === 'string' ? c : textOf(c))).join('');
 const sheet = () => view!.root.findAll(n => n.type === BottomSheet && n.props.testId === 'watch-group-sort')[0];
 const click = async (n: ReactTestInstance) => { await act(async () => { n.props.onClick(); }); };
-const tabOrder = () => view!.root
+const allTabs = () => view!.root
     .findAll(n => typeof n.type === 'string' && String(n.props['data-testid'] ?? '').startsWith('watch-list-tab-'))
     .map(n => String(n.props['data-testid']).slice('watch-list-tab-'.length));
+// 固定清單「股期近月」「股期遠月」一定接在自己的清單之後（不參與群組排序）
+const tabOrder = () => {
+    const ids = allTabs();
+    expect(ids.slice(-2)).toEqual(['fut-near', 'fut-next']);
+    return ids.slice(0, -2);
+};
 const sheetRows = () => all('watch-group-row');
 const sheetOrder = () => sheetRows().map(r => r.props['data-code'] as string);
 const rowOf = (id: string) => sheetRows().find(r => r.props['data-code'] === id)!;

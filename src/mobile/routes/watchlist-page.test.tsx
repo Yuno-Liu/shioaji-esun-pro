@@ -1276,10 +1276,12 @@ describe('WatchlistPage 表頭編輯鍵與清單分頁', () => {
         expect(view!.root.findAll(n => n.props['data-testid'] === 'watch-search' && n.type === 'button')).toHaveLength(1);
     });
 
-    it('只有 1 個清單時不顯示分頁', async () => {
+    it('只有 1 個清單時仍顯示分頁：自己的清單＋最後的固定清單「股期近月」「股期遠月」', async () => {
         m.wl = { ...m.wl, serverLists: [{ id: 'a', name: '我的自選', contracts: [] }] };
         await render();
-        expect(view!.root.findAll(n => n.props['data-testid'] === 'watch-list-tabs')).toHaveLength(0);
+        expect(view!.root.findAll(n => n.props['data-testid'] === 'watch-list-tabs')).toHaveLength(1);
+        const tabs = view!.root.findAll(n => n.type === 'button' && String(n.props['data-testid'] ?? '').startsWith('watch-list-tab-'));
+        expect(tabs.map(t => t.props['data-testid'])).toEqual(['watch-list-tab-a', 'watch-list-tab-fut-near', 'watch-list-tab-fut-next']);
     });
 
     it('清單結構忙碌時分頁停用', async () => {

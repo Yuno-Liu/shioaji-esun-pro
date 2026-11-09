@@ -237,13 +237,13 @@ describe('新增清單（清單列最後的「＋」）', () => {
     const type = async (v: string) => { await act(async () => { input().props.onChange({ target: { value: v } }); }); };
     const submit = async () => { await act(async () => { view!.root.find(n => n.type === 'form').props.onSubmit({ preventDefault: vi.fn() }); }); };
 
-    it('多個清單時在分頁之後；只有一個清單時（不顯示分頁）也有「＋」', async () => {
+    it('在分頁之後；只有一個清單時（仍有固定清單的分頁）也有「＋」', async () => {
         await render();
         expect(one('watch-list-add').props['aria-label']).toBe('新增自選清單');
         await act(async () => view!.unmount());
         m.wl = { ...m.wl, serverLists: [LISTS[0]] };
         await render();
-        expect(all('watch-list-tabs')).toHaveLength(0);
+        expect(all('watch-list-tabs')).toHaveLength(1);
         expect(all('watch-list-add')).toHaveLength(1);
     });
 

@@ -37,7 +37,7 @@ export const controls = style({
     minWidth: 0,
 });
 
-/** 清單列：清單分頁（或只有一個清單時的名稱）＋最後的「＋」新增清單鍵 */
+/** 清單列：清單分頁（自己的清單＋固定清單「股期近月」「股期遠月」，一定有分頁）＋最後的「＋」新增清單鍵 */
 export const listBar = style({
     display: 'flex',
     alignItems: 'center',
@@ -49,18 +49,6 @@ export const listBar = style({
 export const listTabs = style({
     flex: '1 1 auto',
     minWidth: 0,
-});
-
-/** 只有一個清單時的清單名稱（清單列內） */
-export const listBarName = style({
-    flex: '1 1 auto',
-    minWidth: 0,
-    margin: 0,
-    ...TEXT.footnote,
-    color: vars.color.mutedForeground,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
 });
 
 /** 編輯模式的清單工具（重新命名、刪除清單）：點擊區 TOUCH_MIN */
@@ -128,11 +116,17 @@ export const stateBlock = style({
 
 // ---- 表頭（名稱｜指標切換鍵｜編輯） ----
 
-/** 表頭高 TOUCH_MIN（編輯鍵 44px）；指標切換鍵外觀 28px，擴張點擊區仍落在表頭內 */
+/**
+ * 表頭高 TOUCH_MIN（編輯鍵 44px）；指標切換鍵外觀 28px，擴張點擊區仍落在表頭內。
+ * 可換行：股價類排序時「排序依據 HH:MM:SS ⟳」（styles/watch-sort.css.ts basisLine，order 1、佔滿一行）排在第二行。
+ */
 export const listHeader = style([{
     display: 'flex',
+    flexWrap: 'wrap',
     alignItems: 'center',
-    gap: SPACE.s3,
+    columnGap: SPACE.s3,
+    // 換行（排序依據列）時兩行之間不留空
+    rowGap: 0,
     minHeight: TOUCH_MIN,
     padding: `0 calc(${SPACE.s1} + ${SAFE_RIGHT}) 0 calc(${PAD_X} + ${SAFE_LEFT})`,
     borderBottom: HAIRLINE,
@@ -183,7 +177,8 @@ export const metricToggle = style({
 });
 
 export const headerName = style({
-    flex: '1 1 auto',
+    // 基準 0：表頭可換行時「名稱」先縮，其他鍵不會被擠到第二行
+    flex: '1 1 0',
     minWidth: 0,
 });
 

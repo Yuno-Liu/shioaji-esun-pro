@@ -17,9 +17,10 @@
 //   「持倉」見 components/holdings-list.tsx（延遲載入；依 useTradingState().positions 自動列出，沒有任何編輯入口，不另外讀取）；
 //   「排行」分段不掛載自選列，自選列的行情訂閱隨之釋放。分段選擇在模組層保留（切換分頁再回來不變）。
 // - 版面（設計規格 §7.2，依使用者參考圖改版）：PageHeader（搜尋）；Segmented tabs（自選｜排行）；
-//   清單列：多個清單時清單分頁（Segmented scroll 變體，選中的自動捲進可見範圍；順序依這台裝置的群組順序，
-//   lib/watch-list-order.ts），只有一個清單時顯示名稱；最後是「＋」新增清單；
-//   表頭「名稱｜指標切換鍵（watch-metric-toggle）｜編輯（watch-edit）」，都在表頭、不在列按鈕內（避免巢狀互動）；
+//   清單列：清單分頁（Segmented scroll 變體，選中的自動捲進可見範圍；順序依這台裝置的群組順序，
+//   lib/watch-list-order.ts），最後接兩個固定清單「股期近月」「股期遠月」（所以只有一個清單時也顯示分頁）；最後是「＋」新增清單
+//   （固定清單時不顯示）；
+//   表頭「名稱｜排序鍵（watch-sort，延遲載入）｜指標切換鍵（watch-metric-toggle）｜編輯（watch-edit）」，都在表頭、不在列按鈕內（避免巢狀互動）；
 //   列 64px：名稱／代碼＋市場標記＋徽章（試撮、處置）｜成交價／「漲跌 漲跌幅」或總量（純文字、漲跌色）｜迷你走勢｜快速下單鍵。
 //   載入 Skeleton、空清單 EmptyState、錯誤 InlineNote。
 // - 清單增減（使用者要求「自選要增加可增加或減少的功能」）：
@@ -46,6 +47,12 @@
 //   掛載，把拖曳狀態與握把事件交回本頁。載入前與載入失敗時列首、列尾是同尺寸空白佔位（握把 NOOP），失敗在清單上方顯示
 //   「載入失敗」＋［重試］（再次進入編輯模式也會重新 import）；表頭、清單工具、加入股票與非編輯模式的列不受影響。
 //   編輯模式不顯示迷你走勢（列首、列尾各多一個鍵，讓出寬度給名稱）。
+// - 固定清單「股期近月」「股期遠月」（使用者要求；components/futures-list.tsx，延遲載入）：一般＋小型股票期貨的近月／遠月，
+//   由期貨合約清單自動產生（每個台北日 1 次請求），不存到永豐伺服器、不能編輯；選了固定清單時本頁不顯示表頭、編輯入口、
+//   「＋」與自選列，改由該元件顯示（列代碼是實際月份合約，下單路徑都開實際月份）。選擇在模組層保留；不呼叫 setActiveList。
+// - 排序（使用者要求；components/watch-sort.tsx，延遲載入）：表頭排序鍵把排好的代碼順序交回（setOrder），本頁依此排列列；
+//   只是檢視順序，絕不寫回伺服器清單。編輯模式不掛載排序鍵、一律伺服器順序；排序檢視中長按面板不顯示移到最上／上移／下移
+//   （它們依伺服器順序，與畫面不符）。股價類排序依一次批次快照，之後不自動重排。
 // - 迷你走勢（使用者明確要求，有限制地做）：只為可見列讀取目前（或最近一段）交易時段的 1 分 K，模組層快取每檔每段一次
 //   （盤中讀過的收盤後補讀一次）、佇列同時 2 個，即時成交以分鐘為桶接在尾段（lib/watch-sparkline-data.ts）；
 //   帳戶頁「顯示」可關閉，關閉時不掛載走勢欄、不發 K 線請求。指數、組合商品顯示空白佔位。
@@ -66,6 +73,7 @@
 //   （列的合約由 useWatchlist 預先放進快取，指數不經解析）；Quote 訂閱＝指數 2 筆＋每個可見列 Tick、BidAsk 各 1 筆；
 //   K 線 POST 每個可見可交易列 ≤1（假日補找時 2，同時 2 個，每檔每段讀過即快取）；走勢 chunk 1 個（通常已閒置預載）。
 //   清單管理只在使用者操作時發出（新增、改名、刪除、移除、排序各自是 use-watchlist 的既有請求）。
+//   檢視排序：股價類排序開啟（或選擇）時批次快照 POST 1 個（≤500 檔一批；5 秒內沿用）；其他排序 0 個。
 
 import { ChevronsUpDown, Pencil, Plus, Search, Star } from 'lucide-react';
 import { memo, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
@@ -85,7 +93,8 @@ import {
 } from '../components/quote-row';
 import { ModuleErrorBoundary, ModuleLoadError, retryableLazy, SheetLoadError } from '../components/route-error-boundary';
 import { WatchIndexStrip } from '../components/watch-index-strip';
-import { loadHoldingsList, loadRankingList, loadSearchSheet, loadWatchEditControls, loadWatchListSheet } from '../lib/deferred-modules';
+import { loadFuturesList, loadHoldingsList, loadRankingList, loadSearchSheet, loadWatchEditControls, loadWatchListSheet, loadWatchSort } from '../lib/deferred-modules';
+import type { FuturesListId } from '../lib/futures-lists';
 import { navigate } from '../lib/hash-router';
 import { openTicket } from '../lib/mobile-store';
 import { usePunishedCodes } from '../lib/regulatory-punish';
@@ -291,10 +300,12 @@ const WatchRow = memo(function WatchRow({ item, index, tracker, editing, editKey
 // ---------------------------------------------------------------------------
 // 長按操作面板（mode 'remove'：編輯模式列首「−」，只顯示移除並直接進入確認）
 
-function RowActionsSheet({ code, mode, items, onClose, onOpen, onRemove, onMove }: {
+function RowActionsSheet({ code, mode, items, moves, onClose, onOpen, onRemove, onMove }: {
     code: string | null;
     mode: 'actions' | 'remove';
     items: WatchItem[];
+    /** 顯示移到最上／上移／下移（依伺服器順序；排序檢視中不顯示，避免與畫面順序不符） */
+    moves: boolean;
     onClose: () => void;
     onOpen: (code: string) => void;
     onRemove: (code: string) => Promise<void>;
@@ -366,11 +377,13 @@ function RowActionsSheet({ code, mode, items, onClose, onOpen, onRemove, onMove 
                                     />
                                 )}
                             </GroupedSection>
-                            <GroupedSection>
-                                <ListRow title='移到最上' disabled={!top || busy} onClick={() => top && onMove(code, top)} />
-                                <ListRow title='上移' disabled={!up || busy} onClick={() => up && onMove(code, up)} />
-                                <ListRow title='下移' disabled={!down || busy} onClick={() => down && onMove(code, down)} />
-                            </GroupedSection>
+                            {moves && (
+                                <GroupedSection>
+                                    <ListRow title='移到最上' disabled={!top || busy} onClick={() => top && onMove(code, top)} />
+                                    <ListRow title='上移' disabled={!up || busy} onClick={() => up && onMove(code, up)} />
+                                    <ListRow title='下移' disabled={!down || busy} onClick={() => down && onMove(code, down)} />
+                                </GroupedSection>
+                            )}
                         </>
                     )}
                     <GroupedSection footer={confirmRemove && !busy ? '自選清單與桌面共用，移除後桌面也會看不到。' : undefined}>
@@ -404,6 +417,19 @@ const resetRankingList = () => { RankingList.reset(); };
 // 「持倉」分段（依持倉自動列出，不能手動新增或移除）：同排行，延遲載入、閒置時由 app.tsx 預載；載入失敗只在分段內容區顯示「載入失敗」＋［重試］。
 const HoldingsList = retryableLazy(() => loadHoldingsList().then(m => m.HoldingsList), 'HoldingsList');
 const resetHoldingsList = () => { HoldingsList.reset(); };
+
+// 固定清單「股期近月」「股期遠月」（components/futures-list.tsx；不存伺服器、不能編輯）：延遲載入，只在選了該分頁時掛載；
+// 載入失敗只在清單區顯示「載入失敗」＋［重試］。分頁接在自己的清單分頁之後；選擇在模組層保留（同分段）。
+const FuturesList = retryableLazy(() => loadFuturesList().then(m => m.FuturesList), 'FuturesList');
+const resetFuturesList = () => { FuturesList.reset(); };
+const FIXED_TABS = [
+    { value: 'fut:near', label: '股期近月', testId: 'watch-list-tab-fut-near' },
+    { value: 'fut:next', label: '股期遠月', testId: 'watch-list-tab-fut-next' },
+];
+let lastFixed: FuturesListId | null = null;
+// 表頭排序鍵（components/watch-sort.tsx）：延遲載入；只改顯示順序（onOrder 交回代碼順序），不寫回伺服器清單。
+// 載入前與載入失敗時表頭沒有排序鍵、清單照伺服器順序；編輯模式不掛載（顯示伺服器順序）。
+const WatchSort = retryableLazy(() => loadWatchSort().then(m => m.WatchSort), 'WatchSort');
 
 // 搜尋面板只在按「搜尋」（或空清單的「搜尋並加入」、編輯模式的「加入股票」）後才用到：延遲載入（連同 lib/product-search
 // 面板約 1.4 KiB gzip，另需上游搜尋本體 product-search chunk 約 18.7 KiB），閒置時由 app.tsx 預載。第一次要求開啟時才掛載、之後保持掛載（面板開關動畫正常；同 app.tsx 的下單面板）。
@@ -443,6 +469,7 @@ export function deleteListLabel(name: string, confirming: boolean, busy: boolean
 /** 測試用：分段回到「自選」 */
 export function resetWatchlistSegmentForTest(): void {
     lastSegment = 'watchlist';
+    lastFixed = null;
 }
 
 export function WatchlistPage() {
@@ -455,6 +482,10 @@ export function WatchlistPage() {
     const [actionCode, setActionCode] = useState<string | null>(null);
     const [actionMode, setActionMode] = useState<'actions' | 'remove'>('actions');
     const [segment, setSegmentState] = useState<WatchSegment>(lastSegment);
+    /** 選中的固定清單（null：自己的清單） */
+    const [fixed, setFixed] = useState(lastFixed);
+    /** 排序鍵交回的顯示順序（null：伺服器順序） */
+    const [order, setOrder] = useState<string[] | null>(null);
     const [metric, setMetricState] = useState<WatchMetric>(readMetric);
     /** 清單名稱面板（新增／重新命名） */
     const [listSheet, setListSheetState] = useState<'create' | 'rename' | null>(null);
@@ -535,20 +566,20 @@ export function WatchlistPage() {
     const activeList = wl.serverLists.find(l => l.id === wl.activeListId);
     // 群組（清單）分頁的順序只存在這台裝置（lib/watch-list-order.ts，每次渲染讀取）；編輯模式「排序群組」存檔後以 bumpOrder 重繪
     const [orderKey, bumpOrder] = useReducer((n: number) => n + 1, 0);
-    // 不在「自選」分段（排行、持倉）：不顯示清單分頁、編輯入口與自選列
+    // 不在「自選」分段（排行、持倉）：不顯示清單分頁、編輯入口與自選列；固定清單：顯示清單分頁，不顯示編輯入口與自選列
     const otherSegment = segment !== 'watchlist';
-    const showList = !otherSegment && wl.items.length > 0;
+    const own = !otherSegment && !fixed;
+    const showList = own && wl.items.length > 0;
     const metricLabel = WATCH_METRIC_LABEL[metric];
     // 走勢欄：設定開啟且放得下才掛載（窄螢幕＋字級「大」時與設定關閉相同：不掛載、不請求、不留佔位）
     const spark = useSparkColumn();
     // 處置清單：只在顯示自選列且清單含股票時讀取（受 30 分鐘間隔限制）
     const hasStocks = useMemo(() => wl.items.some(i => i.contract.security_type === 'STK'), [wl.items]);
     const punished = usePunishedCodes(showList && hasStocks);
-    const showListTabs = !otherSegment && wl.serverLists.length > 1;
     // 清單本身載入中（hook 的 loading 在清單結構更新時也為 true；結構更新中不算，避免編輯模式中途被收起）
     const listLoading = wl.loading && !wl.structureBusy;
     // 空清單（已載入）也顯示表頭的編輯鍵：才能重新命名或刪除空的清單
-    const emptyList = !otherSegment && !wl.items.length && !listLoading && !wl.loadError;
+    const emptyList = own && !wl.items.length && !listLoading && !wl.loadError;
     const showHeader = showList || (emptyList && activeList !== undefined);
     const listNames = useMemo(() => wl.serverLists.map(l => l.name), [wl.serverLists]);
     const canDeleteList = wl.serverLists.length > 1;
@@ -585,15 +616,21 @@ export function WatchlistPage() {
     const listTabsRef = useRef<HTMLDivElement | null>(null);
     useEffect(() => {
         const root = listTabsRef.current;
-        if (!showListTabs || !root || typeof root.querySelector !== 'function') return;
+        if (!root || typeof root.querySelector !== 'function') return;
         const scroller = root.querySelector<HTMLElement>('[role="tablist"]');
         const selected = root.querySelector<HTMLElement>('[aria-selected="true"]');
         if (!scroller || !selected) return;
         const delta = revealDelta(scroller.getBoundingClientRect(), selected.getBoundingClientRect());
         if (delta !== 0) scroller.scrollLeft += delta;
-    }, [showListTabs, wl.activeListId, wl.serverLists.length, orderKey]);
+    }, [otherSegment, fixed, wl.activeListId, wl.serverLists.length, orderKey]);
 
     const structureBusy = wl.structureBusy || listBusy;
+    // 排序後的顯示順序（編輯模式一律伺服器順序）；排序鍵在清單內容改變時同步交回新順序
+    const shown = useMemo(() => {
+        if (!order || editing) return wl.items;
+        const byCode = new Map(wl.items.map(i => [i.contract.code, i]));
+        return order.flatMap(c => byCode.get(c) ?? []);
+    }, [order, editing, wl.items]);
 
     return (
         <section className={styles.page} data-testid='page-watchlist'>
@@ -616,26 +653,26 @@ export function WatchlistPage() {
                 />
                 {!otherSegment && wl.serverLists.length > 0 && (
                     <div className={styles.listBar}>
-                        {showListTabs ? (
-                            <div ref={listTabsRef} className={styles.listTabs}>
-                                <Segmented<string>
-                                    items={orderLists(wl.serverLists).map(l => ({ value: l.id, label: l.name, testId: `watch-list-tab-${l.id}` }))}
-                                    value={wl.activeListId}
-                                    onChange={id => { if (id !== wl.activeListId) wl.setActiveList(id); }}
-                                    semantics='tabs'
-                                    variant='scroll'
-                                    ariaLabel='自選清單'
-                                    disabled={wl.structureBusy}
-                                    testId='watch-list-tabs'
-                                />
-                            </div>
-                        ) : (
-                            <p className={styles.listBarName}>{activeList?.name ?? ''}</p>
-                        )}
-                        <IconButton ariaLabel='新增自選清單' icon={Plus} onClick={() => setListSheet('create')} disabled={structureBusy} testId='watch-list-add' />
+                        <div ref={listTabsRef} className={styles.listTabs}>
+                            <Segmented<string>
+                                items={[...orderLists(wl.serverLists).map(l => ({ value: l.id, label: l.name, testId: `watch-list-tab-${l.id}` })), ...FIXED_TABS]}
+                                value={fixed ?? wl.activeListId}
+                                onChange={id => {
+                                    const f = FIXED_TABS.some(t => t.value === id) ? id as FuturesListId : null;
+                                    setFixed(lastFixed = f);
+                                    if (!f && id !== wl.activeListId) wl.setActiveList(id);
+                                }}
+                                semantics='tabs'
+                                variant='scroll'
+                                ariaLabel='自選清單'
+                                disabled={wl.structureBusy}
+                                testId='watch-list-tabs'
+                            />
+                        </div>
+                        {!fixed && <IconButton ariaLabel='新增自選清單' icon={Plus} onClick={() => setListSheet('create')} disabled={structureBusy} testId='watch-list-add' />}
                     </div>
                 )}
-                {!otherSegment && editing && activeList && (
+                {own && editing && activeList && (
                     <div className={styles.listTools} data-testid='watch-list-tools'>
                         <button
                             type='button'
@@ -678,19 +715,31 @@ export function WatchlistPage() {
                     </Suspense>
                 </ModuleErrorBoundary>
             )}
+            {!otherSegment && fixed && (
+                <ModuleErrorBoundary onRetry={resetFuturesList} fallback={props => <ModuleLoadError {...props} testId='futures-load-error' />}>
+                    <Suspense fallback={<Skeleton label='股期清單讀取中…' rows={6} testId='futures-module-loading' />}>
+                        <FuturesList listId={fixed} metric={metric} onCycleMetric={cycleMetric} onOpen={openTrade} />
+                    </Suspense>
+                </ModuleErrorBoundary>
+            )}
 
-            {!otherSegment && wl.loadError && (
+            {own && wl.loadError && (
                 <div className={styles.stateBlock}>
                     <InlineNote tone='danger' role='alert' action={{ label: '重試', onClick: () => wl.retryLoad(), testId: 'watch-retry' }}>
                         自選清單載入失敗。
                     </InlineNote>
                 </div>
             )}
-            {!otherSegment && !showList && listLoading && !wl.loadError && <Skeleton label='自選清單載入中…' rows={6} testId='watch-loading' />}
+            {own && !showList && listLoading && !wl.loadError && <Skeleton label='自選清單載入中…' rows={6} testId='watch-loading' />}
 
             {showHeader && (
                 <div className={styles.listHeader} data-testid='watch-list-header'>
                     <span className={styles.headerName} aria-hidden='true'>名稱</span>
+                    {showList && !editing && (
+                        <EditSlot editKey={0} placeholder={null}>
+                            <WatchSort listId={wl.activeListId} items={wl.items} onOrder={setOrder} />
+                        </EditSlot>
+                    )}
                     {showList && (
                         <button
                             type='button'
@@ -741,7 +790,7 @@ export function WatchlistPage() {
             )}
             {showList && (
                 <ul ref={listRef} className={styles.list} aria-label='自選商品' data-testid='watch-list'>
-                    {wl.items.map((item, index) => (
+                    {shown.map((item, index) => (
                         <WatchRow
                             key={item.contract.code}
                             item={item}
@@ -763,7 +812,7 @@ export function WatchlistPage() {
                     ))}
                 </ul>
             )}
-            {!otherSegment && editing && (
+            {own && editing && (
                 <button
                     type='button'
                     className={`${styles.addSymbolRow} ${pressableRow} ${focusRing}`}
@@ -800,6 +849,7 @@ export function WatchlistPage() {
                 code={actionCode}
                 mode={actionMode}
                 items={wl.items}
+                moves={editing || !order}
                 onClose={() => setActionCode(null)}
                 onOpen={openTrade}
                 onRemove={onRemove}

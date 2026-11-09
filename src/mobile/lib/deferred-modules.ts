@@ -11,6 +11,10 @@
 export const loadRankingList = () => import('../components/ranking-list');
 /** 自選頁「持倉」分段（依持倉自動列出；只在該分段掛載） */
 export const loadHoldingsList = () => import('../components/holdings-list');
+/** 自選清單最後的固定清單「股期近月」「股期遠月」（只在選了該分頁時掛載；連同排序鍵） */
+export const loadFuturesList = () => import('../components/futures-list');
+/** 自選清單表頭的排序鍵（顯示自己的清單時掛載；載入前表頭沒有排序鍵、清單照伺服器順序） */
+export const loadWatchSort = () => import('../components/watch-sort');
 /**
  * 自選列迷你走勢（canvas＋1 分 K 資料、時段計算）：只有可見列才載入與掛載；
  * 載入前與載入失敗時走勢欄是同尺寸空白佔位，不影響列與頁面。
