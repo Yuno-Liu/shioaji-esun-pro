@@ -892,6 +892,14 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 - 交易安全：輕點只顯示資訊，不開下單面板、不送單；選價列流程不變（§10 S1 表）。
 - 資訊列也附該根的量（第 2 批，使用者要求「走勢圖新增成交量」）：順序［時間］［價格］［漲跌］［量 1,234 ✕］，量放在漲跌之後（不夾在價格與漲跌之間），千分位整數、單位同量座標（股票為張），不上色（量沒有方向）；無障礙名稱加「成交量 1,234」；指數不附。［漲跌］與［量 ✕］各自成組換行，✕ 不會單獨落到下一行。
 
+**圖表長按選價下單設定**（使用者要求「交易的圖表目前是可以點選圖表價格下單，改成用設定方式讓使用者自己決定是否開啟這樣功能」；預設關由主代理決定，避免誤開下單面板；以程式碼為準）：
+
+- 設定：帳戶 › 本裝置「圖表長按選價下單」Switch（`device-chart-pick`），存 `sj-mobile-device-v1` 的 `chartPricePick`（`lib/mobile-device-settings.ts`，讀寫包 try/catch，storage 不可用時只在本次有效），**預設關**；舊資料沒有這個欄位時視為關。
+- 交易圖表以 `useMobileDeviceSettings()` 讀取，切換後已開著的交易頁立即套用（不重建圖表）；關閉時已浮出的選價列一併收起，長按途中關閉則放開不浮出。走勢與 K 線、直向與橫向全螢幕同一規則。
+- 關閉時長按＝看價格：十字線照樣由程式庫追蹤模式跟著手指、資訊列顯示該根，放開時釘在放開的那一根（同輕點的 `chart-readout`；只釘住、不因「同一點」收起；落在價格軸不切換漲跌停）。不浮出選價列、不呼叫 `openTicket`、不觸發 `haptic('longPress')`。
+- 提示文字（`chartToolNote`）關閉時不提長按：走勢可切換漲跌停「點圖看價格；點價格軸看漲跌停」、不能切換「點圖看價格」，K 線「點一下看收盤與漲跌」（日 K 仍為聚合說明）；開啟時維持原文。
+- 不受影響：輕點資訊列、點價格軸切換漲跌停範圍、點委託線標籤開委託操作面板（管理既有委託）、全螢幕買進／賣出鍵（只開下單面板）。開啟時行為與原本完全相同。
+
 **走勢成交量副圖**（第 2 批，使用者要求「交易-走勢圖新增成交量」；以程式碼為準）：
 
 - 原本走勢的量疊在價格區底部 20%，而且與走勢的漲跌填色同色（`upVol`／`downVol`），幾乎看不出來。改為價格下方獨立的 pane 1（高 `PANE_HEIGHT_PX` 96），外框沿用 `frame[1]` 加高，價格區不縮小（360×780 實測價格 pane 297px，與沒有副圖時相同）。
@@ -1121,6 +1129,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 
 - 帳戶頁維持同一頁的區塊順序（`account-page.tsx:45-57`），不改讀取與刷新時機；`account-ui.tsx` 的 `Card`、`CollapsibleCard`、`Item`、`Switch`、`Segmented` 改為 GroupedSection 外觀（標題移到卡片外 footnote、資訊列 ≥44px、髮絲分隔），props 與 testId 不變；CollapsibleCard 展開立即、內容 150ms 淡入、chevron 旋轉；Switch 拇指改 `transform: translateX`（取代 `account.css.ts:189` 的 left 轉場）。
 - 顯示區（`display-card.tsx`）新增「降低透明度：跟隨系統／開／關」Segmented（寫 `ui-settings.transparency`，立即改寫 html 屬性）。本裝置區（`device-settings-section.tsx`）新增「介面觸覺回饋（Android）」Switch（`ui-settings.uiHaptics`）。風控區註腳「此鎖定只對本裝置有效」沿用。2026-11-09 更正註腳：原本寫「不會同步到桌面」，但鎖定存在與桌面共用的 `sj-pro-risk`（同源 localStorage），同一瀏覽器開啟的桌面網頁版也會套用，改為「此鎖定只對本裝置有效（存在這個瀏覽器，同一瀏覽器開啟的桌面網頁版也會套用）；不會同步到其他裝置或其他瀏覽器，也沒有伺服器端總開關。」（`account-page.test.tsx` 鎖住這段文字）。
+- 本裝置區新增「圖表長按選價下單」Switch（`device-chart-pick`，`sj-mobile-device-v1` 的 `chartPricePick`，預設關；說明「開啟後長按交易圖表選價位…關閉時長按只看價格。」），交易圖表即時套用（§7.3）。
 - HTTPS 說明頁（`secure-context-gate.tsx`、`gate.css.ts`）：仍不建立任何連線；頁面 `overflow-x: hidden`、`overflow-wrap: anywhere`；診斷表 `grid-template-columns: auto minmax(0, 1fr)`；網址與診斷值保留 `SELECTABLE`（已用於 `secure-context-gate.tsx` 與 `diagnostics-card.tsx`）；步驟改編號卡；靜態、無材質、無動畫。裁切原因以 390 寬行動模擬 @2x 重拍確認。
 - 第 1 期起說明頁只在非 secure context 時才載入（`app.tsx` 的 MobileApp 以 retryableLazy 載入 `gate/secure-context-gate`）。載入中與載入失敗時顯示最小的靜態說明（`secure-context-gate-fallback`：「需要 HTTPS」「無法下單」）；兩者都不 bootstrap、不開串流、不掛載交易畫面（`secure-context-gate.test.tsx`、`secure-context-gate-lazy.test.tsx`）。
 
@@ -1274,7 +1283,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 | 指標快速範本（套用、復原） | 只改圖表設定 | `indicator-sheet.test.tsx` |
 | 自選列與排行列日內區間小條 | 不可點；點列只開交易頁 | `quote-row.test.tsx` |
 | 交易頁標頭 ☆ 與「加入自選」面板（勾選、取消、完成） | 只開面板；面板只呼叫 hook 的 `addSymbol`／`removeSymbol`（目前清單）、lib 的 `addWatchlistContracts`／`removeWatchlistContracts`（其他清單）與 `emitWatchlistChanged` | `trade-page.test.tsx`、`watch-picker-sheet.test.tsx`、`trade-watch-picker-lazy.test.tsx` |
-| 交易圖表輕點資訊列（輕點、✕、再點同一點）與走勢成交量副圖 | 只顯示資訊；量副圖內長按不選價；長按選價列流程不變 | `trade-chart.test.tsx` |
+| 交易圖表輕點資訊列（輕點、✕、再點同一點）、走勢成交量副圖與「圖表長按選價下單」設定（帳戶 › 本裝置，預設關） | 只顯示資訊；量副圖內長按不選價；設定關閉時長按只看價格（走勢／K 線、直向／全螢幕都不浮出選價列，`openTicket` 0 次）；開啟時長按選價列流程不變；Switch 只寫本裝置設定 | `trade-chart.test.tsx`、`device-settings-section.test.tsx`、`mobile-device-settings.test.ts` |
 | 走勢點價格軸切換漲跌停範圍、「漲跌停範圍」按鈕 | 只改 Y 軸範圍與價格線，不出資訊列、不選價、不呼叫送單函式 | `trade-chart.test.tsx` |
 | 自選多選刪除、全選、確認面板、排序群組（↑↓、握把） | 只做清單管理（`removeSymbol`）或裝置偏好（localStorage），不開下單或委託面板 | `watchlist-multi.test.tsx`、`watchlist-group-sort.test.tsx`、`watch-edit-controls.test.tsx` |
 | 自選頁「持倉」分段（點列、長按面板、快速下單鍵、分段切換、「前往持倉頁」） | 只呼叫 `navigate` 或 `openTicket`（只開下單面板，之後仍需預覽與滑動確認），沒有任何編輯入口 | `holdings-list.test.tsx`、`watchlist-holdings-lazy.test.tsx` |
@@ -1547,6 +1556,7 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
       - 360 寬、字級「大」時選取模式的版面（勾選鍵、底部工具列換行、組標頭「全選」）；最後一列能否捲到工具列上方。
       - VoiceOver／TalkBack 如何朗讀 role=checkbox 的按鈕與 `aria-checked="mixed"`；「全選」放在 GroupedSection 標頭內。
     - 交易圖表輕點：iOS／Android 上輕點與長按的區分（450ms、10px），與捲動、平移的衝突；資訊列在 360 寬、字級「大」時的換行。
+    - 圖表長按選價下單設定（預設關）：假資料實測（360 寬字級 1.3，直向與橫向全螢幕、走勢與 K 線）關閉時長按 0 次選價列、0 個下單面板、0 個委託請求，放開後資訊列釘在該根（拖動後釘在放開處），開啟時四種組合都浮出選價列；iOS／Android 實機上長按放開後資訊列是否穩定釘住（程式庫追蹤模式在觸控放開時清十字線，由 crosshairMove 放回）待確認。
     - 自選頁「持倉」分段：假資料實測（390 寬字級小、360 寬字級 1.3：合併 2330 永豐＋玉山為「等 2 筆」、融資、融券、零股、期貨、選擇權都列出，0 額外請求、0 委託）。待實機確認：標記換行後的列高；同一檔多空並存時只看得到第一筆的方向（明細在持倉頁）；快速下單用目前選取的帳戶；合約解析失敗的代碼沒有名稱與下單鍵。
     - 走勢 X 軸固定與漲跌停範圍：假資料實測（半天資料右側留白、捏合／拖移／滾輪後不變、漲跌停範圍與還原、全螢幕直向與橫向、退出全螢幕）正確。待實機確認：iOS Safari 的實際手感（headless 的捲動手勢合成不可靠）；價格軸約 56px 寬，主圖那一段是否容易點中；漲跌停範圍下最高、最低、參考、現價的軸標籤擠在一起；圖例按鈕（含資訊列 ✕）在實機可點。
     - 走勢副圖指標：假資料實測（三個副圖的高度、圖例、副圖內長按與輕點、全螢幕、每次載入 1 次逐筆請求）正確，真實逐筆以唯讀查詢核對過格式與單位。待實機確認：大型股逐筆的 JSON 解析與彙總在手機主執行緒的耗時；橫向全螢幕三個副圖各約 28px 的可讀性；開著指標離開這檔再回來時因漏量多 1 次請求（最多每 120 秒）；排除集合競價後的數字與使用者習慣的看盤軟體是否一致；處置股（分盤集合競價）的內外盤標記沒有另外處理。

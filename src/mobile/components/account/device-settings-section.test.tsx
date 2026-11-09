@@ -116,6 +116,27 @@ describe('DeviceSettingsSection', () => {
         expect(byTestId('device-ui-haptics').props.disabled).toBe(true);
     });
 
+    it('圖表長按選價下單: switch defaults off on every platform, explains itself, and writes chartPricePick', async () => {
+        vi.stubGlobal('navigator', {});
+        await mount();
+        const sw = byTestId('device-chart-pick');
+        expect(sw.props.role).toBe('switch');
+        expect(sw.props.disabled).toBe(false);
+        expect(sw.props['aria-checked']).toBe(false);
+        expect(sw.props['aria-label']).toBe('圖表長按選價下單');
+        const row = text(byTestId('device-chart-pick-row'));
+        expect(row).toContain('圖表長按選價下單');
+        expect(row).toContain('關閉時長按只看價格');
+        await act(async () => byTestId('device-chart-pick').props.onClick());
+        expect(getMobileDeviceSettings().chartPricePick).toBe(true);
+        expect(byTestId('device-chart-pick').props['aria-checked']).toBe(true);
+        await act(async () => byTestId('device-chart-pick').props.onClick());
+        expect(getMobileDeviceSettings().chartPricePick).toBe(false);
+        // 其他本裝置設定不受影響
+        expect(getMobileDeviceSettings().vibrate).toBe(true);
+        expect(getMobileDeviceSettings().wakeLock).toBe(false);
+    });
+
     it('wake lock hint follows the status', () => {
         expect(wakeLockHint(true, true, { state: 'active', error: null })).toContain('保持常亮中');
         expect(wakeLockHint(true, true, { state: 'hidden', error: null })).toContain('回到前景');

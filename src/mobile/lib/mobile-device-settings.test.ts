@@ -31,10 +31,10 @@ afterEach(() => {
 });
 
 describe('mobile device settings persistence', () => {
-    it('defaults: vibrate on (existing §5.5 behaviour), wake lock off', () => {
+    it('defaults: vibrate on (existing §5.5 behaviour), wake lock off, chart price pick off', () => {
         vi.stubGlobal('localStorage', memoryStorage());
-        expect(getMobileDeviceSettings()).toEqual({ vibrate: true, wakeLock: false });
-        expect(DEFAULT_MOBILE_DEVICE_SETTINGS).toEqual({ vibrate: true, wakeLock: false });
+        expect(getMobileDeviceSettings()).toEqual({ vibrate: true, wakeLock: false, chartPricePick: false });
+        expect(DEFAULT_MOBILE_DEVICE_SETTINGS).toEqual({ vibrate: true, wakeLock: false, chartPricePick: false });
     });
 
     it('writes to sj-mobile-device-v1 and reloads after reset', () => {
@@ -44,9 +44,9 @@ describe('mobile device settings persistence', () => {
         subscribeMobileDeviceSettings(listener);
         setMobileDeviceSettings({ wakeLock: true });
         expect(listener).toHaveBeenCalledOnce();
-        expect(JSON.parse(storage.data.get(MOBILE_DEVICE_SETTINGS_KEY)!)).toEqual({ vibrate: true, wakeLock: true });
+        expect(JSON.parse(storage.data.get(MOBILE_DEVICE_SETTINGS_KEY)!)).toEqual({ vibrate: true, wakeLock: true, chartPricePick: false });
         resetMobileDeviceSettingsForTest();
-        expect(getMobileDeviceSettings()).toEqual({ vibrate: true, wakeLock: true });
+        expect(getMobileDeviceSettings()).toEqual({ vibrate: true, wakeLock: true, chartPricePick: false });
     });
 
     it('does not notify or write when nothing changed', () => {
@@ -65,20 +65,52 @@ describe('mobile device settings persistence', () => {
             setItem: () => { throw new Error('QuotaExceededError'); },
         });
         expect(getMobileDeviceSettings()).toEqual(DEFAULT_MOBILE_DEVICE_SETTINGS);
-        expect(setMobileDeviceSettings({ vibrate: false })).toEqual({ vibrate: false, wakeLock: false });
+        expect(setMobileDeviceSettings({ vibrate: false })).toEqual({ vibrate: false, wakeLock: false, chartPricePick: false });
         expect(getMobileDeviceSettings().vibrate).toBe(false);
     });
 
     it('ignores corrupt JSON and wrong types field by field', () => {
         vi.stubGlobal('localStorage', memoryStorage({ [MOBILE_DEVICE_SETTINGS_KEY]: '{not json' }));
         expect(getMobileDeviceSettings()).toEqual(DEFAULT_MOBILE_DEVICE_SETTINGS);
-        expect(sanitizeMobileDeviceSettings({ vibrate: 'no', wakeLock: true })).toEqual({ vibrate: true, wakeLock: true });
+        expect(sanitizeMobileDeviceSettings({ vibrate: 'no', wakeLock: true })).toEqual({ vibrate: true, wakeLock: true, chartPricePick: false });
+        expect(sanitizeMobileDeviceSettings({ chartPricePick: 'yes' }).chartPricePick).toBe(false);
+        expect(sanitizeMobileDeviceSettings({ chartPricePick: true }).chartPricePick).toBe(true);
     });
 
     it('works without localStorage at all (node / SSR)', () => {
         vi.stubGlobal('localStorage', undefined);
         expect(getMobileDeviceSettings()).toEqual(DEFAULT_MOBILE_DEVICE_SETTINGS);
         expect(setMobileDeviceSettings({ wakeLock: true }).wakeLock).toBe(true);
+    });
+});
+
+describe('chart price pick (圖表長按選價下單)', () => {
+    it('persists to sj-mobile-device-v1, notifies, and reloads; older stored values without the field read as off', () => {
+        const storage = memoryStorage({ [MOBILE_DEVICE_SETTINGS_KEY]: JSON.stringify({ vibrate: false, wakeLock: true }) });
+        vi.stubGlobal('localStorage', storage);
+        expect(getMobileDeviceSettings()).toEqual({ vibrate: false, wakeLock: true, chartPricePick: false });
+        const listener = vi.fn();
+        subscribeMobileDeviceSettings(listener);
+        setMobileDeviceSettings({ chartPricePick: true });
+        expect(listener).toHaveBeenCalledOnce();
+        expect(JSON.parse(storage.data.get(MOBILE_DEVICE_SETTINGS_KEY)!)).toEqual({ vibrate: false, wakeLock: true, chartPricePick: true });
+        setMobileDeviceSettings({ chartPricePick: true });
+        expect(listener).toHaveBeenCalledOnce();
+        resetMobileDeviceSettingsForTest();
+        expect(getMobileDeviceSettings().chartPricePick).toBe(true);
+    });
+
+    it('storage that throws: defaults to off, a switch-on still applies for this session', () => {
+        vi.stubGlobal('localStorage', {
+            getItem: () => { throw new Error('SecurityError'); },
+            setItem: () => { throw new Error('QuotaExceededError'); },
+        });
+        expect(getMobileDeviceSettings().chartPricePick).toBe(false);
+        const listener = vi.fn();
+        subscribeMobileDeviceSettings(listener);
+        expect(setMobileDeviceSettings({ chartPricePick: true }).chartPricePick).toBe(true);
+        expect(listener).toHaveBeenCalledOnce();
+        expect(getMobileDeviceSettings().chartPricePick).toBe(true);
     });
 });
 

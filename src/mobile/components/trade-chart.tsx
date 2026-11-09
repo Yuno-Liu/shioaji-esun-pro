@@ -38,6 +38,11 @@
 //   一般模式下選價列出現時捲到可見範圍（main 的 scroll-padding-bottom 讓出底部 chrome），以免落在交易鍵列／分頁列後面；
 //   量測用沒有 transform 的外層（pickAnchor），進場動畫的 translateY 不影響捲動量。全螢幕與收回殘影不捲動。
 //   副圖上的十字線不拿來選價（座標不是價格）。點委託線標籤 → openOrderAction(tradeId, 'menu')。
+// - 長按選價下單是本裝置設定（lib/mobile-device-settings 的 chartPricePick，帳戶 › 本裝置「圖表長按選價下單」，**預設關**）；
+//   以 useSyncExternalStore 讀取，切換後已開著的交易頁立即套用（關閉時順便收起選價列）。走勢／K 線、直向／全螢幕同一規則。
+//   關閉時長按只看價格：十字線照樣由程式庫的追蹤模式跟著手指、資訊列顯示該根，放開時釘在放開的那一根（同輕點，不切換、
+//   不收起；落在價格軸不切換漲跌停）；不浮出選價列、不呼叫 openTicket、不觸發 haptic('longPress')；工具列提示不提長按選價。
+//   點價格軸切換漲跌停範圍、點委託線標籤開委託操作面板不受此設定影響。
 // - 輕點（沒拖超過 LONG_PRESS_SLOP_PX、未達 LONG_PRESS_MS、單指、不在按鈕上、落在主圖）：十字線吸附到最近一根並釘住，
 //   圖例第一列顯示價格資訊（lib/chart-readout.ts：走勢＝時間、價格、漲跌、漲跌%，基準同走勢基準線的參考價；
 //   K 線＝收盤與「較前一根」；兩者都附該根的量「量 1,234」，單位同量的座標，指數不顯示）。再點同一根、按 ✕、開始平移或雙指、換週期／商品／全螢幕時收起。
@@ -102,6 +107,7 @@ import {
 } from '../lib/mobile-indicators';
 import { buyRatio, dateOfWallClock, flowView, lineFlowSupported, retainLineFlow, type FlowStatus, type FlowView, type LineFlowSnapshot } from '../lib/line-flow';
 import { thresholdIndex, thresholdLabel, useLineIndicatorSettings, type LineIndicatorSettings } from '../lib/line-indicators';
+import { useMobileDeviceSettings } from '../lib/mobile-device-settings';
 import { openOrderAction, openTicket } from '../lib/mobile-store';
 import { haptic } from '../motion/haptics';
 import { prefersReducedMotion } from '../motion/prefs';
@@ -236,6 +242,16 @@ export interface TradeChartProps {
     onPeriodChange?: (p: ChartPeriod) => void;
 }
 
+/** 圖表下方的操作提示；長按選價下單關閉時不提長按選價 */
+export function chartToolNote(isLine: boolean, limitToggle: boolean, dailyK: boolean, pricePick: boolean): string {
+    if (isLine) {
+        if (limitToggle) return pricePick ? '點圖看價格，長按選價；點價格軸看漲跌停' : '點圖看價格；點價格軸看漲跌停';
+        return pricePick ? '點一下看價格與漲跌；長按選價位，放開開啟下單面板' : '點圖看價格';
+    }
+    if (dailyK) return '日 K 由 1 分 K 聚合，未含除權息調整';
+    return pricePick ? '點一下看收盤與漲跌；長按選價位' : '點一下看收盤與漲跌';
+}
+
 /** 按在按鈕上（選價列、委託線標籤、資訊列 ✕）：不算圖表上的輕點 */
 function isControl(target: EventTarget | null): boolean {
     const el = target as { closest?: (sel: string) => unknown } | null;
@@ -313,6 +329,10 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const lineSettingsKey = `${lineSettings.flow}|${lineSettings.bigSmall}|${lineSettings.threshold}`;
     /** 走勢副圖設定改變：在既有圖表上增減副圖、換門檻（不重建圖表） */
     const flowRebuildRef = useRef<() => void>(() => undefined);
+    /** 圖表長按選價下單（本裝置設定，預設關）：關閉時長按只看價格，不浮出選價列 */
+    const pricePick = useMobileDeviceSettings().chartPricePick;
+    const pricePickRef = useRef(pricePick);
+    pricePickRef.current = pricePick;
 
     const hostRef = useRef<HTMLDivElement | null>(null);
     const chartRef = useRef<IChartApi | null>(null);
@@ -335,12 +355,15 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     const trackingRef = useRef(false);
     const crossPriceRef = useRef<number | null>(null);
     const pressRef = useRef<{ x: number; y: number; timer: ReturnType<typeof setTimeout> } | null>(null);
-    /** 目前這次按壓（第一指）；tap＝仍可能是輕點（沒拖超過容許位移、不是多指、不在按鈕上、未進入追蹤） */
-    const gestureRef = useRef<{ x: number; y: number; tap: boolean } | null>(null);
+    /**
+     * 目前這次按壓（第一指）；tap＝仍可能是輕點（沒拖超過容許位移、不是多指、不在按鈕上、未進入追蹤）；
+     * held＝長按選價下單關閉時的長按（看價格）：放開時釘在放開的那一根
+     */
+    const gestureRef = useRef<{ x: number; y: number; tap: boolean; held?: boolean } | null>(null);
     /** 按著的指標（pointerId）：第二指＝雙指縮放 */
     const pointersRef = useRef(new Set<number>());
-    /** 輕點（相對圖表的座標）：釘住或收起價格資訊（由圖表 effect 提供） */
-    const tapRef = useRef<(x: number, y: number) => void>(() => undefined);
+    /** 輕點（相對圖表的座標）：釘住或收起價格資訊（由圖表 effect 提供）；toggle=false＝只釘住（長按看價格放開） */
+    const tapRef = useRef<(x: number, y: number, toggle?: boolean) => void>(() => undefined);
     /** 漲跌停範圍模式改變：主圖重新自動縮放（由圖表 effect 提供） */
     const rescaleRef = useRef<() => void>(() => undefined);
     /** 收起輕點的價格資訊；clearChart＝一併清掉十字線（長按進入追蹤時不清，十字線交給程式庫） */
@@ -1313,14 +1336,14 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             }
         };
         hideTapRef.current = hideTap;
-        tapRef.current = (x, y) => {
+        tapRef.current = (x, y, toggle = true) => {
             if (cancelled || bars.length === 0) return;
             const ts = chart.timeScale();
             const width = ts.width();
             const mainH = mainPaneHeightRef.current ?? host.clientHeight - 24;
             if (width > 0 && x > width) {
                 // 主圖的價格軸：走勢切換漲跌停範圍（不出資訊列、不選價）；副圖的價格軸不觸發
-                if (isLine && y >= 0 && y <= mainH && hasLimitRange(contractRef.current)) toggleLimitRange();
+                if (toggle && isLine && y >= 0 && y <= mainH && hasLimitRange(contractRef.current)) toggleLimitRange();
                 return;
             }
             if (y < 0 || y > mainH) return; // 時間軸、副圖
@@ -1332,7 +1355,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             // 落在同一根，或離釘住那一根的 x 在 TAP_SAME_SPOT_PX 內，都算同一點
             const pinned = tapTime === null ? -1 : indexOfTime(tapTime);
             const pinnedX = pinned < 0 ? null : ts.logicalToCoordinate(logicalOfBar(pinned) as Logical);
-            if (pinned === i || (pinnedX !== null && Math.abs(x - pinnedX) <= TAP_SAME_SPOT_PX)) hideTap(true);
+            if (toggle && (pinned === i || (pinnedX !== null && Math.abs(x - pinnedX) <= TAP_SAME_SPOT_PX))) hideTap(true);
             else showTap(i);
         };
 
@@ -1562,6 +1585,8 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
     };
     useEffect(() => clearPress, []);
     useEffect(() => { setPick(null); }, [code, period]);
+    // 關閉長按選價下單：已浮出的選價列一併收起
+    useEffect(() => { if (!pricePick) setPick(null); }, [pricePick]);
     // 進出全螢幕：收起輕點的價格資訊（換週期、商品時圖表重建，也會收起）
     useEffect(() => { hideTapRef.current(true); }, [fullscreen]);
 
@@ -1585,6 +1610,16 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             const host = hostRef.current;
             const series = mainRef.current;
             if (!host || !series) return;
+            if (!pricePickRef.current) {
+                // 長按選價下單關閉：長按＝看價格（十字線交給程式庫的追蹤模式），不選價、不震動
+                const g = gestureRef.current;
+                if (g?.tap) {
+                    g.tap = false;
+                    g.held = true;
+                    hideTapRef.current(false);
+                }
+                return;
+            }
             trackingRef.current = true;
             // 長按成立：不是輕點；十字線已由程式庫的追蹤模式接手（不清除）
             if (gestureRef.current) gestureRef.current.tap = false;
@@ -1615,11 +1650,13 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         pointersRef.current.delete(e.pointerId ?? 0);
         const g = gestureRef.current;
         gestureRef.current = null;
-        if (released && g?.tap && !trackingRef.current) {
-            // 輕點：只釘住十字線與價格資訊，不開選價列、不開下單面板
+        if (released && g && (g.tap || g.held) && !trackingRef.current) {
+            // 輕點：只釘住十字線與價格資訊，不開選價列、不開下單面板；
+            // 長按看價格（長按選價下單關閉）：釘在放開的那一根（不切換、不收起）
             try {
                 const rect = hostRef.current?.getBoundingClientRect();
-                if (rect) tapRef.current(g.x - rect.left, g.y - rect.top);
+                if (rect && g.held) tapRef.current(e.clientX - rect.left, e.clientY - rect.top, false);
+                else if (rect) tapRef.current(g.x - rect.left, g.y - rect.top);
             } catch {
                 // 圖表 API 差異不能讓頁面掛掉
             }
@@ -1631,7 +1668,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         crossPriceRef.current = null;
         if (raw === null) return;
         const price = roundToTick(contractRef.current, raw);
-        if (Number.isFinite(price) && price > 0) setPick(price);
+        if (Number.isFinite(price) && price > 0 && pricePickRef.current) setPick(price);
     };
 
     const pickText = pick !== null ? formatToTick(contract, pick) : '';
@@ -1655,7 +1692,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         anchor.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
     }, [pickOpen, fullscreen]);
     const choose = (action: 'Buy' | 'Sell') => {
-        if (pick === null) return;
+        if (pick === null || !pricePickRef.current) return;
         openTicket({ code, action, price: pick, source: 'chart' });
         dismissPick();
     };
@@ -1791,9 +1828,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             {!fullscreen && (
                 <div className={cs.toolRow}>
                     <p className={cs.toolNote}>
-                        {isLine
-                            ? (hasLimitRange(contract) ? '點圖看價格，長按選價；點價格軸看漲跌停' : '點一下看價格與漲跌；長按選價位，放開開啟下單面板')
-                            : period === '1D' ? '日 K 由 1 分 K 聚合，未含除權息調整' : '點一下看收盤與漲跌；長按選價位'}
+                        {chartToolNote(isLine, hasLimitRange(contract), period === '1D', pricePick)}
                     </p>
                     <Chip label='指標' className={cs.toolButton} onClick={() => setSheetOpen(true)} testId='chart-indicators' />
                     <Chip label='全螢幕' className={cs.toolButton} onClick={enterFullscreen} testId='chart-fs-enter' />
