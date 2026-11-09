@@ -91,7 +91,7 @@ const emit = () => listeners.forEach(l => l());
 //
 // sessionWindowFor／hasNightSession／CLOSE_GRACE 與 lib/intraday-session.ts 相同（測試逐分鐘比對）。
 // 不 import 該模組：它與桌面共用，一 import 整個模組（含 findKbarGap 等桌面用函式）都會進首屏共用 chunk，
-// 超出首屏 218 KiB 預算。只 import 型別。
+// 超出首屏預算（≤219 KiB，設計規格 §13）。只 import 型別。
 
 /** 收盤定盤寬限（秒），同 lib/intraday-session.ts CLOSE_GRACE */
 export const CLOSE_GRACE = 240;
