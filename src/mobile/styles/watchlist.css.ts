@@ -579,6 +579,15 @@ export const limitPrice = {
     down: limitFill(vars.color.down, '跌停'),
 };
 
+// 窄螢幕（≤400px，同 quote-row NARROW_WATCH_QUERY）＋字級「大」的排行列：列尾多一顆星號，小標會把名稱擠成「台…」。
+// 只在這個版面隱藏 ::before 小標（保留實心底；列的無障礙名稱仍含「漲停／跌停」），名稱至少留約 3 個字。
+// 以排行列的 data-testid 選取（自選、持倉不受影響），避免為此在首屏 QuoteRow 多傳 class（首屏 JS 0 bytes）。
+for (const c of [limitPrice.up, limitPrice.down]) {
+    globalStyle(`html[data-sj-font-scale="1.3"] [data-testid="ranking-row"] .${c}::before`, {
+        '@media': { '(max-width: 400px)': { display: 'none' } },
+    });
+}
+
 /** 自選列第二行（漲跌 漲跌幅／總量）：純文字 numSm，字距略開 */
 export const rowChange = style({
     ...NUM.numSm,

@@ -77,6 +77,8 @@ import {
     rankingChangePct,
     rankingPriceRange,
     RankingList,
+    rankingLimit,
+    rankingView,
     requestRanking,
     resetRankingForTest,
     sortRanking,
@@ -859,6 +861,51 @@ describe('RankingList — 篩選晶片', () => {
         expect(props.onOpen).not.toHaveBeenCalled();
         expect(props.onAdd).not.toHaveBeenCalled();
         for (const k of ORDER_FNS) expect(m[k], k).not.toHaveBeenCalled();
+    });
+});
+
+describe('排行列的漲停／跌停（scanner change_type；不需要合約）', () => {
+    const rowOf = (code: string) => view!.root.find(n => n.props['data-testid'] === 'ranking-row' && n.props['data-code'] === code && typeof n.type === 'string');
+    const priceBox = (code: string) => rowOf(code).findAll(n => n.props['data-testid'] === 'ranking-price' && typeof n.type === 'string')[0]!.parent!;
+    const label = (code: string) => rowOf(code).findAll(n => n.props['data-testid'] === 'ranking-row-button' && typeof n.type === 'string')[0]!.props['aria-label'] as string;
+
+    it('change_type 1＝漲停、5＝跌停；2／3／4 與其他值不是漲跌停', () => {
+        expect(rankingLimit(1)).toBe('up');
+        expect(rankingLimit(5)).toBe('down');
+        expect(rankingLimit('1')).toBe('up');
+        for (const t of [2, 3, 4, 0, 6, undefined, null, 'Up']) expect(rankingLimit(t)).toBeNull();
+        expect(rankingView(item('2330', 1100, 100, { change_type: 1 })).limit).toBe('up');
+        expect(rankingView(item('2454', 1350, -150, { change_type: 5 })).limit).toBe('down');
+        // −9.62% 的一般跌（4）不標示；值是 null（明確沒有），QuoteRow 不再以合約判斷
+        expect(rankingView(item('3008', 2350, -250, { change_type: 4 })).limit).toBeNull();
+    });
+
+    it('合約不在快取（也不解析）時仍標示：實心底 class 與無障礙名稱；其他列不標示', async () => {
+        setWatchSparklineEnabled(false);
+        m.fetchScanner.mockResolvedValue([
+            item('4101', 55, 5, { change_type: 1 }),
+            item('4102', 45, -5, { change_type: 5 }),
+            item('4103', 50.35, 0.35, { change_type: 2 }),
+        ]);
+        await render();
+        expect(m.cached.size).toBe(0);
+        expect(m.ensureContract).not.toHaveBeenCalled();
+        expect(priceBox('4101').props.className).toContain(wlStyles.limitPrice.up);
+        expect(priceBox('4102').props.className).toContain(wlStyles.limitPrice.down);
+        expect(priceBox('4103').props.className).not.toContain(wlStyles.limitPrice.up);
+        expect(priceBox('4103').props.className).toContain(wlStyles.tone.up);
+        expect(label('4101')).toContain('，漲停 55.00，');
+        expect(label('4102')).toContain('，跌停 45.00，');
+        expect(label('4103')).not.toMatch(/漲停|跌停/);
+    });
+
+    it('合約在快取且價格等於漲停、但 change_type 不是 1：以 change_type 為準（快照資料）', async () => {
+        setWatchSparklineEnabled(false);
+        m.cached.set('2330', { ...stockContract('2330'), limit_up: 1100, limit_down: 900 });
+        m.fetchScanner.mockResolvedValue([item('2330', 1100, 100, { change_type: 2 })]);
+        await render();
+        expect(priceBox('2330').props.className).not.toContain(wlStyles.limitPrice.up);
+        expect(label('2330')).not.toContain('漲停');
     });
 });
 

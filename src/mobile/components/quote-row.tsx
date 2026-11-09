@@ -11,7 +11,7 @@
 // - 本檔不 import 行情 hook：自選以 probe 傳入行情探針（WatchQuoteProbe），排行是快照資料、不訂閱。
 // - 漲停／跌停（lib/limit-hit.ts）：真實成交價等於 quoteContract 的漲跌停價時，成交價格改實心 up／down 底（inkStrong）＋白字，
 //   價格前有「漲停／跌停」小標（styles/watchlist.css limitPrice 的 ::before），並寫進列按鈕的無障礙名稱；
-//   試撮、指數、沒有漲跌停（排行未解析合約）時不標示。
+//   試撮、指數、沒有漲跌停時不標示。排行以 staticView.limit（scanner change_type）為準，不需要合約。
 
 import { ArrowLeftRight } from 'lucide-react';
 import { Suspense, useCallback, useEffect, useRef, useState, type ComponentType, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
@@ -23,7 +23,7 @@ import { fmtPct, fmtPrice } from '../../lib/utils/format';
 import { fmtCompactInt } from '../lib/num-format';
 import { useMediaQuery } from '../hooks/use-media-query';
 import { loadWatchSparkline } from '../lib/deferred-modules';
-import { quoteLimit } from '../lib/limit-hit';
+import { quoteLimit, type LimitState } from '../lib/limit-hit';
 import { useWatchSparklineEnabled } from '../lib/watch-prefs';
 import { haptic } from '../motion/haptics';
 import { pressableRow } from '../styles/primitives.css';
@@ -59,6 +59,8 @@ export interface RowQuoteView {
     /** 今日最高、最低（日內區間小條；缺少時不顯示） */
     high?: number;
     low?: number;
+    /** 資料本身帶的漲跌停狀態（排行：scanner change_type）；有值（含 null）時不再以合約判斷 */
+    limit?: LimitState | null;
 }
 
 /** 有限正數才留下 */
@@ -399,7 +401,7 @@ export function QuoteRow({
     // 總量沒有方向；數值缺少時也不著色
     const changeTone: RowQuoteView['dir'] = metric === 'vol' || changeText === '—' ? 'flat' : view.dir;
     const range = dayRangePosition(view);
-    const limit = quoteLimit(quoteContract, view.close, view.simtrade);
+    const limit = view.limit !== undefined ? view.limit : quoteLimit(quoteContract, view.close, view.simtrade);
     const rangePct = range === null ? 0 : Math.round(range * 100);
     const ariaLabel = `${ariaPrefix}${code} ${name}${tag ? ` ${MARKET_FULL[tag]}` : ''}，${view.simtrade ? `${SIM_LABEL} ` : ''}${limit ? `${DIR_TEXT[limit]}停 ` : ''}${priceText}，${DIR_TEXT[view.dir]} ${chgText} ${pctText}`.trim()
         + (volText ? `，總量 ${volText}` : '')
