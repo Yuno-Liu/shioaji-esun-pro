@@ -214,7 +214,7 @@ export function useVisibilityTracker(): VisibilityTracker | null {
     return tracker;
 }
 
-export function useRowVisible(ref: { current: Element | null }, tracker: VisibilityTracker | null, fallbackVisible: boolean): boolean {
+function useRowVisible(ref: { current: Element | null }, tracker: VisibilityTracker | null, fallbackVisible: boolean): boolean {
     const [visible, setVisible] = useState(false);
     useEffect(() => {
         if (!tracker) return;

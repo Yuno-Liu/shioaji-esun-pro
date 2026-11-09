@@ -18,13 +18,13 @@ import { getIcBootstrapStatus, getIcState, getIcSubError, projectionKey, retainI
 import { IC_INDICES, type IcIndexCode } from '../../../lib/sector-flow-ic';
 import type { IcProjection, IcRankingEntry } from '../../../lib/types/market';
 import { fmtPct, fmtPrice } from '../../../lib/utils/format';
-import { instrumentText, useContractName } from '../../lib/contract-names';
+import { instrumentText, useVisibleRowName } from '../../lib/contract-names';
 import { quoteLimit, type LimitState } from '../../lib/limit-hit';
 import * as s from '../../styles/sector.css';
 import { limitPrice } from '../../styles/watchlist.css';
 import { GroupedSection } from '../../ui/grouped';
 import { Segmented } from '../../ui/segmented';
-import { FALLBACK_VISIBLE_ROWS, useRowVisible, useVisibilityTracker, type VisibilityTracker } from '../quote-row';
+import { FALLBACK_VISIBLE_ROWS, useVisibilityTracker, type VisibilityTracker } from '../quote-row';
 import { fmtSectorMoney, toneOf } from './sector-model';
 
 /** 群組內排行每組最多 10 檔（published matrix，同桌面 GROUP_RANK_LIMIT） */
@@ -74,8 +74,7 @@ function MemberRow({ entry, index, tracker, sim, onPick }: {
 }) {
     const code = entry.code;
     const ref = useRef<HTMLButtonElement | null>(null);
-    const visible = useRowVisible(ref, tracker, index < FALLBACK_VISIBLE_ROWS);
-    const name = useContractName(code, null, 'STK', visible);
+    const name = useVisibleRowName(ref, tracker, index < FALLBACK_VISIBLE_ROWS, code, null, 'STK');
     const contract = useContract(code);
     const limit = quoteLimit(contract, entry.price, sim);
     const tone = toneOf(entry.price_chg);

@@ -8,7 +8,7 @@
 //   篩選改變只送差異；離開或退到背景全部退訂；失敗不自動重試，只提供［重試］。
 // - 名稱：先讀記憶體中的合約快取與名稱目錄（signal-model.ts 的 signalName）；顯示時呼叫 1 次 ensureEquityNamesFresh()
 //   （lib 合併、60 分鐘內不重抓、失敗 30 秒後才可能再抓，且只在下次呼叫時）。部署環境沒有 /metadata 路由時目錄讀不到，
-//   因此仍沒有名稱的「可見」列（整段共用一個 IntersectionObserver，quote-row 的 createVisibilityTracker）以
+//   因此仍沒有名稱的「可見」列（整段共用一個 IntersectionObserver，quote-row 的 useVisibilityTracker）以
 //   lib/contract-names 向永豐查一次合約：每個代碼本 session 最多 1 次、同時 ≤2、失敗不重試、不可見時取消未開始的查詢；
 //   不讀外部網站。名稱到達前列只顯示代碼，之後顯示「名稱 代碼」。
 // 請求（每次進入本分段或回到前景）：scanner subscribe 每鍵 1 次（預設 4 規則 × 2 市場＝8；全選 13 × 2＝26）；
@@ -22,14 +22,14 @@ import { getMarketPulseSnapshot, retainMarketPulseStreams, subscribeMarketPulse 
 import { subscribeEtfNames } from '../../../lib/etf-runtime-catalog';
 import { ensureEquityNamesFresh, subscribeEquityNames } from '../../../lib/stock-runtime-catalog';
 import type { ScannerSignalEvent } from '../../../lib/types/market';
-import { instrumentText, useContractName } from '../../lib/contract-names';
+import { instrumentText, useVisibleRowName } from '../../lib/contract-names';
 import { navigate } from '../../lib/hash-router';
 import * as ms from '../../styles/market-signals.css';
 import { Chip } from '../../ui/chip';
 import { EmptyState } from '../../ui/empty-state';
 import { GroupedSection } from '../../ui/grouped';
 import { InlineNote } from '../../ui/inline-note';
-import { FALLBACK_VISIBLE_ROWS, useRowVisible, useVisibilityTracker, type VisibilityTracker } from '../quote-row';
+import { FALLBACK_VISIBLE_ROWS, useVisibilityTracker, type VisibilityTracker } from '../quote-row';
 import {
     EXCHANGE_LABELS,
     FAMILY_LABELS,
@@ -119,9 +119,8 @@ export function coverageText(c: SignalCoverage): string {
 function SignalRow({ signal, index, tracker }: { signal: ScannerSignalEvent; index: number; tracker: VisibilityTracker | null }) {
     const code = signal.quote.code;
     const ref = useRef<HTMLButtonElement | null>(null);
-    const visible = useRowVisible(ref, tracker, index < FALLBACK_VISIBLE_ROWS);
     // 記憶體中的名稱優先；沒有時只為可見列向永豐查一次合約（lib/contract-names）
-    const name = useContractName(code, signalName(code, signal.exchange), undefined, visible);
+    const name = useVisibleRowName(ref, tracker, index < FALLBACK_VISIBLE_ROWS, code, signalName(code, signal.exchange));
     const quote = signalQuote(signal);
     const label = RULE_LABELS[signal.scanner] ?? String(signal.scanner);
     const detail = signalDetail(signal.scanner, signal.extra);

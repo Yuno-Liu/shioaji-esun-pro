@@ -11,10 +11,11 @@
 // 清單型呼叫端（盤中異動、產業成分股）以 visible 只為可見列查詢（useContractName 第 4 個參數）。
 // 只讀取合約資料（永豐 shioaji 合約 API），不讀外部網站、不訂閱行情、不送任何委託。
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
 import { canonicalBrokerCode, realizedCodeCandidates } from '../../lib/realized-name';
 import type { SecurityType } from '../../lib/types/contract';
+import type { VisibilityTracker } from '../components/quote-row';
 
 /** 同時進行的名稱查詢上限 */
 export const NAME_LOOKUP_CONCURRENCY = 2;
@@ -106,6 +107,32 @@ export function useContractName(code: string | null | undefined, known?: string 
     const need = !own && !fromCache && !!key && visible;
     useEffect(() => (need ? requestContractName(key, type) : undefined), [need, key, type]);
     return own ?? fromCache;
+}
+
+/**
+ * 清單列的名稱：列可見才查（盤中異動、產業成分股）。可見度用整頁共用的 VisibilityTracker（quote-row 的
+ * useVisibilityTracker；與 QuoteRow 內部的可見列追蹤相同規則，這裡另寫一份讓首屏 chunk 不必多匯出）；
+ * 瀏覽器沒有 IntersectionObserver 時以 fallbackVisible（前幾列）代替。
+ */
+export function useVisibleRowName(
+    ref: { current: Element | null },
+    tracker: VisibilityTracker | null,
+    fallbackVisible: boolean,
+    code: string,
+    known?: string | null,
+    type?: SecurityType,
+): string | null {
+    const [visible, setVisible] = useState(false);
+    useEffect(() => {
+        if (!tracker) return;
+        if (!tracker.supported) {
+            setVisible(fallbackVisible);
+            return;
+        }
+        const el = ref.current;
+        return el ? tracker.observe(el, setVisible) : undefined;
+    }, [ref, tracker, fallbackVisible]);
+    return useContractName(code, known, type, visible);
 }
 
 /** 「名稱 代碼」（沒有名稱只回代碼）：aria-label、面板標題、清單文字用 */

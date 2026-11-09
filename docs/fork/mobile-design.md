@@ -1178,7 +1178,7 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 篩選：訊號家族（漲跌停、急漲跌、爆量、狀態）多選 Chip＋市場（上市、上櫃）；存 localStorage `sj-mobile-signal-filters-v1`；預設與桌面相同：急漲跌＋上市＋上櫃（8 個鍵，全選 26 個）。篩選改變只送差異。
 - 狀態列「已訂閱 n/m」；部分失敗用 InlineNote warn 說明不會自動重試＋［重試］（只重送失敗的鍵）；串流重連遺漏用 InlineNote「串流重連期間遺漏 N 筆訊號（起–迄）」。
 - 列（最新在前，最多 100 列，畫面每 500ms 最多依 snapshot.version 重算一次）：第一行名稱＋代碼｜（試撮徽章）成交價；第二行時間・上市／上櫃・訊號文字（方向色輔助）・補充（急漲跌幅度、爆量金額、觸發價）｜漲跌（帶正負號與漲跌幅）。
-- 名稱（第 5 批，2026-11-09 改，使用者要求「盤中異動股票要加股票名字」）：先讀記憶體（合約快取、ETF 內建目錄、上市櫃公司目錄）。部署環境的 nginx 沒有 `/metadata/*` 路由（回 SPA 的 index.html，200 text/html），公司目錄讀不到；因此仍沒有名稱的「可見」列以 `lib/contract-names` 向永豐查一次合約：整段共用一個 IntersectionObserver（`quote-row` 的 `createVisibilityTracker`／`useRowVisible`）、每個代碼本 session 最多 1 次、同時 ≤2、排隊中變不可見就取消（不算用掉）、失敗不重試，不讀外部網站。名稱到達前只顯示代碼，之後「名稱 代碼」。`useContractName` 一律訂閱該代碼的合約快取，名稱來自非響應式來源時合約到達也會重繪。
+- 名稱（第 5 批，2026-11-09 改，使用者要求「盤中異動股票要加股票名字」）：先讀記憶體（合約快取、ETF 內建目錄、上市櫃公司目錄）。部署環境的 nginx 沒有 `/metadata/*` 路由（回 SPA 的 index.html，200 text/html），公司目錄讀不到；因此仍沒有名稱的「可見」列以 `lib/contract-names` 向永豐查一次合約：整段共用一個 IntersectionObserver（`quote-row` 的 `useVisibilityTracker`＋`contract-names` 的 `useVisibleRowName`）、每個代碼本 session 最多 1 次、同時 ≤2、排隊中變不可見就取消（不算用掉）、失敗不重試，不讀外部網站。名稱到達前只顯示代碼，之後「名稱 代碼」。`useContractName` 一律訂閱該代碼的合約快取，名稱來自非響應式來源時合約到達也會重繪。
 - 沒有訊號時說明：盤中異動只在交易時段即時推送；只列出本分段開啟期間收到的訊號，離開或 App 在背景的時段不會補上（lib 保留最近 250 筆，再次進入會看到之前收到的）。
 - 交易安全：點列只 `navigate({ name: 'trade', code })`；沒有下單、聲音、震動（前景提醒是第 2 期）。
 
@@ -1393,7 +1393,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
   - 再加入走勢副圖指標（分時買賣力、大單／小單，全在交易頁 chunk）：首屏 **222,512 bytes**（不變）；交易頁 chunk 25.2 → 29.8 KiB。
 - **第 3 批**（2026-11-08，自選頁「持倉」分段）：首屏 **222,666 bytes（217.4 KiB，15 個 JS）**，+154 bytes：分段標籤、lazy 入口與預載項目、預載對照表多兩個 chunk（holdings-list 1.9 KiB、與持倉頁共用的 position-text 0.6 KiB）。剩約 0.55 KiB。
 - **第 3 批**（2026-11-09，走勢 X 軸固定與漲跌停範圍，全在交易頁 chunk）：首屏 **222,495 bytes**（不變，差異為 chunk 雜湊的 gzip 浮動）。
-- **第 5 批**（2026-11-09，漲停／跌停標示、盤中異動名稱、產業成分股）：首屏 **222,780 bytes（15 個 JS）**，+93（相對 main 222,687）：`quoteLimit` 判斷、列上的 class 切換與無障礙名稱、`limitPrice` 兩個 class、匯出 `useRowVisible`；「漲停／跌停」文字放在 CSS `::before`，不佔 JS。名稱查詢佇列（`lib/contract-names`）與成分股清單都在延遲載入的 chunk。與股期固定清單（+434）合併後需重量（兩者相加可能略超過 223,232）。
+- **第 5 批**（2026-11-09，漲停／跌停標示、盤中異動名稱、產業成分股）：首屏 **222,780 bytes（15 個 JS）**，+93（相對 main 222,687）：`quoteLimit` 判斷、列上的 class 切換與無障礙名稱、`limitPrice` 兩個 class；「漲停／跌停」文字放在 CSS `::before`，不佔 JS。名稱查詢佇列（`lib/contract-names`）與成分股清單都在延遲載入的 chunk。與股期固定清單（+434）合併後需重量（兩者相加可能略超過 223,232）。
 - 未處理（需要修改 `src/lib`，R2 不允許，列入 §16）：trading-state 每筆 tick 重算全部持倉並發布、每秒以 BroadcastChannel 傳出整份 state（P2 根因、P14）；SSE 第一次連線就發 RECONNECT 合約刷新，冷啟動同一份合約抓 3 次（P4）；自選快照等全部合約 info 才讀，LCP 被最慢的一筆卡住（P5）；首屏帶入 Tauri 橋接、閃電下單模組、MockEsunDriver 與玉山整合（P6、P7、P8、P15，稽核估計合計約 50 KiB gzip）。
 - **第 3 批**（2026-11-09，已實現損益自訂區間）：首屏 **222,529 bytes**（+17：segmented 的 wrap 變體在首屏 `ui/segmented`；卡片、日期欄、驗證與玉山視窗都在延遲載入的帳戶頁 chunk），在 223,232 內。
 
