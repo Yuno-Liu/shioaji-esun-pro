@@ -2830,6 +2830,9 @@ class EsunTradeBridge:
         self._drained: bool | None = None
         self._mutations_cond = threading.Condition()  # guards _mutations_in_flight + the shutdown flag
         self._mutations_in_flight = 0
+        # Environment switch in progress (guarded by _mutations_cond): no order mutation may start while
+        # the session is being swapped, and a switch never starts while a mutation is in flight.
+        self._env_switch_in_progress = False
         self._generation_seq = session_generation_base()
 
         cfg, _, env = load_config(selected_path)
@@ -2979,6 +2982,24 @@ class EsunTradeBridge:
                 return False
             self._mutations_in_flight += 1
             return True
+
+    def try_begin_request_mutation(self) -> str | None:
+        """
+        try_begin_mutation for a whole HTTP mutation request, also refused while an environment switch
+        swaps the session. Returns None when counted, else the refusal reason ("shutdown" / "switching").
+        Checked and counted under _mutations_cond, atomically with the switch's own check.
+        """
+        with self._mutations_cond:
+            if self._shutdown_event.is_set():
+                return "shutdown"
+            if self._env_switch_in_progress:
+                return "switching"
+            self._mutations_in_flight += 1
+            return None
+
+    @staticmethod
+    def _switch_in_progress_refusal() -> tuple[dict, int]:
+        return not_sent(409, "ESUN_SWITCH_IN_PROGRESS", "玉山環境切換中，委託未送出：請等切換完成、確認環境後再送出")
 
     def end_mutation(self) -> None:
         with self._mutations_cond:
@@ -4332,7 +4353,20 @@ class EsunTradeBridge:
 
         if not self._session_change_lock.acquire(blocking=False):
             return self._switch_response(False, error="另一個登入或環境切換作業進行中", code="ESUN_SESSION_BUSY"), 409
+        claimed = False
         try:
+            # Never swap the session under an in-flight order mutation (its result would belong to a
+            # session that is going away); while the switch runs, new mutations are refused (not sent).
+            with self._mutations_cond:
+                in_flight = self._mutations_in_flight
+                if in_flight == 0:
+                    self._env_switch_in_progress = claimed = True
+            if not claimed:
+                return self._switch_response(
+                    False,
+                    error=f"玉山委託處理中（{in_flight} 筆），暫時不能切換環境；請等委託結果回來後再試",
+                    code="ESUN_MUTATIONS_IN_FLIGHT",
+                ), 409
             session = self._session
             discovery = discover_esun_config_profiles(self.base_dir, session.config_path)
             if self._session_usable(session) and session.environment == target:  # an expired one logs in again
@@ -4369,6 +4403,10 @@ class EsunTradeBridge:
                 ), 502
             return self._switch_response(True), 200
         finally:
+            if claimed:
+                with self._mutations_cond:
+                    self._env_switch_in_progress = False
+                    self._mutations_cond.notify_all()
             self._session_change_lock.release()
 
     @staticmethod
@@ -4447,6 +4485,8 @@ class EsunTradeBridge:
             return None, not_sent(400, "ESUN_INVALID_JSON", "請求本文必須為 JSON 物件")
         if self.is_shutting_down():
             return None, self._shutting_down_refusal()
+        if self._env_switch_in_progress:  # the HTTP path is already refused before this (try_begin_request_mutation)
+            return None, self._switch_in_progress_refusal()
         session = self._session
         if not session.logged_in:
             return None, not_sent(503, "ESUN_NOT_LOGGED_IN", self._not_logged_in_message())
@@ -5730,9 +5770,15 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         if self._is_mutation_path():
-            # Tracked until the response is written, so a graceful shutdown waits for the answer.
-            if not self.bridge.try_begin_mutation():
+            # Tracked until the response is written, so a graceful shutdown waits for the answer
+            # and an environment switch cannot start meanwhile (nor this start during one).
+            refusal = self.bridge.try_begin_request_mutation()
+            if refusal == "shutdown":
                 self._send_error_json(503, "ESUN_SHUTTING_DOWN", "玉山 bridge 關閉中，委託未送出")
+                return
+            if refusal == "switching":
+                body, status = self.bridge._switch_in_progress_refusal()
+                self._send_json(status, body)
                 return
             try:
                 self._dispatch_post(path, body)

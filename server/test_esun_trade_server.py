@@ -1691,6 +1691,76 @@ class TestSessionHealthAndSwitch(_BridgeCase):
         self.assertEqual(results[0][1], 200)
         self.assertEqual(bridge.environment, "PRODUCTION")
 
+    def test_switch_refused_while_order_mutation_in_flight(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        original = bridge.session
+        self.assertIsNone(bridge.try_begin_request_mutation())  # an order request is being handled
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual((status, res["code"]), (409, "ESUN_MUTATIONS_IN_FLIGHT"))
+        self.assertFalse(res["ok"])
+        self.assertIn("委託處理中", res["error"])
+        self.assertEqual(res["environment"], "SIMULATION")
+        self.assertIs(bridge.session, original)
+        self.assertEqual(factory.login_calls, 1)  # no login attempt
+        bridge.end_mutation()
+        res, status = bridge.switch_environment_with_status("PRODUCTION")
+        self.assertEqual(status, 200)
+        self.assertEqual(bridge.environment, "PRODUCTION")
+        self.assertFalse(bridge._env_switch_in_progress)
+
+    def test_order_mutation_refused_not_sent_while_switch_swaps_session(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        _write_profile(self.dir, "esun-config.production.ini", "PRODUCTION")
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowLoginSDK(MockSDK):
+            def login(self):
+                super().login()
+                if self.config.get("Core", "Entry") == ESUN_PRODUCTION_ENTRY:
+                    entered.set()
+                    release.wait(5)
+
+        factory = RecordingFactory(mock_cls=SlowLoginSDK)
+        bridge = self.make_bridge(sim, factory)
+        old_sdk = factory.instances[0]
+        results = []
+        worker = threading.Thread(target=lambda: results.append(bridge.switch_environment_with_status("PRODUCTION")))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            # HTTP layer: the request is refused before it is counted or dispatched
+            self.assertEqual(bridge.try_begin_request_mutation(), "switching")
+            self.assertEqual(bridge._mutations_in_flight, 0)
+            # direct call: refused in the prelude, never reaches the SDK
+            res, status = bridge.place_order({"payload": {"stockNo": "2330"}, "expected_environment": "SIMULATION"})
+            self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_SWITCH_IN_PROGRESS", "not_sent"))
+            self.assertIn("環境切換中", res["error"])
+            self.assertEqual(old_sdk.placed_orders, [])
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertEqual(results[0][1], 200)
+        self.assertEqual(bridge.environment, "PRODUCTION")
+        # after the switch, mutation requests are counted again
+        self.assertIsNone(bridge.try_begin_request_mutation())
+        bridge.end_mutation()
+
+    def test_switch_flag_cleared_on_every_exit_path(self):
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory()
+        bridge = self.make_bridge(sim, factory)
+        res, status = bridge.switch_environment_with_status("PRODUCTION")  # no production profile
+        self.assertEqual(status, 400)
+        self.assertFalse(bridge._env_switch_in_progress)
+        res, status = bridge.switch_environment_with_status("SIMULATION")  # unchanged
+        self.assertEqual(status, 200)
+        self.assertFalse(bridge._env_switch_in_progress)
+        self.assertIsNone(bridge.try_begin_request_mutation())
+        bridge.end_mutation()
+
     def test_accounts_mask_person_id_and_come_from_session(self):
         sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88407654321")
 
