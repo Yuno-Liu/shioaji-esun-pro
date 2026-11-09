@@ -31,6 +31,8 @@ export function useEsunLimitEstimate(account: EstimateAccount | null | undefined
     const brokerId = account?.broker_id;
     const accountId = account?.account_id;
     const usable = esun && !!data && !limitsLookEmpty(data) && typeof limit === 'number' && Number.isFinite(limit);
+    // 台北日序：跨日後下一次重繪就重算（不沿用前一日把昨天委託算成「今日」的結果）
+    const taipeiDay = Math.floor((Date.now() + 8 * 3_600_000) / 86_400_000);
     return useMemo(() => {
         if (!usable || brokerId === undefined || accountId === undefined) return null;
         return estimateEsunRemaining({
@@ -42,5 +44,5 @@ export function useEsunLimitEstimate(account: EstimateAccount | null | undefined
             limitUpOf,
             now: Date.now(),
         });
-    }, [usable, limit, brokerId, accountId, trades, ordersLoaded, reconcile]);
+    }, [usable, limit, brokerId, accountId, trades, ordersLoaded, reconcile, taipeiDay]);
 }
