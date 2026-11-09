@@ -26,7 +26,7 @@
 //   換檔、換週期再回到走勢沿用。正常情況每檔每日 1 次請求；只有偵測到漏量才再抓。
 // - 失敗不自動重試：下次 retain（重新開關指標、重新進入走勢）且距失敗 ≥ FLOW_RETRY_MIN_MS 才重抓。
 
-import { isWarrant } from '../../lib/contract-market';
+import { isWarrantContract } from '../../lib/contract-market';
 import { fetchHistoryTicks } from '../../lib/shioaji';
 import { onAnyTick } from '../../lib/stream';
 import type { ContractBase } from '../../lib/types/contract';
@@ -49,9 +49,13 @@ export const CONTINUOUS_END_SOD = 13 * H + 25 * 60;
 /** 當日第一筆成交若在 09:00 之後這幾秒內，視為開盤集合競價的撮合，不計入買賣力 */
 export const OPEN_AUCTION_WINDOW_S = 30;
 
-/** 股票＋ETF 才提供（權證、指數、期貨、選擇權不提供） */
-export function lineFlowSupported(securityType: string | null | undefined): boolean {
-    return securityType === 'STK' && !isWarrant(securityType ?? undefined);
+/**
+ * 股票＋ETF 才提供（權證、指數、期貨、選擇權不提供）。
+ * 權證以 lib isWarrantContract 判斷：SDK 1.7 以前權證可能標成 STK，此時看代號編碼區間（上游 #394）。
+ */
+export function lineFlowSupported(contract: { security_type?: string | null; code?: string } | null | undefined): boolean {
+    if (!contract || contract.security_type !== 'STK') return false;
+    return !isWarrantContract({ security_type: contract.security_type, code: contract.code });
 }
 
 // ---- 純函式：解析、分桶、彙總 ----

@@ -63,7 +63,7 @@ import { getRiskSettings } from '../../lib/risk';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
 import { maskMoney, secretMoney, usePrivacyMode, usePrivacyMoney } from '../../lib/privacy';
 import { useServerInfo, yesterdayQuantityNotice } from '../../lib/server-info-store';
-import { contractMarket, isWarrant } from '../../lib/contract-market';
+import { contractMarket, isWarrantContract } from '../../lib/contract-market';
 import { esunStockLegProblem } from '../../lib/order-route';
 import { creditExitLabel, stockExitFor, type CreditExitCond } from '../../lib/stock-exit-cond';
 import { notify, placeQuickOrder, placeStockExitByShares } from '../../lib/trade';
@@ -230,7 +230,8 @@ export function closePlanFor(p: AccountedPosition, contract: ContractInfo | unde
         // 權證與股票同一條下單路徑（lib contractMarket：STK、WRT 都是證券市場）；權證沒有零股，lib 送出前也會再擋
         if (contractMarket(contract.security_type) !== 'S') return POSITIONS_TEXT.contractMismatch;
         const odd = p.quantity % 1000;
-        if (isWarrant(contract.security_type) && odd !== 0) return POSITIONS_TEXT.warrantOddLot;
+        // 權證以 lib isWarrantContract 判斷（SDK 1.7 以前可能標成 STK，看代號；同 lib placeStockExitByShares）
+        if (isWarrantContract(contract) && odd !== 0) return POSITIONS_TEXT.warrantOddLot;
         // 整張以市價 IOC 送出、不用漲跌停價；只有零股腳以漲跌停價限價（同 lib placeStockExitByShares）。
         // 權證的合約資料沒有漲跌停價（lib resolveContract 回 0），整張平倉仍可送出。
         if (odd !== 0 && (!(contract.limit_up > 0) || !(contract.limit_down > 0))) return POSITIONS_TEXT.noLimits;
