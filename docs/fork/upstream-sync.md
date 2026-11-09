@@ -108,6 +108,7 @@ git diff $(git merge-base HEAD upstream/main) -- <檔案> | grep -c '^[+-][^+-]'
   - **權證判斷**：持倉頁平倉的權證零股檢查與 `lineFlowSupported` 改用上游的 `isWarrantContract`。SDK 1.7 以前權證可能標成 STK，此時改看代號；原本的 `isWarrant(security_type)` 判斷不到這種權證。`lineFlowSupported` 改為接收合約，兩個呼叫端都已改，並補上被標成 STK 的權證測試。
   - **配色**：#393 起 `danger` 是獨立的朱紅，不再等於漲跌紅。手機的對比實算測試原本假設「danger＝紅」，已把 `danger` 加入實心填色的驗證；疊上 inkStrong／inkLarge 後白字對比在深色與淺色模式都合格。手機用 `vars.color.danger` 的 40 處自動改為朱紅，「已鎖單」膠囊與確認面板的實心底都有疊墨，所以不需要改用 `dangerSolid`。
 - **首屏**：手機首屏 JS 223,999 → 224,668 bytes，增加的部分全來自上游共用 chunk（`src` +544、`theme.css` +134），超出 ≤219 KiB。目標因此放寬為 ≤220 KiB（225,280），見 mobile-design.md §13。
+- **fork CI 的時鐘相依測試**（與上游無關）：這次 PR 的 fork-ci 在台北 00:05 執行，`TestMutationContractWithRealSdk.test_unlisted_or_uncertain_sdk_errors_stay_unknown` 失敗（得到 503 ESUN_SESSION_EXPIRED，預期 504 ESUN_OUTCOME_UNKNOWN）。原因：測試的 session 在今日 00:05 寬限之前登入，被換日規則視為前一天的 session，解析錯誤使它失效。已比照 `TestSessionExpiryAndAutoRelogin`，把該類別的台北時鐘固定在 10:00。驗證：時鐘設在 00:00 會重現同一個失敗；在台北 00:01 的模擬時鐘下，全部 221 項橋接測試都通過，沒有其他測試依賴午夜時段。
 - **檢查**：
   - `tsc -b` 通過。
   - vitest 共 543 個檔案、8,257 項通過，另有 1 個檔案、2 項略過；這是合併後、手機調整前的結果，調整後受影響的測試另已重跑。

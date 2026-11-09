@@ -2363,8 +2363,18 @@ class FakeCore:
 class TestMutationContractWithRealSdk(_BridgeCase):
     """§4 mutation contract driven through the real esun_trade.sdk.SDK (fake core)."""
 
+    # Fixed daytime Taipei clock (as TestSessionExpiryAndAutoRelogin): run between 00:00 and 00:05 Taipei,
+    # the login predates the day change, a response-parse error then expires the session and later cases
+    # answer ESUN_SESSION_EXPIRED instead of unknown (fork CI failed this way at 00:05 Taipei on 2026-11-10).
+    CLOCK_HOUR = 10
+
     def setUp(self):
         super().setUp()
+        today = datetime.datetime.now(bridge_module.TAIPEI_TZ).date()
+        clock = _TaipeiClock(datetime.datetime.combine(today, datetime.time(self.CLOCK_HOUR, 0), tzinfo=bridge_module.TAIPEI_TZ))
+        clock_patch = mock.patch.object(bridge_module, "taipei_now", clock)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         FakeCore.instances = []
         self._core_patch = mock.patch("esun_trade.sdk.CoreSDK", FakeCore)
         self._core_patch.start()
