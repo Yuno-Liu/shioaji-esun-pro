@@ -78,7 +78,7 @@ import { loadDesktopSettings, saveDesktopSettings, importCredentialEnv, type Des
 export { loadDesktopSettings, saveDesktopSettings, saveCredentialProfile, selectCredentialProfile, deleteCredentialProfile, logoutCredentialProfile, EMPTY_DESKTOP_SETTINGS } from './desktop-credentials';
 export type { DesktopSettings, CredentialProfile, CredentialDraft } from './desktop-credentials';
 import { isChildWindow } from './window-role';
-import { newPopoutWindowId } from './flash-account';
+import { newPopoutWindowId } from './account-identity'; // fork：輕量模組，手機首屏不載入閃電下單模組
 
 export { isTauri } from './runtime';
 export {

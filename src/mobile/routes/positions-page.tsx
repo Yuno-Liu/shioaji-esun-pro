@@ -59,7 +59,7 @@ import { canTrade } from '../../lib/account-tradable';
 import { ensureContract, getCachedContract, useContract } from '../../lib/contracts-cache';
 import { isEsunAccount } from '../../lib/esun';
 import { findEsunInventoryDetail, getEsunInventoryDetailsSnapshot, subscribeEsunInventoryDetails } from '../../lib/esun/account-details';
-import { accountMatches } from '../../lib/flash-account';
+import { accountMatches } from '../../lib/account-identity';
 import { SHARES_PER_LOT } from '../../lib/odd-lot';
 import { getPendingOrderConfirm } from '../../lib/order-confirm';
 import { getRiskSettings } from '../../lib/risk';

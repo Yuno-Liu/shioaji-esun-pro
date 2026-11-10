@@ -12,7 +12,7 @@
 import { getAccountState } from './account-store';
 import { canTrade } from './account-tradable';
 import { esunTradeService, isEsunAccount, validateEsunStockOrder } from './esun';
-import { accountMatches } from './flash-account';
+import { accountMatches } from './account-identity';
 import { knownServerInfo } from './server-info-store';
 import type { ContractBase } from './types/contract';
 import type { StockOrderReq } from './types/order';

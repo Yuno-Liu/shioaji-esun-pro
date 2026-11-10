@@ -15,7 +15,7 @@ vi.mock('../../lib/esun', () => ({
     useEsunEnvironment: () => ({ environment: 'SIMULATION' }),
     esunTradeService: { switchEnvironment: m.switchEnvironment },
 }));
-vi.mock('../../lib/flash-account', () => ({ accountMatches: () => false }));
+vi.mock('../../lib/account-identity', () => ({ accountMatches: () => false }));
 vi.mock('../../lib/order-confirm', () => ({
     accountConfirmLabel: () => '',
     privacyAccountLabel: (s: string) => s,

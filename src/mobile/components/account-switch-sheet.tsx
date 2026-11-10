@@ -11,7 +11,7 @@ import { useSyncExternalStore } from 'react';
 import { selectAccount, useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
 import { isEsunAccount, useEsunEnvironment } from '../../lib/esun';
-import { accountMatches } from '../../lib/flash-account';
+import { accountMatches } from '../../lib/account-identity';
 import { accountConfirmLabel, getPendingOrderConfirm, privacyAccountLabel, subscribeOrderConfirm } from '../../lib/order-confirm';
 import { orderRouteOf, routeEnvText } from '../../lib/order-route';
 import { usePrivacyMode } from '../../lib/privacy';
