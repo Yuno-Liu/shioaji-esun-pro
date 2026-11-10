@@ -28,6 +28,7 @@ const m = vi.hoisted(() => {
         fetchStockReserveDetail: vi.fn(),
         fetchEarmarkingDetail: vi.fn(),
         fetchAccountOverview: vi.fn(),
+        fetchTransactions: vi.fn(),
         refreshHealth: vi.fn(async () => null),
         esunHealth: null as unknown,
         esunTx: null as unknown,
@@ -84,6 +85,7 @@ vi.mock('../../lib/esun', () => ({
         refreshHealth: m.refreshHealth,
         getBridgeHealth: () => m.esunHealth,
         fetchAccountOverview: m.fetchAccountOverview,
+        fetchTransactions: m.fetchTransactions,
         ...m.esunSend,
     },
     isEsunAccount: (a?: { broker_id?: string } | null) => !!a?.broker_id?.startsWith('ESUN'),
@@ -240,6 +242,7 @@ beforeEach(() => {
         tradeStatus: { tradeLimit: 500000, marginLimit: 0, shortLimit: 0, dayTradeCode: 'N', dayTradeLabel: '不可當沖', marginCode: '9', marginLabel: '未開戶', shortCode: '9', shortLabel: '未開戶' },
         marketStatus: { isTradingDay: true, lastTradingDay: '2026-11-04', nextTradingDay: '2026-11-06' },
     });
+    m.fetchTransactions.mockReset().mockResolvedValue([]);
     m.refreshHealth.mockClear();
     m.esunHealth = null;
     m.esunTx = null;
@@ -1271,5 +1274,282 @@ describe('AccountPage today trading limit card', () => {
         expect(el.scrollIntoView).toHaveBeenCalledTimes(1);
         expect(el.focus).toHaveBeenCalledTimes(1);
         expect(el.focus).toHaveBeenCalledWith({ preventScroll: true });
+    });
+});
+
+describe('AccountPage fill history (成交明細)', () => {
+    const NOW = Date.UTC(2026, 10, 9, 2, 0, 0); // 2026-11-09 10:00 台北
+    let t = 0;
+    beforeEach(() => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(NOW);
+        t = NOW;
+        resetOnDemandForTest(() => t);
+    });
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+    const esunOnly = () => {
+        m.accounts = { accounts: [esunStock], selectedStock: esunStock, selectedFutures: null, loaded: true, loadError: false };
+    };
+    async function pickIn(groupId: string, label: string) {
+        const b = byTestId(groupId).findAll(n => n.type === 'button').find(n => textOf(n) === label)!;
+        await act(async () => { b.props.onClick(); });
+    }
+    async function setFillsDate(id: 'fills-begin' | 'fills-end', value: string) {
+        await act(async () => { byTestId(id).props.onChange({ target: { value } }); });
+    }
+    function esunFill(i: number, p: Record<string, unknown> = {}) {
+        return {
+            code: '', name: '', buySell: '', action: null, tradeType: '', tradeTypeLabel: '', marketCode: '', market: null,
+            orderNo: `A${String(1000 + i)}`, tradeDate: '2026-11-09', tradeTime: `09:${String(i % 60).padStart(2, '0')}:00`, settleDate: '',
+            price: 600, shares: 1000, priceQty: 600000, fee: 855, shortFee: null, tax: 0, capitalGainsTax: null, netAmount: -600855,
+            realizedPnl: null, realizedPnlPct: null, userDef: '', ...p,
+        };
+    }
+    function esunRow(p: Record<string, unknown>) {
+        return {
+            rowId: 1, code: '2330', name: '台積電', buySell: 'B', action: 'Buy', tradeType: '0', tradeTypeLabel: '現股', cond: 'Cash', marketCode: 'H', market: 'TSE',
+            tradeDate: '2026-11-09', settleDate: '2026-11-11', profitLossDate: '20261109', shares: 1000, avgPrice: 600, priceQty: 600000,
+            cost: null, income: null, realizedPnl: null, realizedPnlPct: null, realized: false, fills: [esunFill(1)], ...p,
+        };
+    }
+    const twoRows = () => [
+        esunRow({}),
+        esunRow({
+            rowId: 2, code: '2884', name: '玉山金', buySell: 'S', action: 'Sell', tradeDate: '2026-11-06', realized: true, realizedPnl: 1000,
+            fills: [esunFill(2, { tradeDate: '2026-11-06', price: 26, shares: 1000, priceQty: 26000, fee: 37, tax: 78, netAmount: 25885, realizedPnl: 1000 })],
+        }),
+    ];
+
+    it('mounts below the realized P&L card and only reads when opened', async () => {
+        esunOnly();
+        await render();
+        const order = testIdOrder();
+        expect(order.indexOf('account-fills')).toBeGreaterThan(order.indexOf('account-pnl'));
+        expect(order.indexOf('account-fills')).toBeLessThan(order.indexOf('account-esun-overview'));
+        expect(m.fetchTransactions).not.toHaveBeenCalled();
+    });
+
+    it('E.SUN: opening reads once, then the cooldown blocks 查詢 and re-open', async () => {
+        esunOnly();
+        m.fetchTransactions.mockResolvedValue(twoRows());
+        await render();
+        await click('account-fills-toggle');
+        expect(m.fetchTransactions).toHaveBeenCalledTimes(1);
+        expect(m.fetchTransactions).toHaveBeenCalledWith(esunStock, '2026-11-09', '2026-11-09');
+        expect(byTestId('fills-query').props.disabled).toBe(true);
+        expect(textOf(byTestId('fills-query'))).toBe('查詢（30 秒）');
+        await click('fills-query');
+        await click('account-fills-toggle');
+        await click('account-fills-toggle');
+        expect(m.fetchTransactions).toHaveBeenCalledTimes(1);
+        // 總計：買進、賣出、手續費、交易稅、淨收付、已實現損益（玉山才有）
+        const totals = textOf(byTestId('fills-totals'));
+        expect(totals).toContain('（2 筆）');
+        expect(totals).toContain('−$574,970'); // −600,855 + 25,885
+        expect(totals).toContain('$600,000（1,000 股）');
+        expect(totals).toContain('$26,000（1,000 股）');
+        expect(totals).toContain('$892'); // 手續費 855 + 37
+        expect(totals).toContain('$78');
+        expect(totals).toContain('已實現損益');
+        expect(totals).toContain('+$1,000');
+        expect(totals).not.toContain('（估）');
+        expect(allByTestId('fills-sinopac-note')).toHaveLength(0);
+        // 明細：日期新的在前、名稱為主、買／賣徽章與交易類別、書號
+        const rows = allByTestId('fills-row').map(textOf);
+        expect(rows).toHaveLength(2);
+        expect(rows[0]).toContain('台積電');
+        expect(rows[0]).toContain('買');
+        expect(rows[0]).toContain('現股');
+        expect(rows[0]).toContain('600 × 1,000 股');
+        expect(rows[0]).toContain('書號 A1001');
+        expect(rows[1]).toContain('玉山金');
+        expect(rows[1]).toContain('+$25,885');
+        t = NOW + 30_000;
+        await rerender();
+        expect(byTestId('fills-query').props.disabled).toBe(false);
+        await click('fills-query');
+        expect(m.fetchTransactions).toHaveBeenCalledTimes(2);
+    });
+
+    it('E.SUN: switches between 明細／依股票／依日期', async () => {
+        esunOnly();
+        m.fetchTransactions.mockResolvedValue(twoRows());
+        await render();
+        await click('account-fills-toggle');
+        expect(allByTestId('fills-row')).toHaveLength(2);
+        await pickIn('fills-view', '依股票');
+        expect(allByTestId('fills-row')).toHaveLength(0);
+        const stocks = allByTestId('fills-stock-row').map(textOf);
+        expect(stocks).toHaveLength(2);
+        expect(stocks[0]).toContain('台積電'); // |−600,855| > |25,885|
+        expect(stocks[1]).toContain('玉山金');
+        expect(stocks[1]).toContain('已實現損益 +$1,000');
+        await pickIn('fills-view', '依日期');
+        const dates = allByTestId('fills-date-row').map(textOf);
+        expect(dates.map(d => d.slice(0, 10))).toEqual(['2026-11-09', '2026-11-06']);
+        expect(allByTestId('fills-totals')).toHaveLength(1);
+    });
+
+    it('E.SUN: shows 100 rows at a time with 再顯示 100 筆', async () => {
+        esunOnly();
+        m.fetchTransactions.mockResolvedValue([esunRow({ fills: Array.from({ length: 230 }, (_, i) => esunFill(i)) })]);
+        await render();
+        await click('account-fills-toggle');
+        expect(allByTestId('fills-row')).toHaveLength(100);
+        expect(textOf(byTestId('fills-more'))).toBe('再顯示 100 筆');
+        await click('fills-more');
+        expect(allByTestId('fills-row')).toHaveLength(200);
+        expect(textOf(byTestId('fills-more'))).toBe('再顯示 30 筆');
+        await click('fills-more');
+        expect(allByTestId('fills-row')).toHaveLength(230);
+        expect(allByTestId('fills-more')).toHaveLength(0);
+    });
+
+    it('E.SUN: shares the 4-per-minute window with the realized P&L card', async () => {
+        esunOnly();
+        await render();
+        await click('account-pnl-toggle'); // 1：已實現損益（今日）
+        await click('account-fills-toggle'); // 2：成交明細（今日）
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(1);
+        expect(m.fetchTransactions).toHaveBeenCalledTimes(1);
+        await pickIn('fills-period', '自訂');
+        for (const [i, begin] of ['2026-10-12', '2026-10-13'].entries()) {
+            t = NOW + (i + 1) * 10_000; // 3、4：成交明細兩個不同區間
+            await setFillsDate('fills-begin', begin);
+            await click('fills-query');
+        }
+        expect(m.fetchTransactions).toHaveBeenCalledTimes(3);
+        expect(m.fetchTransactions).toHaveBeenLastCalledWith(esunStock, '2026-10-13', '2026-11-09');
+        // 第 5 次：兩張卡都被擋（視窗最舊一次在 t+0）
+        await setFillsDate('fills-begin', '2026-10-14');
+        expect(byTestId('fills-query').props.disabled).toBe(true);
+        expect(textOf(byTestId('fills-query'))).toBe('查詢（40 秒）');
+        await click('fills-query');
+        await pickPeriod('自訂');
+        await setDate('pnl-begin', '2026-10-20');
+        expect(byTestId('pnl-query').props.disabled).toBe(true);
+        await click('pnl-query');
+        expect(m.fetchTransactions).toHaveBeenCalledTimes(3);
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(1);
+        t = NOW + 60_000;
+        await rerender();
+        expect(byTestId('fills-query').props.disabled).toBe(false);
+        await click('fills-query');
+        expect(m.fetchTransactions).toHaveBeenCalledTimes(4);
+        // t+0 的兩次滑出、成交明細占 1 次 → 視窗內 3 次：已實現損益還能查 1 次（實際由 useNow 每秒重繪；這裡手動重繪）
+        await rerender();
+        expect(byTestId('pnl-query').props.disabled).toBe(false);
+        await click('pnl-query');
+        expect(m.fetchProfitLoss).toHaveBeenCalledTimes(2);
+        // 視窗又滿：成交明細的下一個區間要等 t+10s 那次滑出
+        await setFillsDate('fills-begin', '2026-10-15');
+        expect(textOf(byTestId('fills-query'))).toBe('查詢（10 秒）');
+        expect(textOf(byTestId('fills-esun-limit'))).toContain(`每分鐘最多查詢 ${PNL_ESUN_QUERIES_PER_MIN} 次`);
+    });
+
+    it('masks amounts and shares when money privacy is on', async () => {
+        esunOnly();
+        m.privMoney = true;
+        m.fetchTransactions.mockResolvedValue(twoRows());
+        await render();
+        await click('account-fills-toggle');
+        const totals = textOf(byTestId('fills-totals'));
+        const rows = allByTestId('fills-row').map(textOf).join('|');
+        for (const secret of ['600,000', '600,855', '1,000', '25,885', '26,000', '855', '574,970', '892']) {
+            expect(totals).not.toContain(secret);
+            expect(rows).not.toContain(secret);
+        }
+        expect(totals).toContain('•••••');
+        expect(rows).toContain('書號 ••01');
+        await pickIn('fills-view', '依股票');
+        expect(allByTestId('fills-stock-row').map(textOf).join('|')).not.toMatch(/\$\d/);
+        await pickIn('fills-view', '依日期');
+        expect(allByTestId('fills-date-row').map(textOf).join('|')).not.toMatch(/\$\d/);
+    });
+
+    describe('SinoPac', () => {
+        function sinoTrade(p: { code: string; action: 'Buy' | 'Sell'; price: number; qty: number; type?: string; account?: Record<string, string> }) {
+            return {
+                account: p.account ?? stock,
+                contract: { code: p.code, security_type: p.type ?? 'STK', exchange: 'TSE', target_code: null },
+                order: { id: `o-${p.code}`, seqno: 's', ordno: `N${p.code}`, action: p.action, price: p.price, quantity: p.qty, order_type: 'ROD', price_type: 'LMT', order_lot: 'Common' },
+                status: {
+                    id: 'x', status: 'Filled', status_code: '', msg: '', order_quantity: p.qty, deal_quantity: p.qty, cancel_quantity: 0, modified_price: 0, order_ts: NOW / 1000 - 7200,
+                    deals: [{ seq: '1', price: p.price, quantity: p.qty, ts: NOW / 1000 - 3600 }],
+                },
+            };
+        }
+        beforeEach(() => {
+            m.trading = {
+                ...m.trading,
+                trades: [
+                    sinoTrade({ code: '2330', action: 'Sell', price: 600, qty: 1 }),
+                    sinoTrade({ code: 'TXFL6', action: 'Buy', price: 23000, qty: 1, type: 'FUT', account: fut }),
+                    sinoTrade({ code: '2317', action: 'Buy', price: 150, qty: 1, account: { ...stock, account_id: '9999999' } }),
+                ],
+            };
+        });
+
+        it('shows today\'s stock fills of the selected account (estimated) without any request', async () => {
+            await render();
+            await click('account-fills-toggle');
+            expect(m.fetchTransactions).not.toHaveBeenCalled();
+            expect(textOf(byTestId('fills-sinopac-note'))).toBe('永豐不提供歷史成交查詢，只顯示今日成交（來自委託回報；手續費與交易稅為估算）。');
+            expect(allByTestId('fills-query')).toHaveLength(0);
+            const rows = allByTestId('fills-row').map(textOf);
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toContain('2330');
+            expect(rows[0]).toContain('09:00:00');
+            const totals = textOf(byTestId('fills-totals'));
+            expect(totals).toContain('手續費（估）');
+            expect(totals).toContain('交易稅（估）');
+            expect(totals).toContain('$855');
+            expect(totals).toContain('$1,800');
+            expect(totals).toContain('+$597,345');
+            expect(totals).not.toContain('已實現損益');
+            expect(text()).toContain('期貨成交請看委託頁');
+        });
+
+        it('a past range shows only the note and sends nothing', async () => {
+            await render();
+            await click('account-fills-toggle');
+            await pickIn('fills-period', '自訂');
+            await setFillsDate('fills-end', '2026-11-08');
+            expect(allByTestId('fills-row')).toHaveLength(0);
+            expect(allByTestId('fills-totals')).toHaveLength(0);
+            expect(allByTestId('fills-sinopac-note')).toHaveLength(1);
+            expect(allByTestId('fills-empty')).toHaveLength(1);
+            await setFillsDate('fills-end', '2026-11-09');
+            expect(allByTestId('fills-row')).toHaveLength(1);
+            expect(m.fetchTransactions).not.toHaveBeenCalled();
+        });
+
+        it('without a selected stock account shows a hint', async () => {
+            m.accounts = { accounts: [fut], selectedStock: null, selectedFutures: fut, loaded: true, loadError: false };
+            await render();
+            await click('account-fills-toggle');
+            expect(textOf(byTestId('account-fills'))).toContain('尚未選擇證券帳戶。');
+        });
+    });
+
+    it('S1: every control in the card sends, amends or cancels no order', async () => {
+        esunOnly();
+        m.fetchTransactions.mockResolvedValue([esunRow({ fills: Array.from({ length: 120 }, (_, i) => esunFill(i)) })]);
+        await render();
+        await click('account-fills-toggle');
+        for (const view of ['明細', '依股票', '依日期', '明細']) {
+            await pickIn('fills-view', view);
+            const buttons = () => byTestId('account-fills').findAll(n => n.type === 'button');
+            const count = buttons().length;
+            for (let i = 0; i < count; i++) {
+                const b = buttons()[i];
+                if (!b || b.props.disabled || b.props['data-testid'] === 'account-fills-toggle') continue;
+                await act(async () => b.props.onClick?.());
+            }
+        }
+        for (const f of [...Object.values(m.send), ...Object.values(m.esunSend)]) expect(f).not.toHaveBeenCalled();
+        expect(m.fetchTransactions).toHaveBeenCalled();
     });
 });

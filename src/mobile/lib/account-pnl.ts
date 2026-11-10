@@ -10,6 +10,7 @@
 // 不合法時只回傳原因，不自動修正日期。
 
 import type { ProfitLoss, ProfitLossSummaryTotal } from '../../lib/shioaji';
+import type { OnDemandGate } from './account-on-demand';
 
 /** 依今天推算的固定區間 */
 export type PnlPreset = 'today' | 'week' | 'month' | '30d';
@@ -34,6 +35,13 @@ export const PNL_COOLDOWN_MS = 30_000;
  * 4 次查詢 ≤ 8 個額度 < 10 次／分，留空間給同一個 bridge 上的桌面版。永豐沒有這道限制（只有同區間 30 秒不重查）。
  */
 export const PNL_ESUN_QUERIES_PER_MIN = 4;
+
+/**
+ * 玉山 GET /esun/portfolio/profit-loss 的滑動視窗（不分區間）：已實現損益卡片（含玉山帳戶時）與成交明細卡片（玉山帳戶）
+ * 共用同一個物件，兩張卡合計任意 60 秒最多 PNL_ESUN_QUERIES_PER_MIN 次。成交明細每次查詢只發 1 個請求，
+ * 合計仍 ≤ 8 個額度 < 10 次／分。只有永豐帳戶時不套用。
+ */
+export const PNL_ESUN_GATE: OnDemandGate = { name: 'realized-pnl-esun', max: PNL_ESUN_QUERIES_PER_MIN, windowMs: 60_000 };
 
 /** 自訂區間最多天數（含起訖日） */
 export const PNL_MAX_RANGE_DAYS = 180;

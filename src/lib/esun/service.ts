@@ -63,10 +63,12 @@ import {
     parseEsunMarketStatusDetail,
     parseEsunRealizedTransactionDetails,
     parseEsunTradeStatusDetail,
+    parseEsunTransactionDetail,
     setEsunInventoryDetails,
     setEsunOrderMetaSnapshot,
     setEsunTransactionDetails,
     type EsunAccountOverview,
+    type EsunTransactionDetail,
 } from './account-details';
 
 /** esun-bridge 位址：預設同源（由 Vite proxy / Docker 轉發 /esun） */
@@ -1074,6 +1076,20 @@ export class EsunTradeService {
         }
         if (!this.driver.getProfitLoss) this.missing('已實現損益');
         return this.driver.getProfitLoss(beginDate, endDate);
+    }
+
+    /**
+     * 查詢區間內全部成交明細（買進、賣出、未實現列都回傳，不篩選已實現）。與 fetchProfitLoss 打同一個
+     * driver.getTransactions（bridge GET /esun/portfolio/profit-loss），但不寫入任何 store；rowId 依原始列序 1 起算。
+     */
+    async fetchTransactions(account: Account, beginDate: string, endDate: string): Promise<EsunTransactionDetail[]> {
+        this.assertQueryAccount(account);
+        if (!this.driver.getTransactions) this.missing('成交明細');
+        const rows = await this.driver.getTransactions(beginDate, endDate);
+        if (!Array.isArray(rows) || rows.some(r => !r || typeof r !== 'object' || Array.isArray(r))) {
+            throw new Error('玉山已實現損益回應格式錯誤');
+        }
+        return rows.map((r, i) => parseEsunTransactionDetail(r, i + 1));
     }
 
     /** 查詢歷史成交與已實現損益彙總 */

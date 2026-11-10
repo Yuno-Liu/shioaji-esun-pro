@@ -1,12 +1,12 @@
 // src/mobile/routes/account-page.tsx — 帳戶（規格 §6.7、§9.1、§10）
 //
 // 區塊（各自在 src/mobile/components/account/*.tsx）：
-//   今日剩餘交易額度（使用者要求置頂；持倉頁摘要的額度列會跳到這裡）→ 帳號 → 資金（股票＋期貨）→ 交割行事曆 → 已實現損益 → 玉山帳務概覽（玉山證券帳戶）
+//   今日剩餘交易額度（使用者要求置頂；持倉頁摘要的額度列會跳到這裡）→ 帳號 → 資金（股票＋期貨）→ 交割行事曆 → 已實現損益 → 成交明細 → 玉山帳務概覽（玉山證券帳戶）
 //   → 預收券款／圈存（永豐證券帳戶，唯讀）→ 風控 → 交易成本 → 連線（含玉山重新連線）→ 伺服器 → 顯示 → 本裝置 → 診斷。
 // 讀取原則（§9.1）：
 // - 餘額、保證金、持倉只透過 useTradingState()，不自行輪詢。
 // - 交割款 30 秒內重用；交易額度共用 useTradingLimits 快取。
-// - 已實現損益、玉山帳務概覽、永豐預收／圈存只在使用者展開或按「查詢」時讀取，並有冷卻（src/mobile/lib/account-on-demand.ts）。
+// - 已實現損益、成交明細（玉山）、玉山帳務概覽、永豐預收／圈存只在使用者展開或按「查詢」時讀取，並有冷卻（src/mobile/lib/account-on-demand.ts）。
 // - 玉山資料一律經由 src/lib（esunTradeService 或 shioaji 查詢函式的玉山路由），不自行 fetch。
 // - 金額以 usePrivacyMoney＋maskMoney 遮蔽，帳號以 maskAccountId／mobileAccountLabel 遮蔽。
 
@@ -16,6 +16,7 @@ import { DeviceSettingsSection } from '../components/account/device-settings-sec
 import { DiagnosticsCard } from '../components/account/diagnostics-card';
 import { DisplayCard } from '../components/account/display-card';
 import { EsunOverviewCard } from '../components/account/esun-overview-card';
+import { FillHistoryCard, resetFillHistoryCardForTest } from '../components/account/fill-history-card';
 import { FundsSections } from '../components/account/funds-section';
 import { LimitsCard } from '../components/account/limits-card';
 import { RealizedPnlCard, resetRealizedPnlCardForTest } from '../components/account/realized-pnl-card';
@@ -37,6 +38,7 @@ export function resetAccountPageCacheForTest(): void {
     resetSettlementCacheForTest();
     resetOnDemandForTest();
     resetRealizedPnlCardForTest();
+    resetFillHistoryCardForTest();
 }
 
 export function AccountPage() {
@@ -47,6 +49,7 @@ export function AccountPage() {
             <AccountsCard />
             <FundsSections />
             <RealizedPnlCard />
+            <FillHistoryCard />
             <EsunOverviewCard />
             <ReserveCard />
             <RiskCard />
