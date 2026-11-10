@@ -720,6 +720,72 @@ describe('trigger execution (main window only)', () => {
         expect(unprotectedQuantity(planOf(plan.id))).toBe(1);
     });
 
+    // fork：現股庫存 2 張、現股括號停損 2 張；先觸發 entries（送出後仍在途），再讓停損觸發
+    async function cashStopAfterEntries(entries: Record<string, unknown>[]) {
+        await boot();
+        const STK = { code: '2890', target_code: null, security_type: 'STK', exchange: 'TSE' };
+        const stockSpec = { ...spec(S1, 'fixture-s1'), account: { account_type: 'S' as const, broker_id: S1.broker_id, account_id: S1.account_id },
+            quoteCode: '2890', orderCode: '2890', securityType: 'STK' as const, exchange: 'TSE', stopPrice: 44, takePrice: 46 };
+        m.cached.mockResolvedValue([]);
+        const plan = await bracket.registerBracket(stockSpec);
+        await flush();
+        const sDeal = wire[7]!;
+        await emit(sDeal);
+        await emit(edit(sDeal, { exchange_seq: '000002', event_id: 'v1:SD:FIXTURESTREAMSD:FIXTURERESET:3' }));
+        expect(triggersOf(plan.id).map(t => t.quantity)).toEqual([2, 2]);
+        m.positions = { rows: [{ code: '2890', direction: 'Buy', quantity: 2000, cond: 'Cash', account: S1 }], updatedAt: 1, needsReconcile: false };
+        m.ensure.mockResolvedValue(STK);
+        for (const e of entries) {
+            expect(await engine.addTrigger({ code: '2890', condition: 'below', price: 44.8, action: 'Sell', quantity: 1, kind: 'stop',
+                role: 'entry', ...e }, STK as never)).not.toBeNull();
+        }
+        m.tick!({ code: '2890', close: 44.6 }); await flush();
+        expect(m.place).toHaveBeenCalledTimes(entries.length);
+        m.tick!({ code: '2890', close: 43.5 }); await flush();
+        expect(m.place).toHaveBeenCalledTimes(entries.length + 1);
+        const [, action, , qty, opts] = m.place.mock.calls[entries.length]!;
+        expect(action).toBe('Sell');
+        expect(opts).not.toHaveProperty('orderCond');
+        expect(opts).not.toHaveProperty('daytradeShort');
+        return { qty: qty as number, entryOpts: m.place.mock.calls.slice(0, entries.length).map(c => c[4]) };
+    }
+
+    it('fork：在途的融資賣出、融券賣出進場單不佔現股括號停損的可賣量', async () => {
+        const r = await cashStopAfterEntries([{ orderCond: 'MarginTrading' }, { orderCond: 'ShortSelling' }]);
+        expect(r.entryOpts).toEqual([expect.objectContaining({ orderCond: 'MarginTrading' }), expect.objectContaining({ orderCond: 'ShortSelling' })]);
+        expect(r.qty).toBe(2); // 融資餘額、借來的券都不是現股庫存：現股 2 張照樣全數送出（上游會一張都不送）
+    });
+
+    it('fork：在途的現股賣出進場單仍佔現股可賣量（會賣掉庫存）', async () => {
+        expect((await cashStopAfterEntries([{}])).qty).toBe(1);
+    });
+
+    it('fork：在途的現股當沖先賣仍佔現股可賣量（當日沒買回要以庫存交割，避免超賣）', async () => {
+        const r = await cashStopAfterEntries([{ daytradeShort: true }]);
+        expect(r.entryOpts[0]).toMatchObject({ daytradeShort: true });
+        expect(r.qty).toBe(1);
+    });
+
+    it('fork：玉山帳戶的權證觸價單在建立時就擋下，不會「已掛」卻送不出去', async () => {
+        await boot();
+        const ES: Account = { account_type: 'S', broker_id: '8840', account_id: 'fixture-esun', person_id: '', signed: true, username: '' };
+        m.accounts = [F1, ES];
+        const WRT = { code: '030001', target_code: null, security_type: 'WRT', exchange: 'TSE' };
+        const before = engine.getTriggers().length;
+        expect(await engine.addTrigger({ code: '030001', condition: 'below', price: 1.5, action: 'Sell', quantity: 1, kind: 'stop' }, WRT as never)).toBeNull();
+        expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'err', title: '觸價單未建立', body: expect.stringContaining('權證') }));
+        expect(engine.getTriggers()).toHaveLength(before);
+        // 一般股票照常建立
+        const STK = { code: '2890', target_code: null, security_type: 'STK', exchange: 'TSE' };
+        expect(await engine.addTrigger({ code: '2890', condition: 'below', price: 44, action: 'Sell', quantity: 1, kind: 'stop' }, STK as never)).not.toBeNull();
+        // 收盤前平倉（數量 0、範圍可以是整個帳戶）不套用建立時的玉山檢查；時間到時逐筆走下單檢查
+        const at = Date.now() + 3_600_000;
+        expect(await engine.addTrigger({ code: '2890', condition: 'above', price: 0, action: 'Sell', quantity: 0, kind: 'stop',
+            time: { kind: 'flatten', at, scope: 'code' } }, STK as never)).not.toBeNull();
+        expect(await engine.addTrigger({ code: '030001', condition: 'above', price: 0, action: 'Sell', quantity: 0, kind: 'stop',
+            time: { kind: 'flatten', at, scope: 'account' } }, WRT as never)).not.toBeNull();
+    });
+
     it('refuses a second stock exit while position is unknown and another exit is unresolved', async () => {
         const { planExitQuantity } = await import('./trigger-engine');
         const account = { account_type: 'S' as const, broker_id: 'b', account_id: 'a' };

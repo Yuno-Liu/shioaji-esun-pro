@@ -2,11 +2,10 @@
 // 快速下拉：常用的委託條件（信用、效期、期貨倉別與市價鈕）、單位與「更多設定…」。
 // 清單與停用規則來自下單面板共用的 order-conditions；選了什麼由閃電面板保存。
 
-import { Check, Settings2, ShieldCheck } from 'lucide-react';
+import { Check, Lock, Settings2, ShieldCheck, Sigma } from 'lucide-react';
 import type { FlashCond, FlashCredit, FlashLot, FlashOrderOpts } from '../lib/flash-account';
 import { TRIGGER_LIMIT_MAX_TICKS, type FlashTriggerSend } from '../lib/flash-trigger';
 import { FUTURES_OCTYPES, ORDER_TYPES, orderTypeDisabledReason } from '../lib/order-conditions';
-import { WARRANT_FLASH_TEXT } from '../lib/warrant-rules';
 import * as styles from './flash-order.css';
 
 const CREDIT_ITEMS: [FlashCond, string, string][] = [
@@ -45,7 +44,7 @@ function Seg<T extends string>({ label, items, value, disabled, onPick }: {
     );
 }
 
-export function FlashQuickMenu({ market, odd, warrant = false, lot, credit, order, dayTradeOk, top, onCredit, onLot, onOrder, onMore, onClose, triggerSend, onTriggerSend, triggerLayout, onTriggerLayout, onProtect }: {
+export function FlashQuickMenu({ market, odd, warrant = false, lot, credit, order, dayTradeOk, top, onCredit, onLot, onOrder, onMore, onClose, triggerSend, onTriggerSend, triggerMarketBlock = null, triggerLayout, onTriggerLayout, onProtect, protectBlock = null, showTotals, onShowTotals }: {
     market: 'S' | 'F';
     odd: boolean;
     /** 權證：只有整張現股，不顯示信用與零股選項 */
@@ -65,11 +64,18 @@ export function FlashQuickMenu({ market, odd, warrant = false, lot, credit, orde
     /** #216 觸價單觸發後的送出方式 */
     triggerSend?: FlashTriggerSend;
     onTriggerSend?: (s: FlashTriggerSend) => void;
+    /** 觸價後不能送市價的原因（外國標的權證）：市價選項停用並顯示原因 */
+    triggerMarketBlock?: string | null;
     /** #216 觸價單的點法 */
     triggerLayout?: 'columns' | 'modifier';
     onTriggerLayout?: (l: 'columns' | 'modifier') => void;
     /** opens the 自動停損停利 editor */
     onProtect?: () => void;
+    /** 不能自動停損停利的原因（外國標的權證），顯示在入口下 */
+    protectBlock?: string | null;
+    /** 委託合計列（只是顯示，不解除點價下單） */
+    showTotals?: boolean;
+    onShowTotals?: (on: boolean) => void;
 }) {
     const pick = (fn: () => void) => () => { fn(); onClose(); };
     const oddOrderType = orderTypeDisabledReason('IOC', odd);
@@ -151,7 +157,8 @@ export function FlashQuickMenu({ market, odd, warrant = false, lot, credit, orde
                         <Seg
                             label='觸價後'
                             items={[
-                                { value: 'MKT', label: market === 'F' && order.futuresPriceType === 'MKP' ? '範圍市價' : '市價', disabled: odd },
+                                { value: 'MKT', label: market === 'F' && order.futuresPriceType === 'MKP' ? '範圍市價' : '市價', disabled: odd || !!triggerMarketBlock,
+                                    ...(triggerMarketBlock && !odd ? { title: triggerMarketBlock } : {}) },
                                 { value: 'LMT', label: '限價', disabled: odd, title: '觸發價往成交方向 N 檔的限價（買＋N、賣－N），ROD' },
                             ] as const}
                             value={triggerSend.type}
@@ -179,11 +186,13 @@ export function FlashQuickMenu({ market, odd, warrant = false, lot, credit, orde
                                 onPick={l => { onTriggerLayout(l); onClose(); }}
                             />
                         )}
+                        {triggerMarketBlock && !odd && (
+                            <div className={styles.menuNote} data-testid='flash-warrant-trigger-note'>
+                                <Lock size={9} aria-hidden /> {triggerMarketBlock}。
+                            </div>
+                        )}
                         <div className={styles.menuNote}>{odd ? '零股觸價單以漲跌停價限價送出。' : '觸價單觸發後的送出方式；點買量／賣量照常是限價。'}</div>
                     </>
-                )}
-                {market === 'S' && warrant && (
-                    <div className={styles.menuNote} data-testid='flash-warrant-trigger-note'>{WARRANT_FLASH_TEXT.menu}。</div>
                 )}
                 {onProtect && (
                     <>
@@ -191,6 +200,14 @@ export function FlashQuickMenu({ market, odd, warrant = false, lot, credit, orde
                         <button type='button' role='menuitem' className={styles.menuItem.off} onClick={() => { onClose(); onProtect(); }}>
                             <ShieldCheck size={11} aria-hidden />自動停損停利…
                         </button>
+                    </>
+                )}
+                {protectBlock && (
+                    <>
+                        {!onProtect && <div className={styles.menuSep} />}
+                        <div className={styles.menuNote} data-testid='flash-warrant-protect-note'>
+                            <Lock size={9} aria-hidden /> {protectBlock}。
+                        </div>
                     </>
                 )}
                 {market === 'S' && !warrant && (
@@ -209,6 +226,22 @@ export function FlashQuickMenu({ market, odd, warrant = false, lot, credit, orde
                                 {lot === l && <Check size={11} aria-hidden />}
                             </button>
                         ))}
+                    </>
+                )}
+                {showTotals !== undefined && onShowTotals && (
+                    <>
+                        <div className={styles.menuSep} />
+                        <button
+                            type='button'
+                            role='menuitemcheckbox'
+                            aria-checked={showTotals}
+                            className={styles.menuItem[showTotals ? 'on' : 'off']}
+                            title='梯子底部合計列：買單／賣單欄底下顯示今日這個商品我的委託量（成交量），價格欄底下顯示現股當沖先賣回補狀態'
+                            onClick={pick(() => onShowTotals(!showTotals))}
+                        >
+                            <Sigma size={11} aria-hidden />顯示委託合計
+                            {showTotals && <Check size={11} aria-hidden />}
+                        </button>
                     </>
                 )}
                 <div className={styles.menuSep} />

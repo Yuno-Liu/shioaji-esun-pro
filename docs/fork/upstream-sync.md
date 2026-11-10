@@ -85,13 +85,45 @@ git diff $(git merge-base HEAD upstream/main) -- <檔案> | grep -c '^[+-][^+-]'
 | `src/lib/chart-order-settings.ts` | 同步 `SELL_ONLY`；摘要與提示寫明「融券買進（回補）」 | K 線點價買被停用 |
 | `src/components/order-ticket.tsx` | 移除「切回買進時把融券改成現股」的 effect；買進提供「融券（回補）」；借券類買進保留選取並明確擋下說明；確認視窗帶 `credit`，動作名稱為「融券買進」 | 原本會靜默把融券改成現股，送出的是現股買進而不是回補 |
 | `src/components/flash-order.tsx`、`src/lib/flash-trigger.ts` | 股票的持有量只算與面板信用條件相同 cond 的列（`sameCondRows`）；持倉依 cond 分開顯示（`stockPositionGroups`）；現股面板遇到融券空單時顯示「現股買進不會回補融券」；融券面板的買邊為「融券買（回補）」 | 原本融券空單與現股合併成一個淨額：有空單時，現股買進會被判成「減倉」而不附保護；淨額為 0 時，持倉列整個消失 |
+| `src/lib/trigger-credit.ts`、`src/components/flash-order.tsx`（2026-11-11，上游 #399） | 觸價單的 Buy＋ShortSelling 改回傳 fork 專用的 `TRIGGER_CREDIT_TEXT.shortCover`（觸價單不支援融券回補，請直接下融券買進）；閃電融券面板的觸買欄另外停用（Row 的 `trigBuyBlock`、`placeTriggerAt` 的 sideBlock），限價／市價的融券買（回補）照常可送 | 上游 #399 讓觸價單帶信用條件，但以「融券只能賣」拒絕融券買進，用的是 `CREDIT_TEXT.shortBuy`；fork 已把這段文字改成借券說明（「回補融券空單請用融券買進」），訊息會自相矛盾，觸買欄也沒停用。兩個引擎都只收融券賣出，所以不開放回補觸價 |
+| `src/lib/trigger-engine.ts` `reserve()`（2026-11-11，上游 #399） | 已觸發觸價單的保留 key 對融資、融券進場單加後綴（`creditReserveSuffix`：`\|<cond>`）；現股單、現股當沖先賣與括號出場的 key 不變 | 上游所有觸發單共用 `環境\|帳戶\|代碼\|方向` 一個保留 key。融資賣出只賣融資餘額、融券賣出用借來的券，都不動現股庫存，卻會佔掉現股括號停損的可賣量，讓停損少送（「其餘 N 張未保護」），甚至整筆不送。現股當沖先賣不分開：當日沒買回時要以現股庫存交割，必須照樣佔量，否則會和現股停損一起超賣 |
 
 同一批修正也改了持倉面板平倉、全平、`placeStockExitByShares` 與成交投影（`src/components/bottom-dock-positions.tsx`、`src/lib/conditional/flatten.ts`、`src/lib/trade.ts`、`src/lib/portfolio-projection.ts`），讓信用部位能用正確的條件平倉並套用成交。合併時同樣要保留。
 測試時序修正（2026-11-08，使用者同意修改上游測試檔）：`src/components/candle-chart-order.test.tsx` 的兩個信用條件案例在 CI 負載高時常失敗——「融券／借券只能賣」點價後沒等下單函式被呼叫就讀參數，改為先 `vi.waitFor` 等到呼叫；「融券買進查無空單」的 `withTradingState` 改為整個檔案只在第一次換成帶 `getTradingState` 的 mock、之後不再換回（原本每個測試結束時 `vi.doMock` 換回、下一個再換過去，CI 負載高時動態 `import()` 會取到換回的那份：`No "getTradingState" export is defined on the mock`），並先載入一次。合併上游時保留這兩處（上游若自行修正則以上游為準）。
 
-相關測試：`src/lib/odd-lot.test.ts`、`src/lib/trade-credit.test.ts`、`src/lib/credit-eligibility.test.ts`、`src/lib/chart-order-settings.test.ts`、`src/lib/flash-trigger.test.ts`、`src/components/order-ticket-credit.test.tsx`、`src/components/flash-order-credit.test.tsx`、`src/components/flash-order-short-cover.test.tsx`、`src/components/flash-order-cost.test.tsx`。上游若改寫這些規則，這些測試應該會失敗；不要直接改回上游的預期。
+相關測試：`src/lib/odd-lot.test.ts`、`src/lib/trade-credit.test.ts`、`src/lib/credit-eligibility.test.ts`、`src/lib/chart-order-settings.test.ts`、`src/lib/flash-trigger.test.ts`、`src/components/order-ticket-credit.test.tsx`、`src/components/flash-order-credit.test.tsx`、`src/components/flash-order-short-cover.test.tsx`、`src/components/flash-order-cost.test.tsx`；2026-11-11 起另有 `src/lib/trigger-credit.test.ts`、`src/lib/trigger-background.test.ts`、`src/components/flash-order-trigger-credit.test.tsx`（三處融券觸買改為 fork 文字）與 `src/lib/bracket.test.ts` 的「fork：」案例。上游若改寫這些規則，這些測試應該會失敗；不要直接改回上游的預期。
 
 ## 同步紀錄
+
+### 2026-11-11（上游 19 個提交，Sinotrade #396 權證觸價與自動停損停利、#399 觸價單帶信用條件、#400 閃電委託合計與買／賣全刪、v0.1.57）
+
+3 個衝突檔，解法已由 rerere 記錄，細節見合併提交。原則照舊：上游修改完整保留，再補回 fork 的玉山掛鉤與信用交易修正。
+
+- **`src/lib/trade.ts`**：import 保留 fork 的 `esunQuickOrderProblem`、`isEsunAccount`，並加入上游的權證函式。`placeStockExitByShares` 保留 fork 的信用了結檢查：只允許融券買進或融資賣出，信用部位不可零股。原本兩段權證檢查換成上游的 `warrantExitBySharesProblem`，語意等價。
+- **`src/components/order-ticket.tsx`**：import 取聯集，包含上游的 `warrantProtectProblem` 與 fork 的 `creditLabel`。
+- **`src/components/conditional-form.tsx`**（兩處）：同時保留 fork 的 `<CashCreditWarning/>` 與上游 `SendControl` 的 `marketBlock`。
+- **交易正確性審查**（deep-reviewer，只讀）：沒有找到會送錯單的路徑。閃電融券面板的觸買不會變成現股買進，融資面板的觸賣也不會變成現股賣出。買全刪／賣全刪會走 fork 的玉山刪單，範圍只限本帳戶、同代碼、同單位、本交易日。依審查結果修了三項：
+  - **觸價不支援融券回補**（上游 #399 與 fork 語意衝突）：上游以 fork 已改寫的借券文字拒絕，訊息自相矛盾，3 個上游測試也會失敗。改為 fork 專用文字，並停用融券面板的觸買欄，見上方修正表。不開放「融券回補觸價單」，因為兩個引擎都只收融券賣出，背景引擎（Rust）的原始碼不在 repo 內，無法驗證。
+  - **保留量 key 分開**（上游 #399 帶進的缺陷，永豐與玉山都受影響）：見上方修正表。審查第一輪建議連現股當沖先賣也分開；第二輪核對時指出先賣當日沒買回要以庫存交割，分開會超賣，所以只分開融資、融券。測試涵蓋三種在途進場單：融資賣出加融券賣出時，現股停損仍送 2 張（上游一張都不送）；現股賣出、現股當沖先賣仍佔量，只送 1 張。已反向驗證：拿掉修正，或錯加先賣後綴，對應的測試都會失敗。2026-11-10 使用者對桌面版的上游缺陷選擇「等上游修」；這項因為涉及實際保護量，使用者確認這次一起修（2026-11-11），其他桌面版上游缺陷仍逐案詢問。
+  - **玉山觸價單在建立時就檢查**（fork 掛鉤）：上游 #396 開放權證觸價與自動停損停利後，玉山帳戶可以掛權證或興櫃的觸價單、停損單，畫面顯示「已掛」，觸發時才被 `esunQuickOrderProblem` 擋下，使用者會以為有保護。`trigger-engine.ts` 的 `withContext` 在選定帳戶之後呼叫 fork 的 `src/lib/esun/trigger-rules.ts` `esunTriggerProblem`，用同一套 `validateEsunStockOrder` 檢查。價格到觸發時才決定，所以零股視為限價，整股依送出方式（預設市價），限價以觸發價代入。收盤前平倉不檢查：它建立時數量為 0，範圍可以是整個帳戶，時間到時由 `conditional/flatten` 逐筆下單、各自檢查玉山規則。數量未定時，不以數量擋下。
+- **首屏**：
+  - 合併後手機首屏 JS 為 227,626 bytes（225,251 → 227,626，含 F1 的一段文字），超出 ≤220 KiB（225,280）。增加的部分全在上游共用 chunk：
+    - `stock-order-conditions`＋`conditional/session`：經 `shioaji.ts` 帶入。
+    - `trigger-credit`：經 `boot → tauri → flash-account → flash-trigger` 帶入。
+    - `warrant-rules` 也變大了。
+  - 要再壓需修改 `src/lib`（手機規格 R2）。曾評估 fork 輕量模組 `src/lib/account-identity.ts`，加上上游 `tauri.ts` 改 1 行 import，可降到 221,665 bytes。使用者選擇不破例，改為放寬首屏目標為 ≤223 KiB（228,352 bytes），見 mobile-design.md §13。
+- **已知、未修**：
+  - **桌面版（Tauri）背景引擎**：開「背景持續執行」時，玉山的股票觸價單與面板括號單可能交給背景引擎，進而繞過玉山分派。這是合併前就有的問題；網頁版的 `backgroundSupported()` 為 false，不受影響。
+  - **現沖回補欄**：玉山委託的現沖回補欄，在查到玉山委託前可能暫時顯示「待確認」。只影響顯示。
+  - **玉山預約單**：前一晚掛的玉山預約單若 `ord_date` 是下單日，買全刪、賣全刪不會刪到（全部刪單仍會刪到）。這取決於玉山欄位的語意，未證實。
+  - **K 線停損與融券空單**：只持有融券空單時，K 線停損會送出現股買進，不會回補空單。這是合併前就有的上游行為。
+- **檢查**：
+  - `tsc -b` 通過。
+  - vitest 全套通過。合併後、修正前有 3 項失敗，都是上述融券觸買的上游預期；修正後全數通過。
+  - `python -m unittest server.test_esun_trade_server`（221 項）與 `deploy` 測試（57 項，略過 3 項）通過。
+  - `docker compose config -q` 通過。
+  - 這次上游沒有改 `server/`、`deploy/`、`Dockerfile`、`docker-compose.yml`，只重建 web 映像。
+  - README 沒有變動。
 
 ### 2026-11-10（上游 8 個提交，Sinotrade #393 朱紅錯誤色、#394 權證閃電下單）
 
