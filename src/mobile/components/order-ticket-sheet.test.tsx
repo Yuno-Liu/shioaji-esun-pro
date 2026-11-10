@@ -108,6 +108,7 @@ import { ODD_LOT_WAITING } from '../../lib/odd-lot';
 import { NOT_SENT_TITLE, OUTCOME_UNKNOWN_TITLE, TICKET_TEXT } from '../hooks/use-mobile-ticket';
 import { notStarted } from '../lib/errors';
 import { closeTicket, getMobileUi, openTicket, resetMobileUiForTest } from '../lib/mobile-store';
+import { resetBrokerCostSettings, setBrokerFeeSettings } from '../lib/broker-cost-settings';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
 import {
     ACCOUNT_LOCK_NOTE,
@@ -768,6 +769,29 @@ describe('OrderTicketSheet — 信用交易（整股）', () => {
         expect(cost).toContain('證交稅');
         await choosePriceType('MKT');
         expect(byTestId('ticket-cost')).toHaveLength(0);
+    });
+
+    it('交易成本列依下單帳戶的券商設定：玉山 2.8 折月退、永豐維持共用（無折扣）', async () => {
+        setBrokerFeeSettings('esun', { feeDiscount: 0.28, rebateMode: 'monthly' });
+        try {
+            // 永豐：100,000 × 0.1425% = 143，沒有退佣
+            await open({ code: '2330', action: 'Buy' });
+            let cost = text(one('ticket-cost'));
+            expect(cost).toContain('手續費 ≈ 143');
+            expect(cost).not.toContain('退佣後');
+            await act(async () => { closeTicket(); });
+            // 玉山：交割 143、退佣後 round(143 × 0.28) = 40
+            const esun = { ...h.stockAccount, broker_id: '8840-SIM' };
+            h.esunBrokers.add('8840-SIM');
+            h.captured.S = esun;
+            h.selected.S = esun;
+            await open({ code: '2330', action: 'Buy' });
+            cost = text(one('ticket-cost'));
+            expect(cost).toContain('手續費 交割 ≈ 143，退佣後 ≈ 40');
+            expect(m.submit).not.toHaveBeenCalled();
+        } finally {
+            resetBrokerCostSettings();
+        }
     });
 });
 

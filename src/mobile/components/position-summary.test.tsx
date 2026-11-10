@@ -191,3 +191,30 @@ describe('todayLimitView', () => {
         expect(todayLimitView({ data: limits({ trading_limit: 0, trading_used: 0, trading_available: 0 }), error: null, loading: false }, true, estimate).status).toBe('empty');
     });
 });
+
+describe('已含預估退佣', () => {
+    async function renderRebate(rebate: number | undefined, privMoney = false, known = true) {
+        await act(async () => {
+            view = create(createElement(PositionSummaryCard, { summary: stockSummary, known, margin: null, futuresLabel: '', privMoney, rebate }));
+        });
+    }
+
+    it('rebate > 0 時在總額下方顯示，遮蔽金額時不露數字', async () => {
+        await renderRebate(216);
+        expect(text(byTestId('position-total-rebate')[0]!)).toBe('已含預估退佣 ≈ 216');
+        await act(async () => view?.unmount());
+        await renderRebate(1234, true);
+        expect(text(byTestId('position-total-rebate')[0]!)).toBe('已含預估退佣 ≈ •••••');
+    });
+
+    it('沒有退佣或持倉未讀到時不顯示', async () => {
+        await renderRebate(0);
+        expect(byTestId('position-total-rebate')).toHaveLength(0);
+        await act(async () => view?.unmount());
+        await renderRebate(undefined);
+        expect(byTestId('position-total-rebate')).toHaveLength(0);
+        await act(async () => view?.unmount());
+        await renderRebate(216, false, false);
+        expect(byTestId('position-total-rebate')).toHaveLength(0);
+    });
+});

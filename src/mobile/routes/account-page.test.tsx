@@ -142,6 +142,8 @@ import { resetContractNamesForTest } from '../lib/contract-names';
 import { createScrollMemory, ScrollRestorer } from '../lib/scroll-memory';
 import { openTodayLimits, resetTodayLimitsFocusForTest, TODAY_LIMITS_ID } from '../components/account/today-limits';
 import { AccountPage, resetAccountPageCacheForTest, SETTLEMENT_REUSE_MS } from './account-page';
+import { resetTradingCostSettings, setTradingCostSettings } from '../../lib/trading-cost-settings';
+import { resetBrokerCostSettings, setBrokerFeeSettings } from '../lib/broker-cost-settings';
 
 const stock = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A1' };
 const fut = { account_type: 'F', broker_id: 'F002000', account_id: '7654321', person_id: 'A1' };
@@ -628,6 +630,116 @@ describe('AccountPage realized P&L', () => {
         await click('pnl-esun-detail-toggle');
         expect(textOf(byTestId('pnl-esun-cost-total'))).toBe('$2,655');
         expect(textOf(byTestId('pnl-esun-detail'))).toContain('09:01:02');
+    });
+});
+
+describe('AccountPage realized P&L fee rebate', () => {
+    beforeEach(() => {
+        resetTradingCostSettings();
+        resetBrokerCostSettings();
+    });
+    afterEach(() => {
+        resetTradingCostSettings();
+        resetBrokerCostSettings();
+    });
+    /** 永豐現股 2 張 × 100、損益 5,000（2.8 折月退 → 退 405） */
+    const sinoRow = { ...stockPnl(1, '2330', 5000), quantity: 2, price: 100 };
+
+    it('永豐 2.8 折月退：合計下方顯示退佣合計、退佣後損益、設定；股票列有退佣小字，期貨列沒有', async () => {
+        setBrokerFeeSettings('sinopac', { feeDiscount: 0.28, rebateMode: 'monthly' });
+        setBrokerFeeSettings('esun', { feeDiscount: 0.6, rebateMode: 'monthly' });
+        m.fetchProfitLoss.mockImplementation(async (market: string) => (market === 'S'
+            ? [sinoRow]
+            : [{ id: 1, code: 'TXFL6', quantity: 1, pnl: 2000, date: twDate(0), direction: 'Buy', entry_price: 1, cover_price: 2, fee: 0, tax: 0 }]));
+        m.fetchProfitLossSummary.mockImplementation(async (market: string) => (market === 'S' ? pnlSum(5000, 1) : pnlSum(0, 0)));
+        await render();
+        await click('account-pnl-toggle');
+        expect(textOf(byTestId('pnl-total'))).toContain('+$7,000');
+        expect(textOf(byTestId('pnl-rebate-total'))).toBe('$405');
+        expect(textOf(byTestId('pnl-total-after-rebate'))).toBe('+$7,405');
+        // 只列出本次查詢有的股票券商（玉山沒有列 → 不列）
+        expect(textOf(byTestId('pnl-rebate-settings'))).toBe('永豐：月退 2.8 折');
+        expect(text()).toContain('期貨不計退佣');
+        expect(allByTestId('pnl-rebate-unknown')).toHaveLength(0);
+        expect(allByTestId('pnl-rebate-off')).toHaveLength(0);
+        const lines = allByTestId('pnl-row-rebate');
+        expect(lines).toHaveLength(1);
+        expect(textOf(lines[0]!)).toBe('退佣 ≈ $405・退佣後 ≈ +$5,405');
+        const rows = allByTestId('pnl-row');
+        expect(rows.find(r => textOf(r).includes('TXFL6'))!.findAll(n => n.props['data-testid'] === 'pnl-row-rebate')).toHaveLength(0);
+        // 退佣只顯示，不呼叫任何送單、改單、刪單
+        Object.values(m.send).forEach(f => expect(f).not.toHaveBeenCalled());
+    });
+
+    it('缺成交價的列不計入並說明筆數', async () => {
+        setTradingCostSettings({ feeDiscount: 0.28, rebateMode: 'monthly' });
+        m.fetchProfitLoss.mockImplementation(async (market: string) => (market === 'S' ? [sinoRow, { ...stockPnl(2, '2317', 100), price: 0 }] : []));
+        m.fetchProfitLossSummary.mockImplementation(async (market: string) => (market === 'S' ? pnlSum(5100, 2) : pnlSum(0, 0)));
+        await render();
+        await click('account-pnl-toggle');
+        expect(textOf(byTestId('pnl-rebate-total'))).toBe('$405');
+        expect(textOf(byTestId('pnl-total-after-rebate'))).toBe('+$5,505');
+        expect(textOf(byTestId('pnl-rebate-unknown'))).toBe('1 筆缺成交價或數量，無法估算退佣，未計入。');
+        expect(allByTestId('pnl-row-rebate')).toHaveLength(1);
+    });
+
+    it('沒有月退（預設 10 折）：只顯示提示，沒有退佣數字', async () => {
+        await render();
+        await click('account-pnl-toggle');
+        expect(textOf(byTestId('pnl-rebate-off'))).toContain('沒有月退');
+        expect(allByTestId('pnl-rebate-total')).toHaveLength(0);
+        expect(allByTestId('pnl-total-after-rebate')).toHaveLength(0);
+        expect(allByTestId('pnl-row-rebate')).toHaveLength(0);
+    });
+
+    it('成交即折也視為沒有退佣', async () => {
+        setBrokerFeeSettings('sinopac', { feeDiscount: 0.28, rebateMode: 'instant' });
+        await render();
+        await click('account-pnl-toggle');
+        expect(allByTestId('pnl-rebate-off')).toHaveLength(1);
+    });
+
+    it('遮蔽金額時退佣、退佣後損益與列小字都不露數字', async () => {
+        m.privMoney = true;
+        setBrokerFeeSettings('sinopac', { feeDiscount: 0.28, rebateMode: 'monthly' });
+        m.fetchProfitLoss.mockImplementation(async (market: string) => (market === 'S' ? [sinoRow] : []));
+        m.fetchProfitLossSummary.mockImplementation(async (market: string) => (market === 'S' ? pnlSum(5000, 1) : pnlSum(0, 0)));
+        await render();
+        await click('account-pnl-toggle');
+        for (const id of ['pnl-rebate-total', 'pnl-total-after-rebate', 'pnl-row-rebate']) {
+            expect(textOf(byTestId(id))).not.toMatch(/\d/);
+            expect(textOf(byTestId(id))).toContain('•••••');
+        }
+    });
+
+    it('玉山列用玉山的設定與成交明細：列、合計、展開明細三處一致', async () => {
+        setBrokerFeeSettings('sinopac', { feeDiscount: 0.6, rebateMode: 'monthly' });
+        setBrokerFeeSettings('esun', { feeDiscount: 0.28, rebateMode: 'monthly' });
+        m.accounts = { accounts: [esunStock], selectedStock: esunStock, selectedFutures: null, loaded: true, loadError: false };
+        m.esunTx = {
+            fetchedAt: Date.now(),
+            details: [{
+                rowId: 1, code: '2330', name: '台積電', buySell: 'S', action: 'Sell', tradeType: '0', tradeTypeLabel: '現股', cond: 'Cash', marketCode: '', market: null,
+                tradeDate: twDate(0), settleDate: twDate(2), profitLossDate: twDate(0).replace(/-/g, ''), shares: 1000, avgPrice: 600, priceQty: 600000, cost: -500000, income: 598000, realizedPnl: 98000, realizedPnlPct: 19.6,
+                fills: [
+                    { code: '2330', name: '', buySell: 'S', action: 'Sell', tradeType: '0', tradeTypeLabel: '', marketCode: '', market: null, orderNo: 'A1234', tradeDate: twDate(0), tradeTime: '09:01:02', settleDate: '', price: 600, shares: 1000, priceQty: 600000, fee: 855, shortFee: null, tax: 1800, capitalGainsTax: null, netAmount: 597345, realizedPnl: 98000, realizedPnlPct: 19.6, userDef: '' },
+                ],
+            }],
+        };
+        m.fetchProfitLoss.mockResolvedValue([stockPnl(1, '2330', 98000)]);
+        m.fetchProfitLossSummary.mockResolvedValue(pnlSum(98000, 1));
+        await render();
+        await click('account-pnl-toggle');
+        // 平倉手續費 855（明細）退 616；開倉 502,000 估 715 退 515
+        expect(textOf(byTestId('pnl-rebate-total'))).toBe('$1,131');
+        expect(textOf(byTestId('pnl-total-after-rebate'))).toBe('+$99,131');
+        expect(textOf(byTestId('pnl-rebate-settings'))).toBe('玉山：月退 2.8 折');
+        expect(textOf(byTestId('pnl-row-rebate'))).toBe('退佣 ≈ $1,131・退佣後 ≈ +$99,131');
+        await click('pnl-esun-detail-toggle');
+        expect(textOf(byTestId('pnl-esun-rebate'))).toBe('$1,131');
+        expect(textOf(byTestId('pnl-esun-after-rebate'))).toBe('+$99,131');
+        expect(textOf(byTestId('pnl-esun-detail'))).toContain('預估退佣（月退 2.8 折）');
+        expect(textOf(byTestId('pnl-esun-detail'))).toContain('退佣後損益');
     });
 });
 

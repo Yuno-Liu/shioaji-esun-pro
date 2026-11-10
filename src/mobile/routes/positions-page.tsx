@@ -32,6 +32,9 @@
 //   「損益兩平」列（文字標示現價高於／低於兩平價、手續費折數、當沖稅率、估算）點開 position-pnl-sheet 計算明細（只讀）。
 //   今日買進股數：玉山庫存明細（分批成交日）→ 今日成交回報（委託查詢成功時）；都沒有則一般稅率並標「未判斷當沖」。
 //   期權維持券商損益並標「未扣費稅」。摘要、分組小計、損益條、損益／報酬率排序都用同一個值；無法計算的列不猜，標「合計待確認」。
+//   手續費折數與退佣方式依持倉帳戶的券商（lib/broker-cost-settings：永豐、玉山分開，手機版限定；融資年利率、借券費率共用）。
+//   月退且有折扣時淨損益已扣預估退佣：詳細列券商損益後面加「退佣 ≈ N」（StockPnl.rebate＝開倉＋平倉退佣），
+//   摘要卡加「已含預估退佣 ≈ N」（netTotals.rebate／rebateRows），計算明細面板另列交割收取額與退佣。只讀顯示。
 // - 「詳細｜精簡」檢視（篩選列行尾 Segmented toggle；lib/positions-view 存 localStorage，預設詳細）：
 //   精簡＝每個部位一列（名稱／代碼・條件・多空數量｜淨損益／報酬率・已過或未達兩平；第二列現價＋兩平價，期權為均價），
 //   帳戶分組、摘要、篩選、排序照常、摘要卡較緊湊。
@@ -67,12 +70,13 @@ import { contractMarket, isWarrantContract } from '../../lib/contract-market';
 import { esunStockLegProblem } from '../../lib/order-route';
 import { creditExitLabel, stockExitFor, type CreditExitCond } from '../../lib/stock-exit-cond';
 import { notify, placeQuickOrder, placeStockExitByShares } from '../../lib/trade';
-import { discountText, useTradingCostSettings, type TradingCostSettings } from '../../lib/trading-cost-settings';
+import { discountText, type TradingCostSettings } from '../../lib/trading-cost-settings';
 import { RECONCILE_REASON_LABELS, refreshTradingState, useTradingState, type TradingQueryStatus } from '../../lib/trading-state';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { Action } from '../../lib/types/order';
 import type { Account, AccountedPosition, Position, StockPosition } from '../../lib/types/portfolio';
 import { fmtPct, fmtPrice, fmtSigned } from '../../lib/utils/format';
+import { brokerOfAccount, useBrokerCostSettings, type CostBroker } from '../lib/broker-cost-settings';
 import { fmtInt, fmtStockLots, formatToTick } from '../lib/num-format';
 import { isStockPosition, positionCondText, positionQtyText, reconcileText, sideText } from '../lib/position-text';
 import { mobileAccountLabel, useAccountSwitchLocked } from '../components/account-switch-sheet';
@@ -400,7 +404,8 @@ export interface RowPnl {
 }
 
 export interface RowPnlContext {
-    settings: TradingCostSettings;
+    /** 各券商的交易成本設定（依持倉帳戶選用；useBrokerCostSettings） */
+    costs: Record<CostBroker, TradingCostSettings>;
     now: number;
     /** 今日成交（委託查詢尚未成功時為 null） */
     fills: ReadonlyMap<string, TodayFills> | null;
@@ -418,7 +423,12 @@ function esunDetailOf(p: AccountedPosition) {
 export function rowPnlOf(p: AccountedPosition, contract: ContractInfo | undefined, ctx: RowPnlContext): RowPnl {
     if (!isStockPosition(p)) return { value: finiteNum(p.pnl) ? p.pnl : null, stock: null, contract: contract ?? null, deriv: true, reason: null };
     if (!contract) return { value: null, stock: null, contract: null, deriv: false, reason: POSITIONS_TEXT.pnlNoContract };
-    const input = stockPnlInputOf(p, contract, { ...ctx, esun: esunDetailOf(p) });
+    const input = stockPnlInputOf(p, contract, {
+        settings: ctx.costs[brokerOfAccount(p.account)],
+        now: ctx.now,
+        fills: ctx.fills,
+        esun: esunDetailOf(p),
+    });
     const stock = input ? computeStockPnl(input) : null;
     if (!stock) return { value: null, stock: null, contract, deriv: false, reason: POSITIONS_TEXT.pnlUnsupported };
     return { value: stock.net, stock, contract, deriv: false, reason: stock.net === null ? POSITIONS_TEXT.pnlNoPrice : null };
@@ -433,6 +443,10 @@ export interface NetTotals {
     pending: number;
     /** 合計含期權的券商損益（未扣費稅） */
     deriv: boolean;
+    /** 已含在 sum 內的預估退佣合計（股票列 stock.rebate > 0 的加總） */
+    rebate: number;
+    /** 有預估退佣的列數 */
+    rebateRows: number;
 }
 
 export function netTotals(rows: readonly AccountedPosition[], pnlOf: (p: AccountedPosition) => RowPnl): NetTotals {
@@ -440,14 +454,18 @@ export function netTotals(rows: readonly AccountedPosition[], pnlOf: (p: Account
     let counted = 0;
     let pending = 0;
     let deriv = false;
+    let rebate = 0;
+    let rebateRows = 0;
     for (const p of rows) {
         const r = pnlOf(p);
         if (r.value === null) { pending += 1; continue; }
         sum += r.value;
         counted += 1;
         if (r.deriv) deriv = true;
+        const rb = r.stock?.rebate;
+        if (typeof rb === 'number' && rb > 0) { rebate += rb; rebateRows += 1; }
     }
-    return { sum, counted, pending, deriv };
+    return { sum, counted, pending, deriv, rebate, rebateRows };
 }
 
 /** 列的報酬率（%）：股票＝淨損益 ÷（均價 × 股數）；期權沿用 positionReturnPct */
@@ -635,6 +653,9 @@ function PositionRow({ p, priv, privMoney, closeDisabled, accountReason, maxAbsP
                 {stock
                     ? <span className={styles.brokerPnl} data-testid='position-broker-pnl'>{PNL_TEXT.brokerLabel} {maskMoney(fmtSigned(p.pnl, 0), privMoney)}</span>
                     : <span className={styles.brokerPnl} data-testid='position-pnl-note'>{PNL_TEXT.derivNote}</span>}
+                {sp && sp.rebate !== null && sp.rebate > 0 && (
+                    <span className={styles.brokerPnl} data-testid='position-rebate'>{PNL_TEXT.rebateLabel} ≈ {maskMoney(fmtInt(sp.rebate), privMoney)}</span>
+                )}
             </div>
             <dl className={styles.rowGrid}>
                 <Cell label='均價'>{fmtPrice(p.price)}</Cell>
@@ -1030,7 +1051,7 @@ export function PositionsPage() {
     const priv = usePrivacyMode();
     const privMoney = usePrivacyMoney();
     const switchLocked = useAccountSwitchLocked();
-    const costSettings = useTradingCostSettings();
+    const costs = useBrokerCostSettings();
     // 玉山庫存明細（實際手續費、分批成交日）更新時重算淨損益
     const [, bumpEsun] = useReducer((x: number) => x + 1, 0);
     useEffect(() => subscribeEsunInventoryDetails(bumpEsun), []);
@@ -1076,7 +1097,7 @@ export function PositionsPage() {
     const ordersKnown = !!ordersQuery && ordersQuery.updatedAt !== null && !ordersQuery.error;
     const trades = trading.trades;
     const fills = useMemo(() => (ordersKnown ? todayStockFills(trades ?? [], Date.now()) : null), [ordersKnown, trades]);
-    const pnlCtx: RowPnlContext = { settings: costSettings, now: Date.now(), fills };
+    const pnlCtx: RowPnlContext = { costs, now: Date.now(), fills };
     const pnlCache = new Map<string, RowPnl>();
     const pnlOf = (p: AccountedPosition): RowPnl => {
         const key = positionKey(p);
@@ -1535,6 +1556,7 @@ export function PositionsPage() {
                 pending={totals.pending}
                 allPending={totals.counted === 0 && totals.pending > 0}
                 derivGross={totals.deriv}
+                rebate={totals.rebateRows > 0 ? totals.rebate : 0}
                 margin={showMargin ? trading.margin ?? null : null}
                 futuresLabel={accounts.selectedFutures ? mobileAccountLabel(accounts.selectedFutures, priv) : ''}
                 privMoney={privMoney}

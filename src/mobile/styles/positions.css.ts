@@ -144,6 +144,9 @@ export const summaryNote = style({
     color: vars.color.mutedForeground,
 });
 
+/** 「≈ 金額」不拆行（摘要卡的已含預估退佣） */
+export const nowrap = style({ whiteSpace: 'nowrap' });
+
 /** 漲跌色文字（卡片內；淺色為白底） */
 export const tone = styleVariants({
     up: { color: vars.color.up },

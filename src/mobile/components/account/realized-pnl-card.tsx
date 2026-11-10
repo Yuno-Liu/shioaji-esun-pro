@@ -9,10 +9,13 @@
 //   clampEsunDateRange180Days 限制在 180 天內，並以同一組日期字串讀取玉山成交明細 store（useEsunTransactionDetails）。
 // - 合計規則見 src/mobile/lib/account-pnl.ts（sum 優先、列表加總後備、逐帳戶判斷）。
 // - 明細列顯示商品名稱為主、代碼為次（見 PnlRow；名稱查詢沿用合約快取，每個不重複代碼最多一次）。
+// - 預估手續費退佣（lib/realized-rebate，純函式）：每列依該列券商的設定（broker-cost-settings：永豐、玉山分開）估算；
+//   玉山成交明細在卡片層讀 store（hook 無條件呼叫，不適用時傳 null），每列只算一次，列、合計、玉山展開明細三處用同一個結果。
+//   合計與各市場分項之後、逐筆明細之前顯示「預估退佣合計（估）」「退佣後損益（估）」、無法估算的筆數與各券商設定；沒有月退時只顯示提示。只讀，沒有下單入口。
 
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useId, useState } from 'react';
-import { esunFillCosts, esunFillRebate, esunRefOfPnlRow } from '../../../components/esun-pnl-details';
+import { esunFillCosts, esunRefOfPnlRow } from '../../../components/esun-pnl-details';
 import { useAccounts } from '../../../lib/account-store';
 import {
     clampEsunDateRange180Days,
@@ -25,7 +28,7 @@ import {
 import { maskAccountId, maskMoney, usePrivacyMode, usePrivacyMoney } from '../../../lib/privacy';
 import { canonicalBrokerCode } from '../../../lib/realized-name';
 import { fetchProfitLoss, fetchProfitLossSummary } from '../../../lib/shioaji';
-import { discountText, useTradingCostSettings } from '../../../lib/trading-cost-settings';
+import { discountText, type TradingCostSettings } from '../../../lib/trading-cost-settings';
 import type { Account } from '../../../lib/types/portfolio';
 import { accountKeyOf, formatClock, formatPct, formatPrice, formatShares, formatTwd, signDir } from '../../lib/account-format';
 import { canLoadOnDemand, cooldownLeftSec, gateLeftSec, loadOnDemand, onDemandNow, useOnDemand, type OnDemandGate } from '../../lib/account-on-demand';
@@ -44,7 +47,9 @@ import {
     type RealizedPnlResult,
     type RealizedPnlRow,
 } from '../../lib/account-pnl';
+import { brokerOfAccountKey, COST_BROKER_TEXT, COST_BROKERS, useBrokerCostSettings, type CostBroker } from '../../lib/broker-cost-settings';
 import { instrumentText, realizedLookupCode, useContractName } from '../../lib/contract-names';
+import { realizedRebateTotals, realizedRowRebate, type RealizedRebate } from '../../lib/realized-rebate';
 import * as styles from '../../styles/account.css';
 import { brokerName, CollapsibleCard, Item, RefreshButton, Segmented, useNow } from './account-ui';
 
@@ -109,17 +114,37 @@ export async function fetchRealizedPnl(plans: readonly PnlPlan[]): Promise<Reali
     return aggregateRealizedPnl(parts);
 }
 
-function EsunDetailView({ detail }: { detail: EsunTransactionDetail }) {
+export const REBATE_TEXT = {
+    total: '預估退佣合計（估）',
+    after: '退佣後損益（估）',
+    note: '退佣＝買進＋賣出手續費 ×（1 − 折數），依「帳戶 › 交易成本」各券商設定估算；永豐以成交價金估算手續費，玉山的平倉手續費用成交明細。實際以券商入帳為準，期貨不計退佣。',
+    off: '目前的交易成本設定沒有月退（折數 10 或成交即折），沒有退佣可顯示；可在「帳戶 › 交易成本」依券商設定。',
+    unknown: (n: number) => `${n} 筆缺成交價或數量，無法估算退佣，未計入。`,
+} as const;
+
+/** 「月退 6 折」「成交即折 2.8 折」「無折扣」 */
+export function costModeText(s: Pick<TradingCostSettings, 'feeDiscount' | 'rebateMode'>): string {
+    if (s.feeDiscount >= 1) return '無折扣';
+    return `${s.rebateMode === 'monthly' ? '月退' : '成交即折'} ${discountText(s.feeDiscount)} 折`;
+}
+
+/** 一列的玉山成交明細（applies＝玉山證券列）、預估退佣與所用的設定（列、合計、展開明細共用） */
+interface RowInfo {
+    esun: { applies: boolean; detail: EsunTransactionDetail | undefined };
+    rebate: RealizedRebate;
+    settings: TradingCostSettings;
+}
+
+function EsunDetailView({ detail, row, info }: { detail: EsunTransactionDetail; row: RealizedPnlRow; info: RowInfo }) {
     const priv = usePrivacyMode();
     const privMoney = usePrivacyMoney();
-    const costSettings = useTradingCostSettings();
     const money = (n: number | null) => maskMoney(formatTwd(n), privMoney);
     const signed = (n: number | null) => maskMoney(formatTwd(n, true), privMoney);
     const price = (n: number | null) => maskMoney(formatPrice(n), privMoney);
     const shares = (n: number | null) => maskMoney(formatShares(n), privMoney);
     const costs = esunFillCosts(detail.fills);
-    const rebate = esunFillRebate(detail.fills, costSettings);
-    const withRebate = rebate !== null && detail.realizedPnl !== null ? detail.realizedPnl + rebate : null;
+    const rebate = info.rebate.status === 'ok' ? info.rebate.rebate : null;
+    const withRebate = rebate !== null && Number.isFinite(row.pnl) ? row.pnl + rebate : null;
     const side = detail.action === 'Buy' ? '買進' : detail.action === 'Sell' ? '賣出' : '';
     return (
         <div className={styles.detailBox} data-testid='pnl-esun-detail'>
@@ -142,8 +167,8 @@ function EsunDetailView({ detail }: { detail: EsunTransactionDetail }) {
                 <Item term='成本合計' testId='pnl-esun-cost-total'>{money(costs.total)}</Item>
                 {rebate !== null && (
                     <>
-                        <Item term={`預估退佣（月退 ${discountText(costSettings.feeDiscount)} 折）`}>≈ {money(rebate)}</Item>
-                        <Item term='含退佣損益' className={styles.dir[signDir(withRebate)]}>≈ {signed(withRebate)}</Item>
+                        <Item term={`預估退佣（月退 ${discountText(info.settings.feeDiscount)} 折）`} testId='pnl-esun-rebate'>{money(rebate)}</Item>
+                        <Item term='退佣後損益（估）' className={styles.dir[signDir(withRebate)]} testId='pnl-esun-after-rebate'>{signed(withRebate)}</Item>
                     </>
                 )}
             </dl>
@@ -174,17 +199,9 @@ function EsunDetailView({ detail }: { detail: EsunTransactionDetail }) {
     );
 }
 
-/** 玉山證券列對應的成交明細（只讀 store，不發請求）；非玉山證券列 applies＝false */
-function useEsunRowDetail(row: RealizedPnlRow, plans: readonly PnlPlan[]): { applies: boolean; detail: EsunTransactionDetail | undefined } {
-    const ref = esunRefOfPnlRow(row);
-    const plan = ref ? plans.find(p => p.market === 'S' && p.account.broker_id === ref.broker_id && p.account.account_id === ref.account_id) : undefined;
-    const snapshot = useEsunTransactionDetails(plan ? ref : null, plan?.begin ?? '', plan?.end ?? '');
-    if (!ref || !plan) return { applies: false, detail: undefined };
-    return { applies: true, detail: findEsunTransactionDetail(snapshot?.details, row) };
-}
-
 /** 玉山證券列的「交易成本明細」展開 */
-function EsunRowDetail({ detail }: { detail: EsunTransactionDetail | undefined }) {
+function EsunRowDetail({ row, info }: { row: RealizedPnlRow; info: RowInfo }) {
+    const detail = info.esun.detail;
     const [open, setOpen] = useState(false);
     return (
         <>
@@ -192,7 +209,7 @@ function EsunRowDetail({ detail }: { detail: EsunTransactionDetail | undefined }
                 {open ? <ChevronDown size={16} aria-hidden='true' /> : <ChevronRight size={16} aria-hidden='true' />}
                 交易成本明細
             </button>
-            {open && (detail ? <EsunDetailView detail={detail} /> : <p className={styles.note}>尚未取得對應的玉山成交明細，請重新查詢。</p>)}
+            {open && (detail ? <EsunDetailView detail={detail} row={row} info={info} /> : <p className={styles.note}>尚未取得對應的玉山成交明細，請重新查詢。</p>)}
         </>
     );
 }
@@ -202,9 +219,10 @@ function EsunRowDetail({ detail }: { detail: EsunTransactionDetail | undefined }
  * 都沒有才查合約快取（lib/contract-names：每個不重複代碼最多一次合約查詢，失敗只顯示代碼）。
  * 名稱載入前第一行是代碼、第二行是市場與日期；名稱到達後第一行換成名稱、代碼移到第二行開頭，列高不變。
  */
-function PnlRow({ row, plans, showDate }: { row: RealizedPnlRow; plans: readonly PnlPlan[]; showDate: boolean }) {
+function PnlRow({ row, info, showDate }: { row: RealizedPnlRow; info: RowInfo; showDate: boolean }) {
     const privMoney = usePrivacyMoney();
-    const esun = useEsunRowDetail(row, plans);
+    const esun = info.esun;
+    const rebate = info.rebate.status === 'ok' ? info.rebate.rebate : null;
     const code = canonicalBrokerCode(String(row.code ?? '')) || String(row.code ?? '');
     const own = (row as { name?: unknown }).name;
     const known = (typeof own === 'string' && own.trim()) || esun.detail?.name || null;
@@ -223,15 +241,49 @@ function PnlRow({ row, plans, showDate }: { row: RealizedPnlRow; plans: readonly
                 </span>
                 <span className={`${styles.pnlValue} ${styles.dir[signDir(row.pnl)]}`}>{maskMoney(formatTwd(row.pnl, true), privMoney)}</span>
             </div>
-            {esun.applies && <EsunRowDetail detail={esun.detail} />}
+            {rebate !== null && (
+                <p className={styles.pnlRebateLine} data-testid='pnl-row-rebate'>
+                    {/* 只在「・」處換行：「≈」不與金額拆開 */}
+                    <span className={styles.nowrap}>退佣 ≈ {maskMoney(formatTwd(rebate), privMoney)}</span>・<span className={styles.nowrap}>退佣後 ≈ {maskMoney(formatTwd(row.pnl + rebate, true), privMoney)}</span>
+                </p>
+            )}
+            {esun.applies && <EsunRowDetail row={row} info={info} />}
         </div>
     );
 }
 
-function PnlRows({ result, plans, showDate }: { result: RealizedPnlResult; plans: readonly PnlPlan[]; showDate: boolean }) {
+function PnlRows({ result, infos, showDate }: { result: RealizedPnlResult; infos: readonly RowInfo[]; showDate: boolean }) {
     return (
         <div data-testid='pnl-rows'>
-            {result.rows.map((r, i) => <PnlRow key={realizedRowKey(r, i)} row={r} plans={plans} showDate={showDate} />)}
+            {result.rows.map((r, i) => <PnlRow key={realizedRowKey(r, i)} row={r} info={infos[i]!} showDate={showDate} />)}
+        </div>
+    );
+}
+
+/** 合計與各市場分項之後的退佣合計、退佣後損益與設定說明；股票列都沒有月退時只顯示提示 */
+function RebateSummary({ result, infos, costs }: { result: RealizedPnlResult; infos: readonly RowInfo[]; costs: Record<CostBroker, TradingCostSettings> }) {
+    const privMoney = usePrivacyMoney();
+    const totals = realizedRebateTotals(infos.map(i => i.rebate));
+    const stockRows = result.rows.filter(r => r.market === 'S');
+    if (!totals.applies) {
+        return stockRows.length > 0 ? <p className={styles.note} data-testid='pnl-rebate-off'>{REBATE_TEXT.off}</p> : null;
+    }
+    const after = result.total === null ? null : result.total + totals.rebate;
+    const brokers = COST_BROKERS.filter(b => stockRows.some(r => brokerOfAccountKey(r.accountKey) === b));
+    return (
+        <div data-testid='pnl-rebate'>
+            <dl className={styles.kv}>
+                {/* 標籤已寫「估」：數值不加「≈」（鍵值欄的長數值依 overflowWrap 換行，「≈」單獨落到上一行不好看） */}
+                <Item term={REBATE_TEXT.total} testId='pnl-rebate-total'>{maskMoney(formatTwd(totals.rebate), privMoney)}</Item>
+                <Item term={REBATE_TEXT.after} className={styles.dir[signDir(after)]} testId='pnl-total-after-rebate'>
+                    {after === null ? '—' : maskMoney(formatTwd(after, true), privMoney)}
+                </Item>
+            </dl>
+            {totals.unknown > 0 && <p className={styles.note} role='status' data-testid='pnl-rebate-unknown'>{REBATE_TEXT.unknown(totals.unknown)}</p>}
+            <p className={styles.note} data-testid='pnl-rebate-settings'>
+                {brokers.map(b => `${COST_BROKER_TEXT[b]}：${costModeText(costs[b])}`).join('｜')}
+            </p>
+            <p className={styles.note}>{REBATE_TEXT.note}</p>
         </div>
     );
 }
@@ -285,6 +337,18 @@ export function RealizedPnlCard() {
     };
     const result = state.data;
     const money = (v: number | null) => maskMoney(formatTwd(v, true), privMoney);
+
+    // 退佣：各券商設定＋玉山成交明細（卡片層讀 store；hook 無條件呼叫，沒有玉山證券帳戶時傳 null）
+    const costs = useBrokerCostSettings();
+    const esunPlan = plans.find(p => p.market === 'S' && esunRefOfPnlRow({ market: 'S', accountKey: `${p.account.broker_id}:${p.account.account_id}` }) !== null) ?? null;
+    const esunSnapshot = useEsunTransactionDetails(esunPlan ? esunPlan.account : null, esunPlan?.begin ?? '', esunPlan?.end ?? '');
+    const infos: RowInfo[] = (result?.rows ?? []).map((row) => {
+        const ref = esunRefOfPnlRow(row);
+        const applies = !!ref && !!esunPlan && esunPlan.account.broker_id === ref.broker_id && esunPlan.account.account_id === ref.account_id;
+        const detail = applies ? findEsunTransactionDetail(esunSnapshot?.details, row) : undefined;
+        const settings = costs[brokerOfAccountKey(row.accountKey)];
+        return { esun: { applies, detail }, rebate: realizedRowRebate(row, settings, detail), settings };
+    });
 
     return (
         <CollapsibleCard title='已實現損益' open={open} onToggle={toggle} testId='account-pnl'>
@@ -354,9 +418,11 @@ export function RealizedPnlCard() {
                             )}
                             {result.incomplete && <p className={styles.warning} role='status'>部分帳戶查詢失敗，合計只含成功的帳戶。</p>}
                             {result.errors.map(e => <p key={e} className={styles.warning} role='alert'>{e}</p>)}
+                            {/* 退佣放在合計與各市場分項之後、逐筆明細之前（合計與分項不被說明文字隔開） */}
+                            <RebateSummary result={result} infos={infos} costs={costs} />
                             {result.rows.length === 0
                                 ? <p className={styles.note}>這個區間沒有已實現損益。</p>
-                                : <PnlRows result={result} plans={plans} showDate={range.begin !== range.end} />}
+                                : <PnlRows result={result} infos={infos} showDate={range.begin !== range.end} />}
                         </>
                     )}
                     {state.error && <p className={styles.warning} role='alert'>已實現損益查詢失敗：{state.error}</p>}

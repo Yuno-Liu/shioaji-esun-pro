@@ -162,6 +162,7 @@ vi.mock('../../lib/shioaji', async (importOriginal) => ({
 
 import { accountConfirmLabel, type OrderConfirmRequest } from '../../lib/order-confirm';
 import { resetTradingCostSettings, setTradingCostSettings } from '../../lib/trading-cost-settings';
+import { resetBrokerCostSettings, setBrokerFeeSettings } from '../lib/broker-cost-settings';
 import { SlideToConfirm } from '../components/slide-to-confirm';
 import { BATCH_STOPPED, batchExitAbortReason, decideBatchConfirm, isBatchExitActive, setBatchExit } from '../lib/batch-exit-auth';
 import { resetTradingLimitsForTest } from '../hooks/use-trading-limits';
@@ -985,7 +986,7 @@ describe('淨損益與損益兩平價', () => {
         vi.useFakeTimers({ toFake: ['Date'] });
         vi.setSystemTime(Date.parse('2026-11-06T10:00:00+08:00'));
     });
-    afterEach(() => { resetTradingCostSettings(); });
+    afterEach(() => { resetTradingCostSettings(); resetBrokerCostSettings(); });
 
     const okQuery = { updatedAt: 1, needsReconcile: false, error: null, reasons: [] };
     /** 委託查詢成功＋今日成交 */
@@ -1043,6 +1044,44 @@ describe('淨損益與損益兩平價', () => {
         expect(sheet).toContain('證券交易稅條例第 2 條之 1');
     });
 
+    it('月退 2.8 折：列顯示「退佣 ≈」、摘要註明已含預估退佣；明細面板列出交割收取額與退佣，淨損益不變', async () => {
+        setTradingCostSettings({ feeDiscount: 0.28 });
+        // 玉山另設成交即折不影響永豐列
+        setBrokerFeeSettings('esun', { feeDiscount: 0.6, rebateMode: 'instant' });
+        withTrades([stockPos({ yd_quantity: 2500 })], [buyTrade(1)]);
+        await render();
+        expect(textOf(inRow('2330', 'position-pnl'))).toBe('+100,999');
+        // 開倉交割 4,499＋750 退 3,239＋540；平倉交割 4,638＋773 退 3,339＋557 → 7,675
+        expect(textOf(inRow('2330', 'position-rebate'))).toBe('退佣 ≈ 7,675');
+        expect(textOf(one('position-total-rebate'))).toBe('已含預估退佣 ≈ 7,675');
+        await click(inRow('2330', 'position-pnl-info'));
+        const sheet = textOf(sheetNode());
+        expect(sheet).toContain('退佣（月退 2.8 折，估）');
+        expect(sheet).toContain('買進手續費（估算）・退佣後');
+        expect(sheet).toContain('預估賣出手續費・退佣後');
+        expect(textOf(one('pnl-open-fee'))).toBe('1,470');
+        expect(textOf(one('pnl-open-fee-charged'))).toBe('5,249');
+        expect(textOf(one('pnl-open-rebate'))).toBe('≈ 3,779');
+        expect(textOf(one('pnl-close-fee-charged'))).toBe('5,411');
+        expect(textOf(one('pnl-close-rebate'))).toBe('≈ 3,896');
+        expect(textOf(one('pnl-rebate-total'))).toBe('≈ 7,675');
+        expect(textOf(one('pnl-net-before-rebate'))).toBe('+93,324');
+        expect(textOf(one('pnl-net-after-rebate'))).toBe('+100,999');
+    });
+
+    it('依持倉券商選設定：玉山帳戶用玉山的成交即折（沒有退佣），永豐預設 10 折也沒有退佣', async () => {
+        setBrokerFeeSettings('esun', { feeDiscount: 0.6, rebateMode: 'instant' });
+        setBrokerFeeSettings('sinopac', { feeDiscount: 0.28, rebateMode: 'monthly' });
+        setPositions([stockPos({ account: stockAcc2 })]);
+        await render();
+        expect(textOf(inRow('2330', 'position-pnl-tags'))).toContain('手續費以 6 折計');
+        expect(all('position-rebate')).toHaveLength(0);
+        expect(all('position-total-rebate')).toHaveLength(0);
+        await click(inRow('2330', 'position-pnl-info'));
+        expect(all('pnl-rebate-total')).toHaveLength(0);
+        expect(textOf(sheetNode())).not.toContain('退佣後');
+    });
+
     it('收盤後（台北 13:31）今日買進不再以當沖稅率計：標示「今日已收盤」，稅率回到 0.3%', async () => {
         vi.setSystemTime(Date.parse('2026-11-06T13:31:00+08:00'));
         setTradingCostSettings({ feeDiscount: 0.28 });
@@ -1090,9 +1129,13 @@ describe('淨損益與損益兩平價', () => {
         await render();
         expect(textOf(inRow('2330', 'position-pnl'))).toBe('•••••');
         expect(textOf(inRow('2330', 'position-broker-pnl'))).toBe('券商 •••••');
+        expect(textOf(inRow('2330', 'position-rebate'))).toBe('退佣 ≈ •••••');
+        expect(textOf(one('position-total-rebate'))).toBe('已含預估退佣 ≈ •••••');
         expect(textOf(inRow('2330', 'position-breakeven'))).not.toBe('—');
         await click(inRow('2330', 'position-pnl-info'));
         for (const id of ['pnl-open-fee', 'pnl-close-fee', 'pnl-close-tax', 'pnl-net', 'pnl-basis']) expect(textOf(one(id))).toBe('•••••');
+        for (const id of ['pnl-open-fee-charged', 'pnl-close-fee-charged', 'pnl-net-before-rebate', 'pnl-net-after-rebate']) expect(textOf(one(id))).toBe('•••••');
+        for (const id of ['pnl-open-rebate', 'pnl-close-rebate', 'pnl-rebate-total']) expect(textOf(one(id))).toBe('≈ •••••');
         expect(textOf(one('pnl-tax-rate'))).toBe('當沖 0.15% × •••••＋0.3% × •••••');
         expect(textOf(sheetNode())).not.toContain('3張');
     });
