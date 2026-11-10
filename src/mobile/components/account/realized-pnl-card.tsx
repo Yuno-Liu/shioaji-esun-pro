@@ -1,10 +1,12 @@
 // src/mobile/components/account/realized-pnl-card.tsx — 帳戶頁「已實現損益」（規格 Phase 2；比照桌面 PnlSection／pnlFetcher）
 //
-// - 區間：今日／本週／本月／近 30 天／自訂（台北日期）；帳戶＝目前選定的證券與期貨帳戶。
+// - 區間：今日／本週／本月／近 30 天／自訂（台北日期）；帳戶＝目前選定的證券與期貨帳戶。區間 UI 與成交明細卡共用
+//   （period-range.tsx）。
 // - 自訂：原生 <input type="date"> 起日／迄日，最多 180 天（含起訖日；customRangeProblem）；不合法時停用「查詢」並以
 //   role=status 說明原因，不自動修正日期。起訖存在模組層（本次使用期間保留，不寫 storage），第一次切到自訂帶近 30 天。
 // - 只在使用者展開區塊（且這個區間尚未讀過）或按「查詢」時讀取；同一區間＋帳戶 PNL_COOLDOWN_MS 內不重查；
-//   含玉山帳戶時另有不分區間的滑動視窗：任意 60 秒最多 PNL_ESUN_QUERIES_PER_MIN 次（避免觸發 bridge 10 次／分限制）。
+//   含玉山帳戶時另有不分區間的滑動視窗：任意 60 秒最多 PNL_ESUN_QUERIES_PER_MIN 次（避免觸發 bridge 10 次／分限制）；
+//   視窗物件 PNL_ESUN_GATE 與成交明細卡共用（兩者打同一個 bridge 端點）。
 // - 資料經由 src/lib 的 fetchProfitLoss／fetchProfitLossSummary（玉山帳戶由 lib 轉往 bridge）；玉山區間先以
 //   clampEsunDateRange180Days 限制在 180 天內，並以同一組日期字串讀取玉山成交明細 store（useEsunTransactionDetails）。
 // - 合計規則見 src/mobile/lib/account-pnl.ts（sum 優先、列表加總後備、逐帳戶判斷）。
@@ -15,7 +17,7 @@
 //   沒有月退時只顯示提示。每列與玉山展開明細另列買進、賣出兩邊的退佣（核心 src/lib/realized-rebate，桌面玉山明細共用）。只讀，沒有下單入口。
 
 import { ChevronDown, ChevronRight } from 'lucide-react';
-import { useId, useState } from 'react';
+import { useState } from 'react';
 import { esunFillCosts, esunRefOfPnlRow } from '../../../components/esun-pnl-details';
 import { useAccounts } from '../../../lib/account-store';
 import {
@@ -32,19 +34,14 @@ import { fetchProfitLoss, fetchProfitLossSummary } from '../../../lib/shioaji';
 import { discountText, type TradingCostSettings } from '../../../lib/trading-cost-settings';
 import type { Account } from '../../../lib/types/portfolio';
 import { accountKeyOf, formatClock, formatPct, formatPrice, formatShares, formatTwd, signDir } from '../../lib/account-format';
-import { canLoadOnDemand, cooldownLeftSec, gateLeftSec, loadOnDemand, onDemandNow, useOnDemand, type OnDemandGate } from '../../lib/account-on-demand';
+import { canLoadOnDemand, cooldownLeftSec, gateLeftSec, loadOnDemand, onDemandNow, useOnDemand } from '../../lib/account-on-demand';
 import {
     aggregateRealizedPnl,
-    customRangeBounds,
-    customRangeProblem,
     PNL_COOLDOWN_MS,
+    PNL_ESUN_GATE,
     PNL_ESUN_QUERIES_PER_MIN,
-    PNL_PERIODS,
-    pnlDateRange,
-    pnlRangeDays,
     realizedRowKey,
     type PnlPart,
-    type PnlPeriod,
     type RealizedPnlResult,
     type RealizedPnlRow,
 } from '../../lib/account-pnl';
@@ -52,7 +49,8 @@ import { brokerOfAccountKey, COST_BROKER_TEXT, COST_BROKERS, useBrokerCostSettin
 import { instrumentText, realizedLookupCode, useContractName } from '../../lib/contract-names';
 import { realizedRebateSourceText, realizedRebateTotals, realizedRowRebate, type RealizedRebate } from '../../lib/realized-rebate';
 import * as styles from '../../styles/account.css';
-import { brokerName, CollapsibleCard, Item, RefreshButton, Segmented, useNow } from './account-ui';
+import { brokerName, CollapsibleCard, Item, RefreshButton, useNow } from './account-ui';
+import { PeriodRangeFields, usePeriodRange, type CustomRangeSlot } from './period-range';
 
 interface PnlPlan {
     account: Account;
@@ -77,16 +75,11 @@ export function pnlPlans(accounts: readonly (Account | null)[], range: { begin: 
 
 const MARKET_TEXT = { S: '證券', F: '期貨' } as const;
 
-/** 含玉山帳戶的已實現損益查詢共用的滑動視窗（不分區間）；只有永豐帳戶時不套用 */
-const PNL_ESUN_GATE: OnDemandGate = { name: 'realized-pnl-esun', max: PNL_ESUN_QUERIES_PER_MIN, windowMs: 60_000 };
-
-type DateRange = { begin: string; end: string };
-
 /** 自訂起訖（模組層：本次使用期間保留，不寫 storage）；null＝尚未切到自訂 */
-let customRange: DateRange | null = null;
+const customRange: CustomRangeSlot = { current: null };
 
 export function resetRealizedPnlCardForTest(): void {
-    customRange = null;
+    customRange.current = null;
 }
 
 function errorText(e: unknown): string {
@@ -304,24 +297,10 @@ export function RealizedPnlCard() {
     const env = useEsunEnvironment();
     const privMoney = usePrivacyMoney();
     const [open, setOpen] = useState(false);
-    const [period, setPeriod] = useState<PnlPeriod>('today');
-    const [custom, setCustomState] = useState<DateRange | null>(customRange);
-    const problemId = useId();
     // 展開時每秒重繪（冷卻倒數）；收合時只需跟上日期變化
     const now = useNow(open ? 1_000 : 60_000);
-    const setCustom = (next: DateRange) => {
-        customRange = next;
-        setCustomState(next);
-    };
-    const changePeriod = (next: PnlPeriod) => {
-        // 第一次切到自訂：帶近 30 天（今天 − 29 到今天）
-        if (next === 'custom' && !customRange) setCustom(pnlDateRange('30d', Date.now()));
-        setPeriod(next);
-    };
-    const isCustom = period === 'custom';
-    const range: DateRange = period === 'custom' ? (custom ?? pnlDateRange('30d', now)) : pnlDateRange(period, now);
-    const problem = isCustom ? customRangeProblem(range.begin, range.end, now) : null;
-    const bounds = customRangeBounds(range.end, now);
+    const picker = usePeriodRange(customRange, now);
+    const { range, problem } = picker;
     const plans = pnlPlans([selectedStock, selectedFutures], range);
     const hasEsun = plans.some(p => isEsunAccount(p.account));
     // 自訂區間不合法：沒有 key（不讀取、「查詢」停用）
@@ -367,47 +346,7 @@ export function RealizedPnlCard() {
                 <p className={styles.note}>尚未選擇帳戶。</p>
             ) : (
                 <>
-                    {/* 五個選項放不下等寬分段（360 寬、字級 1.3 時會壓到鄰段）：用換行膠囊 */}
-                    <Segmented<PnlPeriod> label='區間' value={period} options={PNL_PERIODS} onChange={changePeriod} testId='pnl-period' variant='wrap' />
-                    {isCustom && (
-                        <div className={styles.dateFields} data-testid='pnl-custom'>
-                            <label className={styles.dateField}>
-                                起日
-                                <input
-                                    type='date'
-                                    className={styles.dateInput}
-                                    value={range.begin}
-                                    min={bounds.beginMin}
-                                    max={bounds.beginMax}
-                                    aria-invalid={!!problem}
-                                    aria-describedby={problem ? problemId : undefined}
-                                    onChange={e => setCustom({ begin: e.target.value, end: range.end })}
-                                    data-testid='pnl-begin'
-                                />
-                            </label>
-                            <label className={styles.dateField}>
-                                迄日
-                                <input
-                                    type='date'
-                                    className={styles.dateInput}
-                                    value={range.end}
-                                    max={bounds.endMax}
-                                    aria-invalid={!!problem}
-                                    aria-describedby={problem ? problemId : undefined}
-                                    onChange={e => setCustom({ begin: range.begin, end: e.target.value })}
-                                    data-testid='pnl-end'
-                                />
-                            </label>
-                        </div>
-                    )}
-                    {problem ? (
-                        <p id={problemId} className={styles.warning} role='status' data-testid='pnl-range-problem'>{problem}</p>
-                    ) : (
-                        <p className={styles.note} data-testid='pnl-range'>
-                            {range.begin === range.end ? range.end : `${range.begin} ～ ${range.end}`}
-                            {isCustom ? `（台北日期，共 ${pnlRangeDays(range.begin, range.end)} 天）` : '（台北日期）'}
-                        </p>
-                    )}
+                    <PeriodRangeFields picker={picker} now={now} testIdPrefix='pnl' />
                     {state.loading && !result && <p className={styles.note}>已實現損益查詢中…</p>}
                     {!state.loading && !result && !state.error && !problem && <p className={styles.note} data-testid='pnl-idle'>按「查詢」讀取這個區間的已實現損益。</p>}
                     {result && (

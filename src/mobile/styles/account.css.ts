@@ -722,6 +722,8 @@ export const totalLine = style({
 export const totalValue = style({
     ...NUM.numLg,
     ...NUMERIC,
+    // 「−$1,866,864」不可在負號後斷行（字級大時負號會單獨落到上一行）；放不下時由左側標籤換行
+    whiteSpace: 'nowrap',
 });
 
 export const pnlItem = style({
@@ -807,4 +809,52 @@ export const fillHead = style({
     justifyContent: 'space-between',
     gap: SPACE.s2,
     fontWeight: 600,
+});
+
+// ---- 成交明細（fill-history-card）：360 寬、字級 1.3 時不溢出（名稱單行省略、數值行可換行） ----
+
+/** 交易日分組標題 */
+export const fillsDate = style({
+    margin: `${SPACE.s2} 0 0`,
+    ...TEXT.subhead,
+    ...NUMERIC,
+    fontWeight: 600,
+    color: vars.color.mutedForeground,
+});
+
+/** 一筆成交、或依股票／依日期的一列 */
+export const fillsRow = style({
+    padding: `${SPACE.s1_5} 0`,
+    minWidth: 0,
+    ...rowDivider('&:last-child'),
+});
+
+/** 第一行：名稱（代碼）與右側淨收付 */
+export const fillsHead = style({
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) auto',
+    alignItems: 'center',
+    columnGap: SPACE.s2,
+    minWidth: 0,
+    ...NUMERIC,
+});
+
+/** 次要數值：逐項換行（不撐寬） */
+export const fillsFacts = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    columnGap: SPACE.s3,
+    rowGap: '0.125rem',
+    minWidth: 0,
+    margin: `${SPACE.s1} 0 0`,
+    ...TEXT.footnote,
+    ...NUMERIC,
+    color: vars.color.mutedForeground,
+    overflowWrap: 'anywhere',
+});
+
+/** 買／賣徽章：框線與文字用漲跌色（文字另寫「買」「賣」，不只靠顏色） */
+export const sideBadge = styleVariants({
+    Buy: [badge, { marginLeft: 0, marginRight: SPACE.s1, borderColor: vars.color.up, color: vars.color.up }],
+    Sell: [badge, { marginLeft: 0, marginRight: SPACE.s1, borderColor: vars.color.down, color: vars.color.down }],
 });

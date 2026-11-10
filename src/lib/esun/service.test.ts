@@ -615,6 +615,36 @@ describe('EsunTradeService', () => {
                 expect(findEsunTransactionDetail(snap!.details, pl[0]!)?.fills[0]).toMatchObject({ orderNo: 'Y1', tradeTime: '10:15:00' });
                 expect(getEsunTransactionDetailsSnapshot(simAccount, '', '')).toBeNull();
             });
+
+            it('fetchTransactions returns every row (buys and unrealized too) without touching the store', async () => {
+                mockDriver.setTransactions([
+                    { stk_no: '2884', stk_na: '玉山金', buy_sell: 'B', trade: '0', t_date: '20261021', qty: '1000', price_qty: '25000', cost: '25000', make: '0', mat_dats: [{ order_no: 'X1', buy_sell: 'B', qty: '1000', price: '25', fee: '35', pay_n: '-25035', t_time: '091000' }] },
+                    { stk_no: '2884', buy_sell: 'S', trade: '0', t_date: '20261022', qty: '1000', cost: '-25000', recv: '26000', make: '1000', mat_dats: [{ order_no: 'Y1', qty: '1000', t_time: '101500' }] },
+                    { stk_no: '1342', buy_sell: 'B', trade: '3', t_date: '20261023', qty: '40', price_qty: '20000', mat_dats: [] },
+                ]);
+                const spy = vi.spyOn(mockDriver, 'getTransactions');
+                const details = await service.fetchTransactions(simAccount, '20261001', '20261023');
+                expect(spy).toHaveBeenCalledTimes(1);
+                expect(spy).toHaveBeenCalledWith('20261001', '20261023');
+                expect(details.map(d => [d.rowId, d.code, d.action, d.tradeTypeLabel, d.realized])).toEqual([
+                    [1, '2884', 'Buy', '現股', false],
+                    [2, '2884', 'Sell', '現股', true],
+                    [3, '1342', 'Buy', '融資', false],
+                ]);
+                expect(details[0]!.fills[0]).toMatchObject({ orderNo: 'X1', action: 'Buy', fee: 35, netAmount: -25035, tradeTime: '09:10:00' });
+                expect(getEsunTransactionDetailsSnapshot(simAccount, '20261001', '20261023')).toBeNull();
+            });
+
+            it('fetchTransactions rejects malformed rows, other accounts and drivers without the query', async () => {
+                vi.spyOn(mockDriver, 'getTransactions').mockResolvedValueOnce([1] as never).mockResolvedValueOnce({} as never);
+                await expect(service.fetchTransactions(simAccount, '20261001', '20261023')).rejects.toThrow('玉山已實現損益回應格式錯誤');
+                await expect(service.fetchTransactions(simAccount, '20261001', '20261023')).rejects.toThrow('玉山已實現損益回應格式錯誤');
+                await expect(service.fetchTransactions(otherAccount, '20261001', '20261023')).rejects.toThrow('非玉山證券帳戶');
+                const bare = new EsunTradeService(Object.assign(Object.create(mockDriver), { getTransactions: undefined }));
+                bare.registerAccount(simAccount);
+                await expect(bare.fetchTransactions(simAccount, '20261001', '20261023')).rejects.toThrow('玉山下單服務未提供成交明細查詢');
+                expect(getEsunTransactionDetailsSnapshot(simAccount, '20261001', '20261023')).toBeNull();
+            });
         });
 
         it('propagates CA expiry errors instead of reporting an empty expiry', async () => {

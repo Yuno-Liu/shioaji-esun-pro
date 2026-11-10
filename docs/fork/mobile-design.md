@@ -1204,6 +1204,22 @@ InlineNote warn：待對帳…［對帳］（orders-reconcile）
 - 讀取：切到自訂或改了起日／迄日就是新的區間 key，回到「按「查詢」讀取」，按「查詢」前 0 個請求；送出的 begin／end 就是畫面上的起訖日。
 - 頻率：所選帳戶含玉山時，所有已實現損益查詢（不分區間）共用滑動視窗「任意 60 秒最多 4 次」（`PNL_ESUN_QUERIES_PER_MIN`；`lib/account-on-demand` 的 gate `{ name, max, windowMs }`）；滿了「查詢」停用並顯示到最舊一次滑出視窗的剩餘秒數（與冷卻倒數取大者），玉山說明改為「玉山已實現損益最長查詢 180 天，每分鐘最多查詢 4 次。」。依據：bridge 的 `profit_loss_limiter` 限 10 次／分，只在快取未命中時取額度（`_cached_query`：single-flight 填充鎖之後、快取鍵＝日期區間、TTL 10 秒）；每次查詢發出 2 個同區間 GET `/esun/portfolio/profit-loss`（列表＋彙總），通常只占 1 個額度、最壞 2 個，4 次 ≤ 8 < 10，留空間給同一個 bridge 上的桌面版。只有永豐帳戶時不套用視窗，維持原本「同一區間＋帳戶 30 秒不重查」。
 
+**成交明細**（2026-11-11，使用者要求「買賣成交完整明細查詢＋統整明細，日期區間可自訂」；以程式碼為準）：
+
+- 位置：帳戶頁「已實現損益」下方的 CollapsibleCard「成交明細」（`components/account/fill-history-card.tsx`，testid `account-fills`），在延遲載入的帳戶頁 chunk。帳戶只看選定的**證券**帳戶（`selectedStock`；沒有時「尚未選擇證券帳戶。」）；期貨不在範圍內，卡片內一行說明「期貨成交請看委託頁『成交』。」。
+- 區間：與已實現損益相同的期間膠囊與自訂日期欄（兩張卡共用 `components/account/period-range.tsx` 的 `usePeriodRange`／`PeriodRangeFields`，testid 前綴 `fills-`；規則仍是 `lib/account-pnl.ts`，最長 180 天、含起訖日）。自訂起訖存在本卡自己的模組層 slot，與已實現損益互不影響。
+- 資料來源與兩家的差異：
+  - 玉山：lib 新增 `esunTradeService.fetchTransactions(account, begin, end)`，與 `fetchProfitLoss` 打同一個 driver `getTransactions`（bridge GET `/esun/portfolio/profit-loss`＝`sdk.get_transactions_by_date`），回傳區間內**全部**成交列（買進、賣出、未實現都有，`parseEsunTransactionDetail`），不寫入任何 store、不改既有方法。費稅、淨收付、已實現損益都是券商值。區間先以 `clampEsunDateRange180Days` 裁切。
+  - 永豐：Shioaji 沒有歷史成交 API（`order_deal_records` 只有今日，模擬環境回空），所以**不發請求**：區間含今天時顯示今日成交（`useTradingState().trades` 中該帳戶的股票成交，經 `order-fills` 的 `collectDealRows`），過去的日期清單為空；一律顯示「永豐不提供歷史成交查詢，只顯示今日成交（來自委託回報；手續費與交易稅為估算）。」。
+- 轉換與估算（`lib/fill-history.ts`，純函式）：
+  - `fromEsunDetails`：攤平每列的逐筆成交（mat_dats），帶上列的名稱、代碼、交易類別（現股／融資／融券／信用當沖／現股當沖賣）；買賣別以逐筆為準，逐筆沒有才用列的。列沒有逐筆時以整列當一筆（費稅為 0）。淨收付：逐筆有 `pay_n` 取絕對值，賣出為正、買進為負；沒有時推算（賣＝價金 − 手續費 − 交易稅 − 證所稅 − 融券手續費；買＝−(價金＋手續費)）。已實現損益只在已實現列（與已實現損益卡片同一個 `isEsunRealizedTransaction`：一般賣出、融券買回、信用當沖）有值，逐筆有 `make` 用逐筆值，整列逐筆都沒有時把列的值記在第一筆（不重複計入）。
+  - `fromSinopacDeals`：只取股票（排除 FUT／OPT／IND）；手續費＝`stockFeeBreakdown(價金, { odd }, 永豐設定).charged`（每筆成交各自套最低手續費，可能略高於券商實收）；賣出交易稅＝`sellTaxRate(合約, now)` 的一般稅率（ETF、權證 0.1%，債券 ETF 停徵期間 0；沒有合約代碼時 0.3%），**不判斷現股當沖減半**、不估融券手續費；已實現損益為 null，費稅標示「（估）」。券商未提供逐筆明細的差額列（價格未知）不列入。
+  - `fillTotals`／`summarizeByStock`（依 |淨收付| 由大到小）／`summarizeByDate`（日期新的在前）／`sortFillRecords`（日期新的在前、同日時間新到舊、沒有時間的排後）。
+- 讀取與頻率：玉山只在展開（且這個區間尚未讀過）或按「查詢」時讀取（`loadOnDemand`，key＝帳戶＋裁切後區間＋玉山環境，同一 key `PNL_COOLDOWN_MS` 30 秒不重查）。兩張卡打的是同一個 bridge 端點，所以滑動視窗 `PNL_ESUN_GATE` 移到 `lib/account-pnl.ts` 匯出、兩張卡共用同一個物件：合計任意 60 秒最多 4 次（成交明細每次 1 個 GET，已實現損益每次 2 個同區間 GET，最壞 8 < bridge 10 次／分）。說明文字「玉山成交明細最長查詢 180 天；與已實現損益合計每分鐘最多查詢 4 次。」。
+- 檢視：有資料時最上面固定總計（`fills-totals`：淨收付與筆數、買進金額（股數）、賣出金額（股數）、手續費、交易稅、有證所稅／融券手續費時另一列、玉山另有已實現損益；估算值標「（估）」），下面是 Segmented［明細｜依股票｜依日期］（`fills-view`）。明細依交易日分組（日期新的在前），每列名稱為主、代碼為次、買／賣徽章（漲跌色框線＋文字）與交易類別、時間、成交價 × 股數、價金、手續費／稅、淨收付（帶正負號上色）、書號（`maskAccountId`）；一次最多 100 筆，下面「再顯示 N 筆」（`fills-more`），換帳戶、區間或重新查詢回到第一頁。依股票（`fills-stock-row`）、依日期（`fills-date-row`）每列顯示買進、賣出、費稅、淨收付，依股票另有已實現損益。
+- 金額、股數、價格一律經 `maskMoney(…, privMoney)`；只讀，沒有任何下單入口。樣式在 `styles/account.css.ts`（`fillsRow`、`fillsHead`、`fillsFacts`、`fillsDate`、`sideBadge`）：名稱單行省略、次要數值逐項換行，360 寬字級 1.3 不撐寬。
+- 待確認：玉山 `pay_n` 的正負號定義（目前不依賴，取絕對值）；信用交易的淨收付——融資買進的實際自備款、融券賣出的保證金與擔保價款，`pay_n` 的意義待以正式環境資料核對，推算公式只是現股公式。
+
 **交易環境（玉山模擬／正式切換）**（2026-11-09，使用者要求「手機板切換模擬/正式讓手機板也可以設定切換」；以程式碼為準）：
 
 - 位置：帳戶 › 連線，「玉山重新連線」之後（`components/account/env-switch-section.tsx`）。永豐列唯讀（`/api/v1/info` 的 simulation），附說明「改 .env 的 SJ_PRODUCTION 後執行 docker compose up -d 重新啟動；手機與桌面都只顯示、不能切換」。玉山列顯示目前環境（切換中、未連線、環境未確認另有文字）；下方兩個選項列沿用帳戶切換面板的列樣式＋環境膠囊：目前環境打勾、停用；沒有設定檔的選項停用並寫「未提供 esun-config.*.ini（不可選）」；共同的擋下原因寫在選項下方。
@@ -1347,6 +1363,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 | 通知中心（狀態列鈴、面板、［全部清除］兩段、SheetLoadError 重試） | 只開唯讀面板與清除記憶體通知紀錄 | `status-bar-notices.test.tsx`、`notice-center-sheet.test.tsx` |
 | 漲停／跌停標示（報價列、交易頁主價）、盤中異動名稱查詢、產業說明面板成分股（排序、點列） | 只改顯示；名稱只讀合約（`ensureContract`）；成分股只 retain／release 群組內排行投影，點列只關面板並 `navigate` 到交易頁 | `quote-row.test.tsx`、`trade-page.test.tsx`、`market-signals.test.tsx`、`sector-page.test.tsx`（S1） |
 | 已實現損益自訂區間（期間膠囊、起日／迄日、查詢） | 只改起訖日（模組層）或發出唯讀損益查詢（`fetchProfitLoss`／`fetchProfitLossSummary`），不呼叫送單、改單、刪單，也不開下單或委託面板 | `account-page.test.tsx`、`account-pnl.test.ts`、`account-on-demand.test.ts` |
+| 帳戶 › 成交明細（期間膠囊、起日／迄日、查詢、［明細｜依股票｜依日期］、再顯示） | 只改起訖日（模組層）、檢視與顯示筆數，或發出唯讀查詢（`esunTradeService.fetchTransactions`）；永豐不發請求；不呼叫送單、改單、刪單，也不開下單或委託面板 | `account-page.test.tsx`、`fill-history.test.ts` |
 | 自選固定清單「股期近月／遠月」（分頁、點列、長按面板、快速下單鍵、［重試］）與清單排序（排序鍵、選項面板、［⟳］） | 點列只 `navigate`；下單鍵與買賣只 `openTicket`（實際月份代碼，之後仍需預覽與滑動確認）；排序只改顯示順序與本裝置偏好，不寫回伺服器清單 | `futures-list.test.tsx`、`watchlist-futures-sort.test.tsx`、`mobile-order.test.ts`（實際月份合約） |
 | 持倉分段排序（排序鍵、選項面板、［⟳］）與產業列排序（四個排序段、再點反向） | 只改顯示順序與本裝置偏好；持倉排序只發排序依據的批次快照，產業排序 0 個請求；不呼叫送單、改單、刪單，也不開 `openTicket`／`openOrderAction` | `holdings-sort.test.tsx`、`sector-page.test.tsx`（S1）、`sector-model.test.ts` |
 
@@ -1487,6 +1504,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 - **第 6 批**（2026-11-09，持倉排序、產業列排序；以 accept/p5＝main＋PR #12／#13／#14 為基準 223,263）：首屏 **223,278 bytes**（+15），在 ≤219 KiB（224,256）內；持倉排序在延遲載入的 `holdings-list`（靜態匯入 `watch-sort`）、產業排序在市場頁 chunk，沒有新的首屏程式碼（差異為 chunk 雜湊的 gzip 浮動）。
 - **首屏目標再調整**（2026-11-10，主代理決定，上游同步）：目標由 ≤219 KiB 放寬為 **≤220 KiB（225,280 bytes）**。同步上游 #393（朱紅錯誤色）與 #394（權證規則）後首屏 224,668 bytes（14 個 JS），增加的部分全來自上游：`src` 共用 chunk +544（`warrant-rules`、`contract-market` 等打包進含 `placeStockOrder` 的 lib 模組，手機首屏必載）、`theme.css` +134（朱紅 `danger`／`dangerSolid` 色票）；手機程式本身沒有增加。要再壓需修改 `src/lib`（R2 不允許）。之後在首屏新增功能仍要先刪減。
 - **自選指數列收合／展開**（2026-11-10）：首屏 **225,198 bytes（15 個 JS）**，相對 main 224,677 +521，在 225,280 內，剩 82 bytes。首屏只多了展開狀態（localStorage）、切換鍵、lazy＋Suspense＋ErrorBoundary 掛載與 `useIndexView` 的匯出；面板、成交金額格式與面板樣式都在延遲載入的 `watch-index-panel` chunk，走勢沿用 `watch-sparkline` chunk。切換鍵用首屏已有的 `ChevronDown` 轉向，不另載 `ChevronUp`。
+- **成交明細**（2026-11-11）：首屏 **225,239 bytes（15 個 JS）**，相對 main（8ad3b6a0）225,188 +51，在 225,280 內，剩 41 bytes。卡片、`lib/fill-history`、共用區間元件與共用視窗都在延遲載入的帳戶頁 chunk；首屏增加的應是 mobile 入口裡帳戶頁 lazy import 的預載相依清單（`__vite__mapDeps`；帳戶頁現在也相依 `order-fills`、`contract-names` 等既有 chunk），未與 main 的建置逐檔比對。
 
 ---
 
