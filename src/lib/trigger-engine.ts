@@ -1375,6 +1375,11 @@ export function disarmBracketGroup(env: string, group: string) {
 
 const reserveKeyOf = (env: string, account: AccountRef, orderCode: string, action: Action) =>
     `${env}|${accountRefKey(account)}|${orderCode}|${action}`;
+/** fork：融資、融券進場是券商端各自獨立的部位（融資賣出只賣融資餘額、融券賣出用借來的券），
+ * 不動現股庫存，另用一個保留 key，不佔現股括號出場（只送現股）的可賣量。現股單與現股當沖
+ * 先賣仍用現股 key：先賣當日沒買回時要以現股庫存交割，必須照樣佔量，避免與現股停損一起超賣 */
+const creditReserveSuffix = (t: Pick<TriggerOrder, 'orderCond'>) =>
+    t.orderCond && t.orderCond !== 'Cash' ? `|${t.orderCond}` : '';
 
 export function reservedQuantity(key: string): number {
     return exits.filter(e => e.reserveKey === key && !isResolved(e))
@@ -1462,7 +1467,7 @@ function reserve(t: TriggerOrder, lastPrice: number): { rec: ExitRecord; sibling
     const account = t.account!;
     const env = t.env!;
     const orderCode = t.orderCode!;
-    const reserveKey = reserveKeyOf(env, account, orderCode, t.action);
+    const reserveKey = reserveKeyOf(env, account, orderCode, t.action) + creditReserveSuffix(t); // fork
     const plan = planFor(t);
     const rec: ExitRecord = {
         id: `ex-${t.id}`, triggerId: t.id, bracketId: t.bracketId, env, account,
