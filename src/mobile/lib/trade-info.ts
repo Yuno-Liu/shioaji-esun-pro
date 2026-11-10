@@ -92,7 +92,20 @@ function sideEmpty(prices: readonly (string | number)[] | undefined, volumes: re
 }
 
 /**
- * 價位在停板時是否「鎖住」：漲停＝最佳委買在漲停（量 > 0）且委賣已空；跌停反之。
+ * 第一個有價格（> 0）且有量的檔位價格。交易所以價格 0 揭示排隊中的市價單（例如鎖漲停時委買第 1 檔 0／3,350 張），
+ * 市價單沒有價位，「最佳價」要從下一檔有價格的檔位算起。沒有回 null。
+ */
+function firstPricedLevel(prices: readonly (string | number)[] | undefined, volumes: readonly number[] | undefined): number | null {
+    const n = Math.max(prices?.length ?? 0, volumes?.length ?? 0);
+    for (let i = 0; i < n; i++) {
+        const p = numOf(prices?.[i]);
+        if (p > 0 && numOf(volumes?.[i]) > 0) return p;
+    }
+    return null;
+}
+
+/**
+ * 價位在停板時是否「鎖住」：漲停＝最佳委買（第一個有價格的檔位，市價單不算）在漲停且委賣已空；跌停反之。
  * 沒有五檔資料、或五檔兩側都空（盤前、收盤後）時回傳 null（無法判斷）。
  */
 export function limitLocked(contract: LimitContract, state: 'up' | 'down', book: BookSide | undefined): boolean | null {
@@ -101,9 +114,11 @@ export function limitLocked(contract: LimitContract, state: 'up' | 'down', book:
     const askEmpty = sideEmpty(book.ask_price, book.ask_volume);
     if (bidEmpty && askEmpty) return null;
     if (state === 'up') {
-        return askEmpty && numOf(book.bid_volume?.[0]) > 0 && limitStateOf(contract, numOf(book.bid_price?.[0])) === 'up';
+        const best = firstPricedLevel(book.bid_price, book.bid_volume);
+        return askEmpty && best !== null && limitStateOf(contract, best) === 'up';
     }
-    return bidEmpty && numOf(book.ask_volume?.[0]) > 0 && limitStateOf(contract, numOf(book.ask_price?.[0])) === 'down';
+    const best = firstPricedLevel(book.ask_price, book.ask_volume);
+    return bidEmpty && best !== null && limitStateOf(contract, best) === 'down';
 }
 
 /**

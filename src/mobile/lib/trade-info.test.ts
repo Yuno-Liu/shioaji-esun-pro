@@ -43,6 +43,19 @@ describe('漲跌停狀態', () => {
         expect(limitChip('up')).toEqual({ key: 'limit', text: '漲停', tone: 'up' });
     });
 
+    it('第 1 檔是市價單（價格 0、量 > 0）時，從第一個有價格的檔位判斷是否鎖住', () => {
+        // 1785 光洋科鎖漲停的實際五檔形狀：委買第 1 檔市價 3,350 張、第 2 檔漲停價；委賣全空
+        // （原本只看第 1 檔價格 0，會誤判成「漲停未鎖」）
+        expect(limitKind(stock, 1175, true, {
+            bid_price: ['0', '1175', '1170', '1165', '1160'], bid_volume: [3350, 1386, 9, 58, 25],
+            ask_price: ['0', '0', '0', '0', '0'], ask_volume: [0, 0, 0, 0, 0],
+        })).toBe('lockedUp');
+        // 跌停：委賣第 1 檔市價單、第 2 檔跌停價，委買全空 → 鎖跌停
+        expect(limitKind(stock, 963, true, { bid_price: ['0'], bid_volume: [0], ask_price: ['0', '963'], ask_volume: [1200, 800] })).toBe('lockedDown');
+        // 只有市價單、兩側都沒有有價格的檔位 → 無法判斷（「漲停」）
+        expect(limitKind(stock, 1175, true, { bid_price: ['0'], bid_volume: [3350], ask_price: [], ask_volume: [] })).toBe('up');
+    });
+
     it('在跌停：委賣在跌停且委買已空→「鎖跌停」；委買仍有→「跌停未鎖」', () => {
         expect(limitKind(stock, 963, true)).toBe('down');
         expect(limitKind(stock, 963, true, { bid_price: [], bid_volume: [], ask_price: ['963'], ask_volume: [800] })).toBe('lockedDown');
