@@ -17,17 +17,25 @@
 //   方向以有色的 ▲／▼ SVG 圖形表示（aria-hidden，圖形門檻 3:1），漲跌幅文字仍帶正負號。
 //   字級「大」值與漲跌幅上下排列；其他字級放不下時自動換行，不截斷（styles/watchlist.css.ts indexValue）。
 // - 點一格只 navigate 到該指數的交易頁（指數不能下單，交易頁不顯示交易鍵）。
+// - 收合／展開（右端切換鈕，觸控區 TOUCH_MIN、aria-expanded／aria-controls）：狀態存 localStorage INDEX_PANEL_KEY（'1' 展開，
+//   其他收合；預設收合＝兩格）。展開時掛載延遲載入的 watch-index-panel（lib/deferred-modules.ts loadWatchIndexPanel：
+//   兩欄的指數、漲跌點數與漲跌幅、成交金額、當日走勢）；載入中與載入失敗都顯示收合的兩格（不跳空白、不顯示錯誤）。
+//   收合時不掛載面板、不讀 K 線；啟動時已記成展開就直接掛載（開始載入 chunk）。
+//   數值與漲跌的計算（即時優先、快照後備）由 useIndexView 與面板共用。
 
-import { useCallback, useEffect, useSyncExternalStore } from 'react';
+import { ChevronDown } from 'lucide-react';
+import { Suspense, useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import { retainContractQuotes } from '../../lib/quote-ownership';
 import { fetchSnapshots } from '../../lib/shioaji';
 import { ensureStream, getQuote, subscribeQuoteStore } from '../../lib/stream';
 import type { ContractBase } from '../../lib/types/contract';
 import type { Snapshot } from '../../lib/types/market';
 import { fmtPct, fmtPrice } from '../../lib/utils/format';
+import { loadWatchIndexPanel } from '../lib/deferred-modules';
 import { navigate } from '../lib/hash-router';
 import { focusRing, pressable } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
+import { ModuleErrorBoundary, retryableLazy } from './route-error-boundary';
 
 /** 指數快照後備的最短讀取間隔（ms） */
 export const INDEX_SNAPSHOT_TTL_MS = 10 * 60_000;
@@ -87,8 +95,33 @@ function useIndexQuote(contract: ContractBase) {
     return useSyncExternalStore(sub, () => getQuote(code)?.index, () => undefined);
 }
 
+/**
+ * 一檔指數的顯示資料（列與展開面板共用）：即時 index 有成交價時以即時為準，否則用快照（close、close − change_price）。
+ * dir：沒有漲跌或平盤為 flat；value／pctText 已格式化（沒有資料時 '—'／''）。
+ */
+export function useIndexView(contract: ContractBase) {
+    const code = contract.code;
+    const index = useIndexQuote(contract);
+    const snap = useSyncExternalStore(subscribe, () => snapshots.get(code), () => undefined);
+    const liveClose = index ? Number(index.close) : NaN;
+    const live = Number.isFinite(liveClose) && liveClose > 0;
+    const close = live ? liveClose : snap ? Number(snap.close) : NaN;
+    const ref = live ? Number(index!.reference) : snap ? Number(snap.close) - Number(snap.change_price) : NaN;
+    const has = Number.isFinite(close) && close > 0;
+    const chg = has && Number.isFinite(ref) && ref > 0 ? close - ref : undefined;
+    const pct = chg !== undefined ? (chg / ref) * 100 : undefined;
+    const dir: 'up' | 'down' | 'flat' = chg === undefined || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down';
+    return {
+        index, snap, live, has, ref, chg, dir,
+        value: has ? fmtPrice(close, 2) : '—',
+        pctText: pct !== undefined ? fmtPct(pct) : '',
+        /** aria-label 的方向字（漲／跌／平盤） */
+        dirWord: dir === 'up' ? '漲' : dir === 'down' ? '跌' : '平盤',
+    };
+}
+
 /** 方向圖形（非文字）：有色實心三角形 */
-function DirArrow({ dir }: { dir: 'up' | 'down' }) {
+export function DirArrow({ dir }: { dir: 'up' | 'down' }) {
     return (
         <svg
             className={`${styles.indexArrow} ${styles.tone[dir]}`}
@@ -105,24 +138,13 @@ function DirArrow({ dir }: { dir: 'up' | 'down' }) {
 
 function IndexCell({ contract, label }: { contract: ContractBase; label: string }) {
     const code = contract.code;
-    const index = useIndexQuote(contract);
-    const snap = useSyncExternalStore(subscribe, () => snapshots.get(code), () => undefined);
-    const liveClose = index ? Number(index.close) : NaN;
-    const live = Number.isFinite(liveClose) && liveClose > 0;
-    const close = live ? liveClose : snap ? Number(snap.close) : NaN;
-    const ref = live ? Number(index!.reference) : snap ? Number(snap.close) - Number(snap.change_price) : NaN;
-    const has = Number.isFinite(close) && close > 0;
-    const chg = has && Number.isFinite(ref) && ref > 0 ? close - ref : undefined;
-    const pct = chg !== undefined ? (chg / ref) * 100 : undefined;
-    const dir = chg === undefined || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down';
-    const value = has ? fmtPrice(close, 2) : '—';
-    const pctText = pct !== undefined ? fmtPct(pct) : '';
+    const { live, has, dir, value, pctText, dirWord } = useIndexView(contract);
     const valueText = has ? value : '— 沒有即時資料';
     return (
         <button
             type='button'
             className={`${styles.indexCell} ${pressable} ${focusRing}`}
-            aria-label={`${label}指數 ${valueText}${pctText ? `，${dir === 'up' ? '漲' : dir === 'down' ? '跌' : '平盤'} ${pctText}` : ''}，開啟交易頁`}
+            aria-label={`${label}指數 ${valueText}${pctText ? `，${dirWord} ${pctText}` : ''}，開啟交易頁`}
             onClick={() => navigate({ name: 'trade', code })}
             data-testid={`watch-index-${code}`}
             data-source={live ? 'live' : has ? 'snapshot' : 'none'}
@@ -142,11 +164,51 @@ function IndexCell({ contract, label }: { contract: ContractBase; label: string 
     );
 }
 
+/** 展開狀態的 localStorage 鍵：'1' 展開，其他（含沒有）收合 */
+export const INDEX_PANEL_KEY = 'sj-mobile-index-panel-v1';
+
+const BODY_ID = 'watch-index-body';
+
+const WatchIndexPanel = retryableLazy(() => loadWatchIndexPanel().then(m => m.WatchIndexPanel), 'WatchIndexPanel');
+
 export function WatchIndexStrip() {
     useEffect(() => { loadIndexSnapshots(); }, []);
-    return (
-        <div className={styles.indexStrip} data-testid='watch-index-strip'>
+    const [open, setOpen] = useState(() => {
+        try { return localStorage.getItem(INDEX_PANEL_KEY) === '1'; } catch { return false; }
+    });
+    const toggle = () => {
+        // 上次載入失敗時，這次展開重新 import（retryableLazy.reset 只在失敗後換新）
+        if (!open) WatchIndexPanel.reset();
+        setOpen(!open);
+        try { localStorage.setItem(INDEX_PANEL_KEY, open ? '0' : '1'); } catch { /* 無法儲存時只影響本次 */ }
+    };
+    const row = (
+        <div className={styles.indexStrip}>
             {WATCH_INDICES.map(i => <IndexCell key={i.contract.code} contract={i.contract} label={i.label} />)}
+        </div>
+    );
+    return (
+        <div className={styles.indexBar} data-testid='watch-index-strip' data-open={open}>
+            <div id={BODY_ID} className={styles.indexBody}>
+                {open ? (
+                    <ModuleErrorBoundary fallback={() => row}>
+                        <Suspense fallback={row}>
+                            <WatchIndexPanel />
+                        </Suspense>
+                    </ModuleErrorBoundary>
+                ) : row}
+            </div>
+            <button
+                type='button'
+                className={`${styles.indexToggle} ${pressable} ${focusRing}`}
+                aria-expanded={open}
+                aria-controls={BODY_ID}
+                aria-label={open ? '收合大盤走勢' : '展開大盤走勢'}
+                onClick={toggle}
+                data-testid='watch-index-toggle'
+            >
+                <ChevronDown size={18} aria-hidden='true' className={open ? undefined : styles.indexChevronUp} />
+            </button>
         </div>
     );
 }

@@ -4,12 +4,13 @@
 //   （vars.color.up／down，跟著台灣／國際配色）；沒有參考價時以第一點比較。
 // - 即時價只更新尾端點（points＋last）；重繪以 rAF 合併，依 devicePixelRatio 設定畫布像素；主題變更時重畫。
 // - 沒有動畫（減少動態下行為相同）。沒有 canvas／2D context 的環境（測試）不畫。
+// - 預設尺寸是自選列的 56×32（styles.spark）；傳 className 時改用該尺寸，並以 ResizeObserver 在版面尺寸改變時重畫（指數列展開面板）。
 // - 資料與請求上限在 lib/watch-sparkline-data.ts；本元件只負責畫。
 // - 延遲載入（首屏體積）：自選頁經 lib/deferred-modules.ts 的 loadWatchSparkline() 載入 WatchSparkCell，
 //   本檔與 lib/watch-sparkline-data.ts（含時段計算）都不進首屏 chunk。自選頁只為「可見列」掛載 WatchSparkCell，
 //   不可見列沒有 canvas、沒有點陣、不排 rAF；卸載時把畫布尺寸歸 0，立即釋放點陣（iOS 對 canvas 總記憶體有上限）。
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { themeKey, useThemeSettings } from '../../lib/theme-store';
 import type { ContractBase } from '../../lib/types/contract';
 import { vars } from '../../theme.css';
@@ -105,9 +106,19 @@ export function drawSparkline(cv: HTMLCanvasElement, data: readonly number[], re
     ctx.stroke();
 }
 
-export function WatchSparkline({ points, last, reference }: { points: readonly number[] | null; last?: number; reference?: number }) {
+export function WatchSparkline({ points, last, reference, className }: { points: readonly number[] | null; last?: number; reference?: number; className?: string }) {
     const ref = useRef<HTMLCanvasElement | null>(null);
     const theme = themeKey(useThemeSettings());
+    // 自訂尺寸（className，例如指數列面板填滿欄寬）：版面寬高改變（旋轉、字級）時重畫；自選列的固定 px 畫布不觀察
+    const [resized, setResized] = useState(0);
+    const fluid = className !== undefined;
+    useEffect(() => {
+        const cv = ref.current;
+        if (!fluid || !cv || typeof ResizeObserver !== 'function') return;
+        const ro = new ResizeObserver(() => setResized(n => n + 1));
+        ro.observe(cv);
+        return () => ro.disconnect();
+    }, [fluid]);
     useEffect(() => {
         const cv = ref.current;
         if (!cv || typeof requestAnimationFrame !== 'function') return;
@@ -117,7 +128,7 @@ export function WatchSparkline({ points, last, reference }: { points: readonly n
             drawSparkline(cv, data, reference);
         });
         return () => cancelAnimationFrame(raf);
-    }, [points, last, reference, theme]);
+    }, [points, last, reference, theme, resized]);
     // 卸載時釋放點陣（DPR 3 的 56×32 畫布約 64 KB；只靠 GC 時 iOS 可能遲遲不回收）
     useEffect(() => {
         const cv = ref.current;
@@ -127,7 +138,7 @@ export function WatchSparkline({ points, last, reference }: { points: readonly n
             cv.height = 0;
         };
     }, []);
-    return <canvas ref={ref} className={styles.spark} aria-hidden='true' data-testid='watch-spark' data-points={points ? points.length : 0} />;
+    return <canvas ref={ref} className={className ?? styles.spark} aria-hidden='true' data-testid='watch-spark' data-points={points ? points.length : 0} />;
 }
 
 export interface WatchSparkCellProps {
@@ -136,14 +147,16 @@ export interface WatchSparkCellProps {
     reference?: number;
     /** 列已節流的即時成交（以分鐘為桶寫入尾段；試撮不算） */
     tick: Parameters<typeof useSparkTick>[1];
+    /** 畫布尺寸（預設自選列的 styles.spark 56×32；底部指數列展開面板填滿欄寬） */
+    className?: string;
 }
 
 /**
  * 自選列走勢欄（延遲載入的入口）：只在列可見時掛載，掛載期間 retain（請求上限見 lib/watch-sparkline-data.ts），
  * 卸載即釋放（尚未開始的請求移出佇列）。
  */
-export function WatchSparkCell({ contract, reference, tick }: WatchSparkCellProps) {
+export function WatchSparkCell({ contract, reference, tick, className }: WatchSparkCellProps) {
     const points = useSparkline(contract, true);
     useSparkTick(contract, tick);
-    return <WatchSparkline points={points} reference={reference} />;
+    return <WatchSparkline points={points} reference={reference} className={className} />;
 }

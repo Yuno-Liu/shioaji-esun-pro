@@ -673,6 +673,13 @@ Stepper({ value: string; onChange(text: string): void; onStep(delta: 1 | -1): vo
   - 列尾快速下單鍵 `watch-row-ticket`（44px，只呼叫 `openTicket({ code, source: 'other' })`，不帶方向）。指數與組合商品放同寬的 aria-hidden 佔位，讓各列對齊；編輯模式維持「⋯」。
   - 多個清單時以 Segmented scroll 分頁（`watch-list-tabs`／`watch-list-tab-<id>`，tablist）取代 PopUpButton，選中分頁自動捲入可見範圍。只有一個清單時不顯示分頁。
   - 底部指數列 `ShellSlot bottom`：加權（IX0001）與櫃買（IX0043）。用 `retainContractQuotes` 帶型別訂閱，不經合約解析；收盤後或首次開啟沒有即時資料時，以快照（10 分鐘最多一次）作後備。文字一律 foreground，方向以有色 SVG 三角形表示；字級大時數值與漲跌幅上下排列。點擊開該指數的交易頁。
+    - 收合／展開（2026-11-10，使用者參考圖）：右端切換鍵 `watch-index-toggle`（觸控區 TOUCH_MIN、`aria-expanded`、`aria-controls`，名稱「展開大盤走勢」／「收合大盤走勢」；圖示是首屏已有的 lucide `ChevronDown`，收合時轉 180° 朝上，不另載 `ChevronUp`）。狀態存 `sj-mobile-index-panel-v1`（`'1'` 展開，其他收合；預設收合＝原本的兩格；讀寫包 try/catch）。字級大時兩格多讓出切換鍵寬度，格內縮小內距，放不下時值換到標籤下一行。
+    - 展開面板 `components/watch-index-panel.tsx`（＋`styles/watch-index-panel.css.ts`）延遲載入（`loadWatchIndexPanel`），不進首屏；只在展開時掛載，載入中與載入失敗都顯示收合的兩格（失敗後再次展開會重新 import）。啟動時已記成展開就直接掛載、開始載入 chunk；不在閒置預載清單內。
+    - 面板兩欄（`watch-index-panel-IX0001`／`-IX0043`），每欄：標籤、指數大字、▲／▼＋漲跌點數＋漲跌幅、`成交金額 10,033 億`（`watch-index-amount`）、盤中（09:00–13:30，`sparkSessionClosed('IND')` 為假）且有 `estimate_amount_sum` 時的 `預估 11,250 億`（`watch-index-estimate`；收盤後最後一筆報價可能仍帶預估值，一律不顯示）、當日走勢面積圖。數值與漲跌（即時優先、快照後備）與收合的兩格共用 `useIndexView`。
+    - 成交金額：即時 `amount_sum` 優先，沒有或空字串時用快照 `total_amount`，單位元換算成億、四捨五入、千分位；兩者都沒有顯示「—」。aria-label 含數值、漲跌點數與漲跌幅、成交金額與預估。點欄位只導頁到該指數交易頁，不新增下單入口。
+    - 走勢：`WatchSparkCell`（迷你走勢同一套資料與快取），contract 是 `WATCH_INDICES` 的 ContractBase、reference 是昨收（即時 `reference` 或快照 close − change_price）、tick 是即時 index（沒有即時時不寫尾段）。圖高 3.75rem、填滿欄寬、兩欄底部對齊；傳 className 的畫布以 ResizeObserver 在尺寸改變時重畫（自選列 56×32 畫布不觀察，行為不變）。
+    - 請求：收合時 0 個 K 線請求；展開時每檔每個時段最多 2 次 1 分 K 讀取、同時最多 2 個，全由 `lib/watch-sparkline-data.ts` 的快取與上限處理，沒有另外的輪詢。面板卸載（收合、離開自選頁）即釋放。
+    - 360／390 寬 × 字級 1／1.15／1.3 以 CDP 行動裝置模擬量過（假快照與假 K 線，其他 `/api` 一律 503）：收合與展開都沒有溢出或裁切，切換鍵 44／51／57px 見方；360 寬字級大時漲跌幅與成交金額各自整段換行，展開後指數列約 237px 高。
   - 搜尋面板改為延遲載入（第一次開啟才掛載，失敗時面板顯示載入失敗與重試），讓首屏仍在目標內。
 - 搜尋面板：large；搜尋框為 body 內 `position: sticky; top: 0` 的 `islandBg` 欄（不模糊）；結果列與自選列同樣式，尾端「加入／已加入」Chip。選做：開啟鍵 handler 內以 `flushSync` 掛載面板後同步 `focus()` 輸入框（iOS 只允許手勢同一呼叫堆疊叫出鍵盤，需實機確認）。
 
@@ -1479,6 +1486,7 @@ S1 的新入口與測試對照（都 mock `src/lib` 的送單、改單、刪單�
 - **第 4 批**（2026-11-09，自選固定清單「股期近月／遠月」與排序）：首屏 **223,125 bytes（15 個 JS）**，+439：兩個分頁標籤、兩個 lazy 入口、顯示順序與排序鍵槽、固定清單時隱藏編輯入口、排序檢視隱藏上移／下移；清單與排序邏輯都在延遲載入的 `futures-list`（3.3 KiB gzip）與 `watch-sort`（2.8 KiB gzip）chunk，在 223,232 內。
 - **第 6 批**（2026-11-09，持倉排序、產業列排序；以 accept/p5＝main＋PR #12／#13／#14 為基準 223,263）：首屏 **223,278 bytes**（+15），在 ≤219 KiB（224,256）內；持倉排序在延遲載入的 `holdings-list`（靜態匯入 `watch-sort`）、產業排序在市場頁 chunk，沒有新的首屏程式碼（差異為 chunk 雜湊的 gzip 浮動）。
 - **首屏目標再調整**（2026-11-10，主代理決定，上游同步）：目標由 ≤219 KiB 放寬為 **≤220 KiB（225,280 bytes）**。同步上游 #393（朱紅錯誤色）與 #394（權證規則）後首屏 224,668 bytes（14 個 JS），增加的部分全來自上游：`src` 共用 chunk +544（`warrant-rules`、`contract-market` 等打包進含 `placeStockOrder` 的 lib 模組，手機首屏必載）、`theme.css` +134（朱紅 `danger`／`dangerSolid` 色票）；手機程式本身沒有增加。要再壓需修改 `src/lib`（R2 不允許）。之後在首屏新增功能仍要先刪減。
+- **自選指數列收合／展開**（2026-11-10）：首屏 **225,198 bytes（15 個 JS）**，相對 main 224,677 +521，在 225,280 內，剩 82 bytes。首屏只多了展開狀態（localStorage）、切換鍵、lazy＋Suspense＋ErrorBoundary 掛載與 `useIndexView` 的匯出；面板、成交金額格式與面板樣式都在延遲載入的 `watch-index-panel` chunk，走勢沿用 `watch-sparkline` chunk。切換鍵用首屏已有的 `ChevronDown` 轉向，不另載 `ChevronUp`。
 
 ---
 

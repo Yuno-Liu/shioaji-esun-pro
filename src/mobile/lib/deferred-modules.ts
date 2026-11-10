@@ -36,3 +36,8 @@ export const loadWatchEditControls = () => import('../components/watch-edit-cont
  * （狀態列面板延遲載入的「點了沒有回饋」風險見上方說明）。兩者共用一個載入入口：首屏少一個載入函式與預載清單項目。
  */
 export const loadNoticeCenterSheet = () => import('../components/notice-center-sheet');
+/**
+ * 自選頁底部指數列的展開面板（加權｜櫃買兩欄：指數、漲跌、成交金額、當日走勢；連同 watch-index-panel.css.ts）：
+ * 只在展開時掛載，收合時不載入、不讀 K 線。載入中與載入失敗時指數列顯示收合的兩格。
+ */
+export const loadWatchIndexPanel = () => import('../components/watch-index-panel');

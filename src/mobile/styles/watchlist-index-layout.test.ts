@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest';
 const source = readFileSync(new URL('./watchlist.css.ts', import.meta.url), 'utf8');
 const iconButtonSource = readFileSync(new URL('../ui/icon-button.css.ts', import.meta.url), 'utf8');
 const stripSource = readFileSync(new URL('../components/watch-index-strip.tsx', import.meta.url), 'utf8');
+const panelCss = readFileSync(new URL('./watch-index-panel.css.ts', import.meta.url), 'utf8');
 /** 去掉 // 與 /* *\/ 註解（只檢查程式碼） */
 const code = (src: string) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 
@@ -78,6 +79,39 @@ describe('底部指數列：字級「大」不裁切、不溢出', () => {
         expect(styleBlock('indexLabel')).toMatch(/flex:\s*'0 0 auto'/);
         // 圖形尺寸以 rem 計，隨字級
         expect(styleBlock('indexArrow')).toMatch(/width:\s*'0\.5rem'/);
+    });
+});
+
+describe('底部指數列：收合／展開鍵與展開面板', () => {
+    it('切換鍵點擊區 TOUCH_MIN×TOUCH_MIN、不縮；圖示 foreground', () => {
+        const block = styleBlock('indexToggle');
+        expect(block).toMatch(/width:\s*TOUCH_MIN/);
+        expect(block).toMatch(/height:\s*TOUCH_MIN/);
+        expect(block).toMatch(/flex:\s*'0 0 auto'/);
+        expect(block).toMatch(/color:\s*vars\.color\.foreground/);
+        expect(styleBlock('indexBody')).toMatch(/minWidth:\s*0/);
+    });
+
+    it('字級「大」：格可換行（值換到標籤下一行，不溢出）', () => {
+        const cell = styleBlock('indexCell');
+        expect(cell.slice(cell.indexOf(FONT_LARGE))).toMatch(/flexWrap:\s*'wrap'/);
+    });
+
+    it('面板文字只用 foreground、不裁切；兩欄 minmax(0, 1fr)；走勢填滿欄寬', () => {
+        const src = code(panelCss);
+        expect(src).not.toMatch(/vars\.color\.(up|down|flat|mutedForeground)/);
+        expect(src).not.toMatch(/overflow|textOverflow|ellipsis/);
+        expect(src).not.toMatch(/@container|:has\(|color-mix\(/);
+        for (const name of ['label', 'value', 'change', 'amount', 'estimate']) {
+            expect(styleBlock(name, panelCss), name).toMatch(/color:\s*vars\.color\.foreground/);
+        }
+        expect(styleBlock('panel', panelCss)).toMatch(/gridTemplateColumns:\s*'repeat\(2, minmax\(0, 1fr\)\)'/);
+        expect(styleBlock('column', panelCss)).toMatch(/minWidth:\s*0/);
+        expect(styleBlock('chart', panelCss)).toMatch(/width:\s*'100%'/);
+        // 漲跌與成交金額放不下時整段換行；指數大字在字級「大」縮小
+        expect(styleBlock('change', panelCss)).toMatch(/flexWrap:\s*'wrap'/);
+        expect(styleBlock('amount', panelCss)).toMatch(/flexWrap:\s*'wrap'/);
+        expect(styleBlock('value', panelCss)).toMatch(/\[LARGE\]:\s*\{\s*fontSize/);
     });
 });
 
