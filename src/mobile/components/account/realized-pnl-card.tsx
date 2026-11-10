@@ -11,7 +11,8 @@
 // - 明細列顯示商品名稱為主、代碼為次（見 PnlRow；名稱查詢沿用合約快取，每個不重複代碼最多一次）。
 // - 預估手續費退佣（lib/realized-rebate，純函式）：每列依該列券商的設定（broker-cost-settings：永豐、玉山分開）估算；
 //   玉山成交明細在卡片層讀 store（hook 無條件呼叫，不適用時傳 null），每列只算一次，列、合計、玉山展開明細三處用同一個結果。
-//   合計與各市場分項之後、逐筆明細之前顯示「預估退佣合計（估）」「退佣後損益（估）」、無法估算的筆數與各券商設定；沒有月退時只顯示提示。只讀，沒有下單入口。
+//   合計與各市場分項之後、逐筆明細之前顯示「預估退佣合計（估）」「其中買進／賣出」「退佣後損益（估）」、無法估算的筆數與各券商設定；
+//   沒有月退時只顯示提示。每列與玉山展開明細另列買進、賣出兩邊的退佣（核心 src/lib/realized-rebate，桌面玉山明細共用）。只讀，沒有下單入口。
 
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useId, useState } from 'react';
@@ -49,7 +50,7 @@ import {
 } from '../../lib/account-pnl';
 import { brokerOfAccountKey, COST_BROKER_TEXT, COST_BROKERS, useBrokerCostSettings, type CostBroker } from '../../lib/broker-cost-settings';
 import { instrumentText, realizedLookupCode, useContractName } from '../../lib/contract-names';
-import { realizedRebateTotals, realizedRowRebate, type RealizedRebate } from '../../lib/realized-rebate';
+import { realizedRebateSourceText, realizedRebateTotals, realizedRowRebate, type RealizedRebate } from '../../lib/realized-rebate';
 import * as styles from '../../styles/account.css';
 import { brokerName, CollapsibleCard, Item, RefreshButton, Segmented, useNow } from './account-ui';
 
@@ -116,6 +117,7 @@ export async function fetchRealizedPnl(plans: readonly PnlPlan[]): Promise<Reali
 
 export const REBATE_TEXT = {
     total: '預估退佣合計（估）',
+    split: '其中買進／賣出',
     after: '退佣後損益（估）',
     note: '退佣＝買進＋賣出手續費 ×（1 − 折數），依「帳戶 › 交易成本」各券商設定估算；永豐以成交價金估算手續費，玉山的平倉手續費用成交明細。實際以券商入帳為準，期貨不計退佣。',
     off: '目前的交易成本設定沒有月退（折數 10 或成交即折），沒有退佣可顯示；可在「帳戶 › 交易成本」依券商設定。',
@@ -145,6 +147,7 @@ function EsunDetailView({ detail, row, info }: { detail: EsunTransactionDetail; 
     const costs = esunFillCosts(detail.fills);
     const rebate = info.rebate.status === 'ok' ? info.rebate.rebate : null;
     const withRebate = rebate !== null && Number.isFinite(row.pnl) ? row.pnl + rebate : null;
+    const rebateSource = realizedRebateSourceText(info.rebate, detail.action === 'Buy');
     const side = detail.action === 'Buy' ? '買進' : detail.action === 'Sell' ? '賣出' : '';
     return (
         <div className={styles.detailBox} data-testid='pnl-esun-detail'>
@@ -168,10 +171,13 @@ function EsunDetailView({ detail, row, info }: { detail: EsunTransactionDetail; 
                 {rebate !== null && (
                     <>
                         <Item term={`預估退佣（月退 ${discountText(info.settings.feeDiscount)} 折）`} testId='pnl-esun-rebate'>{money(rebate)}</Item>
+                        <Item term='買進退佣' testId='pnl-esun-rebate-buy'>{money(info.rebate.buyRebate)}</Item>
+                        <Item term='賣出退佣' testId='pnl-esun-rebate-sell'>{money(info.rebate.sellRebate)}</Item>
                         <Item term='退佣後損益（估）' className={styles.dir[signDir(withRebate)]} testId='pnl-esun-after-rebate'>{signed(withRebate)}</Item>
                     </>
                 )}
             </dl>
+            {rebate !== null && rebateSource && <p className={styles.note} data-testid='pnl-esun-rebate-source'>{rebateSource}</p>}
             <h4 className={styles.subTitle}>逐筆成交</h4>
             {detail.fills.length === 0 ? (
                 <p className={styles.note}>券商未提供逐筆成交。</p>
@@ -223,6 +229,7 @@ function PnlRow({ row, info, showDate }: { row: RealizedPnlRow; info: RowInfo; s
     const privMoney = usePrivacyMoney();
     const esun = info.esun;
     const rebate = info.rebate.status === 'ok' ? info.rebate.rebate : null;
+    const plain = (n: number | null) => maskMoney(n === null ? '—' : n.toLocaleString('en-US'), privMoney);
     const code = canonicalBrokerCode(String(row.code ?? '')) || String(row.code ?? '');
     const own = (row as { name?: unknown }).name;
     const known = (typeof own === 'string' && own.trim()) || esun.detail?.name || null;
@@ -243,8 +250,9 @@ function PnlRow({ row, info, showDate }: { row: RealizedPnlRow; info: RowInfo; s
             </div>
             {rebate !== null && (
                 <p className={styles.pnlRebateLine} data-testid='pnl-row-rebate'>
-                    {/* 只在「・」處換行：「≈」不與金額拆開 */}
-                    <span className={styles.nowrap}>退佣 ≈ {maskMoney(formatTwd(rebate), privMoney)}</span>・<span className={styles.nowrap}>退佣後 ≈ {maskMoney(formatTwd(row.pnl + rebate, true), privMoney)}</span>
+                    {/* 三段各自不拆行（「≈」不與金額拆開），只在段與段之間換行 */}
+                    <span className={styles.nowrap}>退佣 ≈ {maskMoney(formatTwd(rebate), privMoney)}</span>
+                    <span className={styles.nowrap}>（買 {plain(info.rebate.buyRebate)}＋賣 {plain(info.rebate.sellRebate)}）</span>・<span className={styles.nowrap}>退佣後 ≈ {maskMoney(formatTwd(row.pnl + rebate, true), privMoney)}</span>
                 </p>
             )}
             {esun.applies && <EsunRowDetail row={row} info={info} />}
@@ -275,6 +283,9 @@ function RebateSummary({ result, infos, costs }: { result: RealizedPnlResult; in
             <dl className={styles.kv}>
                 {/* 標籤已寫「估」：數值不加「≈」（鍵值欄的長數值依 overflowWrap 換行，「≈」單獨落到上一行不好看） */}
                 <Item term={REBATE_TEXT.total} testId='pnl-rebate-total'>{maskMoney(formatTwd(totals.rebate), privMoney)}</Item>
+                <Item term={REBATE_TEXT.split} testId='pnl-rebate-split'>
+                    {`${maskMoney(formatTwd(totals.buy), privMoney)}／${maskMoney(formatTwd(totals.sell), privMoney)}`}
+                </Item>
                 <Item term={REBATE_TEXT.after} className={styles.dir[signDir(after)]} testId='pnl-total-after-rebate'>
                     {after === null ? '—' : maskMoney(formatTwd(after, true), privMoney)}
                 </Item>

@@ -4,6 +4,8 @@
 // store 的鍵是呼叫 fetchProfitLoss 時傳入的原始區間字串：帳務 tab 以預設值呼叫
 // fetchProfitLoss(market, account)，預設 beginDate／endDate 皆為 todayStr()（YYYY-MM-DD），
 // 經 accountQueryPost 的 begin_date／end_date 原樣送到玉山 dispatch → service，因此這裡也用 todayStr() 查。
+// 預估退佣（月退）用共用核心 lib/realized-rebate：買進＋賣出兩邊手續費都算（平倉用逐筆明細、開倉以價金估算），
+// 與手機版已實現損益一致；桌面仍用共用的交易成本設定（useTradingCostSettings），不分券商。
 
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useState, useSyncExternalStore } from 'react';
@@ -18,14 +20,9 @@ import {
     type EsunTransactionFill,
 } from '../lib/esun';
 import { maskAccountId, maskMoney, usePrivacyMode, usePrivacyMoney } from '../lib/privacy';
+import { estimateRealizedRebate, realizedRebateSourceText, type RealizedRebate } from '../lib/realized-rebate';
 import type { ProfitLoss } from '../lib/shioaji';
-import {
-    discountText,
-    feeRebate,
-    hasMonthlyRebate,
-    useTradingCostSettings,
-    type TradingCostSettings,
-} from '../lib/trading-cost-settings';
+import { discountText, useTradingCostSettings, type TradingCostSettings } from '../lib/trading-cost-settings';
 import { applyRateYuan, STOCK_FEE_RATE } from '../lib/utils/contract-cost';
 import { fmtMoney, fmtPct, fmtPrice, fmtSigned } from '../lib/utils/format';
 import { todayStr } from '../lib/utils/date';
@@ -68,11 +65,23 @@ export function esunFillCosts(fills: readonly EsunTransactionFill[]): EsunFillCo
     return { fee, tax, capitalGainsTax, shortFee, total: sumOf([fee, tax, capitalGainsTax, shortFee]) };
 }
 
-/** 月退且折數 < 1 時的預估退佣＝round(Σfee × (1 − 折數))；不適用或手續費全缺值回 null */
-export function esunFillRebate(fills: readonly EsunTransactionFill[], settings: TradingCostSettings): number | null {
-    if (!hasMonthlyRebate(settings)) return null;
-    const fee = sumOf(fills.map(f => f.fee));
-    return fee === null ? null : feeRebate(fee, settings);
+/**
+ * 一筆玉山成交明細的預估退佣（買進＋賣出兩邊）：股數＝|shares|；平倉價金＝|priceQty|，沒有時用均價 × 股數；
+ * 損益＝realizedPnl；action＝Buy 為空單回補；fills 的逐筆手續費交給核心判斷平倉／開倉是否用實收。
+ */
+export function esunDetailRebate(detail: EsunTransactionDetail, settings: TradingCostSettings): RealizedRebate {
+    const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+    const shares = finite(detail.shares) ? Math.abs(detail.shares) : 0;
+    const closeNotional = finite(detail.priceQty) && detail.priceQty !== 0
+        ? Math.abs(detail.priceQty)
+        : finite(detail.avgPrice) ? Math.abs(detail.avgPrice) * shares : 0;
+    return estimateRealizedRebate({ shares, closeNotional, pnl: detail.realizedPnl, cover: detail.action === 'Buy', fills: detail.fills }, settings);
+}
+
+/** 「（買 572＋賣 618）」：金額不加 $，千分位，依遮蔽設定 */
+function rebateSplitText(buy: number | null, sell: number | null, privMoney: boolean): string {
+    const plain = (n: number | null) => maskMoney(n === null ? '—' : n.toLocaleString('en-US'), privMoney);
+    return `（買 ${plain(buy)}＋賣 ${plain(sell)}）`;
 }
 
 /** 逐筆手續費合計與「價金合計 × 0.1425%」相差 2 元內 → 券商看起來收的是牌告手續費 */
@@ -106,10 +115,12 @@ export function EsunTransactionDetailView({ detail }: { detail: EsunTransactionD
     const pct = (n: number | null) => (n === null ? '—' : maskMoney(fmtPct(n), privMoney));
     const costs = esunFillCosts(detail.fills);
     const costSettings = useTradingCostSettings();
-    const rebate = esunFillRebate(detail.fills, costSettings);
+    const rebateResult = esunDetailRebate(detail, costSettings);
+    const rebate = rebateResult.status === 'ok' ? rebateResult.rebate : null;
+    const rebateSource = realizedRebateSourceText(rebateResult, detail.action === 'Buy');
     const pnlWithRebate = rebate !== null && detail.realizedPnl !== null ? detail.realizedPnl + rebate : null;
     const listRateHint = costSettings.rebateMode === 'instant' && costSettings.feeDiscount < 1 && esunFeesLookListRate(detail.fills);
-    const side =detail.action === 'Buy' ? '買' : detail.action === 'Sell' ? '賣' : '';
+    const side = detail.action === 'Buy' ? '買' : detail.action === 'Sell' ? '賣' : '';
     return (
         <div className={styles.pnlDetail}>
             <div className={styles.kvGrid}>
@@ -131,11 +142,15 @@ export function EsunTransactionDetailView({ detail }: { detail: EsunTransactionD
                 <Kv label='成本合計' value={money(costs.total)} />
                 {rebate !== null && (
                     <>
-                        <Kv label={`預估退佣（月退 ${discountText(costSettings.feeDiscount)} 折）`} value={`≈ ${money(rebate)}`} />
-                        <Kv label='含退佣損益' value={pnlWithRebate === null ? '—' : `≈ ${signed(pnlWithRebate)}`} dir={dirOf(pnlWithRebate)} />
+                        <Kv
+                            label={`預估退佣（月退 ${discountText(costSettings.feeDiscount)} 折）`}
+                            value={`≈ ${money(rebate)}${rebateSplitText(rebateResult.buyRebate, rebateResult.sellRebate, privMoney)}`}
+                        />
+                        <Kv label='退佣後損益' value={pnlWithRebate === null ? '—' : `≈ ${signed(pnlWithRebate)}`} dir={dirOf(pnlWithRebate)} />
                     </>
                 )}
             </div>
+            {rebate !== null && rebateSource && <span className={styles.settleNote}>{rebateSource}</span>}
             {listRateHint && (
                 <span className={styles.settleNote}>券商實際收取牌告手續費，若為事後退佣請將退佣方式設為月退（設定 → 風控 → 交易成本）。</span>
             )}
@@ -204,14 +219,15 @@ export function EsunPnlRowDetail({ row }: { row: EsunPnlRow }) {
 }
 
 /**
- * 今日已實現玉山列的交易成本合計（手續費＋交易稅＋證所稅＋融券手續費）。
- * 回傳原始字串 `${玉山列數}|${對到明細的列數}|${合計或空字串}`，讓 useSyncExternalStore 的快照為原始值。
+ * 今日已實現玉山列的交易成本合計（手續費＋交易稅＋證所稅＋融券手續費）與預估退佣（買進＋賣出兩邊）。
+ * 回傳原始字串 `${玉山列數}|${對到明細的列數}|${成本合計}|${退佣合計}|${買進退佣}|${賣出退佣}`（無值為空字串），
+ * 讓 useSyncExternalStore 的快照為原始值。退佣只加總能估算（ok）的列。
  */
 function esunCostSummaryKey(rows: readonly EsunPnlRow[], date: string, settings: TradingCostSettings): string {
     let count = 0;
     let matched = 0;
     const totals: (number | null)[] = [];
-    const rebates: (number | null)[] = [];
+    const rebates: RealizedRebate[] = [];
     for (const row of rows) {
         const ref = esunRefOfPnlRow(row);
         if (!ref) continue;
@@ -220,11 +236,15 @@ function esunCostSummaryKey(rows: readonly EsunPnlRow[], date: string, settings:
         if (!detail) continue;
         matched += 1;
         totals.push(esunFillCosts(detail.fills).total);
-        rebates.push(esunFillRebate(detail.fills, settings));
+        const r = esunDetailRebate(detail, settings);
+        if (r.status === 'ok') rebates.push(r);
     }
     const total = sumOf(totals);
-    const rebate = sumOf(rebates);
-    return `${count}|${matched}|${total === null ? '' : total}|${rebate === null ? '' : rebate}`;
+    const rebate = sumOf(rebates.map(r => r.rebate));
+    const buy = sumOf(rebates.map(r => r.buyRebate));
+    const sell = sumOf(rebates.map(r => r.sellRebate));
+    const text = (n: number | null) => (n === null ? '' : String(n));
+    return `${count}|${matched}|${text(total)}|${text(rebate)}|${text(buy)}|${text(sell)}`;
 }
 
 /** 已實現損益區塊的「今日交易成本合計（玉山）」；範圍內沒有玉山證券列時不渲染 */
@@ -232,13 +252,15 @@ export function EsunPnlCostTotal({ rows }: { rows: readonly EsunPnlRow[] }) {
     const privMoney = usePrivacyMoney();
     const today = todayStr();
     const costSettings = useTradingCostSettings();
-    const key = useSyncExternalStore(subscribeEsunTransactionDetails, () => esunCostSummaryKey(rows, today, costSettings), () => '0|||');
-    const [countText, matchedText, totalText, rebateText] = key.split('|');
+    const key = useSyncExternalStore(subscribeEsunTransactionDetails, () => esunCostSummaryKey(rows, today, costSettings), () => '0|||||');
+    const [countText, matchedText, totalText, rebateText, buyText, sellText] = key.split('|');
     const count = Number(countText);
     const matched = Number(matchedText);
     if (!count) return null;
     const total = totalText ? Number(totalText) : null;
     const rebate = rebateText ? Number(rebateText) : null;
+    const buy = buyText ? Number(buyText) : null;
+    const sell = sellText ? Number(sellText) : null;
     return (
         <>
             <div className={styles.costTotalRow} title='今日已實現玉山列逐筆成交的手續費、交易稅、證所稅、融券手續費加總'>
@@ -249,9 +271,9 @@ export function EsunPnlCostTotal({ rows }: { rows: readonly EsunPnlRow[] }) {
                 </span>
             </div>
             {rebate !== null && (
-                <div className={styles.costTotalRow} title='月退：今日已實現玉山列逐筆手續費合計 × (1 − 折數) 的估算，實際以券商入帳為準'>
+                <div className={styles.costTotalRow} title='買進＋賣出手續費 ×（1 − 折數）；平倉用逐筆明細、開倉以價金估算；實際以券商入帳為準'>
                     <span className={dock.fundLabel}>{`今日預估退佣（月退 ${discountText(costSettings.feeDiscount)} 折）`}</span>
-                    <span className={dock.fundValue}>{`≈ ${maskMoney(fmtMoney(rebate), privMoney)}`}</span>
+                    <span className={dock.fundValue}>{`≈ ${maskMoney(fmtMoney(rebate), privMoney)}${rebateSplitText(buy, sell, privMoney)}`}</span>
                 </div>
             )}
         </>
