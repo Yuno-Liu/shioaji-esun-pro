@@ -774,6 +774,18 @@ export const pnlValue = style({
     whiteSpace: 'nowrap',
 });
 
+/** 「≈ 金額」不拆行（退佣合計、退佣後損益、每列退佣小字） */
+export const nowrap = style({ whiteSpace: 'nowrap' });
+
+/** 已實現損益列下方的退佣小字（靠右） */
+export const pnlRebateLine = style({
+    margin: `0 0 ${SPACE.s1}`,
+    ...TEXT.footnote,
+    ...NUMERIC,
+    color: vars.color.mutedForeground,
+    textAlign: 'right',
+});
+
 /** 明細島：islandBg（含漲跌色小字與 mutedForeground） */
 export const detailBox = style({
     margin: `0 0 ${SPACE.s2}`,

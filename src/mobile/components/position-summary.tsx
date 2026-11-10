@@ -3,6 +3,7 @@
 // - 未實現淨損益合計（估）：目前篩選範圍（帳戶＋市場）的列加總（股票＝含手續費折數與證交稅的淨損益，期權＝券商損益）；
 //   持倉尚未讀到時顯示「—」，不顯示 0。全部為股票時附報酬率（淨損益 ÷ 成本）。
 //   有列無法計算淨損益時不猜：只加總可計算的列並標示「合計待確認」（全部無法計算時顯示「—」）；含期權時註明未扣費稅。
+//   月退且有折扣時，總額下方註明「已含預估退佣 ≈ N」（rebate > 0 才顯示；金額遮蔽）。
 // - 總市值：股票列 |股數|×現價（sumStockMarketValue）；有列缺價時標示「部分缺價未計」。
 // - 期貨權益數與風險指標：useTradingState().margin 屬於「目前選取的期貨帳戶」，由呼叫端決定是否顯示
 //   並傳入帳戶標籤；風險指標無意義（模擬或未押保證金）時顯示「—」並說明。風險等級一律附文字，不只靠顏色。
@@ -43,6 +44,8 @@ export interface PositionSummaryCardProps {
     allPending?: boolean;
     /** 合計含期權的券商損益（未扣費稅） */
     derivGross?: boolean;
+    /** 合計內已含的預估退佣（元）；0＝不顯示 */
+    rebate?: number;
     /** 額度列要顯示的證券帳戶（持倉頁篩選單一證券帳戶時）；未提供時用目前選取的證券帳戶 */
     limitsAccount?: Pick<Account, 'broker_id' | 'account_id' | 'account_type'> | null;
     /** 持倉頁精簡檢視：內距、間距與合計字級縮小（內容不變） */
@@ -55,7 +58,7 @@ const tone = (v: number): 'up' | 'down' | 'flat' => (v > 0 ? 'up' : v < 0 ? 'dow
 export const RISK_BAR_FULL_PCT = 300;
 const RISK_TONE: Record<RiskLevel, BarTone> = { danger: 'danger', warn: 'amber', ok: 'success' };
 
-export function PositionSummaryCard({ summary, known, margin, futuresLabel, privMoney, pending = 0, allPending = false, derivGross = false, limitsAccount, compact = false }: PositionSummaryCardProps) {
+export function PositionSummaryCard({ summary, known, margin, futuresLabel, privMoney, pending = 0, allPending = false, derivGross = false, rebate = 0, limitsAccount, compact = false }: PositionSummaryCardProps) {
     const risk = margin ? futuresRiskOf(margin) : null;
     const value = summary.marketValue;
     const flashRef = useRef<HTMLSpanElement | null>(null);
@@ -77,6 +80,9 @@ export function PositionSummaryCard({ summary, known, margin, futuresLabel, priv
                             <span className={`${styles.summaryPct} ${styles.tone[tone(summary.pnlPct)]}`} data-testid='position-total-pct'>（{fmtPct(summary.pnlPct)}）</span>
                         )}
                     </div>
+                    {shown && rebate > 0 && (
+                        <p className={styles.summaryNote} data-testid='position-total-rebate'>已含預估退佣 <span className={styles.nowrap}>≈ {maskMoney(fmtInt(Math.round(rebate)), privMoney)}</span></p>
+                    )}
                     {known && pending > 0 && (
                         <p className={styles.summaryNote} data-testid='position-total-pending'>合計待確認：{pending} 筆無法計算淨損益，未計入</p>
                     )}

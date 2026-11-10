@@ -5,6 +5,8 @@
 //   成交即折＝max(最低, 牌告 0.1425% × 折數)；月退＝交割收 max(最低, 牌告)，退佣後淨額 round(交割手續費 × 折數)。
 //   最低手續費生效時兩者不同（月退的最低 20 元也會退佣），所以依使用者設定的退佣方式計算。
 //   有券商實際收取的手續費（例如玉山明細）時優先使用；月退設定下再扣 feeRebate 的預估退佣（＝月退淨額）。
+//   另輸出交割收取額（openFeeCharged、close.feeCharged）與預估退佣（openRebate、close.rebate、rebate），
+//   供畫面顯示「已含預估退佣」；淨損益與兩平價只用淨額，與退佣欄位無關。
 // - 證交稅：stockTaxRate（一般 0.3%、ETF／權證 0.1%、債券 ETF 停徵期間 0）；現股當沖的部分用 day-trade-tax（0.15%）。
 // - 借券費：shortSellingFee（設定的借券費率 × 賣出價金）；融資利息：marginFinancing＋marginInterestDays＋marginInterest。
 //   「以現價平倉」＝今天賣出，利息計到賣出交割日（T+2，sellSettlementYmd）而不是今天；營業日以台北日期的週一至週五推算、
@@ -109,8 +111,12 @@ export interface StockPnlClose {
     price: number;
     /** 平倉價金（元，四捨五入） */
     notional: number;
-    /** 平倉手續費（元；多單為賣出、空單為回補） */
+    /** 平倉手續費（元；多單為賣出、空單為回補；月退為退佣後淨額） */
     fee: number;
+    /** 平倉手續費的交割收取額（元；月退＝牌告，成交即折＝fee） */
+    feeCharged: number;
+    /** 平倉手續費的預估退佣（元；成交即折或無折扣為 0） */
+    rebate: number;
     /** 平倉證交稅（元；空單回補為 0） */
     tax: number;
 }
@@ -126,6 +132,10 @@ export interface StockPnl {
     openNotional: number;
     /** 開倉手續費（元，已扣預估退佣） */
     openFee: number;
+    /** 開倉手續費的交割收取額（元；月退＝牌告或券商實收，成交即折＝openFee） */
+    openFeeCharged: number;
+    /** 開倉手續費的預估退佣（元；成交即折或無折扣為 0） */
+    openRebate: number;
     openFeeEstimated: boolean;
     /** 開倉證交稅（空單；多單為 0） */
     openTax: number;
@@ -150,6 +160,8 @@ export interface StockPnl {
     close: StockPnlClose | null;
     /** 淨損益（元，四捨五入）；沒有現價為 null */
     net: number | null;
+    /** 預估退佣合計（openRebate ＋ close.rebate，已含在 net 內）；沒有現價為 null */
+    rebate: number | null;
     /** 淨損益（分，未四捨五入；兩平驗證用） */
     netCents: number | null;
     /** 多單：成本（價金＋手續費）；空單：賣出淨額（價金 − 手續費 − 稅） */
@@ -221,6 +233,12 @@ export function computeStockPnl(input: StockPnlInput): StockPnl | null {
     const fee = (cents: number, isOdd: boolean) => stockFeeBreakdown(cents, { odd: isOdd }, settings).net;
     /** 以價格 P（分）成交 S 股的兩筆委託手續費 */
     const tradeFee = (pc: number) => fee(pc * whole, false) + fee(pc * odd, true);
+    /** 兩筆委託的交割收取額與預估退佣（顯示用；淨額＝charged − rebate＝tradeFee） */
+    const tradeFeeParts = (wholeC: number, oddC: number) => {
+        const a = stockFeeBreakdown(wholeC, { odd: false }, settings);
+        const b = stockFeeBreakdown(oddC, { odd: true }, settings);
+        return { charged: a.charged + b.charged, rebate: a.rebate + b.rebate };
+    };
 
     // ---- 稅率與當沖 ----
     const taxRate = sellTaxRate(c, now);
@@ -252,6 +270,9 @@ export function computeStockPnl(input: StockPnlInput): StockPnl | null {
     const openFee = openFeeEstimated
         ? fee(wholeCents, false) + fee(oddCents, true)
         : Math.abs(actualFee!) - feeRebate(Math.abs(actualFee!), settings);
+    const openParts = openFeeEstimated
+        ? tradeFeeParts(wholeCents, oddCents)
+        : { charged: Math.abs(actualFee!), rebate: feeRebate(Math.abs(actualFee!), settings) };
     let openTax = 0;
     let openTaxEstimated = false;
     if (side === 'short') {
@@ -304,7 +325,7 @@ export function computeStockPnl(input: StockPnlInput): StockPnl | null {
 
     // ---- 淨損益（分）----
     const dtPart = (pc: number) => stockSellTax(pc * dtShares, dtRate) + stockSellTax(pc * (S - dtShares), taxRate);
-    const closeOf = (price: number): StockPnlClose & { netCents: number } => {
+    const closeOf = (price: number): Omit<StockPnlClose, 'feeCharged' | 'rebate'> & { netCents: number } => {
         const pc = priceCents(price);
         const closeFee = tradeFee(pc);
         if (side === 'long') {
@@ -324,11 +345,15 @@ export function computeStockPnl(input: StockPnlInput): StockPnl | null {
     let close: StockPnlClose | null = null;
     let net: number | null = null;
     let netCents: number | null = null;
+    let rebate: number | null = null;
     if (finite(input.lastPrice) && input.lastPrice > 0) {
         const r = closeOf(input.lastPrice);
-        close = { price: r.price, notional: r.notional, fee: r.fee, tax: r.tax };
+        const pc = priceCents(input.lastPrice);
+        const parts = tradeFeeParts(pc * whole, pc * odd);
+        close = { price: r.price, notional: r.notional, fee: r.fee, feeCharged: parts.charged, rebate: parts.rebate, tax: r.tax };
         netCents = r.netCents;
         net = Math.round(r.netCents / 100) || 0; // 避免 -0
+        rebate = openParts.rebate + parts.rebate;
     }
 
     // ---- 損益兩平價 ----
@@ -356,6 +381,8 @@ export function computeStockPnl(input: StockPnlInput): StockPnl | null {
         rebateMode: settings.rebateMode,
         openNotional: Math.round(openCents / 100),
         openFee,
+        openFeeCharged: openParts.charged,
+        openRebate: openParts.rebate,
         openFeeEstimated,
         openTax,
         openTaxEstimated,
@@ -370,6 +397,7 @@ export function computeStockPnl(input: StockPnlInput): StockPnl | null {
         dayTrade,
         close,
         net,
+        rebate,
         netCents,
         basis,
         breakEven,

@@ -9,7 +9,8 @@
 //   模擬環境或非 08:30–15:00 時 lib 回全 0（limitsLookEmpty）→ 顯示「—」並說明，不顯示「剩餘 0 元」。
 // - 預估價金：沿用 use-mobile-ticket 的 estimateAmount（股票不含手續費與稅；期權為名目價值、不估保證金）。
 // - 交易成本：股票限價單才估（比照桌面 CostEstimate），重用 src/components/trade-cost-summary.tsx 的 tradeCostText
-//   與 src/lib/trading-cost-settings.ts 的使用者設定（手續費折數、退佣、融資利率、借券費率），一律標示「估」。
+//   與 src/lib/trading-cost-settings.ts 的使用者設定（手續費折數、退佣、融資利率、借券費率），一律標示「估」；
+//   折數與退佣方式依下單帳戶的券商（mobile/lib/broker-cost-settings：永豐、玉山分開）。
 // - 金額在「遮蔽金額」模式下以 maskMoney 遮蔽。
 // - 版面（設計規格 §7.4-8）：三者放在同一個中性島（islandBg）兩欄；標籤與備註 mutedForeground 只出現在島內。
 
@@ -17,12 +18,12 @@ import { tradeCostText } from '../../../components/trade-cost-summary';
 import { isOddLot } from '../../../lib/odd-lot';
 import { maskMoney, usePrivacyMoney } from '../../../lib/privacy';
 import type { TradingLimits } from '../../../lib/shioaji';
-import { useTradingCostSettings } from '../../../lib/trading-cost-settings';
 import type { ContractInfo } from '../../../lib/types/contract';
 import type { Account } from '../../../lib/types/portfolio';
 import { parsePrice, sendsDaytradeShort, type TicketFields } from '../../hooks/use-mobile-ticket';
 import { useEsunLimitEstimate } from '../../hooks/use-esun-limit-estimate';
 import { availableLimitFor, limitsAreCapsOnly, limitsLookEmpty, useTradingLimits } from '../../hooks/use-trading-limits';
+import { brokerOfAccount, useBrokerCostSettings } from '../../lib/broker-cost-settings';
 import { ESUN_ESTIMATE_TEXT, esunBreakdownText, esunEstimateFlags } from '../../lib/esun-limit-estimate';
 import * as styles from '../../styles/order-ticket.css';
 
@@ -87,7 +88,8 @@ export function TicketInfo({ contract, account, fields, isFutures, estimate }: T
     const privMoney = usePrivacyMoney();
     const limits = useTradingLimits(isFutures ? null : account);
     const esunEstimate = useEsunLimitEstimate(isFutures ? null : account, limits.data);
-    const settings = useTradingCostSettings();
+    // 手續費折數與退佣方式依下單帳戶的券商（手機版分開設定；融資年利率、借券費率共用）
+    const settings = useBrokerCostSettings()[brokerOfAccount(account)];
 
     const capsOnly = limitsAreCapsOnly(account);
     const closing = closesCreditPosition(fields);

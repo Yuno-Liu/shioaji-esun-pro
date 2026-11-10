@@ -114,7 +114,7 @@ describe('手續費：牌告 × 折數、最低手續費整股 20／零股 1', (
         expect(r.openFee).toBe(143);
         expect(r.openFeeEstimated).toBe(true);
         expect(r.basis).toBe(100_143);
-        expect(r.close).toEqual({ price: 110, notional: 110_000, fee: 157, tax: 330 });
+        expect(r.close).toEqual({ price: 110, notional: 110_000, fee: 157, feeCharged: 157, rebate: 0, tax: 330 });
         expect(r.net).toBe(9_370);
         expect(r.breakEven).toBe(101);
         expect(netCentsAt({}, 100.5)).toBeLessThan(0);
@@ -234,6 +234,78 @@ describe('手續費：牌告 × 折數、最低手續費整股 20／零股 1', (
     });
 });
 
+describe('交割收取額與預估退佣（顯示用；淨損益不變）', () => {
+    it('2.8 折月退估算：開倉交割 143 退 103、平倉交割 157 退 113；rebate＝216，淨額＝交割 − 退佣', () => {
+        const st = settings({ feeDiscount: 0.28, rebateMode: 'monthly' });
+        const r = run({ settings: st });
+        expect(r.openFeeCharged).toBe(143);
+        expect(r.openRebate).toBe(103); // 143 − round(40.04)
+        expect(r.openFee).toBe(40);
+        expect(r.close!.feeCharged).toBe(157);
+        expect(r.close!.rebate).toBe(113); // 157 − round(43.96)
+        expect(r.close!.fee).toBe(44);
+        expect(r.rebate).toBe(216);
+        expect(r.openFeeCharged - r.openRebate).toBe(r.openFee);
+        expect(r.close!.feeCharged - r.close!.rebate).toBe(r.close!.fee);
+        // 淨損益：110,000 − 44 − 330 − 100,000 − 40
+        expect(r.net).toBe(9_586);
+    });
+
+    it('交割收取額＝stockFeeBreakdown(...).charged、退佣＝.rebate（整張＋零股兩筆）', () => {
+        for (const rebateMode of ['monthly', 'instant'] as const) {
+            for (const feeDiscount of [1, 0.6, 0.28]) {
+                const st = settings({ feeDiscount, rebateMode });
+                for (const [shares, avgPrice, lastPrice] of [[1000, 10, 10.5], [3500, 1052.5, 1085], [37, 23.45, 24], [1001, 10, 9.9]] as const) {
+                    const r = run({ settings: st, shares, avgPrice, lastPrice });
+                    const whole = Math.floor(shares / 1000) * 1000;
+                    const odd = shares - whole;
+                    const b = (cents: number, isOdd: boolean) => stockFeeBreakdown(cents, { odd: isOdd }, st);
+                    const pc = (v: number) => Math.round(v * 100);
+                    expect(r.openFeeCharged).toBe(b(pc(avgPrice) * whole, false).charged + b(pc(avgPrice) * odd, true).charged);
+                    expect(r.openRebate).toBe(b(pc(avgPrice) * whole, false).rebate + b(pc(avgPrice) * odd, true).rebate);
+                    expect(r.close!.feeCharged).toBe(b(pc(lastPrice) * whole, false).charged + b(pc(lastPrice) * odd, true).charged);
+                    expect(r.close!.rebate).toBe(b(pc(lastPrice) * whole, false).rebate + b(pc(lastPrice) * odd, true).rebate);
+                    expect(r.rebate).toBe(r.openRebate + r.close!.rebate);
+                    if (rebateMode === 'instant' || feeDiscount === 1) expect(r.rebate).toBe(0);
+                }
+            }
+        }
+    });
+
+    it('券商實際手續費：charged＝|實收|、退佣＝feeRebate(實收)；即折不退', () => {
+        const monthly = run({ actual: { openNotional: 100_000, openFee: 143 }, settings: settings({ feeDiscount: 0.6, rebateMode: 'monthly' }) });
+        expect(monthly.openFeeCharged).toBe(143);
+        expect(monthly.openRebate).toBe(57);
+        expect(monthly.openFee).toBe(86);
+        const instant = run({ actual: { openNotional: 100_000, openFee: 86 }, settings: settings({ feeDiscount: 0.6, rebateMode: 'instant' }) });
+        expect(instant.openFeeCharged).toBe(86);
+        expect(instant.openRebate).toBe(0);
+    });
+
+    it('空單：開倉賣出與回補都有退佣；沒有現價時 rebate 為 null（開倉退佣仍有值）', () => {
+        const st = settings({ feeDiscount: 0.28, rebateMode: 'monthly' });
+        const over = { kind: 'short' as const, avgPrice: 50, lastPrice: 49, settings: st };
+        const r = run(over);
+        expect(r.openFeeCharged).toBe(71);
+        expect(r.openRebate).toBe(51); // 71 − round(19.88)
+        expect(r.close!.feeCharged).toBe(70);
+        expect(r.close!.rebate).toBe(50); // 70 − round(19.6)
+        expect(r.rebate).toBe(101);
+        const noPrice = run({ ...over, lastPrice: null });
+        expect(noPrice.rebate).toBeNull();
+        expect(noPrice.close).toBeNull();
+        expect(noPrice.openRebate).toBe(51);
+    });
+
+    it('退佣欄位不影響淨損益與兩平價（與不看退佣欄位時相同）', () => {
+        const st = settings({ feeDiscount: 0.28, rebateMode: 'monthly' });
+        const r = run({ settings: st, avgPrice: 10, lastPrice: 10.5 });
+        expect(r.net).toBe(456);
+        expect(r.breakEven).toBe(10.05);
+        expect(r.rebate).toBe(28); // 開倉交割 20 退 14＋平倉交割 20 退 14
+    });
+});
+
 describe('證交稅：一般股票、ETF、權證、債券 ETF', () => {
     it('ETF 0.1%：0050 × 1,000 股均價 150 → 兩平 150.60（150.55 <0）', () => {
         const over = { contract: etf, avgPrice: 150, lastPrice: 150.6, todayShares: 1000 };
@@ -307,7 +379,7 @@ describe('現股當沖 0.15%', () => {
         expect(r.openTax).toBe(75);
         expect(r.borrowFee).toBeNull();
         expect(r.basis).toBe(49_854);
-        expect(r.close).toEqual({ price: 49, notional: 49_000, fee: 70, tax: 0 });
+        expect(r.close).toEqual({ price: 49, notional: 49_000, fee: 70, feeCharged: 70, rebate: 0, tax: 0 });
         expect(r.net).toBe(784);
         expect(expectBoundary(over)).toBe(49.75);
         // 期滿後當沖空單賣出稅回到 0.3%

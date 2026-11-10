@@ -7,7 +7,7 @@
 // - esunCashRebate：現股月退的預估退佣（標示「估」）；
 // - esunMarginLotEstimates：融資金額與利息（估）；
 // - 借券費（估）＝價金 × 借券費率（shortSellingFee）。
-// 估算參數來自交易成本設定（useTradingCostSettings）；金額與股數用 maskMoney 遮蔽。
+// 估算參數來自交易成本設定（玉山的折數與退佣方式：useBrokerCostSettings().esun；融資年利率、借券費率共用）；金額與股數用 maskMoney 遮蔽。
 // 版面（設計規格 §7.7）：中性島（islandBg）內呈現；持倉列按「庫存明細」立即展開、內容 150ms 淡入（只動畫 opacity，減少動態時不動畫）。
 
 import {
@@ -24,10 +24,11 @@ import {
     type EsunInventoryDetail,
 } from '../../lib/esun/account-details';
 import { maskMoney, usePrivacyMoney } from '../../lib/privacy';
-import { discountText, percentText, shortSellingFee, useTradingCostSettings } from '../../lib/trading-cost-settings';
+import { discountText, percentText, shortSellingFee, type TradingCostSettings } from '../../lib/trading-cost-settings';
 import type { AccountedPosition, StockPosition } from '../../lib/types/portfolio';
 import { todayStr } from '../../lib/utils/date';
 import { fmtPct, fmtPrice, fmtSigned } from '../../lib/utils/format';
+import { useBrokerCostSettings } from '../lib/broker-cost-settings';
 import { fmtInt } from '../lib/num-format';
 import * as styles from '../styles/positions.css';
 
@@ -67,7 +68,7 @@ function Item({ label, value, className, testId }: { label: string; value: strin
 export function PositionEsunDetails({ position }: { position: EsunStockRow }) {
     const snapshot = useEsunInventoryDetails(position.account);
     const privMoney = usePrivacyMoney();
-    const settings = useTradingCostSettings();
+    const settings = useBrokerCostSettings().esun;
     if (!snapshot) return <p className={styles.detailEmpty} data-testid='esun-detail-empty'>{ESUN_DETAIL_TEXT.noSnapshot}</p>;
     const detail = findEsunInventoryDetail(snapshot.details, position);
     if (!detail) return <p className={styles.detailEmpty} data-testid='esun-detail-empty'>{ESUN_DETAIL_TEXT.noMatch}</p>;
@@ -78,7 +79,7 @@ function EsunDetailBody({ detail, fetchedAt, privMoney, settings }: {
     detail: EsunInventoryDetail;
     fetchedAt: number;
     privMoney: boolean;
-    settings: ReturnType<typeof useTradingCostSettings>;
+    settings: TradingCostSettings;
 }) {
     const m = (text: string) => maskMoney(text, privMoney);
     const money = (v: number | null) => m(v === null ? '—' : fmtInt(v));

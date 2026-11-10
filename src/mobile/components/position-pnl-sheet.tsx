@@ -4,6 +4,8 @@
 // - 融資利息說明：計到以現價賣出的交割日（T+2，週末順延、未計國定假日）；分批缺價（均價估算）、缺股數（未含）如實標示。
 // - 明細面板（點持倉列的「損益兩平」開啟；只讀，沒有任何下單入口）：成本、買進手續費、預估賣出手續費、
 //   稅率與稅額、借券費、融資利息、兩平價；估算的項目逐一標示。金額與股數遵守遮蔽金額（maskMoney）。
+// - 月退且有折扣時另列「退佣（月退 X 折，估）」：開倉／平倉手續費的交割收取額與退佣、預估退佣合計、退佣前與退佣後淨損益
+//   （淨損益本身已扣退佣；退佣前＝net − rebate）；上方手續費列標示「退佣後」。
 // 計算本身在 lib/position-pnl（純函式）；這裡只負責呈現。
 
 import { maskMoney } from '../../lib/privacy';
@@ -28,7 +30,9 @@ export const PNL_TEXT = {
     interestEstimated: '融資利息估算',
     derivNote: '券商損益・未扣費稅',
     totalPending: '合計待確認',
-    settingsHint: '折數、退佣方式、融資年利率、借券費率可在「帳戶 → 交易成本」設定。',
+    settingsHint: '折數、退佣方式（永豐、玉山分開）、融資年利率、借券費率可在「帳戶 → 交易成本」設定。',
+    rebateLabel: '退佣',
+    afterRebate: '退佣後',
 } as const;
 
 /** 「手續費以 X 折計」；無折扣時寫明以牌告計 */
@@ -143,6 +147,11 @@ export function PositionPnlSheet({ summary, pnl, contract, brokerPnl, privMoney,
     const relation = breakEvenRelationText(pnl, pnl.close?.price);
     const counted = pnl.interestStatus === 'included' || pnl.interestStatus === 'estimated';
     const interestText = interestNote(pnl, money(pnl.interest ?? 0));
+    // 月退且有折扣：上方手續費為退佣後淨額，另列交割收取額與退佣
+    const rebated = pnl.rebateMode === 'monthly' && pnl.feeDiscount < 1;
+    const after = rebated ? `・${PNL_TEXT.afterRebate}` : '';
+    const openSide = long ? '買進' : '開倉賣出';
+    const closeSide = long ? '賣出' : '回補';
     return (
         <BottomSheet open onClose={onClose} title='損益計算明細' testId='position-pnl-sheet'>
             <div className={styles.sheetBody}>
@@ -154,7 +163,7 @@ export function PositionPnlSheet({ summary, pnl, contract, brokerPnl, privMoney,
                 <h3 className={styles.detailTitle}>{long ? '買進成本' : '開倉賣出（已發生）'}</h3>
                 <dl className={styles.detailGrid}>
                     <Item label={long ? '買進價金' : '賣出價金'} value={money(pnl.openNotional)} />
-                    <Item label={`${long ? '買進' : '賣出'}手續費${est(pnl.openFeeEstimated)}`} value={money(pnl.openFee)} testId='pnl-open-fee' />
+                    <Item label={`${long ? '買進' : '賣出'}手續費${est(pnl.openFeeEstimated)}${after}`} value={money(pnl.openFee)} testId='pnl-open-fee' />
                     {!long && <Item label={`賣出證交稅${est(pnl.openTaxEstimated)}`} value={money(pnl.openTax)} />}
                     {!long && <Item label='證交稅率' value={taxRateText(pnl, privMoney)} />}
                     {pnl.borrowFee !== null && <Item label='借券費（估算）' value={money(pnl.borrowFee)} testId='pnl-borrow-fee' />}
@@ -176,7 +185,7 @@ export function PositionPnlSheet({ summary, pnl, contract, brokerPnl, privMoney,
                 {pnl.close ? (
                     <dl className={styles.detailGrid}>
                         <Item label={long ? '賣出價金' : '回補價金'} value={money(pnl.close.notional)} />
-                        <Item label={long ? '預估賣出手續費' : '預估回補手續費'} value={money(pnl.close.fee)} testId='pnl-close-fee' />
+                        <Item label={`${long ? '預估賣出手續費' : '預估回補手續費'}${after}`} value={money(pnl.close.fee)} testId='pnl-close-fee' />
                         {long && <Item label='證交稅率' value={taxRateText(pnl, privMoney)} testId='pnl-tax-rate' />}
                         {long && <Item label='預估證交稅' value={money(pnl.close.tax)} testId='pnl-close-tax' />}
                         <Item label='淨損益' value={signed(pnl.net)} className={styles.tone[toneOf(pnl.net)]} testId='pnl-net' />
@@ -184,6 +193,31 @@ export function PositionPnlSheet({ summary, pnl, contract, brokerPnl, privMoney,
                     </dl>
                 ) : (
                     <p className={styles.detailNote}>缺現價，暫時無法計算淨損益。</p>
+                )}
+
+                {rebated && (
+                    <>
+                        <h3 className={styles.detailTitle}>退佣（月退 {discountText(pnl.feeDiscount)} 折，估）</h3>
+                        <dl className={styles.detailGrid} data-testid='pnl-rebate'>
+                            <Item label={`${openSide}手續費（交割收取）`} value={money(pnl.openFeeCharged)} testId='pnl-open-fee-charged' />
+                            <Item label={`${openSide}手續費退佣`} value={`≈ ${money(pnl.openRebate)}`} testId='pnl-open-rebate' />
+                            {pnl.close && (
+                                <>
+                                    <Item label={`預估${closeSide}手續費（交割收取）`} value={money(pnl.close.feeCharged)} testId='pnl-close-fee-charged' />
+                                    <Item label={`${closeSide}手續費退佣`} value={`≈ ${money(pnl.close.rebate)}`} testId='pnl-close-rebate' />
+                                    <Item label='預估退佣合計' value={`≈ ${money(pnl.rebate)}`} testId='pnl-rebate-total' />
+                                    <Item
+                                        label='退佣前淨損益'
+                                        value={signed(pnl.net === null || pnl.rebate === null ? null : pnl.net - pnl.rebate)}
+                                        className={styles.tone[toneOf(pnl.net === null || pnl.rebate === null ? null : pnl.net - pnl.rebate)]}
+                                        testId='pnl-net-before-rebate'
+                                    />
+                                    <Item label='退佣後淨損益' value={signed(pnl.net)} className={styles.tone[toneOf(pnl.net)]} testId='pnl-net-after-rebate' />
+                                </>
+                            )}
+                        </dl>
+                        <p className={styles.detailNote}>退佣＝交割收取的手續費 −（交割收取 × 折數，四捨五入），事後由券商退回；上方淨損益已依退佣後的手續費計算，實際退佣以券商入帳為準。</p>
+                    </>
                 )}
 
                 <h3 className={styles.detailTitle}>損益兩平價</h3>
