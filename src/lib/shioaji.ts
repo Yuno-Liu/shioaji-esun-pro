@@ -15,6 +15,7 @@ import { markConfirmedCancellation, observeTradeMutation } from './trade-mutatio
 import { createCancelBatch, readMark, sharedAuthoritativeTrades, verifyCancellation, type CancelBatchMember } from './cancel-verification';
 import { observeMarketSnapshots } from './market-snapshot-store';
 import { observeTradeResponse } from './trade-observations';
+import { noteStockOrderConditions } from './stock-order-conditions';
 import { beginServerInfoRequest, observeServerInfo } from './server-info-store';
 // src/lib/shioaji.ts
 
@@ -885,7 +886,11 @@ export function placeStockOrder(
     return sendOrderMutation<Trade>('/api/v1/order/place_order', {
         contract: contractKey(contract),
         stock_order: { ...order, account: selected },
-    }, selected, opts).then(ensureAccepted).then(trade => observeTradeResponse(trade, selected));
+    }, selected, opts).then(ensureAccepted).then(trade => {
+        // 回報與 update_status 都不帶 daytrade_short：送出時記下條件（委託合計用）
+        noteStockOrderConditions(selected, { seqno: trade.order?.seqno, ordno: trade.order?.ordno }, order);
+        return observeTradeResponse(trade, selected);
+    });
 }
 
 export function placeFuturesOrder(
