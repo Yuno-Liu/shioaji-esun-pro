@@ -10,11 +10,17 @@
 //     賣出交易稅＝價金 × sellTaxRate(合約, now)（一般稅率；沒有合約代碼時 0.3%）。不判斷現股當沖減半、不估融券手續費，
 //     已實現損益一律 null。券商未提供逐筆明細的差額列（價格未知）不列入。
 //
-// 淨收付（net）：收為正、付為負。
-// - 玉山逐筆有 pay_n 時取其絕對值，賣出為正、買進為負（pay_n 本身的正負號在 bridge／SDK 文件沒有明確定義，故不依賴）；
-//   沒有時以價金與費稅推算：賣＝價金 − 手續費 − 交易稅 − 其他費用；買＝−(價金＋手續費)。
-//   信用交易（融資、融券）的實際交割金額另含融資金額／保證金，pay_n 為券商值；推算值只是現股公式，僅供參考。
-// - 永豐一律用推算公式。
+// 淨收付（net）：收為正、付為負；無法得知為 null（顯示「—」、不計入合計，另計 netUnknown）。
+// - 玉山：直接用逐筆 pay_n，連正負號一起（券商的實際交割收付：負＝扣款、正＝入帳）。2026-11-11 以正式環境資料核對
+//   （最近 180 天）各交易類別一致：現股／當沖買進＝−(價金＋手續費)、賣出＝價金 − 費稅；融資買進為負（自備款約 40%）；
+//   融券賣出為負（保證金約 90%）；融券買進回補為正（退回保證金與擔保價款）。
+//   信用交易的交割金額由券商算好：融資買進只扣自備款、融券賣出要繳保證金（扣款，負數）、融券買進回補會退回
+//   保證金與擔保價款（通常入帳，正數）——所以不可依買賣別自訂正負號（2026-11-11 修正：原本取絕對值再依買賣別
+//   給正負號，融券賣出被顯示成收款、融券回補被顯示成付款）。
+//   沒有 pay_n 時：現股（含現股當沖）以價金與費稅推算並標示估算（賣＝價金 − 手續費 − 交易稅 − 其他費用；
+//   買＝−(價金＋手續費)）；信用交易無從推算 → null。
+// - 永豐：沒有交割金額資料。現股以同一公式推算（估）；信用交易（融資、融券、借券）牽涉融資金額與保證金，
+//   不估算 → null。
 //
 // 已實現損益：玉山的「已實現列」（與已實現損益卡片同一個 isEsunRealizedTransaction 判斷：一般賣出、融券買回、
 // 信用當沖）才有值；逐筆有 make 用逐筆值，整列逐筆都沒有時把列的 make 記在第一筆（避免多筆重複計入）。其餘為 null。
@@ -49,8 +55,8 @@ export interface FillRecord {
     tax: number;
     /** 證所稅＋融券手續費 */
     otherFees: number;
-    /** 淨收付：收為正、付為負 */
-    net: number;
+    /** 淨收付：收為正、付為負；無法得知（信用交易沒有券商交割金額）為 null */
+    net: number | null;
     realizedPnl: number | null;
     /** 委託書號 */
     orderNo: string;
@@ -82,8 +88,11 @@ export function fromEsunDetails(details: readonly EsunTransactionDetail[]): Fill
             const fee = n0(f?.fee);
             const tax = n0(f?.tax);
             const otherFees = n0(f?.capitalGainsTax) + n0(f?.shortFee);
+            // 淨收付以券商 pay_n 為準（帶正負號：負＝扣款、正＝入帳；融券賣出的保證金、回補的退款都由券商算好）。
+            // 沒有 pay_n：現股以公式推算（估）；信用交易（融資、融券、信用當沖）無從推算 → null
             const pay = fin(f?.netAmount);
-            const net = pay !== null ? (action === 'Sell' ? Math.abs(pay) : -Math.abs(pay)) : derivedNet(action, amount, fee, tax, otherFees);
+            const credit = d.cond === 'MarginTrading' || d.cond === 'ShortSelling';
+            const net = pay !== null ? pay : credit ? null : derivedNet(action, amount, fee, tax, otherFees);
             let realizedPnl: number | null = null;
             if (d.realized) realizedPnl = fillHasPnl ? fin(f?.realizedPnl) : (i === 0 ? rowPnl : null);
             out.push({
@@ -103,7 +112,8 @@ export function fromEsunDetails(details: readonly EsunTransactionDetail[]): Fill
                 net,
                 realizedPnl,
                 orderNo: f?.orderNo ?? '',
-                estimated: false,
+                // 費稅是券商值；只有缺 pay_n、以公式推算淨收付時標示估算
+                estimated: pay === null && net !== null,
             });
         });
     }
@@ -156,7 +166,8 @@ export function fromSinopacDeals(rows: readonly DealRow[], opts: SinopacFillOpti
         const at = taipeiDateTime(r.ts);
         const own = (trade.contract as { name?: unknown } | undefined)?.name;
         const cond = trade.order.order_cond;
-        const tradeTypeLabel = trade.order.daytrade_short ? '當沖先賣' : (cond && CREDIT_LABEL[cond]) || '現股';
+        const creditLabel = cond ? CREDIT_LABEL[cond] : undefined;
+        const tradeTypeLabel = trade.order.daytrade_short ? '當沖先賣' : creditLabel || '現股';
         out.push({
             broker: 'sinopac',
             tradeDate: at?.date ?? today,
@@ -171,7 +182,8 @@ export function fromSinopacDeals(rows: readonly DealRow[], opts: SinopacFillOpti
             fee,
             tax,
             otherFees: 0,
-            net: derivedNet(action, amount, fee, tax, 0),
+            // 信用交易的交割金額牽涉融資金額與保證金（融券賣出是扣保證金，不是收款），永豐沒有資料 → 不估算
+            net: creditLabel ? null : derivedNet(action, amount, fee, tax, 0),
             realizedPnl: null,
             orderNo: String(trade.order.ordno || trade.order.id || ''),
             estimated: true,
@@ -189,7 +201,10 @@ export interface FillTotals {
     fee: number;
     tax: number;
     otherFees: number;
+    /** 有值的淨收付加總（net 為 null 的筆不計入，見 netUnknown） */
     net: number;
+    /** 淨收付無法得知（null）的筆數 */
+    netUnknown: number;
     /** 有值的已實現損益加總；全部沒有時 null */
     realizedPnl: number | null;
     /** 含估算值 */
@@ -199,7 +214,7 @@ export interface FillTotals {
 export function fillTotals(records: readonly FillRecord[]): FillTotals {
     const t: FillTotals = {
         count: 0, buyShares: 0, buyAmount: 0, sellShares: 0, sellAmount: 0,
-        fee: 0, tax: 0, otherFees: 0, net: 0, realizedPnl: null, estimated: false,
+        fee: 0, tax: 0, otherFees: 0, net: 0, netUnknown: 0, realizedPnl: null, estimated: false,
     };
     for (const r of records) {
         t.count += 1;
@@ -213,7 +228,8 @@ export function fillTotals(records: readonly FillRecord[]): FillTotals {
         t.fee += r.fee;
         t.tax += r.tax;
         t.otherFees += r.otherFees;
-        t.net += r.net;
+        if (r.net === null) t.netUnknown += 1;
+        else t.net += r.net;
         if (r.realizedPnl !== null) t.realizedPnl = (t.realizedPnl ?? 0) + r.realizedPnl;
         if (r.estimated) t.estimated = true;
     }

@@ -747,19 +747,19 @@ export const pnlCode = style({
     ...TEXT.headline,
 });
 
-/** 商品名稱（名稱為主；載入前為代碼）：單行省略號，名稱到達時列高不變 */
+/**
+ * 商品名稱（名稱為主；載入前為代碼）：完整顯示，放不下時換行（2026-11-11 使用者要求：原本單行省略號，
+ * 右側數值欄較寬或字級大時長名稱只剩約四個字）。名稱過長換行時列高會增加。
+ */
 export const pnlName = style({
-    whiteSpace: 'nowrap',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
+    overflowWrap: 'anywhere',
 });
 
+/** 名稱下方的代碼、市場或交易類別、日期或時間：同樣完整顯示、放不下時換行 */
 export const pnlMeta = style({
     ...TEXT.footnote,
     color: vars.color.mutedForeground,
-    whiteSpace: 'nowrap',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
+    overflowWrap: 'anywhere',
 });
 
 export const pnlQty = style({

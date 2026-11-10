@@ -216,7 +216,7 @@ function EsunRowDetail({ row, info }: { row: RealizedPnlRow; info: RowInfo }) {
 /**
  * 一列已實現損益：商品名稱為主、代碼為次（同自選列）。名稱依序取列本身的 name、玉山成交明細的 stk_na，
  * 都沒有才查合約快取（lib/contract-names：每個不重複代碼最多一次合約查詢，失敗只顯示代碼）。
- * 名稱載入前第一行是代碼、第二行是市場與日期；名稱到達後第一行換成名稱、代碼移到第二行開頭，列高不變。
+ * 名稱載入前第一行是代碼、第二行是市場與日期；名稱到達後第一行換成名稱、代碼移到第二行開頭。名稱完整顯示，過長時換行（列高增加；不再單行省略）。
  */
 function PnlRow({ row, info, showDate }: { row: RealizedPnlRow; info: RowInfo; showDate: boolean }) {
     const privMoney = usePrivacyMoney();

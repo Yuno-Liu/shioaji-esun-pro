@@ -1392,6 +1392,25 @@ describe('AccountPage fill history (成交明細)', () => {
         expect(allByTestId('fills-totals')).toHaveLength(1);
     });
 
+    it('E.SUN: uses the signed pay_n (short-sale margin is a debit); credit rows without pay_n show — and a count note', async () => {
+        esunOnly();
+        m.fetchTransactions.mockResolvedValue([
+            // 融券賣出：繳保證金（pay_n 負數）→ 扣款（原本會被顯示成收款）
+            esunRow({ code: '2317', name: '鴻海', buySell: 'S', action: 'Sell', tradeType: '4', tradeTypeLabel: '融券', cond: 'ShortSelling',
+                fills: [esunFill(1, { price: 200, shares: 1000, priceQty: 200000, fee: 285, tax: 600, shortFee: 160, netAmount: -180000 })] }),
+            // 融資買進、缺 pay_n → 自備款無從推算，顯示「—」、不計入合計
+            esunRow({ rowId: 2, code: '2454', name: '聯發科', tradeType: '3', tradeTypeLabel: '融資', cond: 'MarginTrading',
+                fills: [esunFill(2, { price: 1400, shares: 1000, priceQty: 1400000, fee: 1995, netAmount: null })] }),
+        ]);
+        await render();
+        await click('account-fills-toggle');
+        const rows = allByTestId('fills-row').map(textOf);
+        expect(rows.find(r => r.includes('鴻海'))).toContain('−$180,000');
+        expect(rows.find(r => r.includes('聯發科'))).toContain('—');
+        expect(textOf(byTestId('fills-totals'))).toContain('淨收付（2 筆）−$180,000');
+        expect(textOf(byTestId('fills-net-unknown'))).toContain('1 筆信用交易沒有交割金額資料');
+    });
+
     it('E.SUN: shows 100 rows at a time with 再顯示 100 筆', async () => {
         esunOnly();
         m.fetchTransactions.mockResolvedValue([esunRow({ fills: Array.from({ length: 230 }, (_, i) => esunFill(i)) })]);

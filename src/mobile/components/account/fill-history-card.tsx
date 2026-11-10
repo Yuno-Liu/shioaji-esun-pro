@@ -53,6 +53,7 @@ const VIEWS: readonly { value: FillView; text: string }[] = [
 export const FILLS_TEXT = {
     sinopac: '永豐不提供歷史成交查詢，只顯示今日成交（來自委託回報；手續費與交易稅為估算）。',
     futures: '期貨成交請看委託頁「成交」。',
+    netUnknown: (n: number) => `${n} 筆信用交易沒有交割金額資料（融資自備款、融券保證金由券商計算），未計入淨收付。`,
     noAccount: '尚未選擇證券帳戶。',
 } as const;
 
@@ -80,6 +81,9 @@ function useMoney() {
 
 const est = (estimated: boolean) => (estimated ? '（估）' : '');
 
+/** 淨收付合計：全部筆數都沒有交割金額資料時為 null（顯示「—」），否則為有值筆數的加總 */
+const knownNet = (t: FillTotals): number | null => (t.count > 0 && t.netUnknown === t.count ? null : t.net);
+
 function TotalsView({ totals, showPnl }: { totals: FillTotals; showPnl: boolean }) {
     const { money, signed, shares } = useMoney();
     const e = est(totals.estimated);
@@ -87,7 +91,7 @@ function TotalsView({ totals, showPnl }: { totals: FillTotals; showPnl: boolean 
         <div data-testid='fills-totals'>
             <div className={styles.totalLine}>
                 <span>淨收付{e}（{totals.count} 筆）</span>
-                <span className={`${styles.totalValue} ${styles.dir[signDir(totals.net)]}`}>{signed(totals.net)}</span>
+                <span className={`${styles.totalValue} ${styles.dir[signDir(knownNet(totals))]}`}>{signed(knownNet(totals))}</span>
             </div>
             <dl className={styles.kv}>
                 <Item term='買進'>{money(totals.buyAmount)}（{shares(totals.buyShares)}）</Item>
@@ -99,6 +103,9 @@ function TotalsView({ totals, showPnl }: { totals: FillTotals; showPnl: boolean 
                     <Item term='已實現損益' className={styles.dir[signDir(totals.realizedPnl)]}>{totals.realizedPnl === null ? '—' : signed(totals.realizedPnl)}</Item>
                 )}
             </dl>
+            {totals.netUnknown > 0 && (
+                <p className={styles.note} data-testid='fills-net-unknown'>{FILLS_TEXT.netUnknown(totals.netUnknown)}</p>
+            )}
         </div>
     );
 }
@@ -154,7 +161,7 @@ function StockRow({ s }: { s: StockSummary }) {
                     <span className={styles.pnlName}>{name ?? s.code}</span>
                     <span className={styles.pnlMeta}>{[name ? s.code : '', `${s.count} 筆`].filter(Boolean).join(' · ')}</span>
                 </span>
-                <span className={`${styles.pnlValue} ${styles.dir[signDir(s.net)]}`}>{signed(s.net)}</span>
+                <span className={`${styles.pnlValue} ${styles.dir[signDir(knownNet(s))]}`}>{signed(knownNet(s))}</span>
             </div>
             <SummaryFacts s={s} />
             {s.realizedPnl !== null && (
@@ -173,7 +180,7 @@ function DateRow({ s }: { s: DateSummary }) {
                     <span className={styles.pnlName}>{s.date}</span>
                     <span className={styles.pnlMeta}>{s.count} 筆</span>
                 </span>
-                <span className={`${styles.pnlValue} ${styles.dir[signDir(s.net)]}`}>{signed(s.net)}</span>
+                <span className={`${styles.pnlValue} ${styles.dir[signDir(knownNet(s))]}`}>{signed(knownNet(s))}</span>
             </div>
             <SummaryFacts s={s} />
         </div>
