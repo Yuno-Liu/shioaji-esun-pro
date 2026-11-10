@@ -23,7 +23,7 @@ import { useQuote, useTradingLive } from '../../hooks/use-stream';
 import { useAccounts } from '../../lib/account-store';
 import { canTrade } from '../../lib/account-tradable';
 import { isEsunAccount } from '../../lib/esun';
-import { accountMatches } from '../../lib/account-identity';
+import { accountMatches } from '../../lib/flash-account';
 import { creditLabel, isOddLot, ODD_LOT_MAX_SHARES, oddLotReferencePrice, orderQtyUnit, SHARES_PER_LOT, stockOrderProblem, type OddBaseQuote } from '../../lib/odd-lot';
 import { captureSelectedAccount } from '../../lib/order-account';
 import { defaultOrderTypeFor, futuresOrderProblem, orderTypeDisabledReason, PRICE_TYPE_LABEL, priceTypeDisabledReason } from '../../lib/order-conditions';

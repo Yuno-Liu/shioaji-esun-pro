@@ -75,7 +75,7 @@ vi.mock('../../lib/privacy', () => ({
 }));
 vi.mock('../../lib/account-store', () => ({ useAccounts: () => m.accounts }));
 vi.mock('../../lib/trading-state', () => ({ useTradingState: () => m.trading }));
-vi.mock('../../lib/account-identity', () => ({
+vi.mock('../../lib/flash-account', () => ({
     accountMatches: (a?: { account_type: string; broker_id: string; account_id: string } | null, b?: { account_type: string; broker_id: string; account_id: string } | null) =>
         !!a && !!b && a.account_type === b.account_type && a.broker_id === b.broker_id && a.account_id === b.account_id,
 }));

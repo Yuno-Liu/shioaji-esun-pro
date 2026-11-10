@@ -11,7 +11,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useState } from 'react';
 import { useAccounts } from '../../../lib/account-store';
 import { isEsunAccount } from '../../../lib/esun';
-import { accountMatches } from '../../../lib/account-identity';
+import { accountMatches } from '../../../lib/flash-account';
 import {
     isPriorTaipeiDay,
     pendingSettlementAmount,

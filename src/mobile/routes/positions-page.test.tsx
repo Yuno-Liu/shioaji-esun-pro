@@ -96,7 +96,7 @@ vi.mock('../../lib/esun', async () => {
         useEsunEnvironment: () => ({ environment: m.esunEnv }),
     };
 });
-vi.mock('../../lib/account-identity', () => ({ accountMatches: (a?: Acc | null, b?: Acc | null) => same(a, b) }));
+vi.mock('../../lib/flash-account', () => ({ accountMatches: (a?: Acc | null, b?: Acc | null) => same(a, b) }));
 vi.mock('../../lib/order-outcome', () => ({ reconcileAfterUnknownOutcome: m.reconcileAfterUnknownOutcome }));
 vi.mock('../../lib/privacy', () => ({
     // 批次出清授權以真正的 accountConfirmLabel 比對帳戶標籤（lib/order-confirm 讀隱私模式）
