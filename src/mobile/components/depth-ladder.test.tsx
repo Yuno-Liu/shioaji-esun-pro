@@ -103,10 +103,59 @@ describe('depthBook', () => {
         expect(book.empty).toBe(false);
     });
 
-    it('沒有資料或全為空檔時 empty', () => {
+    it('沒有資料或全為空檔時 empty（價格 0 且量 0 才是空檔）', () => {
         expect(depthBook(undefined)).toMatchObject({ empty: true, bidTotal: 0, askTotal: 0 });
         expect(depthBook(undefined).rows).toHaveLength(5);
-        expect(depthBook({ bid_price: ['0'], bid_volume: [5], ask_price: [], ask_volume: [] }).empty).toBe(true);
+        expect(depthBook({ bid_price: ['0'], bid_volume: [0], ask_price: [], ask_volume: [] }).empty).toBe(true);
+    });
+
+    it('價格 0 且量 > 0 是排隊中的市價單：保留這一檔（market）、計入總量與最大量', () => {
+        // 1785 光洋科鎖漲停的實際五檔：委買第 1 檔市價 3,350 張，委賣全空
+        const book = depthBook({
+            bid_price: ['0', '86.9', '86.8', '86.7', '86.6'], bid_volume: [3350, 1386, 9, 58, 25],
+            ask_price: ['0', '0', '0', '0', '0'], ask_volume: [0, 0, 0, 0, 0],
+        });
+        expect(book.rows[0]?.bid).toEqual({ price: 0, volume: 3350, market: true });
+        expect(book.rows[1]?.bid).toEqual({ price: 86.9, volume: 1386 });
+        expect(book.rows.every(r => r.ask === null)).toBe(true);
+        expect(book.bidTotal).toBe(4828);
+        expect(book.askTotal).toBe(0);
+        expect(book.empty).toBe(false);
+        expect(depthMaxVolume(book)).toBe(3350);
+        // 只有市價單也不是空的
+        expect(depthBook({ bid_price: ['0'], bid_volume: [5], ask_price: [], ask_volume: [] }).empty).toBe(false);
+    });
+});
+
+describe('DepthLadder 市價單', () => {
+    it('市價那一檔顯示「市價」與量並計入五檔總量；不是按鈕、不可點，報讀完整說明', async () => {
+        quoteMock.useQuote.mockImplementation(() => ({
+            bidask: { ...BIDASK, bid_price: ['0', '984', '983', '982', '981'], bid_volume: [3350, 120, 76, 50, 40] },
+            tick: TICK, lastDir: 0, seq: 1, flashSeq: 0,
+        }));
+        await render();
+        const cell = byId('depth-bid-1');
+        expect(cell.type).toBe('div');
+        expect(cell.props['data-market']).toBe('true');
+        expect(cell.props.onClick).toBeUndefined();
+        expect(text(byId('depth-bid-1-market'))).toBe('市價');
+        expect(fullText(cell)).toBe('委買第1檔 市價單，量 3,350 張');
+        // 其餘有價格的檔位照常可點
+        expect(byId('depth-bid-2').type).toBe('button');
+        expect(text(byId('depth-total-bid'))).toBe('3,636');
+        expect(storeMock.openTicket).not.toHaveBeenCalled();
+    });
+
+    it('委賣側的市價單同樣顯示「市價」（例如鎖跌停）', async () => {
+        quoteMock.useQuote.mockImplementation(() => ({
+            bidask: { ...BIDASK, bid_price: ['0', '0', '0', '0', '0'], bid_volume: [0, 0, 0, 0, 0], ask_price: ['0', '963', '964', '0', '0'], ask_volume: [1200, 800, 5, 0, 0] },
+            tick: TICK, lastDir: 0, seq: 1, flashSeq: 0,
+        }));
+        await render();
+        expect(byId('depth-ask-1').props['data-market']).toBe('true');
+        expect(fullText(byId('depth-ask-1'))).toBe('委賣第1檔 市價單，量 1,200 張');
+        expect(byId('depth-ask-2').type).toBe('button');
+        expect(text(byId('depth-total-ask'))).toBe('2,005');
     });
 });
 

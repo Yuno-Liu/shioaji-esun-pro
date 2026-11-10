@@ -52,6 +52,7 @@ import {
     openingPriceSeq,
     openingTicketPrice,
     estimateAmount,
+    firstPositivePrice,
     initialTicketFields,
     isOnTick,
     NOT_SENT_TITLE,
@@ -182,6 +183,15 @@ describe('ticketProblem（§6.3 驗證順序）', () => {
 });
 
 describe('helpers', () => {
+    it('買一／賣一取第一個有價格的檔位：第 1 檔是市價單（價格 0）時跳過', () => {
+        // 1785 光洋科鎖漲停：委買第 1 檔市價 3,350 張 → 買一＝第 2 檔 86.9；委賣全空 → 沒有賣一
+        expect(firstPositivePrice(['0', '86.9', '86.8', '86.7', '86.6'])).toBe(86.9);
+        expect(firstPositivePrice(['0', '0', '0', '0', '0'])).toBeNull();
+        expect(firstPositivePrice(['984', '983'])).toBe(984);
+        expect(firstPositivePrice([])).toBeNull();
+        expect(firstPositivePrice(undefined)).toBeNull();
+    });
+
     it('parses prices and checks tick / band', () => {
         expect(parsePrice('1,085.5')).toBe(1085.5);
         expect(parsePrice('')).toBeNaN();

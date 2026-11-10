@@ -13,6 +13,8 @@
 // - 買價、賣價各是獨立的點擊目標：onPick(price, side)，缺省＝openTicket({ code, price, source: 'depth' })
 //   ——只帶價，不決定買賣，也不會送單。
 // - 自己的未成交限價委託標在該價位所在的那一側（「我 買2」；整股五檔只算整股委託，零股五檔只算零股委託）。
+// - 市價單：交易所以「價格 0、量 > 0」揭示排隊中的市價委託（例如鎖漲停時委買第 1 檔 0／3,350 張）。這一檔顯示「市價」
+//   與量並計入五檔總量；沒有價格可帶入下單面板，所以只顯示、不可點。價格 0 且量 0 才是空檔。
 
 import { useMemo, useRef } from 'react';
 import { useQuote } from '../../hooks/use-stream';
@@ -23,6 +25,7 @@ import { fmtCompactInt, formatToTick } from '../lib/num-format';
 import { depthMarkText, depthOrderMarks, priceKey } from '../lib/chart-model';
 import { openTicket } from '../lib/mobile-store';
 import { innerOuterRatio, splitPercent, toneVsReference, volumeUnit, type SplitPercent } from '../lib/quote-display';
+import { srOnly } from '../styles/primitives.css';
 import * as styles from '../styles/trade.css';
 import { RatioBar as RatioTrack, VolumeBar } from '../ui/bars';
 import { Segmented } from '../ui/segmented';
@@ -30,8 +33,11 @@ import { Segmented } from '../ui/segmented';
 export const DEPTH_LEVELS = 5;
 
 export interface DepthQuote {
+    /** 價格；市價單為 0 */
     price: number;
     volume: number;
+    /** 市價單（交易所揭示價格 0、量 > 0）：顯示「市價」，不可點 */
+    market?: boolean;
 }
 
 export interface DepthRow {
@@ -42,8 +48,9 @@ export interface DepthRow {
 }
 
 export interface DepthBook {
-    /** 固定 5 列；價格 ≤ 0 或缺漏的檔位為 null */
+    /** 固定 5 列；缺漏、價格 < 0、或價格 0 且量 0 的檔位為 null；價格 0 且量 > 0 為市價單（market） */
     rows: DepthRow[];
+    /** 兩側總量（含市價單的量） */
     bidTotal: number;
     askTotal: number;
     /** 買賣兩側都沒有任何有效檔位 */
@@ -54,9 +61,12 @@ type BidAskLike = { bid_price: readonly (string | number)[]; bid_volume: readonl
 
 function quoteAt(prices: readonly (string | number)[], volumes: readonly number[], i: number): DepthQuote | null {
     const price = Number(prices[i]);
-    if (!Number.isFinite(price) || price <= 0) return null;
+    if (!Number.isFinite(price) || price < 0) return null;
     const v = Number(volumes[i] ?? 0);
-    return { price, volume: Number.isFinite(v) && v > 0 ? v : 0 };
+    const volume = Number.isFinite(v) && v > 0 ? v : 0;
+    // 價格 0：量 > 0 是排隊中的市價單；量 0 是空檔
+    if (price === 0) return volume > 0 ? { price: 0, volume, market: true } : null;
+    return { price, volume };
 }
 
 /** BidAsk → 5 列（第 i 列＝買 i、賣 i）與兩側總量 */
@@ -194,6 +204,24 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
         const testId = `depth-${side}-${level}`;
         if (!q) {
             return <div key={side} className={styles.depthCell[side]} data-testid={testId} aria-hidden='true' />;
+        }
+        if (q.market) {
+            // 市價單：沒有價格可帶入下單面板 → 只顯示、不可點；畫面文字 aria-hidden，報讀改讀完整說明
+            const vol = fmtCompactInt(q.volume);
+            const sideText = side === 'bid' ? '委買' : '委賣';
+            const priceEl = (
+                <span className={`${styles.depthPrice[side]} ${level === 1 ? styles.depthBest : ''} ${styles.dirText.flat}`} aria-hidden='true' data-testid={`${testId}-market`}>
+                    市價
+                </span>
+            );
+            const volEl = <span className={styles.depthVol[side]} aria-hidden='true'>{vol}</span>;
+            return (
+                <div key={side} className={styles.depthCell[side]} data-testid={testId} data-market='true'>
+                    <span className={srOnly}>{`${sideText}第${level}檔 市價單，量 ${vol}${unit ? ` ${unit}` : ''}`}</span>
+                    <VolumeBar value={q.volume} max={maxVolume} side={side === 'bid' ? 'buy' : 'sell'} />
+                    {side === 'bid' ? <>{volEl}{priceEl}</> : <>{priceEl}{volEl}</>}
+                </div>
+            );
         }
         const mine = depthMarkText(marks.get(priceKey(q.price)));
         const price = fmt(q.price);

@@ -131,6 +131,18 @@ export function positivePrice(v: string | number | null | undefined): number | n
     return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+/**
+ * 五檔一側第一個有價格的檔位（「買一／賣一」快捷價）。交易所以價格 0 揭示排隊中的市價單，
+ * 市價單沒有價格可帶入（例如鎖漲停時委買第 1 檔是市價，買一應為漲停價那一檔）。沒有回 null。
+ */
+export function firstPositivePrice(prices: readonly (string | number)[] | null | undefined): number | null {
+    for (const p of prices ?? []) {
+        const n = positivePrice(p);
+        if (n !== null) return n;
+    }
+    return null;
+}
+
 /** 價格輸入框文字 → 數字；空白或無法解析回 NaN */
 export function parsePrice(text: string): number {
     const t = text.replace(/,/g, '').trim();
@@ -516,8 +528,9 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         ? oddLotMarketPrice(oddTrade, oddQuote, p => roundToTick(contract, p))
         : marketPrice(commonTrade, snapshot);
     const lastPrice = live?.price ?? null;
-    const bid1 = positivePrice(activeQuote?.bidask?.bid_price?.[0]);
-    const ask1 = positivePrice(activeQuote?.bidask?.ask_price?.[0]);
+    // 第一個有價格的檔位：第 1 檔是市價單（價格 0）時跳過
+    const bid1 = firstPositivePrice(activeQuote?.bidask?.bid_price);
+    const ask1 = firstPositivePrice(activeQuote?.bidask?.ask_price);
 
     // 價格帶入當時的 resumeSeq；不同（或 PRICE_UNCONFIRMED）＝價格可能過期。openTicket 帶入的價格以帶入當下為準
     const [priceSeq, setPriceSeq] = useState(() => openingPriceSeq(gate, ticket.openedAt, initialPrice?.source === 'ticket'));
