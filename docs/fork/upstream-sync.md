@@ -104,17 +104,14 @@ git diff $(git merge-base HEAD upstream/main) -- <檔案> | grep -c '^[+-][^+-]'
 - **`src/components/conditional-form.tsx`**（兩處）：同時保留 fork 的 `<CashCreditWarning/>` 與上游 `SendControl` 的 `marketBlock`。
 - **交易正確性審查**（deep-reviewer，只讀）：沒有找到會送錯單的路徑。閃電融券面板的觸買不會變成現股買進，融資面板的觸賣也不會變成現股賣出。買全刪／賣全刪會走 fork 的玉山刪單，範圍只限本帳戶、同代碼、同單位、本交易日。依審查結果修了三項：
   - **觸價不支援融券回補**（上游 #399 與 fork 語意衝突）：上游以 fork 已改寫的借券文字拒絕，訊息自相矛盾，3 個上游測試也會失敗。改為 fork 專用文字，並停用融券面板的觸買欄，見上方修正表。不開放「融券回補觸價單」，因為兩個引擎都只收融券賣出，背景引擎（Rust）的原始碼不在 repo 內，無法驗證。
-  - **保留量 key 分開**（上游 #399 帶進的缺陷，永豐與玉山都受影響）：見上方修正表。審查第一輪建議連現股當沖先賣也分開；第二輪核對時指出先賣當日沒買回要以庫存交割，分開會超賣，所以只分開融資、融券。測試涵蓋三種在途進場單：融資賣出加融券賣出時，現股停損仍送 2 張（上游一張都不送）；現股賣出、現股當沖先賣仍佔量，只送 1 張。已反向驗證：拿掉修正，或錯加先賣後綴，對應的測試都會失敗。2026-11-10 使用者對桌面版的上游缺陷選擇「等上游修」，所以這項獨立成一個提交，待使用者確認。
+  - **保留量 key 分開**（上游 #399 帶進的缺陷，永豐與玉山都受影響）：見上方修正表。審查第一輪建議連現股當沖先賣也分開；第二輪核對時指出先賣當日沒買回要以庫存交割，分開會超賣，所以只分開融資、融券。測試涵蓋三種在途進場單：融資賣出加融券賣出時，現股停損仍送 2 張（上游一張都不送）；現股賣出、現股當沖先賣仍佔量，只送 1 張。已反向驗證：拿掉修正，或錯加先賣後綴，對應的測試都會失敗。2026-11-10 使用者對桌面版的上游缺陷選擇「等上游修」；這項因為涉及實際保護量，使用者確認這次一起修（2026-11-11），其他桌面版上游缺陷仍逐案詢問。
   - **玉山觸價單在建立時就檢查**（fork 掛鉤）：上游 #396 開放權證觸價與自動停損停利後，玉山帳戶可以掛權證或興櫃的觸價單、停損單，畫面顯示「已掛」，觸發時才被 `esunQuickOrderProblem` 擋下，使用者會以為有保護。`trigger-engine.ts` 的 `withContext` 在選定帳戶之後呼叫 fork 的 `src/lib/esun/trigger-rules.ts` `esunTriggerProblem`，用同一套 `validateEsunStockOrder` 檢查。價格到觸發時才決定，所以零股視為限價，整股依送出方式（預設市價），限價以觸發價代入。收盤前平倉不檢查：它建立時數量為 0，範圍可以是整個帳戶，時間到時由 `conditional/flatten` 逐筆下單、各自檢查玉山規則。數量未定時，不以數量擋下。
 - **首屏**：
-  - 合併後手機首屏 JS 為 227,582 bytes，超出 ≤220 KiB（225,280）。增加的部分全在上游共用 chunk：
+  - 合併後手機首屏 JS 為 227,626 bytes（225,251 → 227,626，含 F1 的一段文字），超出 ≤220 KiB（225,280）。增加的部分全在上游共用 chunk：
     - `stock-order-conditions`＋`conditional/session`：經 `shioaji.ts` 帶入。
     - `trigger-credit`：經 `boot → tauri → flash-account → flash-trigger` 帶入。
     - `warrant-rules` 也變大了。
-  - 新增 fork 輕量模組 `src/lib/account-identity.ts`，內含 `accountMatches` 與 `newPopoutWindowId`。這兩個函式與上游 `flash-account.ts` 同一語意，`account-identity.test.ts` 會逐案比對。
-  - 上游 `src/lib/tauri.ts` 只改 1 行 import（掛鉤），`order-route.ts` 與手機的 4 個檔案也改從這個模組 import。flash-account、flash-trigger、trigger-credit、bracket-rules 因此全部移出手機首屏，首屏降為 221,673 bytes。
-  - 合併時若上游改了 `tauri.ts` 的這行 import，要保留 fork 版本。
-  - 這是手機規格 R2 的例外（修改 `src/lib`），待使用者確認；若不採用，改為放寬首屏目標。
+  - 要再壓需修改 `src/lib`（手機規格 R2）。曾評估 fork 輕量模組 `src/lib/account-identity.ts`，加上上游 `tauri.ts` 改 1 行 import，可降到 221,665 bytes。使用者選擇不破例，改為放寬首屏目標為 ≤223 KiB（228,352 bytes），見 mobile-design.md §13。
 - **已知、未修**：
   - **桌面版（Tauri）背景引擎**：開「背景持續執行」時，玉山的股票觸價單與面板括號單可能交給背景引擎，進而繞過玉山分派。這是合併前就有的問題；網頁版的 `backgroundSupported()` 為 false，不受影響。
   - **現沖回補欄**：玉山委託的現沖回補欄，在查到玉山委託前可能暫時顯示「待確認」。只影響顯示。
