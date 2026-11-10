@@ -58,16 +58,29 @@ describe('fromEsunDetails', () => {
         expect(sell).toMatchObject({ code: '2884', action: 'Sell', net: 26000, realizedPnl: 1000 });
     });
 
-    it('signs pay_n by side (absolute value) and derives net when it is missing', () => {
+    it('uses the broker pay_n as-is, sign included (short sale margin is a debit, a cover refunds); derives net only for cash rows', () => {
         const recs = fromEsunDetails([
-            detail({ fills: [fill({ price: 10, shares: 1000, priceQty: 10000, fee: 20, netAmount: 10020 })] }), // 買進但 pay_n 為正
-            detail({ action: 'Sell', buySell: 'S', fills: [fill({ price: 10, shares: 1000, priceQty: 10000, fee: 20, tax: 30, netAmount: -9950 })] }), // 賣出但為負
+            // 現股買進：扣款（玉山資料一致：pay_n＝−(價金＋手續費)）
+            detail({ fills: [fill({ price: 10, shares: 1000, priceQty: 10000, fee: 20, netAmount: -10020 })] }),
+            // 融券賣出：繳保證金（扣款，負數）——原本取絕對值再依賣出給正號，會被顯示成收款
+            detail({ action: 'Sell', buySell: 'S', tradeType: '4', tradeTypeLabel: '融券', cond: 'ShortSelling',
+                fills: [fill({ price: 100, shares: 1000, priceQty: 100000, fee: 142, tax: 300, shortFee: 80, netAmount: -90000 })] }),
+            // 融券買進回補：退回保證金與擔保價款（入帳，正數）——原本依買進給負號，會被顯示成付款
+            detail({ tradeType: '4', tradeTypeLabel: '融券', cond: 'ShortSelling', realized: true, realizedPnl: 5000,
+                fills: [fill({ price: 95, shares: 1000, priceQty: 95000, fee: 135, netAmount: 104523, realizedPnl: 5000 })] }),
+            // 現股賣出、缺 pay_n：以公式推算（估）
             detail({ action: 'Sell', buySell: 'S', fills: [fill({ price: 10, shares: 1000, priceQty: 10000, fee: 20, tax: 30, capitalGainsTax: 5, shortFee: 8 })] }),
-            detail({ fills: [fill({ price: 10, shares: 1000, fee: 20, tax: 0 })] }), // 沒有 price_qty：價金＝價×量
+            // 現股買進、缺 pay_n 與 price_qty：價金＝價×量
+            detail({ fills: [fill({ price: 10, shares: 1000, fee: 20, tax: 0 })] }),
+            // 融資買進、缺 pay_n：自備款由券商計算，無從推算 → null
+            detail({ tradeType: '3', tradeTypeLabel: '融資', cond: 'MarginTrading', fills: [fill({ price: 50, shares: 1000, priceQty: 50000, fee: 71 })] }),
         ]);
-        expect(recs.map(r => r.net)).toEqual([-10020, 9950, 10000 - 20 - 30 - 13, -10020]);
-        expect(recs[2]).toMatchObject({ otherFees: 13 });
-        expect(recs[3]!.amount).toBe(10000);
+        expect(recs.map(r => r.net)).toEqual([-10020, -90000, 104523, 10000 - 20 - 30 - 13, -10020, null]);
+        expect(recs.map(r => r.estimated)).toEqual([false, false, false, true, true, false]);
+        expect(recs[3]).toMatchObject({ otherFees: 13 });
+        expect(recs[4]!.amount).toBe(10000);
+        // 合計只加有值的淨收付，另計無法得知的筆數
+        expect(fillTotals(recs)).toMatchObject({ net: -10020 - 90000 + 104523 + 9937 - 10020, netUnknown: 1 });
     });
 
     it('keeps the credit trade types and realized P&L only on realized rows (no double counting)', () => {
@@ -106,7 +119,7 @@ describe('fromSinopacDeals', () => {
         return { key: p.code, trade, deal: null, price: p.price, quantity: p.qty, ts: p.ts ?? 0, unit: '張', aggregate: false };
     }
 
-    it('estimates fee on whole lots and odd lots, sell tax by contract, and marks everything estimated', () => {
+    it('estimates fee on whole lots and odd lots, sell tax by contract, and marks everything estimated; credit trades have no net', () => {
         const recs = fromSinopacDeals([
             row({ code: '2330', action: 'Buy', price: 600, qty: 1, ts: NOW / 1000 - 3600, name: '台積電' }),
             row({ code: '2330', action: 'Buy', price: 600, qty: 10, lot: 'IntradayOdd' }),
@@ -117,8 +130,9 @@ describe('fromSinopacDeals', () => {
         expect(recs.map(r => [r.code, r.shares, r.amount, r.fee, r.tax, r.net, r.tradeTypeLabel])).toEqual([
             ['2330', 1000, 600000, 855, 0, -600855, '現股'],
             ['2330', 10, 6000, 9, 0, -6009, '現股'],
-            ['2317', 2000, 301000, 429, 903, 301000 - 429 - 903, '融資'],
-            ['0050', 1000, 180000, 257, 180, 180000 - 257 - 180, '融券'], // ETF 0.1%
+            // 信用交易：交割金額牽涉融資金額與保證金（融券賣出是扣保證金），永豐沒有資料 → 不估算淨收付
+            ['2317', 2000, 301000, 429, 903, null, '融資'],
+            ['0050', 1000, 180000, 257, 180, null, '融券'], // ETF 0.1%
             ['2603', 1000, 100000, 143, 300, 100000 - 143 - 300, '當沖先賣'], // 不判斷當沖減半
         ]);
         expect(recs.every(r => r.estimated && r.realizedPnl === null && r.broker === 'sinopac' && r.tradeDate === '2026-11-09')).toBe(true);
@@ -160,10 +174,12 @@ describe('totals and summaries', () => {
     it('fillTotals sums both sides, costs and only known P&L', () => {
         expect(fillTotals(records)).toEqual({
             count: 4, buyShares: 1010, buyAmount: 600400, sellShares: 3000, sellAmount: 662000,
-            fee: 1799, tax: 1986, otherFees: 10, net: -600855 + 607301 + 51760 - 401, realizedPnl: 7500, estimated: true,
+            fee: 1799, tax: 1986, otherFees: 10, net: -600855 + 607301 + 51760 - 401, netUnknown: 0, realizedPnl: 7500, estimated: true,
         });
         expect(fillTotals([records[0]!]).realizedPnl).toBeNull();
         expect(fillTotals([]).count).toBe(0);
+        // 淨收付無法得知的筆不計入合計，另計 netUnknown
+        expect(fillTotals([rec({ net: null }), rec({ net: -100 })])).toMatchObject({ count: 2, net: -100, netUnknown: 1 });
     });
 
     it('summarizeByStock: one row per code, sorted by |net| descending', () => {
