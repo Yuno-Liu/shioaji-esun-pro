@@ -61,7 +61,7 @@ import { ACTIVE_ORDER_STATUSES, type Action, type FuturesOCType, type OrderType,
 import type { Account, AccountedPosition } from '../lib/types/portfolio';
 import { fmtClock, fmtCompactInt, fmtInt, fmtPrice, fmtSigned, fmtStockLots } from '../lib/utils/format';
 import { clampLotQuantity, CREDIT_TEXT, creditLabel, isOddLot, ODD_LOT_MAX_SHARES, ODD_LOT_TEXT } from '../lib/odd-lot';
-import { triggerCreditFields, triggerCreditText } from '../lib/trigger-credit';
+import { TRIGGER_CREDIT_TEXT, triggerCreditFields, triggerCreditText } from '../lib/trigger-credit';
 import { roundToTick, stepPrice } from '../lib/utils/ticksize';
 import { contractMarket, isWarrantContract } from '../lib/contract-market';
 import { WARRANT_FLASH_TEXT, warrantExitBySharesProblem, warrantMarketOrderBlock, warrantProtectProblem, warrantTriggerProblem } from '../lib/warrant-rules';
@@ -219,6 +219,8 @@ interface RowProps {
     layout: 'columns' | 'modifier';
     /** why triggers cannot be placed now (credit conditions), else null */
     trigBlock: string | null;
+    /** fork：買邊觸價另外停用的原因（融券面板：限價買＝回補可送，觸價不支援回補） */
+    trigBuyBlock?: string | null;
     /** which way a trigger at this price fires (from the traded price); null: unknown */
     trigDir: 'above' | 'below' | null;
     /** what a fired trigger sends, per side (same classification as placing it) */
@@ -256,6 +258,7 @@ const FlashRow = memo(function FlashRow({
     onCancelAt,
     layout,
     trigBlock,
+    trigBuyBlock,
     trigDir,
     trigNote,
     buyMarks,
@@ -270,7 +273,7 @@ const FlashRow = memo(function FlashRow({
     const columns = layout === 'columns';
     const op = trigDir === 'above' ? '≥' : '≤';
     // a side the panel's credit condition cannot send is not a trigger side either
-    const trigSideBlock = (side: 'buy' | 'sell') => trigBlock ?? (side === 'buy' ? buyBlock : sellBlock);
+    const trigSideBlock = (side: 'buy' | 'sell') => trigBlock ?? (side === 'buy' ? trigBuyBlock ?? buyBlock : sellBlock);
     const trigTitle = (side: 'buy' | 'sell') => !armed ? '先啟用閃電下單'
         : trigSideBlock(side) ?? (trigDir === null ? '尚未收到成交價，或此價等於成交價（會立刻觸發），不能掛觸價'
             : `觸價${side === 'buy' ? '買' : '賣'}：成交價 ${op} ${text} 時${trigNote[side]}（不是限價）`);
@@ -285,7 +288,7 @@ const FlashRow = memo(function FlashRow({
             {marks.length > 0 && <MarkChips inline side={side} price={price} marks={marks} dragging={dragSide === side} onMarkDown={onMarkDown} onMarkClick={onMarkClick} />}
         </div>
     );
-    const altHint = (side: 'buy' | 'sell') => (!columns && armed && !trigBlock ? `\nAlt＋點＝觸價${side === 'buy' ? '買' : '賣'}（成交價 ${op} ${text}）` : '');
+    const altHint = (side: 'buy' | 'sell') => (!columns && armed && !trigBlock && !(side === 'buy' && trigBuyBlock) ? `\nAlt＋點＝觸價${side === 'buy' ? '買' : '賣'}（成交價 ${op} ${text}）` : '');
     return (
         <div className={`${styles.row[isLast ? 'last' : 'normal']} ${columns ? styles.cols7 : ''} ${drop ? styles.dropRow[drop] : ''}`}>
             {columns && trigCell('buy', buyMarks)}
@@ -671,6 +674,8 @@ export function FlashOrder({
     const triggerBlock = warrant
         ? warrantTriggerProblem(contract, { send: triggerSendSetting })
         : triggerConditionProblem({ market, creditCond: credit.cond, daytradeShort: credit.daytradeShort });
+    // fork：融券面板的買邊限價／市價＝回補照常可送；觸價單不支援回補，觸買另外停用
+    const triggerBuyBlock = creditApplies && credit.cond === 'ShortSelling' ? TRIGGER_CREDIT_TEXT.shortCover : null;
     const protectRef = useRef({ protect, block: protectBlock });
     protectRef.current = { protect, block: protectBlock };
     // 非預設才顯示標籤
@@ -1304,7 +1309,9 @@ export function FlashOrder({
         if (block) { fail(block); return; }
         // #263 信用條件：點下去當下的面板條件寫進觸價單；不能用的一邊不掛（不改成現股）
         const { applies: creditOn, credit: clickCredit } = creditRef.current;
-        const sideBlock = creditOn ? sideBlockRef.current[action] : null;
+        const sideBlock = creditOn
+            ? (action === 'Buy' && clickCredit.cond === 'ShortSelling' ? TRIGGER_CREDIT_TEXT.shortCover : sideBlockRef.current[action]) // fork：觸價不支援融券回補
+            : null;
         if (sideBlock) { fail(sideBlock); return; }
         const creditFields = creditOn ? triggerCreditFields(clickCredit, action) : {};
         const condition = clickCondition(price, triggerPriceRef.current);
@@ -2162,6 +2169,7 @@ export function FlashOrder({
                             onCancelAt={onCancelAt}
                             layout={triggerLayout}
                             trigBlock={triggerBlock}
+                            trigBuyBlock={triggerBuyBlock}
                             trigDir={trigRef === null ? null : price > trigRef + 1e-9 ? 'above' : price < trigRef - 1e-9 ? 'below' : null}
                             trigNote={trigNote}
                             buyMarks={lm?.buy ?? NO_MARKS}

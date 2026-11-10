@@ -114,12 +114,12 @@ it('融資 both ways; 融券 sells only — its 觸買 column is off and never p
     expect(m.add.mock.calls[0]![0]).toMatchObject({ action: 'Buy', orderCond: 'MarginTrading' });
     const s = await mount(stk, { cond: 'ShortSelling', daytradeShort: false });
     await arm(s);
-    expect(trigCell(s, 'buy', 105).props.title).toContain('融券、借券只能賣出');
+    expect(trigCell(s, 'buy', 105).props.title).toContain('觸價單不支援融券回補'); // fork：限價買＝回補可送，觸買停用
     await trig(s, 'buy', 105);
     await trig(s, 'sell', 95);
     expect(m.add).toHaveBeenCalledTimes(2);
     expect(m.add.mock.calls[1]![0]).toMatchObject({ action: 'Sell', orderCond: 'ShortSelling' });
-    expect(errors().map(e => e.body)).toEqual([expect.stringContaining('融券、借券只能賣出')]);
+    expect(errors().map(e => e.body)).toEqual([expect.stringContaining('觸價單不支援融券回補')]);
 });
 
 it('借券 and a stock that cannot day-trade stay refused, with the exact reason', async () => {

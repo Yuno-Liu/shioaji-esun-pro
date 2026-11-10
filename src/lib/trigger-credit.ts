@@ -17,6 +17,8 @@ export const TRIGGER_CREDIT_TEXT = {
     exit: '停損停利觸價只以現股出場，不能帶信用條件',
     time: '時間條件只支援現股',
     alert: '到價警示不下單，不帶信用條件',
+    // fork：融券買進＝回補（下單匣、閃電、K 線都可送）；觸價單兩個引擎都只收融券賣出，回補不支援
+    shortCover: '觸價單不支援融券回補（融券買進）；回補融券空單請直接下融券買進（限價或市價）',
 } as const;
 
 type CreditShape = Pick<TriggerOrder, 'kind' | 'action' | 'account' | 'orderLot' | 'bracketId' | 'bracketPlan' | 'role' | 'time'
@@ -40,7 +42,7 @@ export function triggerCreditProblem(t: CreditShape): string | null {
     if (t.bracketId || t.bracketPlan) return TRIGGER_CREDIT_TEXT.protect;
     if (t.role !== 'entry') return TRIGGER_CREDIT_TEXT.exit;
     if (t.time) return TRIGGER_CREDIT_TEXT.time;
-    if (cond === 'ShortSelling' && t.action === 'Buy') return CREDIT_TEXT.shortBuy;
+    if (cond === 'ShortSelling' && t.action === 'Buy') return TRIGGER_CREDIT_TEXT.shortCover; // fork：fork 的 CREDIT_TEXT.shortBuy 是借券文字
     if (daytrade && cond) return CREDIT_TEXT.daytradeCond;
     if (daytrade && t.action !== 'Sell') return CREDIT_TEXT.daytradeSide;
     return null;

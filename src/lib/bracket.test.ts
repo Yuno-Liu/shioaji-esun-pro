@@ -720,6 +720,26 @@ describe('trigger execution (main window only)', () => {
         expect(unprotectedQuantity(planOf(plan.id))).toBe(1);
     });
 
+    it('fork：玉山帳戶的權證觸價單在建立時就擋下，不會「已掛」卻送不出去', async () => {
+        await boot();
+        const ES: Account = { account_type: 'S', broker_id: '8840', account_id: 'fixture-esun', person_id: '', signed: true, username: '' };
+        m.accounts = [F1, ES];
+        const WRT = { code: '030001', target_code: null, security_type: 'WRT', exchange: 'TSE' };
+        const before = engine.getTriggers().length;
+        expect(await engine.addTrigger({ code: '030001', condition: 'below', price: 1.5, action: 'Sell', quantity: 1, kind: 'stop' }, WRT as never)).toBeNull();
+        expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'err', title: '觸價單未建立', body: expect.stringContaining('權證') }));
+        expect(engine.getTriggers()).toHaveLength(before);
+        // 一般股票照常建立
+        const STK = { code: '2890', target_code: null, security_type: 'STK', exchange: 'TSE' };
+        expect(await engine.addTrigger({ code: '2890', condition: 'below', price: 44, action: 'Sell', quantity: 1, kind: 'stop' }, STK as never)).not.toBeNull();
+        // 收盤前平倉（數量 0、範圍可以是整個帳戶）不套用建立時的玉山檢查；時間到時逐筆走下單檢查
+        const at = Date.now() + 3_600_000;
+        expect(await engine.addTrigger({ code: '2890', condition: 'above', price: 0, action: 'Sell', quantity: 0, kind: 'stop',
+            time: { kind: 'flatten', at, scope: 'code' } }, STK as never)).not.toBeNull();
+        expect(await engine.addTrigger({ code: '030001', condition: 'above', price: 0, action: 'Sell', quantity: 0, kind: 'stop',
+            time: { kind: 'flatten', at, scope: 'account' } }, WRT as never)).not.toBeNull();
+    });
+
     it('refuses a second stock exit while position is unknown and another exit is unresolved', async () => {
         const { planExitQuantity } = await import('./trigger-engine');
         const account = { account_type: 'S' as const, broker_id: 'b', account_id: 'a' };

@@ -104,7 +104,7 @@ describe('triggerCreditProblem (the engines\' rules)', () => {
     it('refuses what neither engine sends, naming the condition', () => {
         expect(triggerCreditProblem({ ...base, orderCond: 'SBLShort' })).toContain('借券');
         expect(triggerCreditProblem({ ...base, orderCond: 'SBLShortPriceExempt' })).toContain('借券');
-        expect(triggerCreditProblem({ ...base, action: 'Buy', orderCond: 'ShortSelling' })).toContain('融券、借券只能賣出');
+        expect(triggerCreditProblem({ ...base, action: 'Buy', orderCond: 'ShortSelling' })).toContain('觸價單不支援融券回補'); // fork：融券買進＝回補，觸價單不支援
         expect(triggerCreditProblem({ ...base, action: 'Buy', daytradeShort: true })).toContain('只能用在賣出');
         expect(triggerCreditProblem({ ...base, orderCond: 'MarginTrading', daytradeShort: true })).toContain('只限現股');
         expect(triggerCreditProblem({ ...base, orderLot: 'IntradayOdd', daytradeShort: true })).toContain('零股不能現股當沖先賣');

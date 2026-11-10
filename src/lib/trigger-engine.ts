@@ -105,6 +105,7 @@ import type { Account } from './types/portfolio';
 import type { Action, FuturesOCType, StockOrderCond, StockOrderLot, Trade } from './types/order';
 import { triggerCreditProblem, triggerCreditText } from './trigger-credit';
 import { orderStatusLabel, orderStatusWithNumber } from './order-status-label';
+import { esunTriggerProblem } from './esun/trigger-rules'; // fork
 
 /** Why protection resumed with a first-tick check (#144). */
 /** `rearm`: a background trigger turned back on in a new session (#201). */
@@ -900,6 +901,9 @@ function withContext(t: NewTrigger, contract?: ContractBase, account?: Account):
         : futures ? s.selectedFutures : s.selectedStock;
     if (account && !selected) return '指定的下單帳戶已不可用，觸價單未建立';
     if (!selected || !canTrade(selected) || selected.account_type !== (futures ? 'F' : 'S')) return '沒有可用的下單帳戶，觸價單未建立';
+    // fork：玉山帳戶建立時就套用玉山送單規則（權證、興櫃…），不讓「已掛」的觸價單到觸發才送不出去
+    const esun = esunTriggerProblem(selected, contract, t);
+    if (esun) return esun;
     const env = currentProtectionEnv();
     if (!env) return '伺服器模式（模擬／正式）尚未確認，觸價單未建立';
     return { ...t, env,

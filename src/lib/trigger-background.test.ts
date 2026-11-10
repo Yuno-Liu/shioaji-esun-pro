@@ -791,7 +791,7 @@ describe('#226 stocks in the background (step 5)', () => {
         expect(await engine.addTrigger({ ...stop(), code: '2330', price: 900, daytradeShort: true }, STK1 as never)).toBeNull();
         expect(created()).toHaveLength(0);
         const bodies = m.notify.mock.calls.map(([n]) => String((n as { body: string }).body));
-        expect(bodies).toEqual(expect.arrayContaining([expect.stringContaining('不支援借券賣出'), expect.stringContaining('融券、借券只能賣出'),
+        expect(bodies).toEqual(expect.arrayContaining([expect.stringContaining('不支援借券賣出'), expect.stringContaining('觸價單不支援融券回補'), // fork 語意
             expect.stringContaining('現股當沖先賣只能用在賣出'), expect.stringContaining('停損停利觸價只以現股出場')]));
     });
 
