@@ -5,7 +5,8 @@
 //   迷你走勢 canvas（可在帳戶頁關閉）；列尾快速下單鍵 IconButton 44（指數、組合商品不顯示）。
 // - 排行列與自選列共用 components/quote-row.tsx（同一套兩行列）；名次是名稱前的小字，附加資訊在第二行。
 // - 編輯模式：列首移除鍵（rowLeading）、列尾「⋯」＋拖曳握把（grip，touch-action none）；拖曳中的列 rowDragging（transform 由 JS 寫入）。
-// - 底部指數列（indexStrip）放在殼層配件槽（bar 材質上：標籤、數值、漲跌幅文字一律 foreground，方向以有色 ▲▼ 圖形表示）。
+// - 底部指數列（indexStrip）放在殼層配件槽（bar 材質上：標籤、數值、漲跌幅文字一律 foreground，方向以有色 ▲▼ 圖形表示）；
+//   右端收合／展開鍵（indexToggle）。展開面板的樣式在 watch-index-panel.css.ts（隨面板延遲載入）。
 // - 髮絲線左內縮 16；捲動容器內的列用 pressableRow（延後 80ms 加深）。
 // - 顏色只用 vars／sj；漲跌只用 vars.color.up／down 並附 ▲▼ 或正負號；不用 color-mix()、:has()、linear()；
 //   只動畫 opacity（按壓、骨架、跳價閃爍皆由共用元件處理）與拖曳排序的 transform（lib/watch-reorder.ts 寫入）。
@@ -633,11 +634,43 @@ export const ticketSpacer = style({
 
 // ---- 底部指數列（ShellSlot bottom → 配件槽，bar 材質上） ----
 
+/** 指數列外層：左邊是兩格（收合）或展開面板（indexBody），右端是收合／展開鍵（indexToggle） */
+export const indexBar = style({
+    display: 'flex',
+    alignItems: 'flex-start',
+    padding: `0 calc(${SPACE.s1} + ${SAFE_RIGHT}) 0 calc(${SPACE.s2} + ${SAFE_LEFT})`,
+});
+
+export const indexBody = style({
+    flex: '1 1 auto',
+    minWidth: 0,
+});
+
 export const indexStrip = style({
     display: 'grid',
     gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-    padding: `0 calc(${SPACE.s2} + ${SAFE_RIGHT}) 0 calc(${SPACE.s2} + ${SAFE_LEFT})`,
 });
+
+/** 收合／展開鍵：點擊區 TOUCH_MIN×TOUCH_MIN、靠上（展開時在面板右上角）；圖示 foreground（bar 材質） */
+export const indexToggle = style({
+    flex: '0 0 auto',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: TOUCH_MIN,
+    height: TOUCH_MIN,
+    margin: 0,
+    padding: 0,
+    border: 'none',
+    background: 'transparent',
+    color: vars.color.foreground,
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    WebkitTapHighlightColor: 'transparent',
+});
+
+/** 收合時的圖示：ChevronDown 轉 180°（＝向上，表示可往上展開；不另載 ChevronUp） */
+export const indexChevronUp = style({ transform: 'rotate(180deg)' });
 
 export const indexCell = style({
     position: 'relative',
@@ -659,6 +692,8 @@ export const indexCell = style({
     selectors: {
         // 兩格之間一條髮絲線（不用 :has()）
         '& + &': { boxShadow: `inset 0.5px 0 0 ${vars.color.border}` },
+        // 字級「大」：右端多了切換鍵，格約 140px（360 寬）。內距與間距縮小；仍放不下時值換到標籤下一行（不溢出）
+        'html[data-sj-font-scale="1.3"] &': { flexWrap: 'wrap', columnGap: SPACE.s1, padding: `0 ${SPACE.s1}` },
     },
 });
 
