@@ -4930,9 +4930,10 @@ class EsunTradeBridge:
         stock_no = stock_no.strip()
         action = to_action(payload.get("buySell", payload.get("buy_sell")))
         ap_code = to_ap_code(payload.get("apCode", payload.get("ap_code")))
-        bs_flag = to_bs_flag(payload.get("bsFlag", payload.get("bs_flag")))
-        price_flag = to_price_flag(payload.get("priceFlag", payload.get("price_flag")))
-        trade = to_trade(payload.get("trade"))
+        # New orders never fall back to ROD / limit / cash: a missing field is refused (400, not sent).
+        bs_flag = to_bs_flag(payload.get("bsFlag", payload.get("bs_flag")), default=None)
+        price_flag = to_price_flag(payload.get("priceFlag", payload.get("price_flag")), default=None)
+        trade = to_trade(payload.get("trade"), default=None)
         quantity = parse_positive_int(payload.get("quantity"), "quantity")
 
         ap, flag, trade_code, side = enum_value(ap_code), enum_value(price_flag), enum_value(trade), enum_value(action)

@@ -691,7 +691,7 @@ class TestFullHttpIntegration(unittest.TestCase):
     def test_mutation_http_refused_not_sent_inside_switch_swap_window(self):
         env = {"expected_environment": "SIMULATION", "expected_account": "1234567"}
         order = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0,
-                             "apCode": "1", "priceFlag": "0", "bsFlag": "R"}, **env}
+                             "apCode": "1", "priceFlag": "0", "bsFlag": "R", "trade": "0"}, **env}
         placed_before = len(self.mock_sdk.placed_orders)
         with self.bridge._mutations_cond:
             self.bridge._env_switch_in_progress = True
@@ -727,6 +727,7 @@ class TestFullHttpIntegration(unittest.TestCase):
                 "apCode": "1",
                 "priceFlag": "0",
                 "bsFlag": "R",
+                "trade": "0",
             },
             **env,
         }
@@ -1580,7 +1581,8 @@ def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.02) -> bool
     return predicate()
 
 
-_QUIET_ORDER = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1", "priceFlag": "0", "bsFlag": "R"}
+_QUIET_ORDER = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1", "priceFlag": "0", "bsFlag": "R",
+                "trade": "0"}
 
 
 class _BridgeCase(unittest.TestCase):
@@ -2641,6 +2643,29 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         self.assertEqual(self._core_calls("order"), [])
         self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
 
+    def test_place_order_requires_trade_bs_flag_and_price_flag(self):
+        # New orders never silently become cash / ROD / limit: each field is required (400, not_sent).
+        full = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1",
+                "priceFlag": "0", "bsFlag": "R", "trade": "0"}
+        for field in ("trade", "bsFlag", "priceFlag"):
+            for missing in ("absent", None, "", "  "):
+                with self.subTest(field=field, missing=missing):
+                    payload = dict(full)
+                    if missing == "absent":
+                        del payload[field]
+                    else:
+                        payload[field] = missing
+                    res, status = self.bridge.place_order({"payload": payload, **self.env})
+                    self.assertEqual((status, res["outcome"], res["code"]), (400, "not_sent", "ESUN_INVALID_PARAMS"))
+                    self.assertIn(f"缺少必要欄位 {field}", res["error"])
+        # snake_case aliases still satisfy the requirement.
+        snake = {k: v for k, v in full.items() if k not in ("priceFlag", "bsFlag")}
+        snake.update(price_flag="0", bs_flag="R")
+        self.assertEqual(self._core_calls("order"), [])
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
+        res, status = self.bridge.place_order({"payload": snake, **self.env})
+        self.assertEqual(status, 200, res)
+
     def test_environment_and_account_checks(self):
         res, status = self.bridge.place_order({"payload": {"stockNo": "2330"}, "expected_environment": "PRODUCTION"})
         self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ENV_MISMATCH", "not_sent"))
@@ -2656,7 +2681,8 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         self.assertEqual(self.core.calls[1:], [])  # only the login call
         # Accepted forms: lower-case environment, 11-digit account with the right branch.
         res, status = self.bridge.place_order({
-            "payload": {"stockNo": "2330", "buySell": "S", "quantity": 1, "price": 951.0, "apCode": "1"},
+            "payload": {"stockNo": "2330", "buySell": "S", "quantity": 1, "price": 951.0, "apCode": "1",
+                        "priceFlag": "0", "bsFlag": "R", "trade": "0"},
             "expectedEnvironment": "simulation", "expectedAccount": "88401234567",
         })
         self.assertEqual(status, 200, res)
@@ -4785,7 +4811,8 @@ class TestGracefulShutdownMutations(_BridgeCase):
     def setUp(self):
         super().setUp()
         self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
-        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1"},
+        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1",
+                                 "priceFlag": "0", "bsFlag": "R", "trade": "0"},
                      "expected_environment": "SIMULATION", "expected_account": "1234567"}
 
     def _post(self, port, body):
@@ -4974,7 +5001,8 @@ class TestSessionExpiryAndAutoRelogin(_BridgeCase):
     def setUp(self):
         super().setUp()
         self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
-        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1"},
+        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1",
+                                 "priceFlag": "0", "bsFlag": "R", "trade": "0"},
                      "expected_environment": "SIMULATION", "expected_account": "1234567"}
         self.mutation_body = {**self.body, "order_no": "O0001", "price": 951.0,
                               "cancel_quantity": 1, "quantity_unit": "lot"}
