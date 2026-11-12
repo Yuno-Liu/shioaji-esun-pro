@@ -1,6 +1,6 @@
 // src/mobile/lib/chart-readout.ts — 交易圖表點選／長按追蹤時圖例上方的價格資訊列（設計規格 §7.3）
 //
-// - 走勢：時間 HH:mm、該分鐘的價格（formatToTick）、漲跌（▲▼＋差額）與漲跌%（正負號、2 位小數），
+// - 走勢：時間 HH:mm、該分鐘的價格（formatQuotePrice：指數固定兩位、其他 formatToTick）、漲跌（▲▼＋差額）與漲跌%（正負號、2 位小數），
 //   基準與走勢 BaselineSeries 的基準線相同：合約參考價。參考價 ≤ 0（例如指數沒有參考價）時只顯示價格。
 // - K 線：該根的收盤與「較前一根」收盤的漲跌；日 K 時間改 MM/DD；第一根沒有前一根，只顯示收盤。
 // - 漲跌差額不吸附到跳動價位（參考價與成交價可能落在不同級距，例如 99.9 → 100.5 差 0.6，
@@ -11,7 +11,7 @@
 
 import { tickDecimals, tickSizeFor } from '../../lib/utils/ticksize';
 import type { Candle } from '../../lib/types/market';
-import { cachedNumberFormat, formatToTick } from './num-format';
+import { cachedNumberFormat, formatQuotePrice } from './num-format';
 
 type TickContract = Parameters<typeof tickSizeFor>[0];
 
@@ -61,8 +61,9 @@ export function readoutTime(time: number, daily: boolean): string {
     return daily ? `${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}` : `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 }
 
-/** 差額的小數位數：價格與基準各自級距的較大者 */
+/** 差額的小數位數：價格與基準各自級距的較大者；指數沒有跳動單位，固定兩位 */
 function diffDecimals(contract: TickContract, price: number, base: number): number {
+    if (contract.security_type === 'IND') return 2;
     return Math.max(tickDecimals(tickSizeFor(contract, Math.abs(price))), tickDecimals(tickSizeFor(contract, Math.abs(base))));
 }
 
@@ -78,6 +79,16 @@ export function readoutChange(contract: TickContract, price: number, base: numbe
     return { dir, text: `${arrow}${abs}`, pct: `${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`, abs };
 }
 
+/**
+ * 漲跌差額（絕對值，不吸附跳動價位）：價格與漲跌 → 參考價＝價格 − 漲跌，再交給 readoutChange；
+ * 推不出正數參考價時回傳 null（呼叫端自行退回）。交易頁標頭、精簡標頭與下單面板報價共用。
+ */
+export function changeAbsText(contract: TickContract, price: number, change: number): string | null {
+    // 價格 − 漲跌 有浮點誤差（100.5 − 0.6 → 99.89999…），先收斂再判斷級距
+    const base = Number((price - change).toFixed(6));
+    return readoutChange(contract, price, base)?.abs ?? null;
+}
+
 /** bars[i] 的資訊列；i 超出範圍時回傳 null */
 export function chartReadout(bars: readonly Candle[], i: number, o: ReadoutOptions): ChartReadout | null {
     const bar = bars[i];
@@ -86,7 +97,7 @@ export function chartReadout(bars: readonly Candle[], i: number, o: ReadoutOptio
     const base = line ? o.reference : bars[i - 1]?.close ?? NaN;
     const ch = readoutChange(o.contract, bar.close, base);
     const time = readoutTime(bar.time, !line && o.daily);
-    const price = formatToTick(o.contract, bar.close);
+    const price = formatQuotePrice(o.contract, bar.close);
     const label = line ? '' : '較前一根';
     const dirWord = ch ? (ch.dir === 'up' ? '上漲' : ch.dir === 'down' ? '下跌' : '平盤') : '';
     const volume = o.volume && Number.isFinite(bar.volume) && bar.volume >= 0

@@ -464,3 +464,15 @@ describe('DepthLadder 表頭縮寫（設計規格 §4.7：字級「大」以 htm
         expect(view!.root.findAll(n => n.props.className === tradeStyles.depthHeadShort).map(n => text(n))).toEqual(['買量', '賣量']);
     });
 });
+
+describe('DepthLadder 價位著色：盤前／跨夜用串流自身的參考價（2026-11-13 稽核）', () => {
+    it('合約已換成新交易日的參考 1,100，五檔與成交仍是昨日（現價 985、漲 1 → 參考 984）：以 984 著色', async () => {
+        quoteMock.useQuote.mockImplementation(() => ({ bidask: BIDASK, tick: { ...TICK, price_chg: '1' }, lastDir: 0, seq: 1, flashSeq: 0 }));
+        await act(async () => {
+            view = create(createElement(DepthLadder, { code: '2330', contract: { ...contract, reference: 1100 }, trades: [] }));
+        });
+        expect(classOf('depth-bid-1')).toContain('flat');
+        expect(classOf('depth-ask-1')).toContain('up');
+        expect(classOf('depth-bid-2')).toContain('down');
+    });
+});

@@ -1619,3 +1619,66 @@ describe('TradePage 自選 ☆', () => {
         for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
     });
 });
+
+describe('TradePage 行情數字（2026-11-13 稽核）', () => {
+    const tone = (id: string) => String(byId(id).findByType('dd').props.className);
+
+    it('指數不套股票跳動單位：主價、漲跌與統計格固定兩位（23,456.78，不是 23,455；▲123.45，不是 ▲125）', async () => {
+        const ind = { ...stock, code: '001', security_type: 'IND', exchange: 'TSE', name: '加權指數', limit_up: 0, limit_down: 0, reference: 0, day_trade: 'No' } as ContractInfo;
+        m.useContract.mockReturnValue(ind);
+        m.ensureContract.mockResolvedValue(ind);
+        m.useQuote.mockReturnValue({ index: { code: '001', close: '23456.78', reference: '23333.33', open: '23345.67', high: '23501.23', low: '23301.11' } });
+        await render('001');
+        const price = text(byId('trade-price'));
+        expect(price).toContain('23,456.78');
+        expect(price).toContain('▲123.45');
+        expect(price).toContain(`(+${((123.45 / 23333.33) * 100).toFixed(2)}%)`);
+        expect(text(byId('trade-stat-open'))).toBe('開23,345.67');
+        expect(text(byId('trade-stat-high'))).toBe('高23,501.23');
+        expect(text(byId('trade-stat-low'))).toBe('低23,301.11');
+        expect(text(byId('trade-stat-reference'))).toBe('參23,333.33');
+    });
+
+    it('漲跌差額不吸附到現價級距：參考 997 → 成交 1000 是 ▲3（不是 ▲5）；99.9 → 100.5 是 ▲0.6；499.5 → 501 是 ▲1.5', async () => {
+        for (const [close, chg, want] of [['1000', '3', '▲3 ('], ['100.5', '0.6', '▲0.6 ('], ['501', '1.5', '▲1.5 (']] as const) {
+            m.useQuote.mockReturnValue({ tick: { code: '2330', close, price_chg: chg, total_volume: 1 } });
+            await render();
+            expect(text(byId('trade-price'))).toContain(want);
+            await act(async () => view?.unmount());
+        }
+    });
+
+    it('盤前／跨夜：統計格的「參」與著色用報價自身的參考價（合約已換成新交易日的 110；昨日參考 100、收 110）', async () => {
+        m.useContract.mockReturnValue({ ...stock, reference: 110, limit_up: 121, limit_down: 99 });
+        m.useQuote.mockReturnValue({ tick: { code: '2330', close: '110', price_chg: '10', open: '100', high: '111', low: '99', avg_price: '105', total_volume: 1 } });
+        await render();
+        expect(text(byId('trade-stat-reference'))).toBe('參100.0');
+        // 開 100＝昨日參考：平盤（不是相對 110 的下跌綠色）；低 99 下跌、高 111 上漲
+        expect(tone('trade-stat-open')).toContain('flat');
+        expect(tone('trade-stat-low')).toContain('down');
+        expect(tone('trade-stat-high')).toContain('up');
+        // 漲跌幅 10/100＝10.00%，不是 10/110＝9.09%
+        expect(text(byId('trade-price'))).toContain('▲10.0 (+10.00%)');
+    });
+
+    it('選擇權：成交價等於跌停／漲停價也不標「跌停／漲停」', async () => {
+        const opt = { ...stock, code: 'TXO23000L6', security_type: 'OPT', exchange: 'TAIFEX', name: '臺指選', limit_up: 1500, limit_down: 0.1, reference: 5, delivery_month: '202612' } as ContractInfo;
+        m.useContract.mockReturnValue(opt);
+        m.ensureContract.mockResolvedValue(opt);
+        m.useQuote.mockReturnValue({ tick: { code: 'TXO23000L6', close: '0.1', price_chg: '-4.9', total_volume: 1 } });
+        await render('TXO23000L6');
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-limit' })).toHaveLength(0);
+    });
+
+    it('興櫃：沒有漲跌停——不標「漲停／跌停」、不列漲跌停價', async () => {
+        const oes = { ...stock, code: '7777', exchange: 'OES', name: '興櫃股', limit_up: 1175, limit_down: 963, day_trade: 'No' } as ContractInfo;
+        m.useContract.mockReturnValue(oes);
+        m.ensureContract.mockResolvedValue(oes);
+        m.useQuote.mockReturnValue({ tick: { code: '7777', close: '1175', price_chg: '105', total_volume: 1 } });
+        await render('7777');
+        expect(view!.root.findAllByProps({ 'data-testid': 'trade-limit' })).toHaveLength(0);
+        const info = text(byId('trade-info'));
+        expect(info).not.toContain('漲停');
+        expect(info).not.toContain('跌停');
+    });
+});

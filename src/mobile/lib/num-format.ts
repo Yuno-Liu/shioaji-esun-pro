@@ -85,3 +85,18 @@ export function formatToTick(
         useGrouping: opts.grouping ?? true,
     }).format(rounded);
 }
+
+/**
+ * 行情價格文字：指數固定兩位、不吸附跳動價位（同 lib/utils/format fmtPrice(v, 2)、桌面 quote-board 的指數）；
+ * 其他商品同 formatToTick。指數沒有跳動單位，tickSizeFor 對 IND 會套股票級距（23,456.78 → 23,455），不能用。
+ */
+export function formatQuotePrice(
+    contract: Parameters<typeof tickSizeFor>[0],
+    price: number,
+    opts: { grouping?: boolean; at?: number } = {},
+): string {
+    if (contract.security_type !== 'IND') return formatToTick(contract, price, opts);
+    if (!Number.isFinite(price)) return '—';
+    const two = { minimumFractionDigits: 2, maximumFractionDigits: 2 };
+    return cachedNumberFormat('en-US', opts.grouping === false ? { ...two, useGrouping: false } : two).format(price);
+}

@@ -102,11 +102,11 @@ export function positionCostLines(orderableCode: string, positions: readonly Acc
     return out;
 }
 
-type LimitContract = Pick<ContractInfo, 'security_type' | 'limit_up' | 'limit_down' | 'reference'>;
+type LimitContract = Pick<ContractInfo, 'security_type' | 'limit_up' | 'limit_down' | 'reference'> & Partial<Pick<ContractInfo, 'exchange'>>;
 
-/** 漲停／跌停線：只有股票（期貨、選擇權、指數不畫） */
+/** 漲停／跌停線：只有股票（期貨、選擇權、指數不畫；興櫃沒有漲跌停也不畫） */
 export function limitLines(contract: LimitContract): PriceLineSpec[] {
-    if (contract.security_type !== 'STK') return [];
+    if (contract.security_type !== 'STK' || contract.exchange === 'OES') return [];
     const out: PriceLineSpec[] = [];
     if (contract.limit_up > 0) out.push({ key: 'limit-up', price: contract.limit_up, kind: 'limit-up', label: '漲停' });
     if (contract.limit_down > 0) out.push({ key: 'limit-down', price: contract.limit_down, kind: 'limit-down', label: '跌停' });

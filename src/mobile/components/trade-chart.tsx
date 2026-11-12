@@ -404,10 +404,10 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         const c = colorsRef.current;
         const ct = contractRef.current;
         const minutes = periodDef(period).minutes;
-        const tick = tickSizeFor(ct, ct.reference > 0 ? ct.reference : 1);
-        const precision = tickDecimals(tick);
-        const priceFormat = { type: 'price' as const, precision, minMove: Number((10 ** -precision).toFixed(precision)) };
         const isIndex = ct.security_type === 'IND';
+        // 指數沒有跳動單位：價格軸固定兩位、minMove 0.01（tickSizeFor 對 IND 會套股票級距，23,456.78 會變成整數）
+        const precision = isIndex ? 2 : tickDecimals(tickSizeFor(ct, ct.reference > 0 ? ct.reference : 1));
+        const priceFormat = { type: 'price' as const, precision, minMove: Number((10 ** -precision).toFixed(precision)) };
         /** 走勢且開啟漲跌停範圍、商品有正數漲跌停 */
         const limitActive = () => isLine && limitOnRef.current && hasLimitRange(contractRef.current);
 

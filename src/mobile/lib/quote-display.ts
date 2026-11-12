@@ -9,6 +9,9 @@
 //
 // - 試撮（tick.simtrade）揭示價可能是天地價，**不當成最新成交價**：只回傳在 sim 供「試撮」徽章顯示。
 // - 漲跌幅一律以漲跌與參考價推算（指數用 index.reference），不使用 tick.pct_chg（股票與期權串流單位不同）。
+// - 參考價跟著報價自己推（quoteRef：成交＝現價 − price_chg、快照＝收盤 − change_price）：盤前開 App 或跨夜開著時，
+//   合約已換成新交易日的參考價，成交或快照卻還是前一日的，拿合約參考價當漲跌幅分母、統計格的「參」會對不上
+//   （同桌面 src/components/quote-board.tsx 的 derivedRef）。推不出正數時才用合約參考價。
 // - headerStats（統計格）、innerOuterRatio（內外盤比）、splitPercent（五檔買賣比例）也在這裡，與價格來源規則共用。
 
 import { marketTime } from '../../lib/display-book';
@@ -80,14 +83,44 @@ function notOlderThan(tick: HeaderTick, snapshot: Snapshot): boolean {
     return !Number.isFinite(a) || !Number.isFinite(b) || a >= b;
 }
 
+/** 價格 − 漲跌 推回的參考價（收斂浮點誤差：100.5 − 0.6 → 99.9）；不是正數時 null */
+function derivedRef(close: number, change: number): number | null {
+    if (!Number.isFinite(close) || !Number.isFinite(change) || !(close > 0)) return null;
+    const ref = Number((close - change).toFixed(6));
+    return ref > 0 ? ref : null;
+}
+
+/** 成交 tick 自身的參考價（現價 − price_chg）；缺漲跌或推不出正數時 null */
+export function tickQuoteRef(tick: Pick<HeaderTick, 'close' | 'price_chg'> | undefined): number | null {
+    return tick ? derivedRef(num(tick.close), num(tick.price_chg)) : null;
+}
+
+/** 快照自身的參考價（收盤 − change_price）；沒成交的 0／0 快照、推不出正數時 null */
+export function snapshotQuoteRef(snapshot: Pick<Snapshot, 'close' | 'change_price'> | undefined): number | null {
+    return snapshot ? derivedRef(num(snapshot.close), num(snapshot.change_price)) : null;
+}
+
+/**
+ * 報價自己的參考價（與 headerQuote 同一個來源）：指數 index.reference、成交 現價 − 漲跌、快照 收盤 − 漲跌；
+ * 推不出來時用合約參考價；都沒有時 null。統計格的「參」、開高低均與五檔價位的著色都以此為準。
+ */
+export function quoteReference(input: HeaderQuoteInput): number | null {
+    const contractRef = input.reference && input.reference > 0 ? input.reference : null;
+    if (validIndex(input.index)) return positive(input.index.reference) ?? contractRef;
+    const real = chosenTick(input);
+    if (real) return tickQuoteRef(real) ?? contractRef;
+    if (validSnapshot(input.snapshot)) return snapshotQuoteRef(input.snapshot) ?? contractRef;
+    return contractRef;
+}
+
 function fromTick(tick: HeaderTick, reference: number | undefined): Omit<HeaderQuote, 'sim'> | null {
     const price = num(tick.close);
     if (!Number.isFinite(price) || price <= 0) return null;
     const chgRaw = num(tick.price_chg);
     const ref = reference && reference > 0 ? reference : null;
     const change = Number.isFinite(chgRaw) ? chgRaw : ref !== null ? price - ref : null;
-    // 參考價優先用合約；沒有時用串流自身的參考（現價 − 漲跌）
-    const base = ref ?? (change !== null && price - change > 0 ? price - change : null);
+    // 漲跌幅的分母：串流自身的參考（現價 − 漲跌）優先，與漲跌同一個交易日；沒有漲跌時才用合約參考價
+    const base = tickQuoteRef(tick) ?? ref;
     const pct = change !== null && base !== null ? (change / base) * 100 : null;
     const total = num(tick.total_volume);
     return { price, change, pct, dir: dirOf(change), source: 'tick', totalVolume: Number.isFinite(total) ? total : null };
@@ -146,7 +179,7 @@ export interface HeaderStats {
     open: number | null;
     high: number | null;
     low: number | null;
-    /** 參考價（合約；沒有時由成交價與漲跌推回） */
+    /** 參考價（報價自身：成交價或快照收盤與漲跌推回；推不出時用合約，見 quoteReference） */
     reference: number | null;
     /** 均價 */
     avg: number | null;
@@ -172,25 +205,22 @@ const nonNegative = (v: unknown): number | null => {
  * 避免把前一日快照的累計量接在今日成交上。試撮 tick 的開高低與量不採用。
  */
 export function headerStats(input: HeaderQuoteInput): HeaderStats {
-    const { reference, index, snapshot } = input;
-    const contractRef = reference && reference > 0 ? reference : null;
+    const { index, snapshot } = input;
     const empty = { open: null, high: null, low: null, avg: null, totalVolume: null, lastVolume: null, totalAmount: null };
 
+    const reference = quoteReference(input);
     if (validIndex(index)) {
-        return { ...empty, source: 'index', open: positive(index.open), high: positive(index.high), low: positive(index.low), reference: positive(index.reference) ?? contractRef };
+        return { ...empty, source: 'index', open: positive(index.open), high: positive(index.high), low: positive(index.low), reference };
     }
 
     const real = chosenTick(input);
     if (real) {
-        const close = num(real.close);
-        const chg = num(real.price_chg);
-        const derived = Number.isFinite(chg) && close - chg > 0 ? close - chg : null;
         return {
             source: 'tick',
             open: positive(real.open),
             high: positive(real.high),
             low: positive(real.low),
-            reference: contractRef ?? derived,
+            reference,
             avg: positive(real.avg_price),
             totalVolume: nonNegative(real.total_volume),
             lastVolume: nonNegative(real.volume),
@@ -199,13 +229,12 @@ export function headerStats(input: HeaderQuoteInput): HeaderStats {
     }
 
     if (validSnapshot(snapshot)) {
-        const derived = Number.isFinite(snapshot.change_price) && snapshot.close - snapshot.change_price > 0 ? snapshot.close - snapshot.change_price : null;
         return {
             source: 'snapshot',
             open: positive(snapshot.open),
             high: positive(snapshot.high),
             low: positive(snapshot.low),
-            reference: contractRef ?? derived,
+            reference,
             avg: positive(snapshot.average_price),
             totalVolume: nonNegative(snapshot.total_volume),
             lastVolume: nonNegative(snapshot.volume),
@@ -213,7 +242,7 @@ export function headerStats(input: HeaderQuoteInput): HeaderStats {
         };
     }
 
-    return { ...empty, source: 'none', reference: contractRef };
+    return { ...empty, source: 'none', reference };
 }
 
 /** 價格相對參考價的方向（著色用；沒有參考價時為 flat） */

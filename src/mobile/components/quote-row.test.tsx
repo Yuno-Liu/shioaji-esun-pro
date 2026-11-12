@@ -235,3 +235,69 @@ describe('日內區間小條', () => {
         expect(onTicket).not.toHaveBeenCalled();
     });
 });
+
+// ---- 2026-11-13 稽核：盤前／跨夜的參考價、只有快照的列、選擇權與興櫃的停板、試撮時的總量 ----
+
+describe('rowQuoteView：報價自身的參考價（盤前／跨夜）', () => {
+    // 昨日參考 100、收 110；今日合約參考已換成 110
+    const today = { reference: 110, security_type: 'STK' as const };
+
+    it('有 tick：漲跌幅分母用 現價 − price_chg（10/100＝10%，不是 10/110＝9.09%）', () => {
+        const v = rowQuoteView(today, undefined, { tick: { close: '110', price_chg: '10', total_volume: 5 } as never });
+        expect(v).toMatchObject({ close: 110, chg: 10, dir: 'up', ref: 100 });
+        expect(v.pct).toBeCloseTo(10, 10);
+    });
+
+    it('只有快照：漲跌、漲跌幅用快照的 change_price／change_rate（與標頭、watch-sort 一致），不是 收盤 − 合約參考價＝0', () => {
+        const v = rowQuoteView(today, { close: 110, change_price: 10, change_rate: 10, total_volume: 7 } as never, undefined);
+        expect(v).toMatchObject({ close: 110, chg: 10, pct: 10, dir: 'up', ref: 100, vol: 7 });
+    });
+
+    it('快照沒有 change_price 時才退回合約參考價', () => {
+        expect(rowQuoteView(today, { close: 121, change_rate: 0 } as never, undefined)).toMatchObject({ chg: 11, ref: 110 });
+    });
+});
+
+describe('rowQuoteView：試撮時的總量', () => {
+    const c = { reference: 1000, security_type: 'STK' as const };
+    const sim = { close: '1050', price_chg: '50', simtrade: true, total_volume: 3 } as never;
+
+    it('價格維持試撮價（徽章），總量改用上一筆真實成交的 total_volume', () => {
+        const v = rowQuoteView(c, { close: 1000, change_price: 0, change_rate: 0, total_volume: 900 } as never, { tick: sim }, { close: '1010', price_chg: '10', total_volume: 12345 } as never);
+        expect(v).toMatchObject({ close: 1050, simtrade: true, vol: 12345 });
+    });
+
+    it('沒有看過真實成交時用快照的 total_volume；兩者都沒有時不顯示', () => {
+        expect(rowQuoteView(c, { close: 1000, change_price: 0, change_rate: 0, total_volume: 900 } as never, { tick: sim })).toMatchObject({ close: 1050, vol: 900 });
+        expect(rowQuoteView(c, undefined, { tick: sim }).vol).toBeUndefined();
+    });
+
+    it('QuoteRow：先收到真實成交、再收到試撮 tick 時，第二行總量沿用真實成交', async () => {
+        vi.useFakeTimers();
+        let push: ((q: unknown) => void) | undefined;
+        const Probe = ({ onQuote }: { onQuote: (q: never) => void }) => { push = onQuote as never; return null; };
+        await render({ testPrefix: 'watch', staticView: undefined, quoteContract: c, probe: Probe as never, metric: 'vol' });
+        await act(async () => { push!({ tick: { close: '1010', price_chg: '10', total_volume: 12345 } }); vi.advanceTimersByTime(200); });
+        expect(textOf(all('watch-change')[0]!)).toBe('1.2萬');
+        await act(async () => { push!({ tick: sim }); vi.advanceTimersByTime(200); });
+        expect(all('watch-simtrade')).toHaveLength(1);
+        expect(textOf(all('watch-price')[0]!)).toBe('1,050');
+        expect(textOf(all('watch-change')[0]!)).toBe('1.2萬');
+    });
+});
+
+describe('QuoteRow：選擇權與興櫃不標漲停／跌停', () => {
+    const priceBox = () => all('ranking-price')[0]!.parent!;
+
+    it('選擇權（跌停只是最小跳動的地板）、興櫃（沒有漲跌停）：價格等於停板價也不標示', async () => {
+        const opt = { reference: 5, security_type: 'OPT' as const, exchange: 'TAIFEX' as const, limit_up: 1500, limit_down: 0.1 };
+        await render({ quoteContract: opt, staticView: { close: 0.1, chg: -4.9, pct: -98, dir: 'down', simtrade: false } });
+        expect(priceBox().props.className).not.toContain(wlStyles.limitPrice.down);
+        expect(all('ranking-row-button')[0]!.props['aria-label']).not.toContain('跌停');
+        await act(async () => view!.unmount());
+        const oes = { reference: 1000, security_type: 'STK' as const, exchange: 'OES' as const, limit_up: 1100, limit_down: 900 };
+        await render({ quoteContract: oes });
+        expect(priceBox().props.className).not.toContain(wlStyles.limitPrice.up);
+        expect(all('ranking-row-button')[0]!.props['aria-label']).not.toContain('漲停');
+    });
+});

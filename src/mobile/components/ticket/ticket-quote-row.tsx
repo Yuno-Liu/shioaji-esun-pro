@@ -6,16 +6,26 @@
 // - 價格來源與漲跌計算沿用 lib/quote-display.ts 的 headerQuote（排除試撮、成交早於快照時用快照、最後才用參考價）。
 // - 成交價相對參考價著色（vars.color.up／down）並加 ▲▼ 符號（不只靠顏色）；漲跌色小字只放在中性島內（§4.8 規則 7）。
 // - 「單」＝最近一筆真實成交的單量；「總」＝累計成交量。股票整股以張、期權以口。文字格式不變。
+// - 漲跌差額不吸附到現價級距（參考 997 → 成交 1000 是 +3，不是 +5；lib/chart-readout changeAbsText）。
+// - 數字格式走手機快取版 lib/num-format（與 src/lib 版本逐字相同，見 num-format.test.ts）。
 
 import { useRef } from 'react';
 import { useQuote } from '../../../hooks/use-stream';
 import type { ContractInfo } from '../../../lib/types/contract';
 import type { Snapshot } from '../../../lib/types/market';
-import { formatToTick } from '../../../lib/utils/ticksize';
+import { changeAbsText } from '../../lib/chart-readout';
+import { formatNumber, formatToTick } from '../../lib/num-format';
 import { headerQuote, type HeaderTick } from '../../lib/quote-display';
 import * as styles from '../../styles/order-ticket.css';
 
-const fmtInt = (v: number) => Math.round(v).toLocaleString('en-US');
+const fmtInt = (v: number) => formatNumber(Math.round(v), 'en-US');
+
+/** 帶正負號的漲跌差額（+3／-0.6／0）：不吸附跳動價位；推不出參考價時退回現價級距 */
+export function ticketChangeText(contract: ContractInfo, price: number | null, change: number): string {
+    const abs = price !== null ? changeAbsText(contract, price, change) : null;
+    if (abs === null) return formatToTick(contract, change, { at: price ?? undefined });
+    return `${change > 0 ? '+' : change < 0 ? '-' : ''}${abs}`;
+}
 
 export function TicketQuoteRow({ contract, snapshot }: { contract: ContractInfo; snapshot: Snapshot | null | undefined }) {
     const quote = useQuote(contract.code);
@@ -37,7 +47,7 @@ export function TicketQuoteRow({ contract, snapshot }: { contract: ContractInfo;
                 </span>
                 {q.change !== null && (
                     <span className={styles.quoteChange[q.dir]} data-testid='ticket-quote-change'>
-                        {sign}{plus(q.change)}{formatToTick(contract, q.change, { at: q.price ?? undefined })}
+                        {sign}{ticketChangeText(contract, q.price, q.change)}
                         {q.pct !== null && ` ${plus(q.pct)}${q.pct.toFixed(2)}%`}
                     </span>
                 )}
