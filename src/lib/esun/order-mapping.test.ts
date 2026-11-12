@@ -1309,8 +1309,14 @@ describe('Portfolio & SSE Mapping', () => {
             expect(esunTimestamp('20261023', '201530000')).toBe(tpe(20, 15, 30));
         });
 
+        it('more than 9 digits (e.g. microseconds) keeps the leading HHMMSSmmm, like the old 6-digit prefix rule', () => {
+            expect(esunTimestamp('20261023', '09:30:15.123456')).toBe(tpe(9, 30, 15));
+            expect(esunTimestamp('20261023', '093015123456')).toBe(tpe(9, 30, 15));
+            expect(esunTimestamp('20261023', '0930151234')).toBe(tpe(9, 30, 15));
+        });
+
         it('returns undefined for missing or malformed date/time', () => {
-            for (const t of ['', '1234', '0930151234', 'abcdef', undefined]) expect(esunTimestamp('20261023', t)).toBeUndefined();
+            for (const t of ['', '1234', 'abcdef', '09a015', undefined]) expect(esunTimestamp('20261023', t)).toBeUndefined();
             expect(esunTimestamp('', '093015')).toBeUndefined();
         });
 

@@ -639,8 +639,9 @@ export function sortEsunOrderResultsOldestFirst<T extends Record<string, unknown
 export function esunTimestamp(date: unknown, time: unknown): number | undefined {
     const d = String(date ?? '').replace(/-/g, '').trim();
     const raw = String(time ?? '').replace(/[:.]/g, '').trim();
-    if (!/^\d{8}$/.test(d) || !/^\d{5,9}$/.test(raw)) return undefined;
-    const t = raw.length <= 6 ? raw.padStart(6, '0') : raw.padStart(9, '0');
+    if (!/^\d{8}$/.test(d) || !/^\d{5,}$/.test(raw)) return undefined;
+    // 5～6 碼＝HHMMSS；7～9 碼＝去掉前導零的 HHMMSSmmm；超過 9 碼（含微秒，例如 09:30:15.123456）取前 9 碼，與舊版只看前 6 碼相容
+    const t = raw.length <= 6 ? raw.padStart(6, '0') : raw.length <= 9 ? raw.padStart(9, '0') : raw.slice(0, 9);
     const ms = Date.UTC(+d.slice(0, 4), +d.slice(4, 6) - 1, +d.slice(6, 8), +t.slice(0, 2), +t.slice(2, 4), +t.slice(4, 6)) - 8 * 3600_000;
     return Number.isFinite(ms) ? ms / 1000 : undefined;
 }
