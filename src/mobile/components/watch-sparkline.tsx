@@ -1,7 +1,7 @@
 // src/mobile/components/watch-sparkline.tsx — 自選列的迷你走勢（canvas；參考桌面 src/components/sparkline.tsx，不 import 它）
 //
-// - 當日 1 分 K 收盤價折線＋淡色面積；昨收（參考價）畫虛線基準並決定顏色：最後一點 ≥ 參考價 up 色、低於 down 色
-//   （vars.color.up／down，跟著台灣／國際配色）；沒有參考價時以第一點比較。
+// - 當日 1 分 K 收盤價折線＋淡色面積；昨收（參考價）畫虛線基準並決定顏色：最後一點高於參考價 up 色、低於 down 色、
+//   相等（平盤）mutedForeground（vars.color.up／down，跟著台灣／國際配色）；沒有參考價時以第一點比較。
 // - 即時價只更新尾端點（points＋last）；重繪以 rAF 合併，依 devicePixelRatio 設定畫布像素；主題變更時重畫。
 // - 沒有動畫（減少動態下行為相同）。沒有 canvas／2D context 的環境（測試）不畫。
 // - 預設尺寸是自選列的 56×32（styles.spark）；傳 className 時改用該尺寸，並以 ResizeObserver 在版面尺寸改變時重畫（指數列展開面板）。
@@ -28,12 +28,14 @@ function cssColor(el: Element, ref: string): string {
     }
 }
 
-/** 純函式：決定走勢方向（供測試） */
-export function sparkTone(data: readonly number[], reference: number | undefined): 'up' | 'down' {
+/** 純函式：決定走勢方向（供測試）；相等為平盤 flat，不畫成上漲色 */
+export function sparkTone(data: readonly number[], reference: number | undefined): 'up' | 'down' | 'flat' {
     const last = data[data.length - 1]!;
-    if (reference !== undefined && reference > 0) return last >= reference ? 'up' : 'down';
-    return last >= data[0]! ? 'up' : 'down';
+    const base = reference !== undefined && reference > 0 ? reference : data[0]!;
+    return last > base ? 'up' : last < base ? 'down' : 'flat';
 }
+
+const TONE_COLOR = { up: vars.color.up, down: vars.color.down, flat: vars.color.mutedForeground } as const;
 
 export function drawSparkline(cv: HTMLCanvasElement, data: readonly number[], reference: number | undefined): void {
     const cssW = cv.clientWidth || 56;
@@ -78,7 +80,7 @@ export function drawSparkline(cv: HTMLCanvasElement, data: readonly number[], re
         ctx.setLineDash([]);
     }
 
-    const color = cssColor(cv, sparkTone(data, ref) === 'up' ? vars.color.up : vars.color.down);
+    const color = cssColor(cv, TONE_COLOR[sparkTone(data, ref)]);
     ctx.beginPath();
     data.forEach((v, i) => {
         if (i === 0) ctx.moveTo(x(0), y(v));
