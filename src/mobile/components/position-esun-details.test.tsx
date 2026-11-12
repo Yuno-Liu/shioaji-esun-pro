@@ -36,12 +36,12 @@ async function render(p = position()) {
 const textOf = (node: ReactTestInstance): string => node.children.map(c => (typeof c === 'string' ? c : textOf(c))).join('');
 const all = (id: string) => view!.root.findAll(n => n.props['data-testid'] === id && typeof n.type === 'string');
 const one = (id: string) => view!.root.find(n => n.props['data-testid'] === id && typeof n.type === 'string');
-const store = (rows: unknown[]) => setEsunInventoryDetails(esunAccount, parseEsunInventoryDetails(rows), new Date(2026, 10, 6, 9, 30, 0).getTime());
+const store = (rows: unknown[]) => setEsunInventoryDetails(esunAccount, parseEsunInventoryDetails(rows), Date.UTC(2026, 10, 6, 1, 30, 0) /* 台北 09:30（不依執行環境時區，CI 是 UTC） */);
 
 beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date(2026, 10, 6, 10, 0, 0));
+    vi.setSystemTime(Date.UTC(2026, 10, 6, 2, 0, 0)); // 台北 10:00
 });
 afterEach(async () => {
     await act(async () => view?.unmount());
