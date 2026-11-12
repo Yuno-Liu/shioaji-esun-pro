@@ -1315,6 +1315,12 @@ describe('Portfolio & SSE Mapping', () => {
             expect(esunTimestamp('20261023', '0930151234')).toBe(tpe(9, 30, 15));
         });
 
+        it('drops fractional seconds of any length and a timezone suffix before parsing', () => {
+            for (const t of ['09:30:15.1', '09:30:15.12', '09:30:15.123', '09:30:15+08:00', '09:30:15Z', '09:30:15.5+0800', '9:30:15']) {
+                expect(esunTimestamp('20261023', t), t).toBe(tpe(9, 30, 15));
+            }
+        });
+
         it('returns undefined for missing or malformed date/time', () => {
             for (const t of ['', '1234', 'abcdef', '09a015', undefined]) expect(esunTimestamp('20261023', t)).toBeUndefined();
             expect(esunTimestamp('', '093015')).toBeUndefined();

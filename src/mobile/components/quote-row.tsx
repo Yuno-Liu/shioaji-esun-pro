@@ -114,7 +114,10 @@ export function rowQuoteView(
     const realTick = tick && tick.simtrade !== true ? tick : lastRealTick && lastRealTick.simtrade !== true ? lastRealTick : undefined;
     const vol = index || contract.security_type === 'IND'
         ? undefined
-        : realTick ? Number(realTick.total_volume) : snapshot?.total_volume;
+        : realTick ? Number(realTick.total_volume)
+        // 試撮中且本列還沒看過真實成交（例如 08:30–09:00）：盤前快照是前一交易日的量，不顯示
+        : tick?.simtrade === true ? undefined
+        : snapshot?.total_volume;
     const day = tick ?? index;
     return {
         close: close !== undefined && Number.isFinite(close) ? close : undefined,

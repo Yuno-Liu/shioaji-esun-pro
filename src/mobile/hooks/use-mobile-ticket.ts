@@ -27,6 +27,7 @@ import { isEsunAccount } from '../../lib/esun';
 import { accountMatches } from '../../lib/flash-account';
 import { creditLabel, isOddLot, ODD_LOT_MAX_SHARES, oddLotReferencePrice, orderQtyUnit, SHARES_PER_LOT, stockOrderProblem, type OddBaseQuote } from '../../lib/odd-lot';
 import { captureSelectedAccount } from '../../lib/order-account';
+import { useServerInfo } from '../../lib/server-info-store';
 import { defaultOrderTypeFor, futuresOrderProblem, orderTypeDisabledReason, PRICE_TYPE_LABEL, priceTypeDisabledReason } from '../../lib/order-conditions';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
 import { esunStockLegProblem } from '../../lib/order-route';
@@ -515,11 +516,13 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
     // 開啟當下沒有取到帳戶（帳戶尚未載入、或選取的帳戶當時不可交易）：等選取帳戶變成可交易後補取一次。
     // 只在 account 還是 undefined 時補取（沒有帳戶就不能預覽或送出，沒有進行中的送單會用到別的帳戶）；
     // 已取到的帳戶以 prev ?? 保留，絕不替換
+    // canTrade 會讀伺服器模式（模擬環境的未簽署帳戶要等 /info 回來才可交易），所以模式改變時也要再試一次
+    const serverSimulation = useServerInfo()?.simulation;
     useEffect(() => {
         if (account) return;
         const next = captureSelectedAccount(market);
         if (next) setAccount(prev => prev ?? next);
-    }, [account, market, selected]);
+    }, [account, market, selected, serverSimulation]);
     useRiskSettings(); // checkOrderAllowed 讀風控設定：設定改變時重新驗證
     const tradingLive = useTradingLive();
     const gate = useResumeGate();

@@ -267,9 +267,12 @@ describe('rowQuoteView：試撮時的總量', () => {
         expect(v).toMatchObject({ close: 1050, simtrade: true, vol: 12345 });
     });
 
-    it('沒有看過真實成交時用快照的 total_volume；兩者都沒有時不顯示', () => {
-        expect(rowQuoteView(c, { close: 1000, change_price: 0, change_rate: 0, total_volume: 900 } as never, { tick: sim })).toMatchObject({ close: 1050, vol: 900 });
+    it('試撮中且本列沒看過真實成交（盤前）：不顯示總量（盤前快照可能是前一交易日的量）；非試撮只有快照時照常用快照', () => {
+        const v = rowQuoteView(c, { close: 1000, change_price: 0, change_rate: 0, total_volume: 900 } as never, { tick: sim });
+        expect(v).toMatchObject({ close: 1050, simtrade: true });
+        expect(v.vol).toBeUndefined();
         expect(rowQuoteView(c, undefined, { tick: sim }).vol).toBeUndefined();
+        expect(rowQuoteView(c, { close: 1000, change_price: 0, change_rate: 0, total_volume: 900 } as never, {}).vol).toBe(900);
     });
 
     it('QuoteRow：先收到真實成交、再收到試撮 tick 時，第二行總量沿用真實成交', async () => {

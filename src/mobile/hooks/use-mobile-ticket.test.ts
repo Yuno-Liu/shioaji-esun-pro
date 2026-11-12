@@ -521,6 +521,18 @@ describe('開啟時的送單帳戶：尚未載入時補取一次，已取到的�
         expect(t!.problem).toBe(TICKET_TEXT.accountChanged);
     });
 
+    it('伺服器模式較晚確認（選取帳戶物件不變）：模式確認後也會補取一次', async () => {
+        const { beginServerInfoRequest, observeServerInfo } = await import('../../lib/server-info-store');
+        m.captured = undefined;
+        m.accounts = { loaded: true, selectedStock: { ...stockAccount, signed: false }, selectedFutures: null };
+        await mount();
+        expect(t!.account).toBeUndefined();
+        // 模擬環境的未簽署帳戶要等 /info 確認模式才可交易（captureSelectedAccount 以 mock 代表），選取帳戶物件不變
+        m.captured = stockAccount;
+        await act(async () => { observeServerInfo(beginServerInfoRequest(), { simulation: true } as never); });
+        expect(t!.account).toBe(stockAccount);
+    });
+
     it('補取後也固定：補取到的帳戶之後不再替換', async () => {
         m.captured = undefined;
         m.accounts = { loaded: false, selectedStock: null, selectedFutures: null };

@@ -5,7 +5,8 @@
 // （委託查詢＋SSE 回報即時投影）。委託新增、成交、刪改單時交易狀態一更新就重算，不另發任何查詢、不送任何委託。
 // 不是玉山帳戶、沒有額度資料或額度看起來是空的（模擬環境／非交易時段，limitsLookEmpty）時回 null。
 
-import { useMemo } from 'react';
+import { useEffect, useMemo, useReducer } from 'react';
+import { subscribeEsunOrderMeta } from '../../lib/esun/account-details';
 import { getCachedContract } from '../../lib/contracts-cache';
 import { isEsunAccount } from '../../lib/esun/order-mapping';
 import type { TradingLimits } from '../../lib/shioaji';
@@ -33,6 +34,9 @@ export function useEsunLimitEstimate(account: EstimateAccount | null | undefined
     const usable = esun && !!data && !limitsLookEmpty(data) && typeof limit === 'number' && Number.isFinite(limit);
     // 台北日序：跨日後下一次重繪就重算（不沿用前一日把昨天委託算成「今日」的結果）
     const taipeiDay = Math.floor((Date.now() + 8 * 3_600_000) / 86_400_000);
+    // 預約單的「今日」判斷讀委託中繼資料（workDate）：中繼資料更新但 trades 參考沒變時也要重算
+    const [metaSeq, bumpMeta] = useReducer((n: number) => n + 1, 0);
+    useEffect(() => subscribeEsunOrderMeta(bumpMeta), []);
     return useMemo(() => {
         if (!usable || brokerId === undefined || accountId === undefined) return null;
         return estimateEsunRemaining({
@@ -44,5 +48,5 @@ export function useEsunLimitEstimate(account: EstimateAccount | null | undefined
             limitUpOf,
             now: Date.now(),
         });
-    }, [usable, limit, brokerId, accountId, trades, ordersLoaded, reconcile, taipeiDay]);
+    }, [usable, limit, brokerId, accountId, trades, ordersLoaded, reconcile, taipeiDay, metaSeq]); // metaSeq：中繼資料更新時觸發重算
 }
