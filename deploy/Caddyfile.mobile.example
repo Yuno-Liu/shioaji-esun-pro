@@ -8,6 +8,14 @@ trade.lan {
     # 使用 Caddy 內建 CA 簽發憑證；手機需安裝並完全信任 Caddy 根憑證
     tls internal
 
+    # 必須啟用 Basic Auth：nginx 會替通過 Host／Origin 檢查的 /esun/ 請求注入玉山 token，
+    # 區網上任何能連到這台主機 443 的裝置（curl 不帶 Origin 也會放行）都能直接下單、刪單。
+    # 雜湊以 `caddy hash-password` 產生（互動輸入密碼），把下方佔位字串整段換掉；不要把明文密碼寫進此檔。
+    # Caddy 2.8 以前的指令名稱是 basicauth（2.8 起改為 basic_auth）。
+    basic_auth {
+        trader REPLACE_WITH_CADDY_HASH_PASSWORD_OUTPUT
+    }
+
     reverse_proxy 127.0.0.1:8080 {
         # SSE（/api/v1/stream/data、/esun/stream/orders）每個事件立即送出，不緩衝
         flush_interval -1

@@ -53,6 +53,29 @@ def _write(path: str, content: str) -> None:
         f.write(content)
 
 
+GIT = shutil.which("git")
+
+
+def _isolated_git_env(work_dir: str) -> dict[str, str]:
+    """不讀使用者／系統 git 設定（簽章、hooks 等），也不往上找到外層 repo。"""
+    config = os.path.join(work_dir, ".test-gitconfig")
+    _write(config, "[user]\n\tname = deploy-test\n\temail = deploy-test@example.invalid\n")
+    return {
+        "GIT_CONFIG_GLOBAL": config, "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CEILING_DIRECTORIES": os.path.dirname(os.path.abspath(work_dir)),
+    }
+
+
+def _init_git_repo(path: str, git_env: dict[str, str]) -> str:
+    """在 path 建立只有一個空 commit 的 repo，回傳 git rev-parse --short HEAD。"""
+    env = dict(os.environ, **git_env)
+    for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "test"]):
+        subprocess.run([GIT, *args], cwd=path, env=env, check=True, capture_output=True)
+    return subprocess.run(
+        [GIT, "rev-parse", "--short", "HEAD"], cwd=path, env=env, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
 class _TokenCases:
     """bash 與 PowerShell 版本共用的 token 產生案例。"""
 
@@ -150,6 +173,25 @@ class BashDeployScriptTest(_TokenCases, unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(res.stdout, "9000")
 
+    def _git_revision_after_export(self, project_dir: str, git_env: dict[str, str]) -> str:
+        env = {k: v for k, v in os.environ.items() if k != "GIT_REVISION"}
+        env.update(git_env, DEPLOY_PROJECT_ROOT=project_dir, DEPLOY_SH=SH_SCRIPT.replace("\\", "/"))
+        res = subprocess.run(
+            [BASH, "-c", 'source "$DEPLOY_SH" && export_git_revision > /dev/null && printf %s "${GIT_REVISION:-}"'],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout
+
+    @unittest.skipUnless(GIT, "需要 git")
+    def test_export_git_revision(self) -> None:
+        git_env = _isolated_git_env(self.dir)
+        # 不是 git 工作目錄：不設定，compose 以預設 unknown 建置
+        self.assertEqual(self._git_revision_after_export(self.dir, git_env), "")
+        rev = _init_git_repo(self.dir, git_env)
+        self.assertRegex(rev, r"^[0-9a-f]{7,}$")
+        self.assertEqual(self._git_revision_after_export(self.dir, git_env), rev)
+
 
 @unittest.skipUnless(PWSH, "需要 pwsh")
 class PowerShellDeployScriptTest(_TokenCases, unittest.TestCase):
@@ -166,7 +208,7 @@ class PowerShellDeployScriptTest(_TokenCases, unittest.TestCase):
 # 腳本會改動、且必須在結束時還原的行程環境變數
 MANAGED_ENV = (
     "ESUN_BRIDGE_UPSTREAM", "WEB_PORT", "ESUN_SERVER_HOST", "ESUN_SERVER_PORT", "ESUN_BRIDGE_TOKEN",
-    "ESUN_ACCOUNT_PASSWORD", "ESUN_PASSWORD", "ESUN_CERT_PASSWORD", "ESUN_ALLOWED_HOSTS",
+    "ESUN_ACCOUNT_PASSWORD", "ESUN_PASSWORD", "ESUN_CERT_PASSWORD", "ESUN_ALLOWED_HOSTS", "GIT_REVISION",
 )
 
 # 在同一個 pwsh 行程（等同同一個 PowerShell 視窗）內依序執行整支 deploy-docker.ps1。
@@ -367,6 +409,25 @@ class PowerShellDeployFlowTest(unittest.TestCase):
         self.assertIn("deploy/install_sdk.py", python_calls)
         self.start_process(result)
 
+    @unittest.skipUnless(GIT, "需要 git")
+    def test_build_sets_git_revision_for_compose_and_restores_it(self) -> None:
+        git_env = _isolated_git_env(self.dir)
+        # 不是 git 工作目錄：不設定 GIT_REVISION，部署照常進行
+        (plain,) = self.run_steps([{"params": {"Action": "up"}, "envFile": "ESUN_BRIDGE_TOKEN=tok\n"}], shell_env=git_env)
+        self.assertEqual(plain["exit"], 0, self.output)
+        self.assertIsNone(self.compose_up(plain)["env"]["GIT_REVISION"])
+        rev = _init_git_repo(self.dir, git_env)
+        build, no_build = self.run_steps([
+            {"params": {"Action": "up"}, "envFile": None},
+            {"params": {"Action": "up", "NoBuild": True}, "envFile": None},
+        ], shell_env=git_env)
+        self.assertEqual(self.compose_up(build)["env"]["GIT_REVISION"], rev)
+        self.assertIn("--build", self.compose_up(build)["args"])
+        # -NoBuild 不建置映像，不需要版本標籤
+        self.assertIsNone(self.compose_up(no_build)["env"]["GIT_REVISION"])
+        for result in (plain, build, no_build):
+            self.assert_env_restored(result)
+
 
 class ComposeAndDocsTest(unittest.TestCase):
     @staticmethod
@@ -381,6 +442,34 @@ class ComposeAndDocsTest(unittest.TestCase):
         m = re.search(r"^    stop_grace_period:\s*(\d+)s\s*$", self.service_block("esun-bridge"), re.M)
         self.assertIsNotNone(m)
         self.assertGreaterEqual(int(m.group(1)), 15)
+
+    def test_web_does_not_depend_on_esun_bridge(self) -> None:
+        # nginx 以 resolver 在執行期解析 bridge；相依會讓 up -d shioaji-pro-web shioaji-server 啟動被停掉的 bridge
+        web = self.service_block("shioaji-pro-web")
+        self.assertNotRegex(web, r"(?m)^    depends_on:")
+        self.assertNotRegex(web, r"(?m)^\s+esun-bridge:")
+
+    def test_log_rotation_only_on_web_and_sidecar(self) -> None:
+        compose = _read(os.path.join(REPO_ROOT, "docker-compose.yml")).replace("\r\n", "\n")
+        self.assertRegex(compose, r'(?m)^x-logging: &default-logging\n  driver: json-file\n  options:\n'
+                                  r'    max-size: "10m"\n    max-file: "3"$')
+        for name in ("shioaji-pro-web", "shioaji-server"):
+            self.assertRegex(self.service_block(name), r"(?m)^    logging: \*default-logging$", name)
+        # bridge 等收盤後重建時再加（改它的設定會讓下一次 compose up 重建 bridge）
+        self.assertNotIn("logging:", self.service_block("esun-bridge"))
+
+    def test_sidecar_healthcheck_also_checks_web(self) -> None:
+        block = self.service_block("shioaji-server")
+        test = re.search(r"^      test: (.+)$", block, re.M)
+        self.assertIsNotNone(test)
+        self.assertIn("http://127.0.0.1:21322/api/v1/info", test.group(1))
+        self.assertIn("http://127.0.0.1:${PORT:-8080}/healthz", test.group(1))
+        self.assertIn("docker compose up -d --no-deps --force-recreate shioaji-server",
+                      _read(os.path.join(REPO_ROOT, "docs", "fork", "esun.md")))
+
+    def test_web_build_passes_git_revision(self) -> None:
+        self.assertRegex(self.service_block("shioaji-pro-web"),
+                         r"(?m)^      args:\n(?:        #.*\n)*        GIT_REVISION: \$\{GIT_REVISION:-unknown\}$")
 
     def test_linux_host_bridge_gateway_ip_note(self) -> None:
         # nginx 的 resolver 不讀 /etc/hosts：Linux Docker Engine 的模式 B 要改用 gateway IP

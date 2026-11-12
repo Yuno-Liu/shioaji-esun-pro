@@ -1,7 +1,7 @@
 // 交易頁標頭的價格來源（B1 快照、B2 試撮、B8 不用 pct_chg）、統計格、比例條
 import { describe, expect, it } from 'vitest';
 import type { Snapshot } from '../../lib/types/market';
-import { headerQuote, headerStats, innerOuterRatio, limitHit, splitPercent, toneVsReference, volumeUnit } from './quote-display';
+import { headerQuote, headerStats, innerOuterRatio, limitHit, quoteReference, snapshotQuoteRef, splitPercent, tickQuoteRef, toneVsReference, volumeUnit } from './quote-display';
 
 const snap = (over: Partial<Snapshot> = {}): Snapshot => ({
     code: '2330', exchange: 'TSE', datetime: '2026-11-05 13:30:00.000000', open: 1070, high: 1090, low: 1065, close: 1085,
@@ -152,5 +152,44 @@ describe('splitPercent／innerOuterRatio', () => {
         expect(volumeUnit('WRT', true)).toBe('張');
         expect(volumeUnit('OPT', true)).toBe('口');
         expect(volumeUnit('IND')).toBe('');
+    });
+});
+
+describe('盤前／跨夜：報價自身的參考價（quoteRef），不和新交易日的合約參考價混用', () => {
+    // 昨日參考 100、收 110；今日合約參考已換成 110，報價（成交、快照）仍是昨日的
+    const oldTick = { date: '2026-11-12', time: '13:30:00', close: '110', price_chg: '10', open: '100', high: '111', low: '99', total_volume: 5 };
+    const oldSnap = snap({ datetime: '2026-11-12 13:30:00.000000', open: 100, high: 111, low: 99, close: 110, change_price: 10, change_rate: 10 });
+
+    it('tick 的漲跌幅分母用 現價 − price_chg（10/100＝10%，不是 10/110＝9.09%）', () => {
+        const q = headerQuote({ reference: 110, tick: oldTick as never });
+        expect(q).toMatchObject({ price: 110, change: 10, dir: 'up', source: 'tick' });
+        expect(q.pct).toBeCloseTo(10, 10);
+    });
+
+    it('統計格的「參」用報價自身的參考價；開 100、低 99 相對 100 為平盤／下跌，不被當成低於 110', () => {
+        const fromTick = headerStats({ reference: 110, tick: oldTick as never });
+        expect(fromTick.reference).toBe(100);
+        expect(toneVsReference(fromTick.open, fromTick.reference)).toBe('flat');
+        expect(toneVsReference(fromTick.low, fromTick.reference)).toBe('down');
+        expect(toneVsReference(fromTick.high, fromTick.reference)).toBe('up');
+        const fromSnap = headerStats({ reference: 110, snapshot: oldSnap });
+        expect(fromSnap).toMatchObject({ source: 'snapshot', reference: 100 });
+        expect(toneVsReference(fromSnap.open, fromSnap.reference)).toBe('flat');
+    });
+
+    it('推回的參考價收斂浮點誤差（100.5 − 0.6 → 99.9，開 99.9 為平盤）', () => {
+        const s = headerStats({ reference: 100.5, tick: { close: '100.5', price_chg: '0.6', open: '99.9' } as never });
+        expect(s.reference).toBe(99.9);
+        expect(toneVsReference(s.open, s.reference)).toBe('flat');
+    });
+
+    it('推不出時才用合約參考價：tick 沒有 price_chg、快照 0／0、只有合約', () => {
+        expect(tickQuoteRef({ close: '110' } as never)).toBeNull();
+        expect(snapshotQuoteRef(snap({ close: 0, change_price: 0 }))).toBeNull();
+        expect(quoteReference({ reference: 110, tick: { close: '112' } as never })).toBe(110);
+        expect(headerQuote({ reference: 110, tick: { close: '112' } as never }).pct).toBeCloseTo((2 / 110) * 100, 10);
+        expect(quoteReference({ reference: 110 })).toBe(110);
+        expect(quoteReference({ reference: 0 })).toBeNull();
+        expect(quoteReference({ reference: 110, index: { close: '23456.78', reference: '23333.33' } })).toBe(23333.33);
     });
 });

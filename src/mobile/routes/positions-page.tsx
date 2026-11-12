@@ -113,7 +113,7 @@ import { getMobileUi, openTicket, type TicketCond, type TicketLot } from '../lib
 import { readPositionsView, writePositionsView, type PositionsView } from '../lib/positions-view';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { assertResumeReady, getResumeGate, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
-import { assertNoEnvSwitch, beginOrderDispatch } from '../lib/trading-activity';
+import { assertNoEnvSwitch, beginOrderDispatch, orderDispatchInFlight, useTradingActivity } from '../lib/trading-activity';
 import * as controls from '../styles/controls.css';
 import { srOnly } from '../styles/primitives.css';
 import * as styles from '../styles/positions.css';
@@ -167,6 +167,7 @@ export const POSITIONS_TEXT = {
     batchBusy: '其他平倉、下單面板或確認進行中，暫時不能出清',
     batchEnvUnknown: '有帳戶的環境未確認（模擬／正式），未送出',
     batchRunning: '多選市價出清進行中，請等完成後再平倉',
+    dispatchBusy: '另一筆平倉或下單仍在送出中（含全部／批次刪單），請等完成後再平倉',
     batchHidden: '畫面已切到背景，已停止',
     batchResumed: '畫面重新同步過，已停止（請重新確認後再出清）',
     batchNoConfirm: '下單確認設定未開啟，已停止',
@@ -1200,12 +1201,15 @@ export function PositionsPage() {
     const closingRef = useRef(false);
     // 批次是模組層狀態：離開持倉頁前開始的批次在送出中的那一筆完成前仍在進行；這段期間本頁也不開始單筆平倉或另一個批次
     const batchActive = useSyncExternalStore(subscribeBatchExit, isBatchExitActive);
+    // 「委託送出中」是模組層計數（trading-activity；送單流程結束或失敗時在 finally 歸零）：換分頁卸載本頁後 closing 會重設，
+    // 但離開前開始的平倉（含 lib 確認面板）或其他頁的新單仍在送出中；這段期間不開始單筆平倉或批次，避免重送市價平倉
+    const dispatching = useTradingActivity().dispatches > 0;
     const [closeFeedback, setCloseFeedback] = useState<CloseSheetProps['feedback']>(null);
     const gateProblem = closeGateProblem(live, gate);
     const closeTarget = closeKey ? positions.find(p => positionKey(p) === closeKey) : undefined;
 
     const openClose = (p: AccountedPosition) => {
-        if (closingRef.current || isBatchExitActive()) return;
+        if (closingRef.current || isBatchExitActive() || orderDispatchInFlight()) return;
         setCloseFeedback(null);
         setCloseKey(positionKey(p));
     };
@@ -1217,7 +1221,9 @@ export function PositionsPage() {
     const continueClose = async (plan: ClosePlan) => {
         if (closingRef.current) return;
         // 按下當下再驗一次閘門（按鈕停用是第一道，beforeSend 是送出前最後一道）；批次進行中不開始（確認會被批次授權拒絕）
-        const problem = isBatchExitActive() ? POSITIONS_TEXT.batchRunning : closeGateProblem(live, getResumeGate());
+        const problem = isBatchExitActive() ? POSITIONS_TEXT.batchRunning
+            : orderDispatchInFlight() ? POSITIONS_TEXT.dispatchBusy
+            : closeGateProblem(live, getResumeGate());
         if (problem) { setCloseFeedback({ kind: 'notSent', text: `未送出：${problem}` }); return; }
         closingRef.current = true;
         setClosing(true);
@@ -1367,7 +1373,7 @@ export function PositionsPage() {
         }
     }
     // 不能開始的原因（預覽面板停用滑塊並顯示）：單筆平倉進行中、另一個批次仍在處理（例如離開本頁前開始的）、下單面板或確認進行中、閘門
-    const batchBlock = closing || batchActive || switchLocked ? POSITIONS_TEXT.batchBusy : gateProblem;
+    const batchBlock = closing || batchActive || dispatching || switchLocked ? POSITIONS_TEXT.batchBusy : gateProblem;
     const latestLive = useRef({ positions, live });
     useLayoutEffect(() => {
         latestLive.current = { positions, live };
@@ -1377,7 +1383,7 @@ export function PositionsPage() {
         // 與單筆平倉共用 closingRef：其他平倉、下單面板、委託操作面板或確認進行中都不開始（滑動當下再讀一次最新狀態）
         if (closingRef.current || batchRunning) return;
         const ui = getMobileUi();
-        const busy = switchLocked || isBatchExitActive() || ui.ticket !== null || ui.orderAction !== null || getPendingOrderConfirm() !== null;
+        const busy = switchLocked || isBatchExitActive() || orderDispatchInFlight() || ui.ticket !== null || ui.orderAction !== null || getPendingOrderConfirm() !== null;
         const problem = busy ? POSITIONS_TEXT.batchBusy : closeGateProblem(live, getResumeGate());
         const items: BatchExitItem[] = [];
         let envProblem = false;
@@ -1540,6 +1546,11 @@ export function PositionsPage() {
                     <InlineNote tone='warn' role='status' testId='position-reconcile'>{reconcile}</InlineNote>
                 </div>
             )}
+            {dispatching && !closing && !batchActive && positions.length > 0 && (
+                <div className={styles.inset}>
+                    <InlineNote tone='info' role='status' testId='position-dispatch-note'>{POSITIONS_TEXT.dispatchBusy}</InlineNote>
+                </div>
+            )}
             {gateProblem && gateProblem !== POSITIONS_TEXT.staleData && positions.length > 0 && (
                 <div className={styles.inset}>
                     <InlineNote tone='info' role='status' testId='position-gate-note'>{gateProblem}</InlineNote>
@@ -1624,7 +1635,7 @@ export function PositionsPage() {
                                     p,
                                     priv,
                                     privMoney,
-                                    closeDisabled: closing || batchActive || gateProblem !== null,
+                                    closeDisabled: closing || batchActive || dispatching || gateProblem !== null,
                                     accountReason: accountReasonOf(p),
                                     maxAbsPnl,
                                     ydNotice,

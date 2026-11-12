@@ -10,7 +10,7 @@
 // - 檢視：明細（依交易日分組，一次 FILLS_PAGE 筆、「再顯示」加一頁）／依股票／依日期；總計固定在最上面。
 // - 金額、股數、價格經 maskMoney（遮蔽金額）；書號經 maskAccountId。只讀，沒有任何下單入口。
 
-import { useMemo, useState } from 'react';
+import { memo, useMemo, useReducer, useState } from 'react';
 import { useAccounts } from '../../../lib/account-store';
 import { clampEsunDateRange180Days, esunTradeService, isEsunAccount, useEsunEnvironment, type EsunTransactionDetail } from '../../../lib/esun';
 import { maskAccountId, maskMoney, usePrivacyMode, usePrivacyMoney } from '../../../lib/privacy';
@@ -110,7 +110,8 @@ function TotalsView({ totals, showPnl }: { totals: FillTotals; showPnl: boolean 
     );
 }
 
-function FillRow({ r }: { r: FillRecord }) {
+// memo：卡片隨交易狀態發布與倒數計時重繪；records 沒變時（同一個 FillRecord 物件）各列不重繪
+const FillRow = memo(function FillRow({ r }: { r: FillRecord }) {
     const priv = usePrivacyMode();
     const { privMoney, money, signed, price } = useMoney();
     const name = useContractName(r.code || null, r.name || null);
@@ -137,7 +138,7 @@ function FillRow({ r }: { r: FillRecord }) {
             </p>
         </div>
     );
-}
+});
 
 function SummaryFacts({ s }: { s: FillTotals }) {
     const { money } = useMoney();
@@ -221,8 +222,10 @@ export function FillHistoryCard() {
     const costs = useBrokerCostSettings();
     const [open, setOpen] = useState(false);
     const [view, setView] = useState<FillView>('list');
-    // 展開時每秒重繪（冷卻倒數）；收合時只需跟上日期變化
-    const now = useNow(open ? 1_000 : 60_000);
+    // 平時只需跟上日期變化；冷卻／共用視窗倒數期間另外每秒重繪（見下方）
+    const now = useNow(60_000);
+    // 被另一張卡占滿共用視窗時，本卡不會收到通知：按「查詢」被擋下後重繪一次，改顯示倒數
+    const [, bump] = useReducer((n: number) => n + 1, 0);
     const picker = usePeriodRange(customRange, now);
     const { range, problem } = picker;
     const account = selectedStock && selectedStock.account_type === 'S' ? selectedStock : null;
@@ -239,8 +242,12 @@ export function FillHistoryCard() {
         if (!key || !account || !clamp) return;
         const { beginDate, endDate } = clamp;
         // 冷卻與共用視窗由 loadOnDemand 在呼叫當下再判斷一次（被擋下時不發請求）
-        void loadOnDemand(key, () => esunTradeService.fetchTransactions(account, beginDate, endDate), PNL_COOLDOWN_MS, PNL_ESUN_GATE);
+        void loadOnDemand(key, () => esunTradeService.fetchTransactions(account, beginDate, endDate), PNL_COOLDOWN_MS, PNL_ESUN_GATE)
+            .then(ok => { if (!ok) bump(); });
     };
+    const cooldownSec = state.loading || !key ? 0 : Math.max(cooldownLeftSec(state, PNL_COOLDOWN_MS, clockNow), gateLeft);
+    // 展開且冷卻／共用視窗倒數中才每秒重繪（倒數到 0 的那次重繪會換回 60 秒）
+    useNow(open && (cooldownSec > 0 || gateLeft > 0) ? 1_000 : 60_000);
     const toggle = () => {
         const next = !open;
         setOpen(next);
@@ -309,7 +316,7 @@ export function FillHistoryCard() {
                             <RefreshButton
                                 label='查詢'
                                 loading={state.loading}
-                                cooldownSec={state.loading || !key ? 0 : Math.max(cooldownLeftSec(state, PNL_COOLDOWN_MS, clockNow), gateLeft)}
+                                cooldownSec={cooldownSec}
                                 disabled={!canLoad}
                                 onClick={load}
                                 testId='fills-query'

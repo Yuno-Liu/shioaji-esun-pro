@@ -57,3 +57,19 @@ describe('quoteLimit', () => {
         expect(quoteLimit({ security_type: 'STK', limit_up: 0, limit_down: 0 }, 110)).toBeNull();
     });
 });
+
+describe('quoteLimit：選擇權與興櫃不判（2026-11-13 稽核）', () => {
+    it('選擇權：跌停只是最小跳動的地板，價格等於停板價也不標示', () => {
+        expect(quoteLimit({ security_type: 'OPT', exchange: 'TAIFEX', limit_up: 1500, limit_down: 0.1 }, 0.1)).toBeNull();
+        expect(quoteLimit({ security_type: 'OPT', exchange: 'TAIFEX', limit_up: 1500, limit_down: 0.1 }, 1500)).toBeNull();
+    });
+
+    it('興櫃：沒有漲跌停', () => {
+        expect(quoteLimit({ security_type: 'STK', exchange: 'OES', limit_up: 110, limit_down: 90 }, 110)).toBeNull();
+    });
+
+    it('上市股票、期貨照常判斷', () => {
+        expect(quoteLimit({ security_type: 'STK', exchange: 'TSE', limit_up: 110, limit_down: 90 }, 110)).toBe('up');
+        expect(quoteLimit({ security_type: 'FUT', exchange: 'TAIFEX', limit_up: 25000, limit_down: 20000 }, 20000)).toBe('down');
+    });
+});

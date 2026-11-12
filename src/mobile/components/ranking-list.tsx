@@ -37,6 +37,7 @@ import type { LimitState } from '../lib/limit-hit';
 import { openTicket } from '../lib/mobile-store';
 import { requestSparkContract } from '../lib/ranking-spark-contracts';
 import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
+import { taipeiClock } from '../lib/taipei-clock';
 import { focusRing, pressable } from '../styles/primitives.css';
 import * as styles from '../styles/watchlist.css';
 import { chip, expandHit } from '../ui/chip.css';
@@ -302,11 +303,6 @@ function useCooldownLeft(kind: RankingKind): number {
 }
 
 
-function fmtTime(ms: number): string {
-    const d = new Date(ms);
-    const p = (n: number) => String(n).padStart(2, '0');
-    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
 
 function fmtAmount(amount: number): string {
     if (!Number.isFinite(amount) || amount <= 0) return '—';
@@ -416,7 +412,7 @@ export function RankingList({ watchedCodes, canAdd, onAdd, onOpen }: RankingList
                         {state.loading
                             ? `${def.label}排行讀取中…`
                             : state.fetchedAt !== null
-                                ? `${def.label}前 ${RANKING_COUNT} 名${hidden > 0 ? `・已排除 ${hidden} 檔` : ''}・更新於 ${fmtTime(state.fetchedAt)}`
+                                ? `${def.label}前 ${RANKING_COUNT} 名${hidden > 0 ? `・已排除 ${hidden} 檔` : ''}・更新於 ${taipeiClock(state.fetchedAt)}`
                                 : ''}
                     </span>
                     <button

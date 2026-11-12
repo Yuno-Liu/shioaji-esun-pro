@@ -44,6 +44,10 @@ export const volume = styleVariants({
 
 // ---- 共用軌道（RatioBar、ProgressBar） ----
 
+/**
+ * 軌道底色 muted 與深色主題卡片（groupedBg＝muted）相同（1.00:1），看不出軌道長度；
+ * 加 1px mutedForeground 內框：對卡片 深色 4.92:1、淺色 5.38:1。填色是子元素，畫在內框之上。
+ */
 export const track = style({
     position: 'relative',
     display: 'block',
@@ -52,6 +56,7 @@ export const track = style({
     borderRadius: '3px',
     overflow: 'hidden',
     background: vars.color.muted,
+    boxShadow: `inset 0 0 0 1px ${vars.color.mutedForeground}`,
 });
 
 const fillBase = style([scaleBase, {

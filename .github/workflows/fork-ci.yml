@@ -53,10 +53,30 @@ jobs:
         run: docker build --target shioaji -t shioaji-pro-sinopac:ci .
 
       - name: Build web (nginx) image
-        run: docker build --target runner -t shioaji-pro-web:ci .
+        run: docker build --target runner --build-arg GIT_REVISION="$(git rev-parse --short HEAD)" -t shioaji-pro-web:ci .
 
       - name: Web image contains the mobile entry (mobile.html)
         run: docker run --rm --entrypoint test shioaji-pro-web:ci -f /usr/share/nginx/html/mobile.html
+
+      - name: Extract web dist from image
+        run: |
+          cid="$(docker create shioaji-pro-web:ci)"
+          docker cp "$cid:/usr/share/nginx/html" "$RUNNER_TEMP/web-dist"
+          docker rm "$cid"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 手機首屏 JS（gzip -9）預算：≤223 KiB（docs/fork/mobile-trading-spec.md §9.4）
+      - name: Mobile first-load JS budget
+        run: python scripts/check_mobile_budget.py "$RUNNER_TEMP/web-dist"
+
+      # 以映像內實際建置輸出驗證長快取 regex（BuildOutputLongCacheTest；沒有 SHIOAJI_WEB_DIST 時會略過）
+      - name: nginx long-cache regex against built dist
+        env:
+          SHIOAJI_WEB_DIST: ${{ runner.temp }}/web-dist
+        run: python -m unittest discover -s deploy -p test_nginx_template.py -v
 
       - name: nginx -t with rendered template
         run: |

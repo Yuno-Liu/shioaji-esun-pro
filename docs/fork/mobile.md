@@ -42,7 +42,10 @@
    `ESUN_ALLOWED_HOSTS`，否則 `/esun/` 回 421。
 3. **SSE 不可緩衝**：TLS 前端需即時 flush `text/event-stream`，讀取逾時 ≥ 120 秒（心跳 30 秒、看門狗 75 秒）。
 4. **不對外開放**：維持 `WEB_BIND=127.0.0.1`，只讓同機的 TLS 前端連 `127.0.0.1:8080`；不得設定路由器轉埠。
-5. **存取控制**：方案 A 以 tailnet 存取控制為主；方案 B／C 建議同時啟用 Basic Auth（設定方式見
+5. **存取控制**：方案 A 以 tailnet 存取控制為主；方案 B／C **必須**啟用 Basic Auth。原因：nginx 會替通過
+   Host／Origin 檢查的 `/esun/` 請求注入玉山 token，而不帶 `Origin` 的請求（例如 curl）會被放行，區網上任何能連到
+   TLS 前端的裝置都能直接送 `/esun/` 請求下單、刪單；Basic Auth 是方案 B／C 唯一的使用者驗證。
+   方案 B 在 Caddy 設定 `basic_auth`（見下方範例）；方案 C 用 nginx 的 `WEB_BASIC_AUTH`（設定方式見
    [esun.md 的「區網存取」](esun.md#區網存取)）。iOS「加入主畫面」模式下的 Basic Auth 行為尚未驗證（⚠️）。
 
 ```dotenv
@@ -99,7 +102,9 @@ WEB_SERVER_NAMES=trade.lan
    caddy run --config ./Caddyfile
    ```
    範例內容見 [`deploy/Caddyfile.mobile.example`](../../deploy/Caddyfile.mobile.example)：`tls internal`、
-   `reverse_proxy 127.0.0.1:8080` 並設定 `flush_interval -1`。
+   `basic_auth`、`reverse_proxy 127.0.0.1:8080` 並設定 `flush_interval -1`。
+   **必須**把 `basic_auth` 的佔位字串換成 `caddy hash-password` 產生的雜湊；
+   Caddy 2.8 以前的指令名稱是 `basicauth`。
 2. 手機安裝並**完全信任** Caddy 根憑證（Caddy 資料目錄的 `pki/authorities/local/root.crt`）：
    - iOS：安裝描述檔後，到「設定 → 一般 → 關於本機 → 憑證信任設定」開啟完全信任。
    - Android：「設定 → 安全性 → 加密與憑證 → 安裝憑證 → CA 憑證」。
@@ -109,6 +114,7 @@ WEB_SERVER_NAMES=trade.lan
 
 在 `deploy/nginx.conf.template` 增加 TLS listener（`listen <port> ssl;`、`ssl_certificate`、`ssl_certificate_key`），
 並以 `docker-compose.override.yml` 唯讀掛載憑證。少一個元件，但需要修改 fork 的部署檔，憑證信任問題同方案 B。
+**必須**同時以 `WEB_BASIC_AUTH` 與 htpasswd 啟用 Basic Auth（原因同上方必要條件 5）。
 修改時須保留既有的 Host 白名單、Origin／`Sec-Fetch-Site` 檢查與安全標頭，並以 `nginx -t` 驗證。
 
 ## nginx 安全設定（2026-11-06 安全稽核後補強）

@@ -181,6 +181,10 @@ describe('limitLines／referenceLines', () => {
         expect(limitLines(contract({ security_type: 'IND' }))).toEqual([]);
     });
 
+    it('興櫃沒有漲跌停：不畫停板線', () => {
+        expect(limitLines(contract({ exchange: 'OES' }))).toEqual([]);
+    });
+
     it('沒有漲跌停值時不畫', () => {
         expect(limitLines(contract({ limit_up: 0, limit_down: 0 }))).toEqual([]);
     });

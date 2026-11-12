@@ -35,9 +35,14 @@ export const fmtRatio = (v: number | null | undefined): string => (v === null ||
 export const fmtGrowth = (v: number | null | undefined): string =>
     v === null || v === undefined || !Number.isFinite(v) ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
 
-/** 營收組成的色階（同桌面 MIX_OPACITY） */
-export const MIX_OPACITY = [1, 0.7, 0.5, 0.36, 0.25, 0.17, 0.12];
-export const mixOpacity = (i: number): number => MIX_OPACITY[i] ?? 0.1;
+/**
+ * 營收組成的色階（前 3 段同桌面 MIX_OPACITY）。第 4 段起改為對比等比遞減：桌面的 0.36／0.25／0.17／0.12／0.10
+ * 疊在深色 muted 上只有 1.75→1.13:1、相鄰段 1.03:1，分不出來。改後各段對軌道底 深色 2.03→1.32、淺色 1.82→1.30，
+ * 相鄰段 深色約 1.11–1.12、淺色約 1.09（前 3 段不變）。
+ */
+export const MIX_OPACITY = [1, 0.7, 0.5, 0.44, 0.38, 0.32, 0.26];
+export const MIX_OPACITY_FLOOR = 0.2;
+export const mixOpacity = (i: number): number => MIX_OPACITY[i] ?? MIX_OPACITY_FLOOR;
 
 /**
  * 外部連結：只接受 http／https（公司網站可能沒有通訊協定，補 https://，同桌面）；其他（javascript:、mailto: 等）回 null，

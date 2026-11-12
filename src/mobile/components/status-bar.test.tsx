@@ -18,6 +18,7 @@ const m = vi.hoisted(() => ({
     acknowledgeStaleData: vi.fn(),
     retryResume: vi.fn(),
     stream: 'live' as 'live' | 'connecting' | 'down' | 'stale',
+    heartbeat: 0,
 }));
 
 vi.mock('../../lib/account-store', () => ({ useAccounts: () => m.accounts }));
@@ -25,7 +26,7 @@ vi.mock('../../lib/contracts-cache', () => ({ useContract: () => m.contract }));
 vi.mock('../../lib/esun/stream', () => ({ getEsunStreamStatus: () => 'idle' }));
 vi.mock('../../lib/order-route', () => ({ routeEnvText: (s: boolean | undefined) => (s === true ? '模擬' : s === false ? '正式' : '環境未確認') }));
 vi.mock('../../lib/risk', () => ({ setRiskSettings: vi.fn(), useRiskSettings: () => ({ locked: false }) }));
-vi.mock('../../lib/stream', () => ({ getLastHeartbeat: () => 0, streamConnectionEpoch: () => 3 }));
+vi.mock('../../lib/stream', () => ({ getLastHeartbeat: () => m.heartbeat, streamConnectionEpoch: () => 3 }));
 const NO_NOTICES: never[] = [];
 vi.mock('../../lib/trade', () => ({
     isFuturesContract: (c: { security_type: string }) => c.security_type === 'FUT' || c.security_type === 'OPT',
@@ -119,6 +120,28 @@ describe('B7：狀態列帳戶依目前商品市場', () => {
         m.accounts = { loaded: true, selectedStock: null, selectedFutures: futAcc };
         await rerender();
         expect(textOf(one('status-route'))).toContain('F002000-***4321');
+    });
+});
+
+describe('連線面板：開著時每秒刷新（殼層不再隨交易狀態重繪）', () => {
+    it('最後心跳是模組狀態：面板開著時 1 秒內更新；關閉後不再計時', async () => {
+        vi.useFakeTimers();
+        try {
+            m.heartbeat = 0;
+            await render();
+            await act(async () => { one('status-connection').props.onClick(); });
+            expect(textOf(one('connection-sheet'))).toContain('—');
+            m.heartbeat = Date.UTC(2026, 10, 13, 1, 2, 3); // 台北 09:02:03
+            await act(async () => { vi.advanceTimersByTime(1000); });
+            expect(textOf(one('connection-sheet'))).toContain('09:02:03');
+            const sheet = view!.root.findAll(n => n.props.testId === 'connection-sheet' && typeof n.type !== 'string')[0]!;
+            await act(async () => { sheet.props.onClose(); });
+            await act(async () => { vi.runOnlyPendingTimers(); }); // 退場動畫
+            expect(vi.getTimerCount()).toBe(0); // 每秒刷新的 interval 已清掉
+        } finally {
+            m.heartbeat = 0;
+            vi.useRealTimers();
+        }
     });
 });
 

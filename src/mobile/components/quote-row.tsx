@@ -61,30 +61,63 @@ export interface RowQuoteView {
     low?: number;
     /** 資料本身帶的漲跌停狀態（排行：scanner change_type）；有值（含 null）時不再以合約判斷 */
     limit?: LimitState | null;
+    /** 報價自身的參考價（指數 index.reference、成交 現價 − 漲跌、快照 收盤 − 漲跌）；迷你走勢的基準優先用它 */
+    ref?: number;
 }
 
 /** 有限正數才留下 */
 const pos = (n: number | undefined) => (n !== undefined && n > 0 && Number.isFinite(n) ? n : undefined);
 
+/** 價格 − 漲跌 推回的參考價（收斂浮點誤差）；不是正數時 undefined */
+function derivedRef(close: number | undefined, chg: number | undefined): number | undefined {
+    if (close === undefined || chg === undefined || !Number.isFinite(close) || !Number.isFinite(chg)) return undefined;
+    const r = Number((close - chg).toFixed(6));
+    return r > 0 ? r : undefined;
+}
+
 /**
  * 即時 tick／指數優先，沒有時退回快照收盤。
  * 不使用 tick.pct_chg（股票與期權串流的單位不同），一律由漲跌與參考價推算。
+ * 參考價跟著報價自己推（同桌面 quote-board、watch-sort）：盤前或跨夜時合約已換成新交易日的參考價，
+ * 成交與快照卻還是前一日的——tick 的漲跌幅分母用 現價 − price_chg；只有快照的列直接用快照的 change_price／change_rate。
+ * 試撮時價格維持試撮價（列上有徽章），總量改用上一筆真實成交（lastRealTick）或快照的 total_volume（試撮 tick 的量不是成交）。
  */
-export function rowQuoteView(contract: Pick<ContractInfo, 'reference'> & Partial<Pick<ContractInfo, 'security_type'>>, snapshot: Snapshot | undefined, quote: PriceQuoteState | undefined): RowQuoteView {
+export function rowQuoteView(
+    contract: Pick<ContractInfo, 'reference'> & Partial<Pick<ContractInfo, 'security_type'>>,
+    snapshot: Snapshot | undefined,
+    quote: PriceQuoteState | undefined,
+    lastRealTick?: PriceQuoteState['tick'],
+): RowQuoteView {
     const tick = quote?.tick;
     const index = quote?.index;
     const close = tick ? Number(tick.close) : index ? Number(index.close) : snapshot?.close;
-    const ref = index ? Number(index.reference) : contract.reference;
-    const chg = tick?.price_chg
-        ? Number(tick.price_chg)
-        : index
-            ? Number(index.close) - Number(index.reference)
-            : close !== undefined && ref
-                ? close - ref
-                : undefined;
-    const pct = chg !== undefined && ref ? (chg / ref) * 100 : snapshot?.change_rate;
+    let chg: number | undefined;
+    let ref: number | undefined;
+    let pct: number | undefined;
+    if (tick?.price_chg) {
+        chg = Number(tick.price_chg);
+        ref = derivedRef(close, chg) ?? pos(contract.reference);
+    } else if (index) {
+        ref = Number(index.reference);
+        chg = Number(index.close) - ref;
+    } else if (!tick && snapshot && Number.isFinite(snapshot.change_price)) {
+        // 只有快照：漲跌與漲跌幅都用快照自己的（與 lib/watch-sort sortValuesOf 一致），不和合約參考價混算
+        chg = snapshot.change_price;
+        ref = derivedRef(close, chg);
+        pct = Number.isFinite(snapshot.change_rate) ? snapshot.change_rate : undefined;
+    } else {
+        ref = pos(contract.reference);
+        chg = close !== undefined && ref ? close - ref : undefined;
+    }
+    if (pct === undefined) pct = chg !== undefined && ref ? (chg / ref) * 100 : snapshot?.change_rate;
     const dir = chg === undefined || !Number.isFinite(chg) || chg === 0 ? 'flat' : chg > 0 ? 'up' : 'down';
-    const vol = index || contract.security_type === 'IND' ? undefined : tick ? Number(tick.total_volume) : snapshot?.total_volume;
+    const realTick = tick && tick.simtrade !== true ? tick : lastRealTick && lastRealTick.simtrade !== true ? lastRealTick : undefined;
+    const vol = index || contract.security_type === 'IND'
+        ? undefined
+        : realTick ? Number(realTick.total_volume)
+        // 試撮中且本列還沒看過真實成交（例如 08:30–09:00）：盤前快照是前一交易日的量，不顯示
+        : tick?.simtrade === true ? undefined
+        : snapshot?.total_volume;
     const day = tick ?? index;
     return {
         close: close !== undefined && Number.isFinite(close) ? close : undefined,
@@ -95,6 +128,7 @@ export function rowQuoteView(contract: Pick<ContractInfo, 'reference'> & Partial
         vol: vol !== undefined && Number.isFinite(vol) && vol >= 0 ? vol : undefined,
         high: pos(day ? Number(day.high) : snapshot?.high),
         low: pos(day ? Number(day.low) : snapshot?.low),
+        ref: ref !== undefined && Number.isFinite(ref) && ref > 0 ? ref : undefined,
     };
 }
 
@@ -313,13 +347,13 @@ export interface QuoteRowProps {
     spark: boolean;
     /** 走勢資料的合約；null 時走勢欄是空白佔位（指數、組合商品、排行中未知交易所的股票） */
     sparkContract: ContractBase | null;
-    /** 昨收（參考價）；0 或缺少時走勢不畫基準線 */
+    /** 昨收（參考價）；0 或缺少時走勢不畫基準線。列有報價時改用報價自身的參考價（RowQuoteView.ref），盤前、跨夜不和新交易日的合約參考價混用 */
     sparkReference?: number;
     punished: boolean;
     /** 固定的行情（排行：快照資料、不訂閱）；未給時以 quoteContract＋snapshot＋即時行情推算 */
     staticView?: RowQuoteView;
     /** 行情推算與漲跌停判斷用的合約（staticView 時只用來判斷漲跌停） */
-    quoteContract?: Pick<ContractInfo, 'reference'> & Partial<Pick<ContractInfo, 'security_type' | 'limit_up' | 'limit_down'>>;
+    quoteContract?: Pick<ContractInfo, 'reference'> & Partial<Pick<ContractInfo, 'security_type' | 'exchange' | 'limit_up' | 'limit_down'>>;
     snapshot?: Snapshot;
     /** 可見時掛載的行情探針（自選：WatchQuoteProbe）；行情交給列自行節流重繪 */
     probe?: ComponentType<{ code: string; onQuote: (q: PriceQuoteState | undefined) => void }>;
@@ -355,7 +389,11 @@ export function QuoteRow({
     const visible = useRowVisible(ref, tracker, index < FALLBACK_VISIBLE_ROWS);
     useEffect(() => { onVisibleChange?.(visible); }, [visible, onVisibleChange]);
     const [quote, pushQuote] = useThrottledValue<PriceQuoteState | undefined>(undefined, WATCH_REPAINT_MS);
-    const view = staticView ?? rowQuoteView(quoteContract ?? { reference: 0 }, snapshot, quote);
+    // 試撮期間總量沿用本列看過的上一筆真實成交（換代碼時重來）
+    const lastReal = useRef<{ code: string; tick: PriceQuoteState['tick'] } | null>(null);
+    if (quote?.tick && quote.tick.simtrade !== true) lastReal.current = { code, tick: quote.tick };
+    const lastRealTick = lastReal.current?.code === code ? lastReal.current.tick : undefined;
+    const view = staticView ?? rowQuoteView(quoteContract ?? { reference: 0 }, snapshot, quote, lastRealTick);
     // 跳價閃爍：快照 → 即時的那一筆不閃（來源切換）；只閃可見格（price-flash 內共用 IntersectionObserver）
     usePriceFlash(flashRef, view.close, { source: quote ? 'live' : 'snapshot', enabled: visible });
 
@@ -474,7 +512,7 @@ export function QuoteRow({
                 {spark && (!sparkContract
                     ? <SparkPlaceholder state='na' testId={t('spark-blank')} />
                     : visible
-                        ? <VisibleSpark contract={sparkContract} reference={sparkReference} tick={quote?.tick} testId={t('spark-blank')} />
+                        ? <VisibleSpark contract={sparkContract} reference={view.ref ?? sparkReference} tick={quote?.tick} testId={t('spark-blank')} />
                         : <SparkPlaceholder state='hidden' testId={t('spark-blank')} />)}
             </button>
             {visible && Probe && <Probe code={code} onQuote={pushQuote} />}

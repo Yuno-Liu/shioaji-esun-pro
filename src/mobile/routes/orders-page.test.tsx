@@ -12,6 +12,8 @@ const h = vi.hoisted(() => ({
     meta: new Map<string, unknown>(),
     contracts: {} as Record<string, unknown>,
     privMoney: false,
+    /** 列元件渲染次數：OrderRow 每次渲染呼叫一次 useEsunOrderMeta；DealItem 每次渲染呼叫一次 mobileAccountLabel */
+    renders: { orderRow: 0, dealItem: 0 },
 }));
 const m = vi.hoisted(() => ({
     refresh: vi.fn(async () => undefined),
@@ -54,7 +56,10 @@ vi.mock('../../lib/contracts-cache', () => ({
     ensureContract: () => Promise.resolve(undefined),
 }));
 vi.mock('../../lib/esun/account-details', () => ({
-    useEsunOrderMeta: (t: { order: { id: string } } | null) => (t ? h.meta.get(t.order.id) ?? null : null),
+    useEsunOrderMeta: (t: { order: { id: string } } | null) => {
+        h.renders.orderRow++;
+        return t ? h.meta.get(t.order.id) ?? null : null;
+    },
 }));
 vi.mock('../../lib/privacy', () => ({
     usePrivacyMode: () => false,
@@ -68,7 +73,10 @@ vi.mock('../components/route-badge', () => ({
     routeBadgeText: (r: { broker: string } | null) => (r ? `送往 ${r.broker} 模擬` : '未選擇下單帳戶'),
 }));
 vi.mock('../components/account-switch-sheet', () => ({
-    mobileAccountLabel: (a: { broker_id: string; account_id: string }) => `${a.broker_id}-***${a.account_id.slice(-2)}`,
+    mobileAccountLabel: (a: { broker_id: string; account_id: string }) => {
+        h.renders.dealItem++;
+        return `${a.broker_id}-***${a.account_id.slice(-2)}`;
+    },
 }));
 
 import type { AccountedTrade } from '../../lib/types/order';
@@ -856,5 +864,43 @@ describe('OrdersPage — 勾選批次刪單', () => {
         await press(testIdIn(row('o1')!, 'order-row-main')[0]!);
         expect(text(byTestId('orders-selected-count')[0]!)).toBe('已選 0 筆');
         expect(byTestId('order-detail-sheet')).toHaveLength(0);
+    });
+});
+
+describe('OrdersPage — 重繪範圍（效能）', () => {
+    /** 模擬 lib 發布：交易狀態換新物件、只換 positions（trades 陣列與各 trade 物件不變） */
+    async function publishPositionsOnly(n: number) {
+        for (let i = 0; i < n; i++) {
+            h.state = { ...(h.state as object), positions: [{ id: i, code: '2330', pnl: i * 100 }] };
+            await rerender();
+        }
+    }
+
+    it('委託清單：發布 3 次只換 positions，OrderRow 不重繪（修正前每次發布每列各重繪一次）', async () => {
+        setState([trade('1'), trade('2'), trade('3')]);
+        await render();
+        expect(rows()).toHaveLength(3);
+        const before = h.renders.orderRow;
+        await publishPositionsOnly(3);
+        expect(h.renders.orderRow - before).toBe(0);
+        expect(rows()).toHaveLength(3);
+    });
+
+    it('成交清單：發布 3 次只換 positions，DealItem 不重繪；某筆委託換新物件時只重繪該筆的列', async () => {
+        const filled = (id: string) => trade(id, { status: { status: 'Filled', deal_quantity: 5, deals: [{ seq: `D${id}`, price: 1080, quantity: 5, ts: 1_700_000_100 }] } });
+        setState([filled('1'), filled('2'), filled('3')]);
+        await render();
+        await press(byTestId('orders-tab-deals')[0]!);
+        expect(byTestId('deal-row')).toHaveLength(3);
+        const before = h.renders.dealItem;
+        await publishPositionsOnly(3);
+        expect(h.renders.dealItem - before).toBe(0);
+
+        const trades = (h.state as { trades: AccountedTrade[] }).trades;
+        h.state = { ...(h.state as object), trades: [trades[0]!, trades[1]!, filled('3')] };
+        await rerender();
+        // mobileAccountLabel 2 次＝換新的那一列 1 次＋帳戶篩選選項 1 次（accounts 依 trades 重算）；其他兩列不重繪
+        expect(h.renders.dealItem - before).toBe(2);
+        expect(byTestId('deal-row')).toHaveLength(3);
     });
 });

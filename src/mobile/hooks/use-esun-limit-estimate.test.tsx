@@ -7,6 +7,7 @@ import type { TradingLimits } from '../../lib/shioaji';
 import type { AccountedTrade } from '../../lib/types/order';
 import type { Account } from '../../lib/types/portfolio';
 import type { EsunLimitEstimate } from '../lib/esun-limit-estimate';
+import { clearEsunOrderMeta, setEsunOrderMetaSnapshot } from '../../lib/esun/account-details';
 
 const m = vi.hoisted(() => ({ trades: [] as unknown[] }));
 
@@ -56,4 +57,15 @@ it('recomputes "today" on the next render after Taipei midnight (yesterday\'s or
     vi.setSystemTime(Date.UTC(2026, 10, 9, 16, 0, 5)); // 2026-11-10 00:00:05 台北；委託與額度都沒變
     await act(async () => { view!.update(createElement(Probe)); });
     expect(latest).toMatchObject({ pending: 0, remaining: 1_000_000, buyOrders: 0 });
+});
+
+it('委託中繼資料更新（trades 參考不變）也會重算：前一晚的預約單在 workDate 當天計入今日', async () => {
+    vi.setSystemTime(Date.UTC(2026, 10, 10, 1, 0, 0)); // 2026-11-10 09:00 台北；buy 的 order_ts 是前一天 23:59
+    clearEsunOrderMeta();
+    await act(async () => { view = create(createElement(Probe)); });
+    const before = latest!.remaining;
+    expect(before).toBe(limits.trading_limit); // 沒有中繼資料：依 order_ts 判斷為前一日，不扣
+    await act(async () => { setEsunOrderMetaSnapshot(esun, [{ pre_ord_no: 'B1', ord_no: 'B1', ord_status: '1', work_date: '20261110', ord_date: '20261109', ord_time: '235900000' }]); });
+    expect(latest!.remaining).toBeLessThan(before); // workDate＝今日：預約單計入今日買進
+    clearEsunOrderMeta();
 });

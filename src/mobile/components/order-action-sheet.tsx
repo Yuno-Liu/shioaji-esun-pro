@@ -7,6 +7,9 @@
 //   減量＝剩餘量 ≥ 2 且非玉山預約單，輸入「新的剩餘數量」n，送出 updateOrderQty(tradeId, 剩餘 − n)；
 //   刪單＝一律提供（不因玉山 celable 提示隱藏），cancelOrder(tradeId)。
 // - 每個動作都必須 SlideToConfirm 滑動完成才呼叫 lib；進行中停用並鎖住面板（不可關閉）。
+//   lib 的改價／減量沒有逾時：處理超過 ORDER_ACTION_SLOW_MS 仍未結束時解除鎖定（可關閉面板）並提示結果未確認、勿重送。
+//   不重送、不提前釋放 lib 的鎖或計數；關閉後 promise 結束時只發通知，不更新已卸載的元件、不關閉之後開啟的另一個面板。
+//   同一筆委託仍有未結束的操作時（面板關閉後重新開啟），改價、減量、刪單一律停用並說明。
 // - 改價、減量：按鈕在 useTradingLive() 為 false 或 ResumeGate 不允許時停用並說明；滑動完成後、呼叫 lib 前
 //   再同步檢查 assertResumeReady({ allowStale: staleAcknowledged }) 與 assertTradingLive()，丟出就顯示「未送出」且不呼叫 lib。
 //   刪單不受 ResumeGate、LIVE 與風控鎖限制（降低風險的動作；桌面刪單同樣不要求 LIVE）。
@@ -20,7 +23,7 @@
 //   kind 為 price／qty／cancel 時直接進入對應子畫面。樣式在 styles/order-action.css.ts（OrderLines 仍用 orders.css.ts）。
 
 import { Minus, Pencil, Trash2 } from 'lucide-react';
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { mutationErrorNotice, isEsunReservationTrade } from '../../components/esun-order-meta';
 import { useTradingLive } from '../../hooks/use-stream';
 import { ensureContract, useContract } from '../../lib/contracts-cache';
@@ -44,7 +47,7 @@ import { useResumeGate } from '../hooks/use-resume-gate';
 import { instrumentText, useContractName } from '../lib/contract-names';
 import { isNotStarted, notStarted } from '../lib/errors';
 import { avgFillPrice, avgPriceDigits, fillProgress, orderBadges } from '../lib/order-fills';
-import { closeOrderAction, useMobileUi, type OrderActionKind } from '../lib/mobile-store';
+import { closeOrderAction, getMobileUi, useMobileUi, type OrderActionKind } from '../lib/mobile-store';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
 import { acknowledgeStaleData, assertResumeReady, getResumeGate, retryResume, type ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import { assertNoEnvSwitch } from '../lib/trading-activity';
@@ -75,7 +78,41 @@ export const ORDER_ACTION_TEXT = {
     priceTick: '價格不符合升降單位',
     priceSame: '新價格與目前委託價相同',
     busy: '處理中…',
+    slow: '處理超過 20 秒仍未完成：結果未確認，請到委託頁核對，勿重送（可關閉此面板）',
+    unsettled: '這筆委託上一次的改價／減量／刪單仍在處理，結果未確認，請到委託頁核對，勿重送',
 } as const;
+
+/** 改價、減量、刪單處理超過這個時間仍未結束：允許關閉面板並提示結果未確認 */
+export const ORDER_ACTION_SLOW_MS = 20_000;
+
+// 已送出但尚未結束的操作（依委託 id 計數）：面板關閉後 promise 仍在進行，重新開啟同一筆委託時據此停用所有動作，避免重送。
+// promise 結束（成功、失敗或結果未知）時在 finally 歸零；重新整理頁面會清空
+const unsettled = new Map<string, number>();
+const unsettledListeners = new Set<() => void>();
+const unsettledChanged = () => unsettledListeners.forEach(l => l());
+
+function trackUnsettled(tradeId: string): () => void {
+    unsettled.set(tradeId, (unsettled.get(tradeId) ?? 0) + 1);
+    unsettledChanged();
+    let done = false;
+    return () => {
+        if (done) return;
+        done = true;
+        const n = (unsettled.get(tradeId) ?? 1) - 1;
+        if (n > 0) unsettled.set(tradeId, n);
+        else unsettled.delete(tradeId);
+        unsettledChanged();
+    };
+}
+
+function subscribeUnsettled(listener: () => void): () => void {
+    unsettledListeners.add(listener);
+    return () => { unsettledListeners.delete(listener); };
+}
+
+function useUnsettled(tradeId: string): boolean {
+    return useSyncExternalStore(subscribeUnsettled, () => unsettled.has(tradeId), () => unsettled.has(tradeId));
+}
 
 /** 「未成交」＝ACTIVE_ORDER_STATUSES 且剩餘量 > 0（部分成交仍有剩餘的委託也算） */
 export function isWorkingTrade(trade: Trade): boolean {
@@ -359,29 +396,44 @@ export function OrderActionSheet() {
 }
 
 interface MutationRunner {
+    /** 本面板的操作進行中，或同一筆委託仍有未結束的操作（面板關閉前送出的） */
     busy: boolean;
+    /** 本面板的操作已處理超過 ORDER_ACTION_SLOW_MS */
+    slow: boolean;
+    /** 同一筆委託有面板關閉前送出、尚未結束的操作（不是本面板這一次） */
+    unsettledElsewhere: boolean;
     resetKey: number;
     /** 「未送出：…」；null＝無 */
     feedback: string | null;
     run: <T>(verb: Verb, call: () => Promise<T>, onOk: (value: T) => void, opts: { gated: boolean }) => Promise<void>;
 }
 
-function useMutationRunner(onBusyChange: (busy: boolean) => void, account: TradeAccount | null): MutationRunner {
+function useMutationRunner(onBusyChange: (busy: boolean) => void, account: TradeAccount | null, tradeId: string): MutationRunner {
     const [busy, setBusy] = useState(false);
+    const [slow, setSlow] = useState(false);
     const [resetKey, setResetKey] = useState(0);
     const [feedback, setFeedback] = useState<string | null>(null);
     const busyRef = useRef(false);
+    const mounted = useRef(true);
+    const unsettledNow = useUnsettled(tradeId);
 
-    useEffect(() => { onBusyChange(busy); }, [busy, onBusyChange]);
+    useEffect(() => {
+        mounted.current = true;
+        return () => { mounted.current = false; };
+    }, []);
+    // 面板鎖定：進行中且尚未超過 ORDER_ACTION_SLOW_MS（超過後可關閉面板；送出本身不中止）
+    useEffect(() => { onBusyChange(busy && !slow); }, [busy, slow, onBusyChange]);
     useEffect(() => () => onBusyChange(false), [onBusyChange]);
 
     const notSent = (err: unknown) => {
+        if (!mounted.current) return; // 面板已關閉：mutationErrorNotice 的通知已告知
         setFeedback(`未送出：${err instanceof Error ? err.message : String(err)}`);
         setResetKey(k => k + 1); // 滑動確認重新啟用，修改後可再試
     };
 
     const run: MutationRunner['run'] = async (verb, call, onOk, opts) => {
-        if (busyRef.current) return;
+        // 同一筆委託仍有未結束的操作（面板關閉前送出的）：不送
+        if (busyRef.current || unsettled.has(tradeId)) return;
         setFeedback(null);
         // 玉山環境切換中：玉山委託的改價、減量、刪單一律不送（含不受 ResumeGate 限制的刪單）；永豐照常
         try {
@@ -402,22 +454,33 @@ function useMutationRunner(onBusyChange: (busy: boolean) => void, account: Trade
         }
         busyRef.current = true;
         setBusy(true);
+        // 只關閉這一次開啟的面板：逾時後使用者可能已關閉並開啟另一筆委託的面板
+        const seq = getMobileUi().orderAction?.seq;
+        const closeThis = () => { if (seq !== undefined && getMobileUi().orderAction?.seq === seq) closeOrderAction(); };
+        const settled = trackUnsettled(tradeId);
+        const slowTimer = setTimeout(() => { if (mounted.current) setSlow(true); }, ORDER_ACTION_SLOW_MS);
         try {
             const value = await call();
             onOk(value);
-            closeOrderAction();
+            closeThis();
         } catch (err) {
             notify({ kind: 'err', ...mutationErrorNotice(err, verb) });
             // 確定未送出：面板保留可修改後重試；結果未知：關閉面板，不自動重送、不提供重送鍵
             if (isNotStarted(err)) notSent(err);
-            else closeOrderAction();
+            else closeThis();
         } finally {
+            clearTimeout(slowTimer);
+            settled();
             busyRef.current = false;
-            setBusy(false);
+            if (mounted.current) {
+                setBusy(false);
+                setSlow(false);
+            }
         }
     };
 
-    return { busy, resetKey, feedback, run };
+    const unsettledElsewhere = unsettledNow && !busy;
+    return { busy: busy || unsettledNow, slow: busy && slow, unsettledElsewhere, resetKey, feedback, run };
 }
 
 /** 「未送出」回饋（role=alert；只分未送出，結果未知已關閉面板並通知） */
@@ -445,7 +508,7 @@ function ActionBody({ kind, trade, working, onBusyChange }: { kind: OrderActionK
     const meta = useEsunOrderMeta(trade);
     const live = useTradingLive();
     const gate = useResumeGate();
-    const runner = useMutationRunner(onBusyChange, tradeAccountOf(trade));
+    const runner = useMutationRunner(onBusyChange, tradeAccountOf(trade), trade.order.id);
     const avail = orderActionAvailability(trade, meta);
     const gateReason = mutationGateReason(live, gate);
     const { busy } = runner;
@@ -460,6 +523,8 @@ function ActionBody({ kind, trade, working, onBusyChange }: { kind: OrderActionK
                 </div>
             </GroupedSection>
             {!working && <InlineNote tone='warn' role='status' testId='order-action-gone'>{ORDER_ACTION_TEXT.gone}</InlineNote>}
+            {runner.slow && <InlineNote tone='warn' role='alert' testId='order-action-slow'>{ORDER_ACTION_TEXT.slow}</InlineNote>}
+            {runner.unsettledElsewhere && <InlineNote tone='warn' role='status' testId='order-action-unsettled'>{ORDER_ACTION_TEXT.unsettled}</InlineNote>}
 
             {view === 'menu' && (
                 <>

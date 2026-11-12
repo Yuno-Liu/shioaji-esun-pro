@@ -29,7 +29,6 @@ import { manualStockCreditHint } from '../../lib/stock-exit-cond';
 import { useTradingState } from '../../lib/trading-state';
 import type { ContractInfo } from '../../lib/types/contract';
 import type { FuturesOCType, FuturesPriceType, OrderType } from '../../lib/types/order';
-import { formatToTick } from '../../lib/utils/ticksize';
 import {
     COMMON_LOT_INPUT_MAX,
     ODD_QTY_PRESETS,
@@ -44,6 +43,7 @@ import {
     type TicketFields,
 } from '../hooks/use-mobile-ticket';
 import { closeTicket, useMobileUi, type TicketRequest } from '../lib/mobile-store';
+import { formatNumber, formatToTick } from '../lib/num-format';
 import * as layout from '../styles/layout.css';
 import * as styles from '../styles/order-ticket.css';
 import { fill, focusRing, pressable, srOnly } from '../styles/primitives.css';
@@ -98,8 +98,9 @@ export function priceDeviationText(input: {
     return `偏離成交價 ${ratio > 0 ? '+' : ''}${pct}%`;
 }
 
-const fmtNumber = (v: number) => v.toLocaleString('en-US', { maximumFractionDigits: 4 });
-const fmtAmount = (v: number) => Math.round(v).toLocaleString('en-US');
+// 手機快取版格式器（num-format）：與 toLocaleString 輸出逐字相同，不每次重建 Intl 格式器
+const fmtNumber = (v: number) => formatNumber(v, 'en-US', { maximumFractionDigits: 4 });
+const fmtAmount = (v: number) => formatNumber(Math.round(v), 'en-US');
 
 /**
  * footer 摘要：「限價 1,085 × 1 張 ≈ 1,085,000 元」；期權「… ≈ 名目 … 元」；沒有估值時只到數量。
@@ -247,7 +248,7 @@ function TicketForm({ ticket, contract, onBusyChange, onToneChange }: TicketForm
     const accountText = account
         ? `${isEsunAccount(account) ? '玉山' : '永豐'} ${mobileAccountLabel(account, priv)}（${isFutures ? '期貨／選擇權' : '證券'}）`
         : isFutures ? '沒有可用的期貨帳戶' : '沒有可用的證券帳戶';
-    const qtyNote = isFutures ? null : odd ? `以股計（1～${ODD_LOT_MAX_SHARES} 股）` : `1 張＝${SHARES_PER_LOT.toLocaleString('en-US')} 股`;
+    const qtyNote = isFutures ? null : odd ? `以股計（1～${ODD_LOT_MAX_SHARES} 股）` : `1 張＝${formatNumber(SHARES_PER_LOT, 'en-US')} 股`;
 
     return (
         <div className={styles.form} data-testid='order-ticket-form'>

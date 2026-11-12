@@ -73,7 +73,7 @@ import {
     type UTCTimestamp,
 } from 'lightweight-charts';
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from 'react';
-import { useQuote } from '../../hooks/use-stream';
+import { useQuote, useStreamStatus } from '../../hooks/use-stream';
 import { useResumeGate } from '../hooks/use-resume-gate';
 import { nextChartHistoryRevision } from '../../lib/chart-history';
 import { DEF_BY_TYPE, type IndicatorDef, type OutputDef } from '../../lib/indicator-defs';
@@ -404,10 +404,10 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
         const c = colorsRef.current;
         const ct = contractRef.current;
         const minutes = periodDef(period).minutes;
-        const tick = tickSizeFor(ct, ct.reference > 0 ? ct.reference : 1);
-        const precision = tickDecimals(tick);
-        const priceFormat = { type: 'price' as const, precision, minMove: Number((10 ** -precision).toFixed(precision)) };
         const isIndex = ct.security_type === 'IND';
+        // 指數沒有跳動單位：價格軸固定兩位、minMove 0.01（tickSizeFor 對 IND 會套股票級距，23,456.78 會變成整數）
+        const precision = isIndex ? 2 : tickDecimals(tickSizeFor(ct, ct.reference > 0 ? ct.reference : 1));
+        const priceFormat = { type: 'price' as const, precision, minMove: Number((10 ** -precision).toFixed(precision)) };
         /** 走勢且開啟漲跌停範圍、商品有正數漲跌停 */
         const limitActive = () => isLine && limitOnRef.current && hasLimitRange(contractRef.current);
 
@@ -1750,6 +1750,7 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             {fullscreen && (
                 <div className={cs.fsBar} data-testid='chart-fs-bar'>
                     <span className={cs.fsTitle}>{contract.name || code}</span>
+                    <FullscreenStatusPill />
                     <div className={cs.fsPeriods}>
                         {/* 全螢幕上列空間窄（直向手動全螢幕只剩約一半寬）：用可橫向捲動的膠囊，不用等寬 thumb（會擠成文字重疊） */}
                         {onPeriodChange
@@ -1843,4 +1844,22 @@ export function TradeChart({ code, contract, period, lines, onPeriodChange }: Tr
             <IndicatorSheet open={sheetOpen} onClose={() => setSheetOpen(false)} lineMode={isLine} lineFlowSupported={lineFlowSupported(contract)} />
         </div>
     );
+}
+
+/**
+ * 全螢幕（z-index 高於狀態列）會蓋住連線燈號：串流不是 LIVE、或 ResumeGate 不是 ready 時，在頂列顯示狀態膠囊。
+ * 文字比照狀態列的連線燈號（ResumeGate 優先，其次串流）；在這裡自寫對應，不從 status-bar 匯入（不同 chunk）。
+ * 只在全螢幕時掛載，訂閱跟著元件；連線狀態變化只重繪這顆膠囊，不重繪整張圖。
+ */
+function FullscreenStatusPill() {
+    const stream = useStreamStatus();
+    const resume = useResumeGate().state;
+    const label = resume === 'resyncing' ? '同步中'
+        : resume === 'stale-data' ? '資料過期'
+            : resume === 'failed' ? '未恢復'
+                : stream === 'live' ? null
+                    : stream === 'connecting' ? '連線中'
+                        : '中斷';
+    if (!label) return null;
+    return <span className={`${styles.badge} ${cs.toolButton}`} role='status' data-testid='chart-fs-status'>{label}</span>;
 }

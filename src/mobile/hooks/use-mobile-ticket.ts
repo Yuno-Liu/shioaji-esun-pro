@@ -1,6 +1,7 @@
 // src/mobile/hooks/use-mobile-ticket.ts — 下單面板的欄位狀態、即時驗證與送出（規格 §6.3、§7.1、§7.2）
 //
-// - 帳戶在開啟時以 captureSelectedAccount(market) 固定（面板顯示的就是送單帳戶）。
+// - 帳戶在開啟時以 captureSelectedAccount(market) 固定（面板顯示的就是送單帳戶）。開啟當下沒有取到（帳戶尚未載入、
+//   或選取的帳戶當時不可交易）時，等同市場選取帳戶變成可交易後補取一次；取到之後一律固定，不會被換成別的帳戶。
 // - 價格只在開啟時帶入一次，之後不自動跟價；ResumeGate 的 resumeSeq 改變時標示「價格可能過期」，
 //   需重新點快捷價、手動修改或按「使用此價格」確認才可預覽。ResumeGate 不是 ready 時自動帶入的價格、
 //   以及同步中／失敗時的確認，一律記為未確認（PRICE_UNCONFIRMED），回到可下單狀態後仍須使用者重新確認。
@@ -26,6 +27,7 @@ import { isEsunAccount } from '../../lib/esun';
 import { accountMatches } from '../../lib/flash-account';
 import { creditLabel, isOddLot, ODD_LOT_MAX_SHARES, oddLotReferencePrice, orderQtyUnit, SHARES_PER_LOT, stockOrderProblem, type OddBaseQuote } from '../../lib/odd-lot';
 import { captureSelectedAccount } from '../../lib/order-account';
+import { useServerInfo } from '../../lib/server-info-store';
 import { defaultOrderTypeFor, futuresOrderProblem, orderTypeDisabledReason, PRICE_TYPE_LABEL, priceTypeDisabledReason } from '../../lib/order-conditions';
 import { reconcileAfterUnknownOutcome } from '../../lib/order-outcome';
 import { esunStockLegProblem } from '../../lib/order-route';
@@ -90,6 +92,7 @@ export const TICKET_TEXT = {
     esunFutures: '玉山證券不支援期貨交易',
     marketMismatch: '帳戶市場與商品不符，請關閉面板後重新選擇帳戶',
     notTradable: '這個帳戶目前不可交易（未簽署）',
+    accountLoading: '帳戶載入中…',
     accountChanged: '帳戶已變更，請關閉面板後重新開啟',
     quantity: '數量須為正整數',
     priceRequired: '限價單需要有效價格',
@@ -348,6 +351,8 @@ export interface TicketCheck {
     account: Account | undefined;
     /** 目前 account-store 的同市場選取帳戶（與固定的帳戶不同＝已被切換） */
     selected: Account | null | undefined;
+    /** account-store 已載入過帳戶清單（成功或失敗）；false＝還在載入 */
+    accountsLoaded?: boolean;
     fields: TicketFields;
     /** ResumeGate 的 resumeSeq 已不是帶入價格當時的值 */
     priceStale: boolean;
@@ -366,7 +371,11 @@ export function ticketProblem(c: TicketCheck): string | null {
     if (!isTradableContract(contract)) return TICKET_TEXT.unsupported;
     if (!fields.action) return TICKET_TEXT.noAction;
     // 1) 帳戶：存在、市場相符、玉山不可用於期權、canTrade、仍是目前選取的帳戶
-    if (!account) return isFutures ? TICKET_TEXT.noFuturesAccount : TICKET_TEXT.noStockAccount;
+    if (!account) {
+        if (c.selected && !canTrade(c.selected)) return TICKET_TEXT.notTradable;
+        if (c.accountsLoaded === false) return TICKET_TEXT.accountLoading;
+        return isFutures ? TICKET_TEXT.noFuturesAccount : TICKET_TEXT.noStockAccount;
+    }
     if (isFutures && isEsunAccount(account)) return TICKET_TEXT.esunFutures;
     if (account.account_type !== (isFutures ? 'F' : 'S')) return TICKET_TEXT.marketMismatch;
     if (!canTrade(account)) return TICKET_TEXT.notTradable;
@@ -501,9 +510,19 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
     const isFutures = isFuturesContract(contract);
     const market = isFutures ? 'F' : 'S';
     // 帳戶在開啟時固定（面板關閉前不會因 store 改變而換成別的帳戶）
-    const [account] = useState(() => captureSelectedAccount(market));
+    const [account, setAccount] = useState(() => captureSelectedAccount(market));
     const accounts = useAccounts();
     const selected = isFutures ? accounts.selectedFutures : accounts.selectedStock;
+    // 開啟當下沒有取到帳戶（帳戶尚未載入、或選取的帳戶當時不可交易）：等選取帳戶變成可交易後補取一次。
+    // 只在 account 還是 undefined 時補取（沒有帳戶就不能預覽或送出，沒有進行中的送單會用到別的帳戶）；
+    // 已取到的帳戶以 prev ?? 保留，絕不替換
+    // canTrade 會讀伺服器模式（模擬環境的未簽署帳戶要等 /info 回來才可交易），所以模式改變時也要再試一次
+    const serverSimulation = useServerInfo()?.simulation;
+    useEffect(() => {
+        if (account) return;
+        const next = captureSelectedAccount(market);
+        if (next) setAccount(prev => prev ?? next);
+    }, [account, market, selected, serverSimulation]);
     useRiskSettings(); // checkOrderAllowed 讀風控設定：設定改變時重新驗證
     const tradingLive = useTradingLive();
     const gate = useResumeGate();
@@ -556,6 +575,7 @@ export function useMobileTicket(ticket: TicketRequest, contract: ContractInfo) {
         contract,
         account,
         selected,
+        accountsLoaded: accounts.loaded,
         fields,
         priceStale,
         tradingLive,

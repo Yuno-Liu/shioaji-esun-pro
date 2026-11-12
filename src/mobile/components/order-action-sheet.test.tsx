@@ -52,6 +52,7 @@ import { ListRow } from '../ui/grouped';
 import { BottomSheet, SheetFooter } from './bottom-sheet';
 import {
     newRemainingProblem,
+    ORDER_ACTION_SLOW_MS,
     ORDER_ACTION_TEXT,
     OrderActionSheet,
     orderTimeText,
@@ -281,6 +282,87 @@ describe('OrderActionSheet — 改價', () => {
         expect(m.updatePrice).toHaveBeenCalledTimes(1);
         await act(async () => { resolve({}); });
         expect(getMobileUi().orderAction).toBeNull();
+    });
+});
+
+describe('OrderActionSheet — 處理超過 20 秒（lib 改價／減量沒有逾時）', () => {
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('改價卡住：20 秒前鎖住；之後可關閉面板並提示結果未確認、勿重送；不重送', async () => {
+        vi.useFakeTimers();
+        let resolve!: (v: unknown) => void;
+        m.updatePrice.mockReturnValue(new Promise(r => { resolve = r; }));
+        try {
+            await open('o1', 'price');
+            await typeInto('order-action-price', '1085');
+            await confirm();
+            expect(sheet().props.dismissible).toBe(false);
+            await act(async () => { vi.advanceTimersByTime(ORDER_ACTION_SLOW_MS - 1); });
+            expect(sheet().props.dismissible).toBe(false);
+            expect(byTestId('order-action-slow')).toHaveLength(0);
+            await act(async () => { vi.advanceTimersByTime(1); });
+            expect(sheet().props.dismissible).toBe(true);
+            expect(text(byTestId('order-action-slow')[0]!)).toBe(ORDER_ACTION_TEXT.slow);
+            expect(ORDER_ACTION_TEXT.slow).toContain('結果未確認，請到委託頁核對，勿重送');
+            // 送出仍在進行：滑塊與「返回」停用，再滑一次也不重送
+            expect(slide()!.props.disabled).toBe(true);
+            expect(button('返回')!.props.disabled).toBe(true);
+            await confirm();
+            expect(m.updatePrice).toHaveBeenCalledTimes(1);
+            await act(async () => { resolve({}); });
+            expect(m.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ok', title: '改價已送出' }));
+            expect(getMobileUi().orderAction).toBeNull();
+        } finally {
+            await act(async () => { resolve({}); }); // 斷言失敗時也結束送出，不讓未結束的操作留到下一個測試
+        }
+    });
+
+    it('逾時後關閉面板：重新開啟同一筆委託時所有動作停用；結果到達時只通知，不關閉之後開啟的面板、不更新已卸載的面板', async () => {
+        vi.useFakeTimers();
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        h.trades = [trade('o1'), trade('o2')];
+        let resolve!: (v: unknown) => void;
+        m.updateQty.mockReturnValue(new Promise(r => { resolve = r; }));
+        try {
+            await open('o1', 'qty');
+            await typeInto('order-action-qty', '2');
+            await confirm();
+            expect(m.updateQty).toHaveBeenCalledTimes(1);
+            await act(async () => { vi.advanceTimersByTime(ORDER_ACTION_SLOW_MS); });
+            // 關閉面板（暗化幕／下拉／X 都是 onClose）
+            await act(async () => { sheet().props.onClose(); });
+            expect(getMobileUi().orderAction).toBeNull();
+            expect(byTestId('order-action-body')).toHaveLength(0);
+            // 重新開啟同一筆：改價、減量、刪單一律停用並說明；面板本身可關閉
+            await open('o1', 'menu');
+            expect(text(byTestId('order-action-unsettled')[0]!)).toBe(ORDER_ACTION_TEXT.unsettled);
+            expect(root().findAll(n => n.type === ListRow).every(r => r.props.disabled === true)).toBe(true);
+            expect(sheet().props.dismissible).toBe(true);
+            await open('o1', 'qty');
+            await typeInto('order-action-qty', '3');
+            expect(slide()!.props.disabled).toBe(true);
+            await confirm();
+            await open('o1', 'cancel');
+            expect(slide()!.props.disabled).toBe(true);
+            await confirm();
+            expect(m.updateQty).toHaveBeenCalledTimes(1);
+            expect(m.cancelOrder).not.toHaveBeenCalled();
+            // 另一筆委託的面板開著時，前一筆的結果到達（結果未知）：通知，但不關閉這個面板
+            await open('o2', 'menu');
+            expect(byTestId('order-action-unsettled')).toHaveLength(0);
+            const seq = getMobileUi().orderAction!.seq;
+            await act(async () => { resolve(Promise.reject(new Error('timeout'))); });
+            expect(m.notify).toHaveBeenCalledWith({ kind: 'err', title: '改量失敗或結果未知', body: 'timeout；請手動更新委託確認，勿自動重送' });
+            expect(getMobileUi().orderAction?.seq).toBe(seq);
+            // 結束後同一筆委託恢復可操作
+            await open('o1', 'menu');
+            expect(byTestId('order-action-unsettled')).toHaveLength(0);
+            expect(root().findAll(n => n.type === ListRow).some(r => r.props.disabled === false)).toBe(true);
+            expect(errors.mock.calls.filter(c => !String(c[0]).includes('react-test-renderer is deprecated'))).toEqual([]);
+        } finally {
+            errors.mockRestore();
+            await act(async () => { resolve(undefined); }); // 已結束時無作用
+        }
     });
 });
 

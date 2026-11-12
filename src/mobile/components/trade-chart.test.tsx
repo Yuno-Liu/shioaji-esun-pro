@@ -79,7 +79,9 @@ const m = vi.hoisted(() => {
         openOrderAction: vi.fn(),
         rev: 100,
         tickListeners: new Set<(tk: unknown) => void>(),
-        gate: { resumeSeq: 0 },
+        gate: { resumeSeq: 0 } as { resumeSeq: number; state?: string },
+        /** useStreamStatus()（全螢幕狀態膠囊） */
+        stream: 'live' as string,
         haptic: vi.fn(),
         // S1：lib 的送單／改單／刪單函式（圖表任何入口都不得呼叫）
         send: { placeStockOrder: vi.fn(), placeFuturesOrder: vi.fn(), cancelOrder: vi.fn(), updateOrderPrice: vi.fn(), updateOrderQty: vi.fn() },
@@ -104,7 +106,7 @@ vi.mock('../../lib/stream', () => ({
     onAnyTick: (fn: (tk: unknown) => void) => { m.tickListeners.add(fn); return () => { m.tickListeners.delete(fn); }; },
 }));
 vi.mock('../hooks/use-resume-gate', () => ({ useResumeGate: () => m.gate }));
-vi.mock('../../hooks/use-stream', () => ({ useQuote: () => undefined }));
+vi.mock('../../hooks/use-stream', () => ({ useQuote: () => undefined, useStreamStatus: () => m.stream }));
 vi.mock('../../lib/theme-store', () => ({
     useThemeSettings: () => ({}),
     themeKey: () => 'dark-tw',
@@ -216,6 +218,7 @@ beforeEach(() => {
     m.rev = 100;
     m.tickListeners.clear();
     m.gate = { resumeSeq: 0 };
+    m.stream = 'live';
     m.openTicket.mockReset();
     m.openOrderAction.mockReset();
     resetHistoryEntriesForTest();
@@ -645,6 +648,39 @@ describe('TradeChart 全螢幕（W2）', () => {
         await act(async () => { byTestId('chart-fs-exit')[0]!.props.onClick(); });
         expect(rootNode().props['data-fullscreen']).toBe('false');
         expect(byTestId('chart-fs-exit')).toHaveLength(0);
+    });
+
+    it('全螢幕頂列狀態膠囊（role=status）：LIVE＋已同步不顯示；連線中／中斷／同步中／資料過期／未恢復時顯示，ResumeGate 優先', async () => {
+        const el = () => createElement(TradeChart, { code: '2330', contract, period: '5m', lines: [] });
+        await act(async () => { view = create(el(), { createNodeMock: nodeMock }); });
+        await tick(50);
+        m.stream = 'connecting';
+        await act(async () => { view!.update(el()); });
+        expect(byTestId('chart-fs-status')).toHaveLength(0); // 非全螢幕：狀態列看得到，不重複顯示
+        await act(async () => { byTestId('chart-fs-enter')[0]!.props.onClick(); });
+        const pill = () => byTestId('chart-fs-bar')[0]!.findAll(n => n.props['data-testid'] === 'chart-fs-status' && typeof n.type === 'string');
+        const cases: [string, string | undefined, string | null][] = [
+            ['connecting', 'ready', '連線中'],
+            ['down', 'ready', '中斷'],
+            ['stale', undefined, '中斷'],
+            ['connecting', 'resyncing', '同步中'],
+            ['live', 'stale-data', '資料過期'],
+            ['live', 'failed', '未恢復'],
+            ['live', 'ready', null],
+        ];
+        for (const [stream, state, want] of cases) {
+            m.stream = stream;
+            m.gate = { resumeSeq: 0, state };
+            await act(async () => { view!.update(el()); });
+            const p = pill();
+            if (want === null) {
+                expect(p).toHaveLength(0);
+            } else {
+                expect(p).toHaveLength(1);
+                expect(p[0]!.props.role).toBe('status');
+                expect(textOf(p[0]!)).toBe(want);
+            }
+        }
     });
 
     it('指數不顯示全螢幕買賣鍵', async () => {

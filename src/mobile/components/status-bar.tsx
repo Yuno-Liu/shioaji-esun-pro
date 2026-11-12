@@ -35,6 +35,7 @@ import type { ResumeGateState } from '../lib/resume-gate';
 import type { ResumeGateSnapshot } from '../lib/resume-gate-runtime';
 import { loadNoticeCenterSheet } from '../lib/deferred-modules';
 import { trackServerLost } from '../lib/server-down-hint';
+import { taipeiClock } from '../lib/taipei-clock';
 import { useMobileUi } from '../lib/mobile-store';
 import * as controls from '../styles/controls.css';
 import { fill, srOnly } from '../styles/primitives.css';
@@ -98,14 +99,20 @@ const STREAM_TEXT: Record<StreamStatus, string> = { live: 'LIVE', connecting: '�
 const RESUME_TEXT: Record<ResumeGateState, string> = { ready: '已同步', resyncing: '同步中', 'stale-data': '資料可能過期', failed: '連線未恢復' };
 const ESUN_STREAM_TEXT: Record<string, string> = { idle: '未啟動', connecting: '連線中', live: 'LIVE', down: '中斷' };
 
-function formatTime(ms: number): string {
-    if (!ms) return '—';
-    const d = new Date(ms);
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+// 面板開著時每秒重繪：最後心跳、連線世代、玉山串流是模組狀態（沒有訂閱）。
+// 殼層不再隨交易狀態發布而整個重繪（RiskPnlFeed 葉節點），所以要自己刷新
+function useTickWhileOpen(open: boolean) {
+    const [, setTick] = useState(0);
+    useEffect(() => {
+        if (!open) return;
+        const id = setInterval(() => setTick(t => t + 1), 1000);
+        return () => clearInterval(id);
+    }, [open]);
 }
 
 function ConnectionDetails({ open, onClose, stream, gate, serverLost }: { open: boolean; onClose: () => void; stream: StreamStatus; gate: ResumeGateSnapshot; serverLost: boolean }) {
+    useTickWhileOpen(open);
     const resume = gate.state;
     const message = gate.message;
     return (
@@ -114,7 +121,7 @@ function ConnectionDetails({ open, onClose, stream, gate, serverLost }: { open: 
                 <dt className={styles.detailTerm}>永豐串流</dt>
                 <dd className={styles.detailValue}>{STREAM_TEXT[stream]}</dd>
                 <dt className={styles.detailTerm}>最後心跳</dt>
-                <dd className={styles.detailValue}>{formatTime(getLastHeartbeat())}</dd>
+                <dd className={styles.detailValue}>{taipeiClock(getLastHeartbeat())}</dd>
                 <dt className={styles.detailTerm}>連線世代</dt>
                 <dd className={styles.detailValue}>{streamConnectionEpoch()}</dd>
                 <dt className={styles.detailTerm}>玉山回報串流</dt>

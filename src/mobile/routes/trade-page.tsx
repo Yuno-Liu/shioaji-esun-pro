@@ -53,8 +53,10 @@ import { CHART_PERIODS, DEFAULT_CHART_PERIOD, isChartPeriod, type ChartPeriod } 
 import { createFocusProxy, type FocusProxy } from '../lib/focus-proxy';
 import { formatRoute, navigate } from '../lib/hash-router';
 import { openTicket, setCurrentCode } from '../lib/mobile-store';
-import { fmtCompactInt, fmtInt, fmtStockLots, formatNumber, formatToTick } from '../lib/num-format';
-import { headerQuote, headerStats, limitHit, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
+import { changeAbsText } from '../lib/chart-readout';
+import { quoteLimit } from '../lib/limit-hit';
+import { fmtCompactInt, fmtInt, fmtStockLots, formatNumber, formatQuotePrice } from '../lib/num-format';
+import { headerQuote, headerStats, toneVsReference, volumeUnit, type HeaderStats, type HeaderTick } from '../lib/quote-display';
 import { recordRecentCode } from '../lib/recent-codes';
 import { usePunishedCodes, usePunishedListLoaded } from '../lib/regulatory-punish';
 import { orderLists } from '../lib/watch-list-order';
@@ -220,7 +222,8 @@ const fmtAvg = (v: number) => formatNumber(v, 'en-US', { minimumFractionDigits: 
 
 function StatsGrid({ contract, stats }: { contract: ContractInfo; stats: HeaderStats }) {
     const unit = volumeUnit(contract.security_type);
-    const price = (v: number | null) => (v === null ? '—' : formatToTick(contract, v));
+    // 指數固定兩位（不吸附跳動價位）；著色與「參」用報價自身的參考價（headerStats.reference）
+    const price = (v: number | null) => (v === null ? '—' : formatQuotePrice(contract, v));
     const vol = (v: number | null) => (v === null ? '—' : `${fmtCompactInt(v)}${unit}`);
     const value: Record<StatKey, { text: string; tone: 'up' | 'down' | 'flat' }> = {
         open: { text: price(stats.open), tone: toneVsReference(stats.open, stats.reference) },
@@ -393,15 +396,19 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef, i
     const chg = q.change !== null ? { change: q.change, pct: q.pct, dir: q.dir } : null;
     const isStock = contract?.security_type === 'STK';
     const isFop = contract?.security_type === 'FUT' || contract?.security_type === 'OPT';
-    const fmt = (p: number) => (contract ? formatToTick(contract, p) : String(p));
+    // 興櫃沒有漲跌停（上游 lib/limit-state hasPriceLimits）：不列漲跌停價
+    const noLimits = contract?.exchange === 'OES';
+    const fmt = (p: number) => (contract ? formatQuotePrice(contract, p) : String(p));
     const arrow = chg?.dir === 'up' ? '▲' : chg?.dir === 'down' ? '▼' : '';
     // 「可當沖」放徽章；其他狀態（僅先買後賣、不可當沖）以文字放資訊列
     const dayTrade = contract && isStock && contract.day_trade !== 'Yes' ? dayTradeText(contract.day_trade) : null;
     const delivery = contract && isFop ? deliveryMonthText(contract.delivery_month) : null;
-    // 只有成交或快照的價格才判斷漲跌停（參考價不算）
-    const limit = contract && (q.source === 'tick' || q.source === 'snapshot') ? limitHit(price, contract.limit_up, contract.limit_down) : null;
+    // 只有成交或快照的價格才判斷漲跌停（參考價不算）；傳整個合約：指數、選擇權、興櫃不判（lib/limit-hit）
+    const limit = contract && (q.source === 'tick' || q.source === 'snapshot') ? quoteLimit(contract, price) : null;
     const priceText = price !== null ? fmt(price) : '—';
-    const changeText = chg ? `${arrow}${contract && price !== null ? formatToTick(contract, Math.abs(chg.change), { at: price }) : Math.abs(chg.change)}` : null;
+    // 漲跌差額不吸附到現價級距（參考 997 → 成交 1000 是 ▲3，不是 ▲5）；小數位取兩邊級距較多者、指數兩位（lib/chart-readout）
+    const changeAbs = chg && contract && price !== null ? changeAbsText(contract, price, chg.change) : null;
+    const changeText = chg ? `${arrow}${changeAbs ?? (contract ? formatQuotePrice(contract, Math.abs(chg.change)) : Math.abs(chg.change))}` : null;
     const pctText = chg && chg.pct !== null ? ` (${chg.pct > 0 ? '+' : ''}${chg.pct.toFixed(2)}%)` : null;
     const title = `${code}${contract?.name ? ` ${contract.name}` : ''}`;
     const switchLabel = `切換商品，目前 ${title}`;
@@ -493,10 +500,10 @@ function Header({ code, contract, onOpenSwitch, switchOpen = false, switchRef, i
                 </ShellSlot>
             )}
             {contract && <StatsGrid contract={contract} stats={stats} />}
-            {contract && isStock && (contract.limit_up > 0 || contract.limit_down > 0 || dayTrade) && (
+            {contract && isStock && ((!noLimits && (contract.limit_up > 0 || contract.limit_down > 0)) || dayTrade) && (
                 <div className={styles.infoRow} data-testid='trade-info'>
-                    {contract.limit_up > 0 && <span className={styles.infoUp}>漲停 {fmt(contract.limit_up)}</span>}
-                    {contract.limit_down > 0 && <span className={styles.infoDown}>跌停 {fmt(contract.limit_down)}</span>}
+                    {!noLimits && contract.limit_up > 0 && <span className={styles.infoUp}>漲停 {fmt(contract.limit_up)}</span>}
+                    {!noLimits && contract.limit_down > 0 && <span className={styles.infoDown}>跌停 {fmt(contract.limit_down)}</span>}
                     {dayTrade && <span>{dayTrade}</span>}
                 </div>
             )}
@@ -696,7 +703,8 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
                 )}
             </div>
             {panel === 'depth' && <DepthWithTrades code={sym} contract={contract} oddLot={oddLot} />}
-            {panel === 'ticks' && contract && <TickList code={sym} contract={contract} />}
+            {/* 明細同公司分頁：第一次切入才掛載，切走只隱藏（不重抓歷史；隱藏時不重繪，TickList 內部處理） */}
+            {contract && <TickList code={sym} contract={contract} active={panel === 'ticks'} />}
             {companyMounted && (
                 <div hidden={panel !== 'company'} data-testid='trade-company'>
                     <ModuleErrorBoundary onRetry={resetCompanyTab} fallback={props => <ModuleLoadError {...props} testId='company-load-error' />}>

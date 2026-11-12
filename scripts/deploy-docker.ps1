@@ -58,7 +58,7 @@ $EnvFile = Join-Path $ProjectRoot ".env"
 # 沿用殘留的上游與舊密碼（compose 以 shell 環境優先於 .env）。
 $ManagedEnvNames = @(
     "ESUN_BRIDGE_UPSTREAM", "WEB_PORT", "ESUN_SERVER_HOST", "ESUN_SERVER_PORT", "ESUN_BRIDGE_TOKEN",
-    "ESUN_ACCOUNT_PASSWORD", "ESUN_PASSWORD", "ESUN_CERT_PASSWORD", "ESUN_ALLOWED_HOSTS"
+    "ESUN_ACCOUNT_PASSWORD", "ESUN_PASSWORD", "ESUN_CERT_PASSWORD", "ESUN_ALLOWED_HOSTS", "GIT_REVISION"
 )
 $OriginalEnv = @{}
 foreach ($name in $ManagedEnvNames) {
@@ -359,6 +359,28 @@ function Start-HostBridgeProcess {
     Start-Sleep -Seconds 2
 }
 
+# 建置版本標籤：docker-compose.yml 以 GIT_REVISION 傳給 web 映像（畫面顯示「dev · <commit>」）。
+# 對應 deploy-docker.sh 的 export GIT_REVISION=$(git rev-parse --short HEAD)；不是 git 工作目錄或沒有 git 時
+# 不設定，compose 以預設 unknown 建置。Windows PowerShell 5.1 在 $ErrorActionPreference=Stop 下會把原生指令的
+# stderr 當成例外，所以暫時改為 Continue 並吞掉錯誤。
+function Set-GitRevision {
+    if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) { return }
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $rev = (& git -C $ProjectRoot rev-parse --short HEAD 2>$null | Select-Object -First 1)
+        if ($LASTEXITCODE -eq 0 -and $rev) {
+            $env:GIT_REVISION = "$rev".Trim()
+            Write-Info "建置版本：$env:GIT_REVISION"
+        }
+    } catch {
+        # 取不到 commit 不影響部署
+    } finally {
+        $ErrorActionPreference = $previous
+        $global:LASTEXITCODE = 0
+    }
+}
+
 function Action-Up {
     Test-DockerPrerequisites
     Initialize-ConfigFiles
@@ -369,7 +391,10 @@ function Action-Up {
     }
 
     $composeArgs = @("compose", "up", "-d")
-    if (-not $NoBuild) { $composeArgs += "--build" }
+    if (-not $NoBuild) {
+        $composeArgs += "--build"
+        Set-GitRevision
+    }
 
     if ($HostBridge) {
         Start-HostBridgeProcess

@@ -31,9 +31,9 @@ export function useLimitRange(): boolean {
     return useSyncExternalStore(subscribe, getLimitRange, getLimitRange);
 }
 
-/** 有漲跌停可用：非指數，漲停、跌停都是正數且漲停高於跌停 */
-export function hasLimitRange(c: { security_type: string | null | undefined; limit_up: number; limit_down: number }): boolean {
-    return c.security_type !== 'IND' && c.limit_up > 0 && c.limit_down > 0 && c.limit_up > c.limit_down;
+/** 有漲跌停可用：非指數、非興櫃（沒有漲跌停），漲停、跌停都是正數且漲停高於跌停 */
+export function hasLimitRange(c: { security_type: string | null | undefined; exchange?: string | null; limit_up: number; limit_down: number }): boolean {
+    return c.security_type !== 'IND' && c.exchange !== 'OES' && c.limit_up > 0 && c.limit_down > 0 && c.limit_up > c.limit_down;
 }
 
 /** 測試用：回到預設（自動範圍） */

@@ -40,7 +40,13 @@ describe('sparkTone', () => {
         expect(sparkTone([10, 9, 11], 10)).toBe('up');
         expect(sparkTone([10, 12, 9.5], 10)).toBe('down');
         expect(sparkTone([10, 9], undefined)).toBe('down');
-        expect(sparkTone([10, 10], 0)).toBe('up');
+        expect(sparkTone([10, 12], 0)).toBe('up');
+    });
+
+    it('最後一點等於參考價（或沒有參考價時等於第一點）為平盤 flat，不算上漲', () => {
+        expect(sparkTone([9, 11, 10], 10)).toBe('flat');
+        expect(sparkTone([10, 10], 0)).toBe('flat');
+        expect(sparkTone([10, 12, 10], undefined)).toBe('flat');
     });
 });
 
@@ -63,6 +69,13 @@ describe('drawSparkline', () => {
         const down = fakeCtx();
         drawSparkline(fakeCanvas(down) as never, [10, 9, 8], 10);
         expect(down.strokes).toEqual(['MUTED', 'DOWN']);
+    });
+
+    it('平盤（最後一點等於昨收）：折線與面積用 mutedForeground，不用 up 色', () => {
+        const ctx = fakeCtx();
+        drawSparkline(fakeCanvas(ctx) as never, [10, 11, 10], 10);
+        expect(ctx.strokes).toEqual(['MUTED', 'MUTED']);
+        expect(ctx.fills).toEqual(['MUTED@0.14']);
     });
 
     it('少於 2 點只清空不畫；沒有 2D context 時不拋錯', () => {

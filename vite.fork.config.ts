@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { defineConfig, mergeConfig, type ConfigEnv, type Plugin, type UserConfig } from 'vite';
 import upstream from './vite.config';
+import { buildVersionLabel } from './src/lib/build-version';
 import {
     buildMobileManifest,
     MANIFEST_CONTENT_TYPE,
@@ -59,12 +60,31 @@ function excludeFromVendorGroup(config: UserConfig, excluded: RegExp): UserConfi
     return config;
 }
 
+/**
+ * 部署版本標籤：Docker 建置環境沒有 .git，上游 vite.config.ts 只能得到「dev · unknown」。
+ * Dockerfile 以 build arg GIT_REVISION 傳入 SHIOAJI_BUILD_REVISION（git rev-parse --short HEAD），
+ * 這裡用上游同一個 buildVersionLabel 產生相同格式（「dev · <8 碼 commit>」，正式 tag 建置仍為 vX.Y.Z）。
+ * 沒有這個變數、或不是 7–40 碼十六進位（例如預設的 unknown）時不覆寫，維持上游原行為。
+ */
+function buildRevisionDefine(command: ConfigEnv['command']): Record<string, string> {
+    const revision = process.env.SHIOAJI_BUILD_REVISION?.trim().toLowerCase();
+    if (!revision || !/^[0-9a-f]{7,40}$/.test(revision)) return {};
+    const label = buildVersionLabel({
+        command,
+        revision,
+        refType: process.env.GITHUB_REF_TYPE,
+        refName: process.env.GITHUB_REF_NAME,
+    });
+    return { __SHIOAJI_BUILD_VERSION__: JSON.stringify(label) };
+}
+
 export default defineConfig(async (env: ConfigEnv) => {
     // 上游設定是函式型（依 mode／command 產生），用同一組 env 取得實際設定
     const base = (typeof upstream === 'function' ? await upstream(env) : upstream) as UserConfig;
     // mergeConfig 會深層合併：rolldownOptions.input 保留 main、approval，再加上 mobile；plugins 陣列串接
     const merged = mergeConfig(base, {
         plugins: [mobileManifestPlugin()],
+        define: buildRevisionDefine(env.command),
         build: {
             rolldownOptions: {
                 input: { mobile: path.resolve(__dirname, 'mobile.html') },

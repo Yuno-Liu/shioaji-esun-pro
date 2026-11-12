@@ -1,7 +1,8 @@
 // 玉山「估算剩餘」：上限 − 今日買進（已成交＋未成交）。只扣買進；部分成交後刪單、市價以漲停價估、零股以股計、
 // 結果未知以未成交計並標示、其他帳戶與其他日期不計；也以 lib 的 fromEsunOrderResult 轉出的列驗證張／股單位。
 // 純函式，不打任何 API。
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { clearEsunOrderMeta, setEsunOrderMetaSnapshot } from '../../lib/esun/account-details';
 import { fromEsunOrderResult } from '../../lib/esun/order-mapping';
 import type { EsunOrderResult } from '../../lib/esun/types';
 import type { AccountedTrade } from '../../lib/types/order';
@@ -132,6 +133,58 @@ describe('estimateEsunRemaining', () => {
         const s = est([row({ qty: 1, price: 50 })]);
         expect(esunBreakdownText(s, v => `$${v}`)).toBe('上限 $1000000；今日買進 已成交 $0＋未成交 $50000');
         expect(esunBreakdownText(s, () => '•••••')).toBe('上限 •••••；今日買進 已成交 •••••＋未成交 •••••');
+    });
+});
+
+describe('estimateEsunRemaining uses the E.SUN work_date (EsunOrderMeta.workDate) for "today" when present', () => {
+    // 前一日（2026-11-08）20:15 台北
+    const PREV_EVENING_TS = Date.UTC(2026, 10, 8, 12, 15, 0) / 1000;
+    afterEach(() => clearEsunOrderMeta());
+
+    it('a reservation placed the previous evening for today counts today (order_ts stays the previous day)', () => {
+        setEsunOrderMetaSnapshot(esun, [
+            // 預約單轉入盤中後 ord_date 仍是前一日，work_date 為今日
+            { pre_ord_no: 'R1', ord_no: 'N1', ord_status: '2', work_date: '20261109', ord_date: '20261108', ord_time: '201500000' },
+            { pre_ord_no: 'R2', ord_no: '', ord_status: '1', work_date: '20261109', ord_date: '20261108', ord_time: '201600000' },
+        ]);
+        const r = est([
+            row({ id: 'R1', ts: PREV_EVENING_TS, status: 'PartFilled', qty: 2, deal: 1, price: 50, deals: [{ price: 50, quantity: 1 }] }),
+            row({ id: 'R2', ts: PREV_EVENING_TS, status: 'PreSubmitted', qty: 1, price: 40 }),
+        ]);
+        expect(r).toMatchObject({ filled: 50_000, pending: 90_000, buyOrders: 2 });
+        // 中繼資料未讀取時沿用 order_ts：前一日，不計入（修正前的行為）
+        clearEsunOrderMeta();
+        expect(est([row({ id: 'R2', ts: PREV_EVENING_TS, status: 'PreSubmitted', qty: 1, price: 40 })])).toMatchObject({ pending: 0, buyOrders: 0 });
+    });
+
+    it('a normal today order with meta is unaffected', () => {
+        const trades = [row({ id: 'D1', qty: 3, price: 50 })];
+        const without = est(trades);
+        setEsunOrderMetaSnapshot(esun, [{ ord_no: 'D1', ord_status: '2', work_date: '20261109', ord_date: '20261109', ord_time: '090000000' }]);
+        expect(est(trades)).toEqual(without);
+        expect(without).toMatchObject({ pending: 150_000, buyOrders: 1 });
+    });
+
+    it('a previous-day order whose work_date is the previous day is not counted', () => {
+        setEsunOrderMetaSnapshot(esun, [
+            { ord_no: 'Y1', ord_status: '2', work_date: '20261108', ord_date: '20261108', ord_time: '100000000' },
+            { pre_ord_no: 'Y2', ord_no: 'N2', ord_status: '2', work_date: '20261108', ord_date: '20261107', ord_time: '201500000' },
+        ]);
+        const r = est([
+            row({ id: 'Y1', ts: YESTERDAY_TS, status: 'Filled', qty: 1, deal: 1, price: 50, deals: [{ price: 50, quantity: 1 }] }),
+            row({ id: 'Y2', ts: Date.UTC(2026, 10, 7, 12, 15, 0) / 1000, status: 'Cancelled', qty: 1, cancel: 1, price: 50 }),
+        ]);
+        expect(r).toMatchObject({ filled: 0, pending: 0, buyOrders: 0 });
+    });
+
+    it('meta of another account is not used; a missing work_date falls back to order_ts', () => {
+        setEsunOrderMetaSnapshot(other, [{ pre_ord_no: 'R3', ord_status: '1', work_date: '20261109', ord_date: '20261108', ord_time: '201500000' }]);
+        setEsunOrderMetaSnapshot(esun, [{ ord_no: 'T1', ord_status: '2', work_date: '', ord_date: '20261109', ord_time: '090000000' }]);
+        const r = est([
+            row({ id: 'R3', ts: PREV_EVENING_TS, qty: 1, price: 40 }),
+            row({ id: 'T1', qty: 1, price: 50 }),
+        ]);
+        expect(r).toMatchObject({ pending: 50_000, buyOrders: 1 });
     });
 });
 

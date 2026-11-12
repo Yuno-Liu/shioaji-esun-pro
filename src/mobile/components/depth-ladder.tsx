@@ -24,7 +24,7 @@ import type { AccountedTrade } from '../../lib/types/order';
 import { fmtCompactInt, formatToTick } from '../lib/num-format';
 import { depthMarkText, depthOrderMarks, priceKey } from '../lib/chart-model';
 import { openTicket } from '../lib/mobile-store';
-import { innerOuterRatio, splitPercent, toneVsReference, volumeUnit, type SplitPercent } from '../lib/quote-display';
+import { innerOuterRatio, splitPercent, tickQuoteRef, toneVsReference, volumeUnit, type SplitPercent } from '../lib/quote-display';
 import { srOnly } from '../styles/primitives.css';
 import * as styles from '../styles/trade.css';
 import { RatioBar as RatioTrack, VolumeBar } from '../ui/bars';
@@ -183,13 +183,15 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
     const marks = useMemo(() => depthOrderMarks(orderable, trades, oddLot), [orderable, trades, oddLot]);
     const unit = contract ? volumeUnit(contract.security_type, oddLot) : '';
     const fmt = (p: number) => (contract ? formatToTick(contract, p) : String(p));
-    const reference = contract?.reference;
 
     // 內外盤比：試撮期間沿用本元件看過的上一筆真實成交（換商品或整股／零股時重來）
     const lastReal = useRef<{ code: string; oddLot: boolean; tick: SseTick } | null>(null);
     const tick = quote?.tick;
     if (tick && !tick.simtrade) lastReal.current = { code, oddLot, tick };
     const realTick = lastReal.current?.code === code && lastReal.current.oddLot === oddLot ? lastReal.current.tick : undefined;
+    // 價位著色的基準：同一串流的參考價（現價 − 漲跌；試撮 tick 也帶同一個參考），與五檔同一個交易日；
+    // 盤前或跨夜時合約已換成新交易日的參考價，不拿它比前一日的五檔。推不出時才用合約參考價
+    const reference = tickQuoteRef(tick) ?? tickQuoteRef(realTick) ?? contract?.reference;
     // 下單面板內嵌也顯示（設計規格 §7.3、§7.4-11）
     const innerOuter = innerOuterRatio(realTick);
     const bidAsk = splitPercent(book.bidTotal, book.askTotal);
@@ -269,7 +271,7 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
                                 {cell('ask', r.level, r.ask)}
                             </div>
                         ))}
-                        <div className={styles.depthTotal} data-testid='depth-total' aria-label={`五檔總量：委買 ${fmtCompactInt(book.bidTotal)}，委賣 ${fmtCompactInt(book.askTotal)}${unit ? ` ${unit}` : ''}`}>
+                        <div className={styles.depthTotal} data-testid='depth-total' role='group' aria-label={`五檔總量：委買 ${fmtCompactInt(book.bidTotal)}，委賣 ${fmtCompactInt(book.askTotal)}${unit ? ` ${unit}` : ''}`}>
                             <span className={styles.depthTotalVol} data-testid='depth-total-bid'>{fmtCompactInt(book.bidTotal)}</span>
                             <span className={styles.depthTotalLabel}>五檔總量{unit && `（${unit}）`}</span>
                             <span className={styles.depthTotalVolRight} data-testid='depth-total-ask'>{fmtCompactInt(book.askTotal)}</span>

@@ -188,6 +188,9 @@ describe('DepthLadder（page）', () => {
         expect(text(byId('depth-total-bid'))).toBe('316');
         expect(text(byId('depth-total-ask'))).toBe('173');
         expect(text(byId('depth-total'))).toContain('五檔總量（張）');
+        // aria-label 需掛在有角色的元素上才會被報讀（沒有 role 的 div 上 aria-label 不生效）
+        expect(byId('depth-total').props.role).toBe('group');
+        expect(byId('depth-total').props['aria-label']).toBe('五檔總量：委買 316，委賣 173 張');
         // 316 / 489 = 64.6% → 65 / 35
         expect(text(byId('depth-ratio-left'))).toBe('買 65%');
         expect(text(byId('depth-ratio-right'))).toBe('35% 賣');
@@ -462,5 +465,17 @@ describe('DepthLadder 表頭縮寫（設計規格 §4.7：字級「大」以 htm
         await render([], { variant: 'ticket', oddLot: false });
         expect(fullText(head())).toBe('委買量買價賣價委賣量');
         expect(view!.root.findAll(n => n.props.className === tradeStyles.depthHeadShort).map(n => text(n))).toEqual(['買量', '賣量']);
+    });
+});
+
+describe('DepthLadder 價位著色：盤前／跨夜用串流自身的參考價（2026-11-13 稽核）', () => {
+    it('合約已換成新交易日的參考 1,100，五檔與成交仍是昨日（現價 985、漲 1 → 參考 984）：以 984 著色', async () => {
+        quoteMock.useQuote.mockImplementation(() => ({ bidask: BIDASK, tick: { ...TICK, price_chg: '1' }, lastDir: 0, seq: 1, flashSeq: 0 }));
+        await act(async () => {
+            view = create(createElement(DepthLadder, { code: '2330', contract: { ...contract, reference: 1100 }, trades: [] }));
+        });
+        expect(classOf('depth-bid-1')).toContain('flat');
+        expect(classOf('depth-ask-1')).toContain('up');
+        expect(classOf('depth-bid-2')).toContain('down');
     });
 });
