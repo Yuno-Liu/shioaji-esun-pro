@@ -132,8 +132,11 @@ describe('splitPercent／innerOuterRatio', () => {
         expect(splitPercent(NaN, 5)).toBeNull();
     });
 
-    it('內外盤比：內盤＝bid_side_total_vol、外盤＝ask_side_total_vol；缺欄位或試撮回傳 null', () => {
-        expect(innerOuterRatio({ close: '1', bid_side_total_vol: 580, ask_side_total_vol: 420 })).toMatchObject({ leftPct: 58, rightPct: 42 });
+    it('內外盤比：內盤＝ask_side_total_vol（賣方主動）、外盤＝bid_side_total_vol（買方主動）；缺欄位或試撮回傳 null', () => {
+        expect(innerOuterRatio({ close: '1', bid_side_total_vol: 580, ask_side_total_vol: 420 })).toMatchObject({ left: 420, right: 580, leftPct: 42, rightPct: 58 });
+        // 2026-11-12 2313 華通實際資料（09:57 前逐筆成交：tick_type 1 外盤 22,458 張、tick_type 2 內盤 8,281 張；
+        // 同時刻串流 tick 的 bid_side 占比為 73%）：外盤 73%、內盤 27%，不是相反
+        expect(innerOuterRatio({ close: '211.5', bid_side_total_vol: 22458, ask_side_total_vol: 8281 })).toMatchObject({ leftPct: 27, rightPct: 73 });
         expect(innerOuterRatio({ close: '1' })).toBeNull();
         expect(innerOuterRatio({ close: '1', bid_side_total_vol: 580 })).toBeNull();
         expect(innerOuterRatio({ close: '1', bid_side_total_vol: 580, ask_side_total_vol: 420, simtrade: true })).toBeNull();

@@ -193,10 +193,10 @@ describe('DepthLadder（page）', () => {
         expect(text(byId('depth-ratio-right'))).toBe('35% 賣');
     });
 
-    it('內外盤比：有 bid_side／ask_side_total_vol 時顯示並以文字標示', async () => {
+    it('內外盤比：有 bid_side／ask_side_total_vol 時顯示並以文字標示（內盤＝ask_side、外盤＝bid_side）', async () => {
         await render();
-        expect(text(byId('depth-inner'))).toBe('58%（內盤）');
-        expect(text(byId('depth-outer'))).toBe('42%（外盤）');
+        expect(text(byId('depth-inner'))).toBe('42%（內盤）');
+        expect(text(byId('depth-outer'))).toBe('58%（外盤）');
     });
 
     it('內外盤比：沒有資料或全為 0 時隱藏', async () => {
@@ -312,11 +312,11 @@ describe('DepthLadder（ticket）', () => {
     it('B3b：ticket 變體也顯示內外盤比（文字標示內盤／外盤，比例條為 scaleX）', async () => {
         await render([], { variant: 'ticket', onPick: vi.fn() });
         expect(allById('depth-inner-outer')).toHaveLength(1);
-        expect(text(byId('depth-inner'))).toBe('58%（內盤）');
-        expect(text(byId('depth-outer'))).toBe('42%（外盤）');
-        expect(byId('depth-inner-outer').props['aria-label']).toBe('內外盤比：內盤 58%，外盤 42%');
+        expect(text(byId('depth-inner'))).toBe('42%（內盤）');
+        expect(text(byId('depth-outer'))).toBe('58%（外盤）');
+        expect(byId('depth-inner-outer').props['aria-label']).toBe('內外盤比：內盤 42%，外盤 58%');
         const fills = byId('depth-inner-outer-bar').findAll(n => typeof n.type === 'string' && n.props.style !== undefined);
-        expect(fills.map(f => f.props.style)).toEqual([{ transform: 'scaleX(0.58)' }, { transform: 'scaleX(0.42)' }]);
+        expect(fills.map(f => f.props.style)).toEqual([{ transform: 'scaleX(0.42)' }, { transform: 'scaleX(0.58)' }]);
     });
 
     it('B3b：ticket 變體沒有內外盤量（或試撮）時仍隱藏內外盤比', async () => {
