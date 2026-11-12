@@ -458,3 +458,91 @@ describe('面板退場凍結（設計規格 §7.4 第 13 點、§10 S4）', () =
         expect(notify).not.toHaveBeenCalled();
     });
 });
+
+describe('開啟時的送單帳戶：尚未載入時補取一次，已取到的不替換', () => {
+    type Ticket = ReturnType<typeof useMobileTicket>;
+    let view: ReactTestRenderer | undefined;
+    let t: Ticket | undefined;
+    const ticket: TicketRequest = { code: '2330', action: 'Buy', price: 100, source: 'button', seq: 1 };
+    const Probe = () => { t = useMobileTicket(ticket, stock); return null; };
+    const mount = async () => { await act(async () => { view = create(createElement(Probe)); }); };
+    /** useAccounts 是 mock（不是 store）：改 m.accounts 後重繪才讀得到 */
+    const rerender = async () => { await act(async () => { view!.update(createElement(Probe)); }); };
+    const other: Account = { ...stockAccount, broker_id: '9A96', account_id: '7777777' };
+
+    beforeEach(() => {
+        vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+        m.route = { esun: false, broker: '永豐', simulation: true };
+    });
+    afterEach(async () => {
+        await act(async () => view?.unmount());
+        view = undefined;
+        t = undefined;
+        m.captured = undefined;
+        m.accounts = {};
+        m.route = null;
+        vi.unstubAllGlobals();
+    });
+
+    it('ticketProblem：沒有帳戶時，選取帳戶未簽署＝notTradable、帳戶還在載入＝載入中，其他＝沒有可交易帳戶', () => {
+        const unsigned = { ...stockAccount, signed: false };
+        expect(ticketProblem(check({ account: undefined, selected: unsigned, accountsLoaded: true }))).toBe(TICKET_TEXT.notTradable);
+        expect(ticketProblem(check({ account: undefined, selected: null, accountsLoaded: false }))).toBe(TICKET_TEXT.accountLoading);
+        expect(ticketProblem(check({ account: undefined, selected: null, accountsLoaded: true }))).toBe(TICKET_TEXT.noStockAccount);
+        expect(ticketProblem(check({ account: undefined, selected: undefined }))).toBe(TICKET_TEXT.noStockAccount);
+        expect(ticketProblem(check({ contract: futures, account: undefined, selected: null, accountsLoaded: true, fields: fields({ priceText: '22800' }) }))).toBe(TICKET_TEXT.noFuturesAccount);
+        // 已取到帳戶時不受影響
+        expect(ticketProblem(check({ accountsLoaded: false }))).toBeNull();
+    });
+
+    it('開啟時帳戶尚未載入：顯示載入中；選取帳戶變成可交易後補取一次並可預覽', async () => {
+        m.captured = undefined;
+        m.accounts = { loaded: false, selectedStock: null, selectedFutures: null };
+        await mount();
+        expect(t!.account).toBeUndefined();
+        expect(t!.problem).toBe(TICKET_TEXT.accountLoading);
+        m.captured = stockAccount;
+        m.accounts = { loaded: true, selectedStock: stockAccount, selectedFutures: null };
+        await rerender();
+        expect(t!.account).toBe(stockAccount);
+        expect(t!.problem).toBeNull();
+    });
+
+    it('已取到的帳戶不會被換掉：之後選取帳戶改變只顯示「帳戶已變更」', async () => {
+        m.captured = stockAccount;
+        m.accounts = { loaded: true, selectedStock: stockAccount, selectedFutures: null };
+        await mount();
+        expect(t!.account).toBe(stockAccount);
+        m.captured = other;
+        m.accounts = { loaded: true, selectedStock: other, selectedFutures: null };
+        await rerender();
+        await rerender();
+        expect(t!.account).toBe(stockAccount);
+        expect(t!.problem).toBe(TICKET_TEXT.accountChanged);
+    });
+
+    it('補取後也固定：補取到的帳戶之後不再替換', async () => {
+        m.captured = undefined;
+        m.accounts = { loaded: false, selectedStock: null, selectedFutures: null };
+        await mount();
+        m.captured = stockAccount;
+        m.accounts = { loaded: true, selectedStock: stockAccount, selectedFutures: null };
+        await rerender();
+        expect(t!.account).toBe(stockAccount);
+        m.captured = other;
+        m.accounts = { loaded: true, selectedStock: other, selectedFutures: null };
+        await rerender();
+        expect(t!.account).toBe(stockAccount);
+        expect(t!.problem).toBe(TICKET_TEXT.accountChanged);
+    });
+
+    it('選取的帳戶未簽署：顯示 notTradable，不取帳戶', async () => {
+        const unsigned = { ...stockAccount, signed: false };
+        m.captured = undefined; // captureSelectedAccount 不回傳不可交易的帳戶
+        m.accounts = { loaded: true, selectedStock: unsigned, selectedFutures: null };
+        await mount();
+        await rerender();
+        expect(t!.account).toBeUndefined();
+        expect(t!.problem).toBe(TICKET_TEXT.notTradable);
+    });
+});
