@@ -38,6 +38,7 @@ import {
 } from '../../lib/order-confirm';
 import { usePrivacyMode } from '../../lib/privacy';
 import { notify } from '../../lib/trade';
+import { SHARES_PER_LOT } from '../../lib/odd-lot';
 import { fmtPrice } from '../../lib/utils/format';
 import { decideBatchConfirm, isBatchExitActive, subscribeBatchExit } from '../lib/batch-exit-auth';
 import { resumeAllowsNewOrders } from '../lib/resume-gate';
@@ -63,6 +64,23 @@ export const CONFIRM_TEXT = {
 
 /** 手機沒有觸價單即時價來源（見檔頭）：有 livePriceCode 時一律視為沒有即時價 */
 const NO_LIVE_PRICE = undefined;
+
+/**
+ * 價格欄文字。priceLabel 優先；限價顯示價格。
+ * price === null 且單位是「股」：只有持倉股數平倉（lib placeStockExitByShares）會送出這種確認（手機新單的零股一律限價，
+ * 送出前就擋下市價）。lib 把整張以市價 IOC、零股以跌停（賣出）／漲停（買回）價的盤中零股限價 ROD 送出；
+ * 含零股時不能只寫「市價」。全是整張時兩腳只有市價那一腳，仍顯示「市價」。
+ */
+export function confirmPriceText(request: Pick<OrderConfirmRequest, 'action' | 'price' | 'priceLabel' | 'quantity' | 'unit'>): string {
+    if (request.priceLabel !== undefined) return request.priceLabel;
+    if (request.price !== null) return fmtPrice(request.price);
+    const odd = request.unit === '股' && Number.isSafeInteger(request.quantity) ? request.quantity % SHARES_PER_LOT : 0;
+    if (odd === 0) return '市價';
+    const limit = request.action === 'Buy' ? '漲停' : '跌停';
+    return request.quantity > SHARES_PER_LOT
+        ? `市價（盤中零股以${limit}價限價 ROD 送出）`
+        : `盤中零股以${limit}價限價 ROD 送出`;
+}
 
 /** 環境大字：true＝模擬、false＝正式、null＝未確認 */
 export function confirmEnvText(simulation: boolean | null): string {
@@ -233,7 +251,7 @@ export function OrderConfirmSheet() {
     };
 
     const envKey = request.simulation === true ? 'simulation' : request.simulation === false ? 'production' : 'unknown';
-    const priceText = request.priceLabel ?? (request.price === null ? '市價' : fmtPrice(request.price));
+    const priceText = confirmPriceText(request);
 
     const footer = (
         <div className={styles.footer}>

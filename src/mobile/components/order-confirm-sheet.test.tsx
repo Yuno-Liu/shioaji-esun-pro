@@ -37,7 +37,7 @@ vi.mock('../../lib/trade', () => ({ notify: m.notify }));
 
 import { abortBatchExit, armBatchExit, BATCH_STOPPED, batchExitAbortReason, setBatchExit, type ExpectedConfirm } from '../lib/batch-exit-auth';
 import { getResumeGate, setResumeGateForTest } from '../lib/resume-gate-runtime';
-import { CONFIRM_TEXT, confirmActionText, OrderConfirmSheet } from './order-confirm-sheet';
+import { CONFIRM_TEXT, confirmActionText, confirmPriceText, OrderConfirmSheet } from './order-confirm-sheet';
 import type { ReactElement } from 'react';
 import { setMotionClockForTest } from '../motion/spring';
 import { SlideToConfirm } from './slide-to-confirm';
@@ -135,6 +135,31 @@ describe('OrderConfirmSheet — 內容', () => {
         await emit({ ...base, priceLabel: '1,080～1,085' });
         expect(text(one('confirm-price'))).toBe('1,080～1,085');
         expect(text(one('confirm-account'))).toBe('9A95-•••••56');
+    });
+
+    it('持倉股數平倉（單位「股」、price null）含零股：價格寫出零股以跌停（賣）／漲停（買回）價限價 ROD，不只寫市價', async () => {
+        await render();
+        // 同 lib placeStockExitByShares：整張＋零股
+        await emit({ ...base, action: 'Sell', price: null, quantity: 3500, unit: '股', note: '拆為 3 張市價＋500 股盤中零股限價' });
+        expect(text(one('confirm-price'))).toBe('市價（盤中零股以跌停價限價 ROD 送出）');
+        // 只有零股：全部以限價送出，不寫市價
+        await emit({ ...base, action: 'Sell', price: null, quantity: 500, unit: '股', note: undefined });
+        expect(text(one('confirm-price'))).toBe('盤中零股以跌停價限價 ROD 送出');
+        // 買回（空單平倉）：漲停價
+        await emit({ ...base, action: 'Buy', price: null, quantity: 1200, unit: '股', note: '拆為 1 張市價＋200 股盤中零股限價' });
+        expect(text(one('confirm-price'))).toBe('市價（盤中零股以漲停價限價 ROD 送出）');
+        await emit({ ...base, action: 'Buy', price: null, quantity: 300, unit: '股', note: undefined });
+        expect(text(one('confirm-price'))).toBe('盤中零股以漲停價限價 ROD 送出');
+    });
+
+    it('confirmPriceText：整張股數平倉、張、口仍是市價；限價與 priceLabel 不變', () => {
+        const req = { action: 'Sell' as const, price: null, quantity: 2000, unit: '股' };
+        expect(confirmPriceText(req)).toBe('市價');
+        expect(confirmPriceText({ ...req, quantity: 3, unit: '張' })).toBe('市價');
+        expect(confirmPriceText({ ...req, quantity: 3, unit: '口' })).toBe('市價');
+        expect(confirmPriceText({ ...req, quantity: 1500, unit: '口' })).toBe('市價');
+        expect(confirmPriceText({ ...req, price: 963, quantity: 500 })).toBe('963');
+        expect(confirmPriceText({ ...req, quantity: 500, priceLabel: '範圍市價' })).toBe('範圍市價');
     });
 });
 
@@ -532,6 +557,22 @@ describe('OrderConfirmSheet — 持倉多選市價出清（lib/batch-exit-auth�
         await emit(exitReq);
         expect(sheetOpen()).toBe(true);
         expect(q.resolve).not.toHaveBeenCalled();
+    });
+
+    it('零股平倉的價格文字只改畫面：確認請求不變，批次授權照常比對（price null、單位股）', async () => {
+        expect(exitReq.price).toBeNull();
+        await render();
+        await emit(exitReq);
+        expect(text(one('confirm-price'))).toBe('市價（盤中零股以跌停價限價 ROD 送出）');
+        // 卸載時待確認會 resolve(false)（不讓 promise 懸置）；之後從頭以批次路徑再送同一份請求
+        await act(async () => view!.unmount());
+        view = undefined;
+        q.resolve.mockReset();
+        await emit(null);
+        await render();
+        await start();
+        await emit(exitReq);
+        expect(q.resolve.mock.calls).toEqual([[true]]);
     });
 
     it('批次中相符：不渲染面板（也不閃現），自動 resolve(true) 一次', async () => {
