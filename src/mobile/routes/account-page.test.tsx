@@ -1373,6 +1373,34 @@ describe('AccountPage fill history (成交明細)', () => {
         expect(m.fetchTransactions).toHaveBeenCalledTimes(2);
     });
 
+    it('展開時只在冷卻倒數期間每秒重繪（1 秒計時器只在倒數中存在）', async () => {
+        esunOnly();
+        m.fetchTransactions.mockResolvedValue(twoRows());
+        const active = new Map<unknown, number>();
+        const realSet = globalThis.setInterval;
+        const realClear = globalThis.clearInterval;
+        vi.spyOn(globalThis, 'setInterval').mockImplementation(((fn: () => void, ms?: number) => {
+            const id = realSet(fn, ms);
+            active.set(id, ms ?? 0);
+            return id;
+        }) as typeof setInterval);
+        vi.spyOn(globalThis, 'clearInterval').mockImplementation(((id?: Parameters<typeof clearInterval>[0]) => {
+            active.delete(id);
+            realClear(id);
+        }) as typeof clearInterval);
+        const perSecond = () => [...active.values()].filter(ms => ms === 1_000).length;
+        await render();
+        const base = perSecond(); // 其他卡片（例如玉山重新連線）自己的每秒計時器
+        await click('account-fills-toggle'); // 展開即讀取一次 → 冷卻 30 秒
+        expect(textOf(byTestId('fills-query'))).toBe('查詢（30 秒）');
+        expect(perSecond() - base).toBe(1);
+        t = NOW + 30_000;
+        await rerender();
+        expect(byTestId('fills-query').props.disabled).toBe(false);
+        // 修正前：展開期間一律每秒重繪（+1）；修正後冷卻結束即停止
+        expect(perSecond() - base).toBe(0);
+    });
+
     it('E.SUN: switches between 明細／依股票／依日期', async () => {
         esunOnly();
         m.fetchTransactions.mockResolvedValue(twoRows());

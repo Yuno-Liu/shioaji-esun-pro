@@ -24,7 +24,7 @@
 //   載入 Skeleton（保留「委託載入中…」）、空狀態 EmptyState；全部刪單／批次刪單面板為 GroupedSection＋footer 滑塊。
 
 import { Inbox } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { mutationErrorNotice } from '../../components/esun-order-meta';
 import { useEsunOrderMeta } from '../../lib/esun/account-details';
 import { maskMoney, usePrivacyMode, usePrivacyMoney } from '../../lib/privacy';
@@ -369,7 +369,9 @@ interface OrderRowProps {
     onOpen: (id: string) => void;
 }
 
-function OrderRow({ trade, selecting, selected, disabled, onToggle, onOpen }: OrderRowProps) {
+// memo：OrdersPage 隨交易狀態每次發布重繪；trade 物件、布林值與回呼（toggle 為 useCallback、onOpen 為 setState）都穩定，
+// 沒變的列不重繪。
+const OrderRow = memo(function OrderRow({ trade, selecting, selected, disabled, onToggle, onOpen }: OrderRowProps) {
     const meta = useEsunOrderMeta(trade);
     const working = isWorkingTrade(trade);
     const avail = orderActionAvailability(trade, meta);
@@ -419,11 +421,11 @@ function OrderRow({ trade, selecting, selected, disabled, onToggle, onOpen }: Or
             )}
         </li>
     );
-}
+});
 
 // ---- 成交分頁 ----
 
-function DealsList({ rows, onOpen }: { rows: DealRow[]; onOpen: (id: string) => void }) {
+const DealsList = memo(function DealsList({ rows, onOpen }: { rows: DealRow[]; onOpen: (id: string) => void }) {
     const privMoney = usePrivacyMoney();
     const totals = useMemo(() => dealTotals(rows), [rows]);
     const money = (n: number) => maskMoney(fmtInt(Math.round(n)), privMoney);
@@ -460,9 +462,15 @@ function DealsList({ rows, onOpen }: { rows: DealRow[]; onOpen: (id: string) => 
             </GroupedSection>
         </>
     );
+});
+
+/** collectDealRows 每次重算都產生新的列物件：逐欄比較（trade／deal 為參考比較），內容沒變的列不重繪 */
+function sameDealRow(a: DealRow, b: DealRow): boolean {
+    return a === b || (a.key === b.key && a.trade === b.trade && a.deal === b.deal && a.price === b.price
+        && a.quantity === b.quantity && a.ts === b.ts && a.unit === b.unit && a.aggregate === b.aggregate);
 }
 
-function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void }) {
+const DealItem = memo(function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void }) {
     const priv = usePrivacyMode();
     const t = row.trade;
     const account = tradeAccountOf(t);
@@ -495,7 +503,7 @@ function DealItem({ row, onOpen }: { row: DealRow; onOpen: (id: string) => void 
             </button>
         </li>
     );
-}
+}, (prev, next) => prev.onOpen === next.onOpen && sameDealRow(prev.row, next.row));
 
 // ---- 確認面板 ----
 

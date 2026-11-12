@@ -17,7 +17,7 @@
 // 點列只呼叫 navigate({ name: 'trade', code })：沒有下單鍵、不呼叫 openTicket／openOrderAction（§10 S1）；沒有聲音或震動。
 
 import { Activity } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { getMarketPulseSnapshot, retainMarketPulseStreams, subscribeMarketPulse } from '../../../lib/market-pulse';
 import { subscribeEtfNames } from '../../../lib/etf-runtime-catalog';
 import { ensureEquityNamesFresh, subscribeEquityNames } from '../../../lib/stock-runtime-catalog';
@@ -116,11 +116,21 @@ export function coverageText(c: SignalCoverage): string {
     return `已訂閱 ${c.ok}/${c.total}`;
 }
 
-function SignalRow({ signal, index, tracker }: { signal: ScannerSignalEvent; index: number; tracker: VisibilityTracker | null }) {
+interface SignalRowProps {
+    signal: ScannerSignalEvent;
+    /** 不支援 IntersectionObserver 時是否當作可見（前 FALLBACK_VISIBLE_ROWS 列）；傳布林而非 index，新訊號插在最上面時其他列 props 不變 */
+    fallbackVisible: boolean;
+    /** 記憶體中的名稱（signalName）：由父層讀取後傳入，名稱目錄更新時只有名稱改變的列重繪 */
+    knownName: string | null | undefined;
+    tracker: VisibilityTracker | null;
+}
+
+// memo：清單每 500ms 重算一次，訊號物件不變的列不重繪
+const SignalRow = memo(function SignalRow({ signal, fallbackVisible, knownName, tracker }: SignalRowProps) {
     const code = signal.quote.code;
     const ref = useRef<HTMLButtonElement | null>(null);
     // 記憶體中的名稱優先；沒有時只為可見列向永豐查一次合約（lib/contract-names）
-    const name = useVisibleRowName(ref, tracker, index < FALLBACK_VISIBLE_ROWS, code, signalName(code, signal.exchange));
+    const name = useVisibleRowName(ref, tracker, fallbackVisible, code, knownName);
     const quote = signalQuote(signal);
     const label = RULE_LABELS[signal.scanner] ?? String(signal.scanner);
     const detail = signalDetail(signal.scanner, signal.extra);
@@ -160,7 +170,7 @@ function SignalRow({ signal, index, tracker }: { signal: ScannerSignalEvent; ind
             </span>
         </button>
     );
-}
+});
 
 export function MarketSignals() {
     // 本元件只在「市場」分頁的「盤中異動」分段掛載；再加上文件在前景才持有串流監聽與訂閱
@@ -194,7 +204,15 @@ export function MarketSignals() {
     } else {
         list = (
             <GroupedSection header={`最新 ${rows.length} 筆（新的在上）・點一下開啟交易頁`} testId='signal-list'>
-                {rows.map((signal, i) => <SignalRow key={signalRowKey(signal)} signal={signal} index={i} tracker={tracker} />)}
+                {rows.map((signal, i) => (
+                    <SignalRow
+                        key={signalRowKey(signal)}
+                        signal={signal}
+                        fallbackVisible={i < FALLBACK_VISIBLE_ROWS}
+                        knownName={signalName(signal.quote.code, signal.exchange)}
+                        tracker={tracker}
+                    />
+                ))}
             </GroupedSection>
         );
     }

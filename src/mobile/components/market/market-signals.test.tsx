@@ -31,6 +31,10 @@ const m = vi.hoisted(() => ({
     },
     openTicket: vi.fn(),
     openOrderAction: vi.fn(),
+    /** SignalRow 渲染次數，依訊號時間分列（每次渲染呼叫一次 fmtSignalTime；測試中每筆訊號時間不同） */
+    rowRenders: new Map<string, number>(),
+    /** 名稱目錄更新通知（subscribeEquityNames 的監聽者） */
+    namesListeners: new Set<() => void>(),
 }));
 
 vi.mock('../../../lib/api', () => ({ apiPost: m.post, apiGet: m.get, apiPut: vi.fn(), apiDelete: vi.fn() }));
@@ -53,8 +57,22 @@ vi.mock('../../../lib/shioaji', async importOriginal => ({ ...(await importOrigi
 vi.mock('../../../lib/stock-runtime-catalog', () => ({
     ensureEquityNamesFresh: m.ensureNames,
     equityNameForLive: (ex: string, code: string) => m.equity.get(`${ex}:${code}`),
-    subscribeEquityNames: () => () => undefined,
+    subscribeEquityNames: (l: () => void) => {
+        m.namesListeners.add(l);
+        return () => { m.namesListeners.delete(l); };
+    },
 }));
+vi.mock('./signal-model', async importOriginal => {
+    const actual = await importOriginal<typeof import('./signal-model')>();
+    return {
+        ...actual,
+        fmtSignalTime: (time: string | undefined) => {
+            const text = actual.fmtSignalTime(time);
+            m.rowRenders.set(text, (m.rowRenders.get(text) ?? 0) + 1);
+            return text;
+        },
+    };
+});
 vi.mock('../../../lib/etf-runtime-catalog', () => ({ etfNameForLive: () => undefined, subscribeEtfNames: () => () => undefined }));
 vi.mock('../../lib/hash-router', async importOriginal => ({ ...(await importOriginal<Record<string, unknown>>()), navigate: m.navigate }));
 vi.mock('../../lib/mobile-store', async importOriginal => ({
@@ -163,6 +181,8 @@ beforeEach(() => {
     m.openTicket.mockReset();
     m.openOrderAction.mockReset();
     seq = 0;
+    m.rowRenders.clear();
+    m.namesListeners.clear();
 });
 
 afterEach(async () => {
@@ -427,5 +447,39 @@ describe('S1：只導覽，不下單', () => {
         for (const [name, fn] of Object.entries(m.send)) expect(fn, name).not.toHaveBeenCalled();
         expect(m.navigate.mock.calls).toEqual([[{ name: 'trade', code: '2603' }], [{ name: 'trade', code: '2330' }]]);
         expect(m.post.mock.calls.every(([path]) => /^\/api\/v1\/stream\/(un)?subscribe\/scanner$/.test(String(path)))).toBe(true);
+    });
+});
+
+describe('重繪範圍（效能）', () => {
+    const renders = () => Object.fromEntries(m.rowRenders);
+    const rowTimes = () => byTestId('signal-row-time').map(textOf);
+
+    it('新訊號插在最上面：既有列不重繪（修正前 index 改變使每列都重繪）', async () => {
+        await mount();
+        await emit(scanner('2330'));
+        await emit(scanner('2317'));
+        await emit(scanner('2454'));
+        const old = rowTimes();
+        expect(old).toHaveLength(3);
+        const before = renders();
+        await emit(scanner('2603'));
+        expect(byTestId('signal-row').map(r => r.props['data-code'])).toEqual(['2603', '2454', '2317', '2330']);
+        const after = renders();
+        expect(old.map(t => (after[t] ?? 0) - (before[t] ?? 0))).toEqual([0, 0, 0]);
+    });
+
+    it('名稱目錄更新：只有名稱改變的列重繪並顯示「名稱 代碼」', async () => {
+        await mount();
+        await emit(scanner('2330'));
+        await emit(scanner('2317'));
+        expect(byTestId('signal-row-name').map(textOf)).toEqual(['2317', '2330']);
+        const times = rowTimes();
+        const before = renders();
+        m.equity.set('TSE:2330', { name: '台積電', aliases: [] });
+        await act(async () => { m.namesListeners.forEach(l => l()); });
+        await settle();
+        expect(byTestId('signal-row-name').map(textOf)).toEqual(['2317', '台積電']);
+        const after = renders();
+        expect(times.map(t => (after[t] ?? 0) - (before[t] ?? 0))).toEqual([0, 1]);
     });
 });
