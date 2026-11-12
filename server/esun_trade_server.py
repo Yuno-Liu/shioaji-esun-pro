@@ -129,6 +129,12 @@ _REPORT_LOG_DROP_KEY_RE = re.compile(
 _REPORT_LOG_ORDER_KEYS = frozenset({"ord_no", "ordNo", "pre_ord_no", "preOrdNo"})
 
 
+def mask_order_no(value: any) -> str:
+    """An order number for logs: only the last 2 characters stay visible (A1234 -> ***34)."""
+    text = str(value or "")
+    return ("*" * max(len(text) - 2, 0) + text[-2:]) if text else text
+
+
 def report_log_fields(data: dict) -> str:
     """A WebSocket report's raw fields for an INFO diagnostic, without account / identity fields."""
     out: dict[str, any] = {}
@@ -137,8 +143,7 @@ def report_log_fields(data: dict) -> str:
         if _REPORT_LOG_DROP_KEY_RE.search(name):
             continue
         if name in _REPORT_LOG_ORDER_KEYS:
-            text = str(value or "")
-            out[name] = ("*" * max(len(text) - 2, 0) + text[-2:]) if text else text
+            out[name] = mask_order_no(value)
             continue
         out[name] = value if isinstance(value, (int, float, bool)) or value is None else str(value)
     return redact(json.dumps(out, ensure_ascii=False, sort_keys=True))
@@ -664,6 +669,7 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
             problems.append("設定檔缺少 [Api] Secret")
         elif api_secret.upper().startswith("YOUR_"):
             problems.append("設定檔 [Api] Secret 仍為範本預設值，請填入玉山核發的密鑰")
+        register_secret(api_key)
         register_secret(api_secret)
     if parser.has_section("User") and not parser["User"].get("Account"):
         problems.append("設定檔缺少 [User] Account")
@@ -1689,7 +1695,7 @@ class OrderBookCache:
             if info is not None:
                 info["covered_by_snapshot"] = False
             if not seq:
-                logger.warning(f"[WebSocket] 成交回報缺少 mkt_seq_num，無法去重，不計入快取成交量（ord_no={ord_no}）")
+                logger.warning(f"[WebSocket] 成交回報缺少 mkt_seq_num，無法去重，不計入快取成交量（ord_no={mask_order_no(ord_no)}）")
                 self._mat_order_info_locked(internal_id, info)
                 return True
             meta["seen_mat"].add(seq)
@@ -1698,7 +1704,7 @@ class OrderBookCache:
             mat_shares = mat_report_shares(mat_data, mat_ap_code)
             if mat_shares is None and mat_ap_code == _EMERGING_AP_CODE:
                 logger.warning(
-                    f"[WebSocket] 興櫃成交回報缺少 mat_qty_share，數量單位未知，不計入快取成交量（ord_no={ord_no}, "
+                    f"[WebSocket] 興櫃成交回報缺少 mat_qty_share，數量單位未知，不計入快取成交量（ord_no={mask_order_no(ord_no)}, "
                     f"mkt_seq_num={seq}）"
                 )
                 self._mat_order_info_locked(internal_id, info)
@@ -4267,7 +4273,7 @@ class EsunTradeBridge:
         )
         if not accepted:
             logger.info(
-                f"[WebSocket] 略過重複的成交回報（ord_no={data.get('ord_no')}, mkt_seq_num={data.get('mkt_seq_num')}）"
+                f"[WebSocket] 略過重複的成交回報（ord_no={mask_order_no(data.get('ord_no'))}, mkt_seq_num={data.get('mkt_seq_num')}）"
             )
             return None
         self.positions_cache.mark_dirty()

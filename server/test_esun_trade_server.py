@@ -318,6 +318,20 @@ Account = 88401234567
         cp_legacy_prod.read_string("[Core]\nEntry = https://custom.api.com\n")
         self.assertEqual(detect_esun_environment(cp_legacy_prod), "PRODUCTION")
 
+    def test_load_config_registers_api_key_and_secret_for_redaction(self):
+        path = os.path.join(self.temp_dir.name, "redact_config.ini")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                f"[Core]\nEntry = {ESUN_SIMULATION_ENTRY}\nEnvironment = SIMULATION\n[Cert]\nPath = test.p12\n"
+                "[Api]\nKey = ApiKeyZq81Vt\nSecret = ApiSecretWx52Lp\n[User]\nAccount = 88401234567\n"
+            )
+        _cfg, problems, _env = load_config(path)
+        self.assertEqual(problems, [])
+        text = redact(RuntimeError("SDK 失敗：key=ApiKeyZq81Vt secret=ApiSecretWx52Lp"))
+        self.assertNotIn("ApiKeyZq81Vt", text)
+        self.assertNotIn("ApiSecretWx52Lp", text)
+        self.assertIn("key=***", text)
+
     def test_override_esun_config_environment_roundtrip_in_memory(self):
         # Contract change (§3): switching environments never rewrites the user's ini file;
         # the [Core] section is overridden on the in-memory ConfigParser handed to SDK(config).
@@ -3771,6 +3785,26 @@ class TestReportEvents(_BridgeCase):
         self.assertEqual(len(deals), 2)
         row = self.bridge.order_book_cache.get("A0710")
         self.assertEqual((row.get("mat_qty", 0), row.get("deal_qty", 0), row["esun_fills"]), (0, 0, []))
+
+    def test_mat_warning_and_duplicate_logs_keep_only_last_two_order_number_chars(self):
+        # docs/fork/esun.md: order numbers in logs keep only their last 2 characters.
+        self.bridge.order_book_cache.update_from_ack({"ord_no": "K4321", "stock_no": "2330", "ap_code": "1", "org_qty": 2})
+        self.bridge.order_book_cache.update_from_ack({"ord_no": "E8765", "stock_no": "7777", "ap_code": "4", "org_qty": 2000})
+        mat = {"kind": "MAT", "ord_no": "K4321", "stock_no": "2330", "ap_code": "1", "mat_qty": 1, "mat_price": 950.0}
+        with self.assertLogs("esun_trade_server", level="INFO") as logs:
+            self.bridge._handle_mat(dict(mat))  # no mkt_seq_num
+            self.bridge._handle_mat({**mat, "mkt_seq_num": "000901"})
+            self.bridge._handle_mat({**mat, "mkt_seq_num": "000901"})  # duplicate
+            self.bridge._handle_mat({"kind": "MAT", "ord_no": "E8765", "stock_no": "7777", "ap_code": "4",
+                                     "mat_qty": 1000, "mat_price": 10.0, "mkt_seq_num": "000902"})  # no mat_qty_share
+        text = "\n".join(logs.output)
+        self.assertIn("無法去重", text)
+        self.assertIn("略過重複的成交回報", text)
+        self.assertIn("數量單位未知", text)
+        self.assertIn("ord_no=***21", text)
+        self.assertIn("ord_no=***65", text)
+        self.assertNotIn("K4321", text)
+        self.assertNotIn("E8765", text)
 
     def test_mat_pre_ord_no_is_looked_up_by_ord_no_only(self):
         # PA2-6: a reservation whose pre_ord_no equals the MAT's ord_no is a different order.
