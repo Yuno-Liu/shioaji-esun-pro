@@ -3,16 +3,15 @@
 // 金額一律交給呼叫端以 maskMoney 遮蔽；這裡只負責文字。數字經 num-format 的快取 Intl.NumberFormat（輸出同 toLocaleString）。
 
 import { formatNumber } from './num-format';
+import { taipeiClock } from './taipei-clock';
 
 function pad2(n: number) {
     return String(n).padStart(2, '0');
 }
 
-/** HH:mm:ss（本機時間）；沒有值顯示 — */
+/** HH:mm:ss（台北時間，不依裝置時區）；沒有值顯示 — */
 export function formatClock(ms: number | null | undefined): string {
-    if (!ms || !Number.isFinite(ms)) return '—';
-    const d = new Date(ms);
-    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+    return taipeiClock(ms);
 }
 
 /** 金額：$1,234；帶正負號時 +$1,234／−$1,234 */

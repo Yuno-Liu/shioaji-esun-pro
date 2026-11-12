@@ -30,6 +30,7 @@ import { todayStr } from '../../lib/utils/date';
 import { fmtPct, fmtPrice, fmtSigned } from '../../lib/utils/format';
 import { useBrokerCostSettings } from '../lib/broker-cost-settings';
 import { fmtInt } from '../lib/num-format';
+import { taipeiClock } from '../lib/taipei-clock';
 import * as styles from '../styles/positions.css';
 
 export const ESUN_DETAIL_TEXT = {
@@ -41,12 +42,6 @@ export const ESUN_DETAIL_TEXT = {
 
 type EsunStockRow = StockPosition & { account?: AccountedPosition['account'] };
 
-function clock(ms: number): string {
-    const d = new Date(ms);
-    if (!Number.isFinite(d.getTime())) return '—';
-    const p2 = (n: number) => String(n).padStart(2, '0');
-    return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
-}
 
 /** 全部有值才加總；空陣列或任一筆缺值 → null */
 function sumOrNull(values: readonly (number | null)[]): number | null {
@@ -107,7 +102,7 @@ function EsunDetailBody({ detail, fetchedAt, privMoney, settings }: {
                 <span className={styles.tag}>{esunMarketLabel(detail.marketCode) || '市場別未知'}</span>
                 <span className={styles.tag}>{esunTradeTypeLabel(detail.tradeType) || '交易類別未知'}</span>
                 <span className={styles.tag}>{esunInventoryApCodeLabel(detail.apCode)}</span>
-                <span className={styles.detailNote}>券商快照 {clock(fetchedAt)}</span>
+                <span className={styles.detailNote}>券商快照 {taipeiClock(fetchedAt)}</span>
             </div>
             <p className={styles.detailNote}>{ESUN_DETAIL_TEXT.snapshotNote}</p>
 
