@@ -19,14 +19,27 @@ const scaleBase = style({
 
 // ---- VolumeBar（五檔每格背景量條） ----
 
+/** 量條底部實心邊條的高度（像框線，用 px，不隨字級） */
+export const VOLUME_EDGE = '3px';
+
 const volumeBase = style([scaleBase, {
     transition: `transform ${DUR.bar}ms linear`,
+    backgroundRepeat: 'no-repeat',
+    backgroundPosition: 'left bottom',
+    backgroundSize: `100% ${VOLUME_EDGE}`,
 }]);
 
-/** 買側 origin right（由右往左長）、賣側 origin left；upDim／downDim 淡色 */
+/**
+ * 買側 origin right（由右往左長）、賣側 origin left。
+ * - 填色維持單層 upDim／downDim：價格（漲跌色、numMd 一般字級）疊在量條上，深色紅字對單層買進量條 4.54:1，
+ *   再加深就低於 4.5:1（§4.8）。
+ * - 量的長短改由底部 VOLUME_EDGE 實心 up／down 邊條標示（2026-11-12：深色主題的淡色填色對 panel 只有約 1.1:1，
+ *   看不清楚）；邊條對 panel 深色紅 5.02、綠 7.31，達圖形 3:1。列高 TOUCH_MIN、文字垂直置中，邊條不與文字重疊。
+ *   邊條是同一元素的 background-image，跟著 scaleX 一起縮放。
+ */
 export const volume = styleVariants({
-    buy: [volumeBase, { transformOrigin: 'right center', background: vars.color.upDim }],
-    sell: [volumeBase, { transformOrigin: 'left center', background: vars.color.downDim }],
+    buy: [volumeBase, { transformOrigin: 'right center', backgroundColor: vars.color.upDim, backgroundImage: `linear-gradient(${vars.color.up}, ${vars.color.up})` }],
+    sell: [volumeBase, { transformOrigin: 'left center', backgroundColor: vars.color.downDim, backgroundImage: `linear-gradient(${vars.color.down}, ${vars.color.down})` }],
 });
 
 // ---- 共用軌道（RatioBar、ProgressBar） ----
