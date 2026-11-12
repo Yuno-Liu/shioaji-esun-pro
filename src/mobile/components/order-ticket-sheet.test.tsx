@@ -1149,6 +1149,15 @@ describe('B3a 下單面板 v2 — 純函式', () => {
             .toBe('限價 — × — 張');
     });
 
+    it('ticketSummaryText：改用手機快取格式器後，與 toLocaleString 輸出逐字相同（小數、千分位、四捨五入）', () => {
+        const cases: [string, number, number][] = [['0.0123', 1, 12.3], ['1234.56789', 2500, 3_086_419.725], ['99999.5', 10, 999_995.5], ['18.05', 1, 18_049.4999]];
+        for (const [priceText, quantity, value] of cases) {
+            const p = Number(priceText);
+            const want = `限價 ${p.toLocaleString('en-US', { maximumFractionDigits: 4 })} × ${quantity.toLocaleString('en-US', { maximumFractionDigits: 4 })} 張 ≈ ${Math.round(value).toLocaleString('en-US')} 元`;
+            expect(ticketSummaryText({ priceType: 'LMT', priceText, quantity, orderLot: 'Common' }, false, { value }, false)).toBe(want);
+        }
+    });
+
     it('blurFocusedField：只讓輸入類欄位失焦；沒有 document 不丟錯', () => {
         const blur = vi.fn();
         vi.stubGlobal('document', { activeElement: { tagName: 'INPUT', blur } });
