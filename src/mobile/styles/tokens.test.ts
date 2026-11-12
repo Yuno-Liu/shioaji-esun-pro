@@ -226,6 +226,39 @@ describe('§4.8 對比實算（以 theme.css.ts 色值重算）', () => {
     });
 });
 
+describe('五檔量條（ui/bars VolumeBar；§6.12）', () => {
+    it.each(MODES)('%s：價格疊在單層量條上；量的長短由實心 up／down 底邊條標示（對 panel 達圖形 3:1）', mode => {
+        const p = palette(mode);
+        const panel = hex(p('panel'));
+        const red = hex(p('red'));
+        const green = hex(p('green'));
+        const buy1 = over(...rgba(p('redDim')), panel); // 台灣配色買進＝up＝紅
+        const sell1 = over(...rgba(p('greenDim')), panel);
+        // 填色維持單層：深色紅字對買進量條 4.54（不得再加深，否則 numMd 一般字級的漲跌色價格低於 4.5）
+        const expected: Record<string, [number, number]> = { redOnBuy1: [4.54, 4.33], greenOnSell1: [6.22, 3.82], redOnSell1: [4.27, 4.47] };
+        const actual: Record<string, number> = { redOnBuy1: contrast(red, buy1), greenOnSell1: contrast(green, sell1), redOnSell1: contrast(red, sell1) };
+        const col = mode === 'dark' ? 0 : 1;
+        for (const [key, values] of Object.entries(expected)) {
+            expect(Math.abs((actual[key] ?? Number.NaN) - values[col]), `${mode} ${key}=${actual[key]?.toFixed(3)}`).toBeLessThanOrEqual(0.02);
+        }
+        if (mode === 'dark') expect(actual.redOnBuy1).toBeGreaterThanOrEqual(4.5);
+        // 淡色填色本身幾乎看不出來（約 1.1:1），所以要靠邊條
+        expect(contrast(buy1, panel)).toBeLessThan(1.3);
+        // 邊條（實心 up／down，兩種配色都是紅或綠）對 panel ≥ 3:1
+        expect(contrast(red, panel)).toBeGreaterThanOrEqual(3);
+        expect(contrast(green, panel)).toBeGreaterThanOrEqual(3);
+    });
+
+    it('bars.css.ts：量條填色用單層 upDim／downDim、邊條用實心 up／down（不自訂漲跌 hex）', () => {
+        const src = readFileSync(join(mobileDir, 'ui', 'bars.css.ts'), 'utf8');
+        expect(src).toMatch(/buy: \[volumeBase, \{[^}]*backgroundColor: vars\.color\.upDim, backgroundImage: `linear-gradient\(\$\{vars\.color\.up\}, \$\{vars\.color\.up\}\)`/);
+        expect(src).toMatch(/sell: \[volumeBase, \{[^}]*backgroundColor: vars\.color\.downDim, backgroundImage: `linear-gradient\(\$\{vars\.color\.down\}, \$\{vars\.color\.down\}\)`/);
+        expect(src).toMatch(/backgroundSize: `100% \$\{VOLUME_EDGE\}`/);
+        expect(src).toMatch(/backgroundPosition: 'left bottom'/);
+        expect(/#[0-9a-f]{6}/i.test(src)).toBe(false);
+    });
+});
+
 describe('漲停／跌停實心底（報價列、交易頁主價、產業成分股；§7.2）', () => {
     // up／down 依配色翻轉：台灣 up＝紅、down＝綠；國際 up＝綠、down＝紅（theme.css.ts makeTokens）
     const SCHEMES = { tw: { up: 'red', down: 'green' }, intl: { up: 'green', down: 'red' } } as const;

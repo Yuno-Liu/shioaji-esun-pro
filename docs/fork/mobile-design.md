@@ -269,6 +269,11 @@ WCAG 相對亮度實算（以 sRGB 疊色、與瀏覽器合成一致）：
 | mutedForeground／單層著色 | 4.90 | 4.60 |
 | foreground／雙層著色 | 11.05 | 11.46 |
 | 紅字／islandBg | 5.23 | 5.08 |
+| 紅字／單層買進量條（五檔價格） | 4.54 | 4.33 |
+| 綠字／單層賣出量條 | 6.22 | 3.82 |
+| 紅字／單層賣出量條 | 4.27 | 4.47 |
+| 量條填色（單層 dim）／panel | 1.11 | 1.17 |
+| 量條底邊條（實心紅／綠）／panel | 5.02／7.31 | 5.08／4.34 |
 | 綠字／islandBg | 7.61 | 4.34（theme 層級問題） |
 | mutedForeground／islandBg | 5.64 | 5.38 |
 | 紅字／background | 5.39 | 4.45 |
@@ -287,6 +292,7 @@ WCAG 相對亮度實算（以 sRGB 疊色、與瀏覽器合成一致）：
 9. 淺色主題：含漲跌色文字的清單、五檔、統計放在 `contentBg`（白），不直接放 #eef0f3。淺色綠對白 4.34 屬 theme 層級問題，本案不可改；記錄為已知問題，建議主代理另案評估把淺色綠調到約 #088262（約 4.8:1）並同時考量桌面。
 10. 狀態色固定：success（LIVE、全部成交）、amber（連線中、資料過期、結果未知、待對帳）、danger（中斷、錯誤、正式環境、已鎖單、刪單）、accent（同步中、模擬環境）。不隨台灣／國際配色翻轉。
 11. 暗化幕只用黑色 rgba；白字只用 `#ffffff`；不自訂任何漲跌 hex。
+12. **五檔量條**（2026-11-12，使用者回報深色主題看不清楚）：填色維持單層 upDim／downDim，不得加深。漲跌色價格（numMd 一般字級）直接疊在量條上，深色紅字對單層買進量條只有 4.54，再加深就低於 4.5。量的長短改由底部 3px 實心 up／down 邊條標示，它對 panel 達圖形 3:1。列高 TOUCH_MIN、文字垂直置中，邊條不與文字重疊：實測字級「小」390 寬至少間隔 10px，字級「大」360 寬至少 13.9px。紅字／單層賣出量條 4.27（深色）是既有值，本次未改。
 
 ### 4.9 動態 token
 
@@ -607,7 +613,7 @@ Stepper({ value: string; onChange(text: string): void; onStep(delta: 1 | -1): vo
 ### 6.12 PriceFlash、VolumeBar、RatioBar、ProgressBar
 
 - `ui/price-flash.ts`：`usePriceFlash(ref, value, { enabled })`。與上一筆比較，上漲用 upFlash、下跌 downFlash 的絕對定位覆蓋層，`element.animate([{opacity:1},{opacity:0}], { duration: 600, easing: 'ease-out' })`；同一格距上次 <350ms 不閃；不閃：第一次渲染、資料來源切換（快照→成交）、金額遮蔽、元素不可見（共用 IntersectionObserver）、減少動態；沒有 `Element.prototype.animate` 時略過。套用：交易頁主價、自選列價格、持倉損益合計。不用 theme 的 flash 關鍵影格。
-- `ui/bars.tsx`：VolumeBar（五檔每格，`transform: scaleX(量 ÷ 五檔最大量)`；買側 origin right、賣側 origin left；upDim／downDim；`transition: transform 120ms linear`）；RatioBar（兩個 span 分別 `scaleX(L/100)` origin left、`scaleX(R/100)` origin right，旁附百分比文字，取代 `trade.css.ts:411` 的 width 轉場）；ProgressBar（委託成交進度、持倉損益條，取代 `orders.css.ts:371`、`account.css.ts:399`）。數值寫在 React `style.transform`（非手勢），減少動態由全域規則取消轉場。
+- `ui/bars.tsx`：VolumeBar（五檔每格，`transform: scaleX(量 ÷ 五檔最大量)`；買側 origin right、賣側 origin left；填色單層 upDim／downDim，底部 3px 實心 up／down 邊條（`VOLUME_EDGE`，同一元素的 background-image，隨 scaleX 縮放）；`transition: transform 120ms linear`）；RatioBar（兩個 span 分別 `scaleX(L/100)` origin left、`scaleX(R/100)` origin right，旁附百分比文字，取代 `trade.css.ts:411` 的 width 轉場）；ProgressBar（委託成交進度、持倉損益條，取代 `orders.css.ts:371`、`account.css.ts:399`）。數值寫在 React `style.transform`（非手勢），減少動態由全域規則取消轉場。
 
 ### 6.13 Skeleton、EmptyState
 
