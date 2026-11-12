@@ -524,14 +524,56 @@ def public_config_profiles(discovery: dict) -> dict:
     }
 
 
+def _entry_host(entry: str) -> str:
+    """Lower-case host name of a [Core] Entry URL (scheme optional); '' when it cannot be parsed."""
+    text = str(entry or "").strip()
+    if not text:
+        return ""
+    try:
+        return (urlsplit(text if "://" in text else "//" + text).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+ESUN_SIMULATION_HOST = _entry_host(ESUN_SIMULATION_ENTRY)
+ESUN_PRODUCTION_HOST = _entry_host(ESUN_PRODUCTION_ENTRY)
+
+
+def describe_esun_environment_conflict(config: configparser.ConfigParser | None) -> str | None:
+    """
+    A known E.Sun Entry host whose [Core] Environment says the other environment (e.g. a template
+    switched to the production Entry but still carrying Environment = SIMULATION): orders would go to
+    one host while the bridge reports the other. Returns the problem text, or None when consistent.
+    """
+    if not config or not config.has_section("Core"):
+        return None
+    host = _entry_host(config.get("Core", "Entry", fallback=""))
+    env_val = config.get("Core", "Environment", fallback="").strip().upper()
+    if host == ESUN_PRODUCTION_HOST and env_val == "SIMULATION":
+        return (
+            f"設定檔 [Core] Entry 與 Environment 不一致：Entry 指向正式環境（{ESUN_PRODUCTION_HOST}），"
+            "但 Environment = SIMULATION；正式環境請刪除 Environment 行，模擬環境請改用模擬 Entry"
+        )
+    if host == ESUN_SIMULATION_HOST and env_val == "PRODUCTION":
+        return (
+            f"設定檔 [Core] Entry 與 Environment 不一致：Entry 指向模擬環境（{ESUN_SIMULATION_HOST}），"
+            "但 Environment = PRODUCTION；模擬環境請設 Environment = SIMULATION，正式環境請改用正式 Entry 並刪除 Environment 行"
+        )
+    return None
+
+
 def detect_esun_environment(config: configparser.ConfigParser | None) -> str:
     """
     Detects whether an E.Sun configuration is SIMULATION or PRODUCTION based on [Core]:
     - Simulation: Entry == ESUN_SIMULATION_ENTRY and Environment == SIMULATION
     - Production: Entry == ESUN_PRODUCTION_ENTRY and (no Environment key or empty)
+    - Conflict: a known production host with Environment = SIMULATION, or a known simulation host
+      with Environment = PRODUCTION -> UNKNOWN (load_config reports it as a problem; login refused).
     - Fallback: Environment == SIMULATION or "simulation" in Entry URL -> SIMULATION, else PRODUCTION.
     """
     if not config or not config.has_section("Core"):
+        return "UNKNOWN"
+    if describe_esun_environment_conflict(config):
         return "UNKNOWN"
     entry = config.get("Core", "Entry", fallback="").strip().rstrip("/")
     has_env = config.has_option("Core", "Environment")
@@ -608,6 +650,9 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
 
     if parser.has_section("Core") and not parser["Core"].get("Entry"):
         problems.append("設定檔缺少 [Core] Entry")
+    env_conflict = describe_esun_environment_conflict(parser)
+    if env_conflict:
+        problems.append(env_conflict)
     if parser.has_section("Api"):
         api_key = str(parser["Api"].get("Key") or "").strip()
         api_secret = str(parser["Api"].get("Secret") or "").strip()

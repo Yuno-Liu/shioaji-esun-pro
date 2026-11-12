@@ -1014,6 +1014,99 @@ class TestConfigProfilesDiscovery(unittest.TestCase):
         self.assertTrue(discovery["profiles"]["PRODUCTION"]["available"])
         self.assertEqual(discovery["profiles"]["PRODUCTION"]["fileName"], "esun-config.production.ini")
 
+    def _write_full_config(self, name: str, core: str) -> str:
+        path = os.path.join(self.temp_dir.name, name)
+        with open(path, "w") as f:
+            f.write(core + "[Cert]\nPath=cert.p12\n[Api]\nKey=k_test\nSecret=s_test\n[User]\nAccount=88401234567\n")
+        return path
+
+    def test_real_world_entry_without_api_path_detects_both_environments(self):
+        # The two configs actually deployed: bare host Entry (no /api/v1); production has no Environment line.
+        prod = self._write_full_config(
+            "esun-config.production.ini", "[Core]\nEntry = https://esuntradingapi.esunsec.com.tw\n"
+        )
+        sim = self._write_full_config(
+            "esun-config.simulation.ini",
+            "[Core]\nEntry = https://esuntradingapi-simulation.esunsec.com.tw\nEnvironment = SIMULATION\n",
+        )
+        cfg, problems, env = load_config(prod)
+        self.assertEqual((problems, env), ([], "PRODUCTION"))
+        cfg, problems, env = load_config(sim)
+        self.assertEqual((problems, env), ([], "SIMULATION"))
+        discovery = discover_esun_config_profiles(base_dir=self.temp_dir.name)
+        self.assertEqual(discovery["availableEnvironments"], ["SIMULATION", "PRODUCTION"])
+
+        mock_sdk = MockSDK()
+        bridge = EsunTradeBridge(config_path=prod, sdk_factory=lambda cfg: mock_sdk, auto_login=True)
+        self.assertTrue(bridge.logged_in)
+        self.assertEqual(bridge.environment, "PRODUCTION")
+        mock_sdk_sim = MockSDK()
+        bridge_sim = EsunTradeBridge(config_path=sim, sdk_factory=lambda cfg: mock_sdk_sim, auto_login=True)
+        self.assertTrue(bridge_sim.logged_in)
+        self.assertEqual(bridge_sim.environment, "SIMULATION")
+
+    def test_entry_environment_conflict_is_unknown_and_refuses_login(self):
+        cases = [
+            # Template switched to the production Entry but Environment = SIMULATION left behind.
+            ("prod_host_sim_env.ini", "[Core]\nEntry = https://esuntradingapi.esunsec.com.tw\nEnvironment = SIMULATION\n", "SIMULATION"),
+            (
+                "prod_entry_sim_env.ini",
+                f"[Core]\nEntry = {ESUN_PRODUCTION_ENTRY}\nEnvironment = simulation\n",
+                "SIMULATION",
+            ),
+            (
+                "sim_host_prod_env.ini",
+                "[Core]\nEntry = https://ESUNTRADINGAPI-SIMULATION.esunsec.com.tw/\nEnvironment = PRODUCTION\n",
+                "PRODUCTION",
+            ),
+        ]
+        for name, core, env_value in cases:
+            with self.subTest(name=name):
+                path = self._write_full_config(name, core)
+                cp = configparser.ConfigParser()
+                cp.read(path)
+                self.assertEqual(detect_esun_environment(cp), "UNKNOWN")
+                cfg, problems, env = load_config(path)
+                self.assertEqual(env, "UNKNOWN")
+                conflict = [p for p in problems if "Entry 與 Environment 不一致" in p]
+                self.assertEqual(len(conflict), 1)
+                self.assertIn(f"Environment = {env_value}", conflict[0])
+
+                mock_sdk = MockSDK()
+                bridge = EsunTradeBridge(config_path=path, sdk_factory=lambda cfg: mock_sdk, auto_login=True)
+                self.assertFalse(bridge.logged_in)
+                self.assertEqual(mock_sdk.login_calls, 0)
+                self.assertIn("Entry 與 Environment 不一致", bridge.login_error or "")
+                # An explicit switch cannot paper over the conflict by rewriting [Core] in memory.
+                success, _res, _status = bridge.reconnect()
+                self.assertFalse(success)
+                self.assertEqual(mock_sdk.login_calls, 0)
+
+    def test_single_fallback_conflicting_config_is_not_an_available_environment(self):
+        self._write_full_config(
+            "esun-config.ini", "[Core]\nEntry = https://esuntradingapi.esunsec.com.tw\nEnvironment = SIMULATION\n"
+        )
+        discovery = discover_esun_config_profiles(base_dir=self.temp_dir.name)
+        self.assertEqual(discovery["availableEnvironments"], [])
+
+    def test_unknown_entry_and_environment_only_detection_unchanged(self):
+        def detect(core: str) -> str:
+            cp = configparser.ConfigParser()
+            cp.read_string(core)
+            return detect_esun_environment(cp)
+
+        # Unknown hosts keep the legacy fallback, whatever Environment says.
+        self.assertEqual(detect("[Core]\nEntry = https://custom.api.com\nEnvironment = SIMULATION\n"), "SIMULATION")
+        self.assertEqual(detect("[Core]\nEntry = https://custom-simulation.api.com\nEnvironment = PRODUCTION\n"), "SIMULATION")
+        self.assertEqual(detect("[Core]\nEntry = https://custom.api.com\nEnvironment = PRODUCTION\n"), "PRODUCTION")
+        # Environment only (no Entry).
+        self.assertEqual(detect("[Core]\nEnvironment = SIMULATION\n"), "SIMULATION")
+        self.assertEqual(detect("[Core]\nEnvironment = PRODUCTION\n"), "PRODUCTION")
+        # Known hosts with a matching or empty Environment.
+        self.assertEqual(detect(f"[Core]\nEntry = {ESUN_PRODUCTION_ENTRY}\nEnvironment =\n"), "PRODUCTION")
+        self.assertEqual(detect(f"[Core]\nEntry = {ESUN_PRODUCTION_ENTRY}\nEnvironment = PRODUCTION\n"), "PRODUCTION")
+        self.assertEqual(detect(f"[Core]\nEntry = {ESUN_SIMULATION_ENTRY}\n"), "SIMULATION")
+
     def test_discover_aliases(self):
         sim_alias = os.path.join(self.temp_dir.name, "esun-config.sim.ini")
         prod_alias = os.path.join(self.temp_dir.name, "esun-config.prod.ini")
