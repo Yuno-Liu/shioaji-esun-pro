@@ -188,6 +188,9 @@ describe('DepthLadder（page）', () => {
         expect(text(byId('depth-total-bid'))).toBe('316');
         expect(text(byId('depth-total-ask'))).toBe('173');
         expect(text(byId('depth-total'))).toContain('五檔總量（張）');
+        // aria-label 需掛在有角色的元素上才會被報讀（沒有 role 的 div 上 aria-label 不生效）
+        expect(byId('depth-total').props.role).toBe('group');
+        expect(byId('depth-total').props['aria-label']).toBe('五檔總量：委買 316，委賣 173 張');
         // 316 / 489 = 64.6% → 65 / 35
         expect(text(byId('depth-ratio-left'))).toBe('買 65%');
         expect(text(byId('depth-ratio-right'))).toBe('35% 賣');

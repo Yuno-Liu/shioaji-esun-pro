@@ -271,7 +271,7 @@ export function DepthLadder({ code, contract, trades, onPick, variant = 'page', 
                                 {cell('ask', r.level, r.ask)}
                             </div>
                         ))}
-                        <div className={styles.depthTotal} data-testid='depth-total' aria-label={`五檔總量：委買 ${fmtCompactInt(book.bidTotal)}，委賣 ${fmtCompactInt(book.askTotal)}${unit ? ` ${unit}` : ''}`}>
+                        <div className={styles.depthTotal} data-testid='depth-total' role='group' aria-label={`五檔總量：委買 ${fmtCompactInt(book.bidTotal)}，委賣 ${fmtCompactInt(book.askTotal)}${unit ? ` ${unit}` : ''}`}>
                             <span className={styles.depthTotalVol} data-testid='depth-total-bid'>{fmtCompactInt(book.bidTotal)}</span>
                             <span className={styles.depthTotalLabel}>五檔總量{unit && `（${unit}）`}</span>
                             <span className={styles.depthTotalVolRight} data-testid='depth-total-ask'>{fmtCompactInt(book.askTotal)}</span>
