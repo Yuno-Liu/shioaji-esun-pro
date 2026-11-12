@@ -275,12 +275,17 @@ function RoutePage({ route }: { route: MobileRoute }) {
     }
 }
 
+/** 風控損益餵送的葉節點：useTradingState 每次發布只重繪這裡，不連帶重繪整個殼層與目前頁面 */
+function RiskPnlFeed() {
+    useRiskPnlFeed();
+    return null;
+}
+
 /** secure context 才掛載：所有會連線的 hook 都在這裡以下 */
 export function MobileShell() {
     // 與桌面 src/App.tsx 相同：根層確保行情串流已開（ensureStream 冪等；bootstrap 的交易狀態也會開）
     useEffect(ensureStream, []);
     useEffect(() => startResumeGate(), []);
-    useRiskPnlFeed();
     useFillSound();
     useWakeLock();
     usePrefetchDeferredModules();
@@ -342,6 +347,8 @@ export function MobileShell() {
             <SheetRootContext.Provider value={sheetRootValue}>
                 <ShellSlotsContext.Provider value={slotsValue}>
                     <div ref={shellRef} className={layout.shell} data-testid='mobile-shell' data-sheet-open={sheetOpen ? 'true' : 'false'}>
+                        {/* 交易狀態訂閱只放在葉節點（本元件與 TabBar），lib 的 start 由它們的 effect 觸發 */}
+                        <RiskPnlFeed />
                         <div className={layout.statusWrap} {...background}>
                             <StatusBar />
                         </div>
