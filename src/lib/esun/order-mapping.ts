@@ -632,11 +632,15 @@ export function sortEsunOrderResultsOldestFirst<T extends Record<string, unknown
         .map(x => x.row);
 }
 
-/** 台北時間 YYYYMMDD + HHMMSS[mmm] → epoch 秒；缺資料回 undefined */
+/**
+ * 台北時間 YYYYMMDD + HHMMSS[mmm] → epoch 秒；缺資料回 undefined。
+ * ord_time 前導零可能被去掉：補零規則同 esunOrderSortKey（7～9 碼補到 9 碼 HHMMSSmmm，5～6 碼補到 6 碼 HHMMSS）。
+ */
 export function esunTimestamp(date: unknown, time: unknown): number | undefined {
     const d = String(date ?? '').replace(/-/g, '').trim();
-    const t = String(time ?? '').replace(/:/g, '').trim();
-    if (!/^\d{8}$/.test(d) || !/^\d{6}/.test(t)) return undefined;
+    const raw = String(time ?? '').replace(/[:.]/g, '').trim();
+    if (!/^\d{8}$/.test(d) || !/^\d{5,9}$/.test(raw)) return undefined;
+    const t = raw.length <= 6 ? raw.padStart(6, '0') : raw.padStart(9, '0');
     const ms = Date.UTC(+d.slice(0, 4), +d.slice(4, 6) - 1, +d.slice(6, 8), +t.slice(0, 2), +t.slice(2, 4), +t.slice(4, 6)) - 8 * 3600_000;
     return Number.isFinite(ms) ? ms / 1000 : undefined;
 }

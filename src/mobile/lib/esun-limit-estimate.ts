@@ -20,9 +20,12 @@
 //   - 結果未知：Inactive、PendingSubmit，以及玉山列帶 esun_unresolved_failure（失敗 ACK 尚未判定）或
 //     數量矛盾（esun_quantity_conflict）的委託 → 剩餘量一律以未成交計，並標示 uncertain。
 //   - 委託查詢待對帳（queries.orders.needsReconcile）時清單可能不完整 → 標示 reconcile。
-// - 今日：委託時間（status.order_ts，epoch 秒）以台北日期比對；沒有委託時間的列視為今日（交易狀態只保留當日委託，
-//   保守計入）。帳戶以 broker_id＋account_id 比對（AccountedTrade.account 優先，其次 order.account）。
+// - 今日：玉山委託中繼資料（lib/esun/account-details 的 EsunOrderMeta，委託查詢時寫入）有有效交易日 workDate 時，
+//   以 workDate 是否為台北今日判斷（前一日晚間下的預約單 ord_date／order_ts 是前一日，但占用 workDate 當天額度）；
+//   沒有中繼資料（例如 SSE 新委託、下一次委託查詢前）或 workDate 缺值時，以委託時間（status.order_ts，epoch 秒）
+//   的台北日期比對；沒有委託時間的列視為今日（交易狀態只保留當日委託，保守計入）。帳戶以 broker_id＋account_id 比對（AccountedTrade.account 優先，其次 order.account）。
 
+import { getEsunOrderMeta } from '../../lib/esun/account-details';
 import { esunQuantityConflictOf, esunUnresolvedFailureOf } from '../../lib/esun/order-mapping';
 import { isOddLot, SHARES_PER_LOT } from '../../lib/odd-lot';
 import { ACTIVE_ORDER_STATUSES, type AccountedTrade, type Trade } from '../../lib/types/order';
@@ -78,7 +81,16 @@ function sameAccount(t: AccountedTrade, account: Pick<Account, 'broker_id' | 'ac
     return a.broker_id === account.broker_id && a.account_id === account.account_id;
 }
 
-function isToday(t: Trade, today: number): boolean {
+/** 台北日期序號 → 'YYYY-MM-DD'（與 EsunOrderMeta.workDate 同格式） */
+function taipeiDateText(day: number): string {
+    return new Date(day * 86_400_000).toISOString().slice(0, 10);
+}
+
+function isToday(t: AccountedTrade, today: number): boolean {
+    // 玉山委託中繼資料有有效交易日（work_date）時以它判斷：前一日晚間下的預約單 ord_date 是前一日、
+    // order_ts 也是前一日，但會在 work_date 當天進入盤中撮合、占用當天額度
+    const workDate = getEsunOrderMeta(t.account ?? t.order.account, t.order.id)?.workDate;
+    if (workDate) return workDate === taipeiDateText(today);
     const ts = t.status.order_ts;
     if (!positive(ts)) return true;
     const ms = ts > 1e11 ? ts : ts * 1000;

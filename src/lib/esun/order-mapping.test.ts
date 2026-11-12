@@ -21,6 +21,7 @@ import {
     fromEsunTransactionsToProfitLossSummary,
     esunMktSeqNum,
     esunOrderSortKey,
+    esunTimestamp,
     esunQuantityConflictOf,
     esunQuantityHoldOpenOf,
     esunTransactionCondOf,
@@ -1287,6 +1288,38 @@ describe('Portfolio & SSE Mapping', () => {
             ];
             expect(ids(sortEsunOrderResultsOldestFirst(rows))).toEqual(['noTime1', 'noDate', 'noTime2', 't1', 't2', 'same1']);
             expect(ids(rows)).toEqual(['t2', 'noTime1', 't1', 'noDate', 'same1', 'noTime2']); // 不改動輸入
+        });
+    });
+
+    describe('esunTimestamp', () => {
+        // 台北 2026-10-23 HH:MM:SS → epoch 秒
+        const tpe = (hh: number, mm: number, ss: number) => Date.UTC(2026, 9, 23, hh - 8, mm, ss) / 1000;
+
+        it('pads ord_time with dropped leading zero (7–8 digits) to HHMMSSmmm like esunOrderSortKey', () => {
+            expect(esunTimestamp('20261023', '93015123')).toBe(tpe(9, 30, 15));
+            expect(esunTimestamp('20261023', '90000500')).toBe(tpe(9, 0, 0));
+            expect(esunTimestamp('20261023', '093015123')).toBe(tpe(9, 30, 15));
+            expect(esunTimestamp('2026-10-23', '93015123')).toBe(esunTimestamp('20261023', '093015123'));
+        });
+
+        it('pads 5-digit ord_time to HHMMSS and keeps 6-digit / colon formats', () => {
+            expect(esunTimestamp('20261023', '93015')).toBe(tpe(9, 30, 15));
+            expect(esunTimestamp('20261023', '093015')).toBe(tpe(9, 30, 15));
+            expect(esunTimestamp('20261023', '09:30:15')).toBe(tpe(9, 30, 15));
+            expect(esunTimestamp('20261023', '201530000')).toBe(tpe(20, 15, 30));
+        });
+
+        it('returns undefined for missing or malformed date/time', () => {
+            for (const t of ['', '1234', '0930151234', 'abcdef', undefined]) expect(esunTimestamp('20261023', t)).toBeUndefined();
+            expect(esunTimestamp('', '093015')).toBeUndefined();
+        });
+
+        it('fromEsunOrderResult order_ts uses the padded ord_time', () => {
+            const trade = fromEsunOrderResult({
+                ord_date: '20261023', ord_time: '93015123', ord_no: 'T0001', stock_no: '2330', buy_sell: 'B', ap_code: '1',
+                price_flag: '0', bs_flag: 'R', trade: '0', od_price: '1000', org_qty: '1', mat_qty: '0', cel_qty: '0',
+            } as never, esunAccount)!;
+            expect(trade.status.order_ts).toBe(tpe(9, 30, 15));
         });
     });
 
