@@ -1683,6 +1683,13 @@ B0-motion ─┼─ B0-ui ─┬─ B2-shell（inert 開關待 B1-sheet）──
       - 連線面板每秒刷新。
       - bridge：Entry 與 Environment 不一致時拒絕登入；新單必填 trade／bsFlag／priceFlag；log 遮蔽委託書號與 API Key（另一個 PR，收盤後部署）。
       - 部署：web 不再依賴 bridge；sidecar 的 healthcheck 同時檢查 web；web 與 sidecar 輪替日誌；加入版本標籤；CI 檢查首屏預算與 nginx 長快取。
+    - 深度審查（交易相關改動）沒有 critical、high、medium。已修的 low 項目：
+      - 補取帳戶跟著伺服器模式重試。
+      - 估算剩餘訂閱委託中繼資料。
+      - 盤前試撮時不顯示前一日總量。
+      - 委託時間解析前，先去掉小數秒與時區尾碼。
+    - 刻意保留：全部／批次刪單期間，平倉也停用（反向掛單還沒確認取消就平倉，可能超賣）。
+    - 未證實：盤中零股五檔以零股 tick 的 price_chg 推回參考價，需要零股實際資料。
     - 延後，需要使用者決定或先驗證：
       - 交易圖表的圖例與委託線標籤改成小 store（1,846 行元件，風險較高）。
       - 持倉頁淨損益快取：先量測，小於 1ms/s 就不做。
