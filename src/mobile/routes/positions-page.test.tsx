@@ -168,7 +168,7 @@ import { BATCH_STOPPED, batchExitAbortReason, decideBatchConfirm, isBatchExitAct
 import { resetTradingLimitsForTest } from '../hooks/use-trading-limits';
 import { POSITIONS_VIEW_KEY, readPositionsView } from '../lib/positions-view';
 import { addOnBlockReason, addOnPlanFor, batchGateProblem, batchLegs, batchSelectReason, closeBeforeSend, closePlanFor, COMPACT_TEXT, executeClose, POSITIONS_TEXT, PositionsPage, REFRESH_COOLDOWN_MS, reconcileText, yesterdayText, type ClosePlan } from './positions-page';
-import { ENV_SWITCH_NOT_SENT, orderDispatchInFlight, resetTradingActivityForTest, setEnvSwitch } from '../lib/trading-activity';
+import { beginOrderDispatch, ENV_SWITCH_NOT_SENT, orderDispatchInFlight, resetTradingActivityForTest, setEnvSwitch } from '../lib/trading-activity';
 
 const stockAcc = { account_type: 'S', broker_id: '9A95', account_id: '1234567', person_id: 'A', signed: true, username: '' };
 const stockAcc2 = { account_type: 'S', broker_id: 'ESUN1', account_id: '7777777', person_id: 'A', signed: true, username: '' };
@@ -805,6 +805,52 @@ describe('平倉', () => {
         expect(m.placeStockExitByShares).toHaveBeenCalledTimes(1);
         await act(async () => { resolve([]); });
         expect(all('position-close-sheet')).toHaveLength(0);
+    });
+
+    it('送出中換分頁（卸載）再回來：平倉鍵、批次與直接呼叫都停用，不會重送；送出結束後才恢復', async () => {
+        let resolve: (v: unknown) => void = () => undefined;
+        m.placeStockExitByShares.mockImplementation(() => new Promise(r => { resolve = r; }));
+        try {
+            await render();
+            await click(inRow('2330', 'position-close'));
+            await click(one('position-close-continue'));
+            expect(m.placeStockExitByShares).toHaveBeenCalledTimes(1);
+            expect(orderDispatchInFlight()).toBe(true);
+            // 換分頁：app.tsx 的 <Suspense key={route.name}> 卸載本頁（元件內的 closing 隨之消失）
+            await act(async () => view!.unmount());
+            view = undefined;
+            await render();
+            expect(all('position-close-sheet')).toHaveLength(0);
+            expect(inRow('2330', 'position-close').props.disabled).toBe(true);
+            expect(inRow('TXFL6', 'position-close').props.disabled).toBe(true);
+            expect(textOf(one('position-dispatch-note'))).toBe(POSITIONS_TEXT.dispatchBusy);
+            // 停用鍵被直接觸發（硬性備援）：不開說明面板、不送出
+            await click(inRow('2330', 'position-close'));
+            expect(all('position-close-sheet')).toHaveLength(0);
+            expect(m.placeStockExitByShares).toHaveBeenCalledTimes(1);
+            // 前一筆送出結束（計數歸零）後恢復
+            await act(async () => { resolve([]); });
+            expect(orderDispatchInFlight()).toBe(false);
+            expect(inRow('2330', 'position-close').props.disabled).toBe(false);
+            expect(all('position-dispatch-note')).toHaveLength(0);
+        } finally {
+            resetTradingActivityForTest();
+        }
+    });
+
+    it('說明面板開著時另一筆送單開始：按「繼續」顯示未送出（另一筆送出中），不呼叫 lib', async () => {
+        await render();
+        await click(inRow('2330', 'position-close'));
+        const release = beginOrderDispatch();
+        try {
+            await rerender();
+            await click(one('position-close-continue'));
+            expect(m.placeStockExitByShares).not.toHaveBeenCalled();
+            expect(pageText()).toContain(`未送出：${POSITIONS_TEXT.dispatchBusy}`);
+        } finally {
+            release();
+            resetTradingActivityForTest();
+        }
     });
 });
 
@@ -1754,6 +1800,20 @@ describe('多選市價出清（§7.7、§10 S10）', () => {
         m.locked = true;
         await rerender();
         expect(slide()!.props.disabledReason).toBe(POSITIONS_TEXT.batchBusy);
+        // 單筆平倉或新單送出中（模組層計數；例如離開本頁前開始的平倉）：停用，直接觸發也不開始
+        m.locked = false;
+        const release = beginOrderDispatch();
+        try {
+            await rerender();
+            expect(slide()!.props.disabled).toBe(true);
+            expect(slide()!.props.disabledReason).toBe(POSITIONS_TEXT.batchBusy);
+            await act(async () => { slide()!.props.onConfirm(); });
+            expect(isBatchExitActive()).toBe(false);
+        } finally {
+            release();
+        }
+        await rerender();
+        expect(slide()!.props.disabled).toBe(false);
         for (const f of sendFns()) expect(f).not.toHaveBeenCalled();
         expect(isBatchExitActive()).toBe(false);
     });
