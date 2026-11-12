@@ -22,6 +22,7 @@ const m = vi.hoisted(() => ({
     snapshot: undefined as unknown,
     snapshotListeners: new Set<() => void>(),
     chartProps: [] as unknown[],
+    tickListProps: [] as { code: string; active?: boolean }[],
     // 當沖資訊列：處置名單（usePunishedCodes 的 active 參數）與「籌碼與當沖」面板替身收到的 props
     punished: new Set<string>() as ReadonlySet<string>,
     punishActive: [] as boolean[],
@@ -57,7 +58,7 @@ vi.mock('../../lib/privacy', () => ({ usePrivacyMoney: m.usePrivacyMoney, maskMo
 vi.mock('../lib/mobile-store', () => ({ openTicket: m.openTicket, openOrderAction: m.openOrderAction, setCurrentCode: m.setCurrentCode }));
 vi.mock('../../lib/product-search', () => ({ searchProducts: m.searchProducts }));
 vi.mock('../components/trade-chart', () => ({ TradeChart: (props: unknown) => { m.chartProps.push(props); return null; } }));
-vi.mock('../components/tick-list', () => ({ TickList: () => null }));
+vi.mock('../components/tick-list', () => ({ TickList: (props: { code: string; active?: boolean }) => { m.tickListProps.push(props); return null; } }));
 // 「公司」分頁（延遲載入）：以替身取代，不讀 shioaji-data（內容與 S1 另見 components/company/company-tab.test.tsx）
 vi.mock('../components/company/load-company-tab', async () => {
     const { createElement: h } = await import('react');
@@ -153,6 +154,7 @@ beforeEach(() => {
     m.snapshot = undefined;
     m.snapshotListeners.clear();
     m.chartProps.length = 0;
+    m.tickListProps.length = 0;
     m.punished = new Set();
     m.punishActive.length = 0;
     m.punishLoaded = true;
@@ -502,6 +504,17 @@ describe('TradePage B3b', () => {
         await act(async () => { btn('明細').props.onClick(); });
         expect(btn('明細').props['aria-selected']).toBe(true);
         expect(view!.root.findAllByProps({ 'data-testid': 'depth-ladder' })).toHaveLength(0);
+    });
+
+    it('明細同公司分頁保持掛載：一直渲染 TickList，以 active 告知是否顯示（第一次掛載、隱藏時不重繪由 TickList 處理）', async () => {
+        await render();
+        expect(m.tickListProps.at(-1)).toMatchObject({ code: '2330', active: false });
+        for (let i = 0; i < 5; i++) {
+            await act(async () => { btn('明細').props.onClick(); });
+            expect(m.tickListProps.at(-1)!.active).toBe(true);
+            await act(async () => { btn(i % 2 ? '公司' : '五檔').props.onClick(); });
+            expect(m.tickListProps.at(-1)!.active).toBe(false);
+        }
     });
 
     it('交易鍵列經 ShellSlot bottom：inline 時原地渲染（文字與 testid 不變）；殼層目標未掛上時不落回捲動內容', async () => {

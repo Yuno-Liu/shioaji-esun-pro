@@ -703,7 +703,8 @@ function TradeView({ code, onOpenSwitch, switchOpen, switchRef }: { code: string
                 )}
             </div>
             {panel === 'depth' && <DepthWithTrades code={sym} contract={contract} oddLot={oddLot} />}
-            {panel === 'ticks' && contract && <TickList code={sym} contract={contract} />}
+            {/* 明細同公司分頁：第一次切入才掛載，切走只隱藏（不重抓歷史；隱藏時不重繪，TickList 內部處理） */}
+            {contract && <TickList code={sym} contract={contract} active={panel === 'ticks'} />}
             {companyMounted && (
                 <div hidden={panel !== 'company'} data-testid='trade-company'>
                     <ModuleErrorBoundary onRetry={resetCompanyTab} fallback={props => <ModuleLoadError {...props} testId='company-load-error' />}>
