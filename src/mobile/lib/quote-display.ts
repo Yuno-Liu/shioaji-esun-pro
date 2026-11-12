@@ -32,9 +32,9 @@ export interface HeaderTick {
     /** 最後一筆成交量（單量） */
     volume?: number;
     total_amount?: string;
-    /** 內盤累計量（以買價成交） */
+    /** 外盤累計量：Shioaji「Buy side total volume 買方總量」＝主動買進（tick_type 1，成交在委賣價），不是「以買價成交」 */
     bid_side_total_vol?: number;
-    /** 外盤累計量（以賣價成交） */
+    /** 內盤累計量：Shioaji「Sell side total volume 賣方總量」＝主動賣出（tick_type 2，成交在委買價） */
     ask_side_total_vol?: number;
 }
 
@@ -247,10 +247,15 @@ export function splitPercent(left: number | null | undefined, right: number | nu
     return { left, right, leftPct, rightPct: 100 - leftPct };
 }
 
-/** 內外盤比（左＝內盤 bid_side_total_vol、右＝外盤 ask_side_total_vol）；欄位缺漏、試撮或全為 0 時回傳 null（隱藏） */
+/**
+ * 內外盤比（左＝內盤 ask_side_total_vol、右＝外盤 bid_side_total_vol）；欄位缺漏、試撮或全為 0 時回傳 null（隱藏）。
+ * Shioaji 的 bid_side／ask_side 是「買方／賣方（主動方）」總量，不是「成交在委買價／委賣價」：
+ * bid_side＝外盤（tick_type 1）、ask_side＝內盤（tick_type 2）。2026-11-12 以 2313 實際逐筆成交驗證：
+ * 09:57 前 tick_type 1 共 22,458 張（73.1%）、tick_type 2 共 8,281 張（26.9%），與畫面 bid_side 占比 73% 一致。
+ */
 export function innerOuterRatio(tick: HeaderTick | undefined): SplitPercent | null {
     if (!tick || tick.simtrade === true) return null;
-    return splitPercent(tick.bid_side_total_vol, tick.ask_side_total_vol);
+    return splitPercent(tick.ask_side_total_vol, tick.bid_side_total_vol);
 }
 
 /** 量的單位：股票整股以張、零股以股、期權以口；指數等無單位 */

@@ -834,6 +834,7 @@ GroupedSection：持倉：現股 3 張 · 均價 1,052.5 · +97,500 ／ 未成�
 **第二階段實作差異**（以程式碼為準）：
 
 - 內嵌五檔顯示內外盤比後，`depth-ladder.test.tsx` 原本「ticket 變體不顯示內外盤比」的斷言與本節衝突，已刪除，改由新增案例驗證「ticket 變體顯示內外盤比」與「沒有內外盤量（或試撮）時仍隱藏」（§14 刻意更新 3）。
+- **內外盤比的欄位對應**（2026-11-12，使用者回報「內外盤比相反」）：內盤＝`ask_side_total_vol`、外盤＝`bid_side_total_vol`（`lib/quote-display.ts` 的 `innerOuterRatio`）。Shioaji 的 bid_side／ask_side 是「買方／賣方（主動方）」總量，文件寫「Buy side total volume 買方總量」，對應 tick_type 1（外盤，成交在委賣價）／2（內盤），不是「成交在委買價／委賣價」。以 2313 華通當日逐筆成交驗證：09:57 前 tick_type 1 共 22,458 張（73.1%）、tick_type 2 共 8,281 張（26.9%），與畫面上 bid_side 的占比 73% 一致；原本的實作把兩者對調。漲停鎖住時的成交，交易所標為 tick_type 1（外盤）。
 - 長按（圖表與自選列）呼叫 `haptic('longPress')`：只在 Android 且使用者開啟「介面觸覺回饋」時震動，iOS 不震（`motion/haptics.ts`）。
 - 選價列收回：另渲染一個 `chart-pick-closing` 殘影節點（`aria-hidden`＋`inert`）播放沿原路收回的動畫，`chart-pick` 本身在選完或取消時立即移除，測試與輔助技術不會看到兩份選價列。
 - 精簡標頭（`trade-compact`）設 `aria-hidden`：內容與頁面 h1、主價重複；唯一的互動（切換商品）是 aria-hidden 之外的兄弟按鈕 `trade-compact-switch`。
