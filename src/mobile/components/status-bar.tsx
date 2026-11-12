@@ -100,7 +100,19 @@ const RESUME_TEXT: Record<ResumeGateState, string> = { ready: '已同步', resyn
 const ESUN_STREAM_TEXT: Record<string, string> = { idle: '未啟動', connecting: '連線中', live: 'LIVE', down: '中斷' };
 
 
+// 面板開著時每秒重繪：最後心跳、連線世代、玉山串流是模組狀態（沒有訂閱）。
+// 殼層不再隨交易狀態發布而整個重繪（RiskPnlFeed 葉節點），所以要自己刷新
+function useTickWhileOpen(open: boolean) {
+    const [, setTick] = useState(0);
+    useEffect(() => {
+        if (!open) return;
+        const id = setInterval(() => setTick(t => t + 1), 1000);
+        return () => clearInterval(id);
+    }, [open]);
+}
+
 function ConnectionDetails({ open, onClose, stream, gate, serverLost }: { open: boolean; onClose: () => void; stream: StreamStatus; gate: ResumeGateSnapshot; serverLost: boolean }) {
+    useTickWhileOpen(open);
     const resume = gate.state;
     const message = gate.message;
     return (
