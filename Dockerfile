@@ -28,7 +28,11 @@ COPY scripts/dev-etf-proxy.ts ./scripts/dev-etf-proxy.ts
 # Build production assets into /app/dist
 # 以 fork 的 vite.fork.config.ts 建置：合併上游設定並加入手機入口 mobile.html
 # （型別檢查同 pnpm run build 的 tsc -b；docs/fork/mobile-trading-spec.md §4.3）
-RUN pnpm exec tsc -b && pnpm exec vite build --config vite.fork.config.ts
+# 建置版本標籤：建置環境沒有 .git，由 build arg 傳入 commit（docker-compose.yml 的 args、
+# scripts/deploy-docker.*）；vite.fork.config.ts 以 SHIOAJI_BUILD_REVISION 產生「dev · <commit>」，
+# 預設 unknown 時維持上游行為（dev · unknown）。ARG 放在依賴安裝之後，commit 改變不會讓 pnpm install 快取失效。
+ARG GIT_REVISION=unknown
+RUN pnpm exec tsc -b && SHIOAJI_BUILD_REVISION="${GIT_REVISION}" pnpm exec vite build --config vite.fork.config.ts
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2: SinoPac Shioaji API server (行情 sidecar)
@@ -113,6 +117,10 @@ CMD ["python", "-u", "server/esun_trade_server.py"]
 # Stage 4: Nginx Web Server & Reverse Proxy (Runner)
 # ─────────────────────────────────────────────────────────────────────────────
 FROM nginx:1.30-alpine AS runner
+
+# 與 builder 相同的 commit，供 docker inspect 查詢目前執行的版本
+ARG GIT_REVISION=unknown
+LABEL org.opencontainers.image.revision="${GIT_REVISION}"
 
 # Template configuration for environment substitution at container startup
 COPY deploy/nginx.conf.template /etc/nginx/templates/default.conf.template

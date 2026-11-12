@@ -155,9 +155,21 @@ init_files() {
     ensure_bridge_token
 }
 
+# 建置版本標籤：docker-compose.yml 以 GIT_REVISION 傳給 web 映像（畫面顯示「dev · <commit>」）。
+# 不是 git 工作目錄或沒有 git 時不設定，compose 以預設 unknown 建置。
+export_git_revision() {
+    local rev
+    if rev="$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null)" && [ -n "$rev" ]; then
+        export GIT_REVISION="$rev"
+        info "建置版本：$GIT_REVISION"
+    fi
+}
+
 action_up() {
     check_docker
     init_files
+
+    export_git_revision
 
     info "以全容器化模式啟動 Shioaji Pro Web 與 esun-bridge 容器..."
     if ! docker compose up -d --build; then

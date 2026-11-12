@@ -137,6 +137,31 @@ class HostAllowlistTest(unittest.TestCase):
         self.assertIn('"~*^https?://([^/|]+)\\|\\1$" 0;', text)
 
 
+def main_server_directives() -> list[str]:
+    """允許 Host 的主 server 在第一個 location 之前的指令（server 層級）。"""
+    text = _read(TEMPLATE)
+    server = text[text.index("server_name localhost 127.0.0.1"):]
+    return directives(server[:server.index("location ")])
+
+
+class ServerLevelRedirectAndGzipTest(unittest.TestCase):
+    """重新導向只送相對 Location（不帶 :8080）；gzip 涵蓋新版 mime.types 的 JS 與 PWA manifest。"""
+
+    def test_absolute_redirect_off_at_server_level(self) -> None:
+        self.assertIn("absolute_redirect off;", main_server_directives())
+        # 只在 server 層設定一次，不在個別 location 重複
+        for arg, body in all_locations():
+            with self.subTest(location=arg):
+                self.assertFalse([ln for ln in directives(body) if ln.startswith("absolute_redirect")])
+
+    def test_gzip_types_cover_js_and_manifest(self) -> None:
+        lines = [ln for ln in main_server_directives() if ln.startswith("gzip_types ")]
+        self.assertEqual(len(lines), 1)
+        types = lines[0].rstrip(";").split()[1:]
+        for mime in ("text/javascript", "application/javascript", "application/manifest+json", "text/css"):
+            self.assertIn(mime, types)
+
+
 class MobileManifestLocationTest(unittest.TestCase):
     """手機版 PWA manifest：明確的 MIME、不快取，且仍有安全標頭與 Basic Auth。"""
 

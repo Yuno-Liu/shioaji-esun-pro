@@ -53,6 +53,10 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
+    # 所有重新導向（/m、/esun、/api 的 301／302，以及目錄補斜線）的 Location 只送相對路徑：
+    # 前面接 TLS 前端時不會被改寫成 http:// 或帶上容器內的 :8080
+    absolute_redirect off;
+
     include /etc/nginx/snippets/security-headers.conf;
 
     # 選用的 Basic Auth：WEB_BASIC_AUTH 預設 off；要開放區網時設成任意 realm 名稱，
@@ -69,7 +73,7 @@ server {
     gzip_vary on;
     gzip_proxied any;
     gzip_comp_level 6;
-    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+    gzip_types text/plain text/css text/xml text/javascript application/json application/javascript application/manifest+json application/rss+xml application/atom+xml image/svg+xml;
 
     # 容器 healthcheck（無副作用、免 Basic Auth）
     location = /healthz {
@@ -86,11 +90,9 @@ server {
         try_files /approval.html =404;
     }
 
-    # 手機版短網址（選配）：/m → /mobile.html。
-    # absolute_redirect off：Location 只送相對路徑，前面接 TLS 前端時不會被改寫成 http:// 或帶上 :8080。
+    # 手機版短網址（選配）：/m → /mobile.html（相對 Location，見 server 層的 absolute_redirect off）。
     # 此 location 不自訂 add_header，安全標頭沿用 server 層級設定。
     location = /m {
-        absolute_redirect off;
         return 302 /mobile.html;
     }
 

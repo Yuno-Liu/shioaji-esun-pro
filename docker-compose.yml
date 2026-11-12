@@ -6,6 +6,16 @@
 #   注入 /esun/ 請求；橋接要求此 token，瀏覽器不持有。
 # - 專案目錄以唯讀掛載給橋接（ESUN_CONFIG_HOST_DIR，預設 .），登入熔斷狀態存於具名 volume。
 # 需要區網存取時，請設定 WEB_BIND、WEB_SERVER_NAMES 並啟用 WEB_BASIC_AUTH，切勿直接開放 8080/8090。
+
+# 容器日誌輪替（json-file，每檔 10 MB、保留 3 檔）：只套用在 web 與永豐 sidecar。
+# esun-bridge 刻意不加：改它的 compose 設定會讓下一次 docker compose up 重建連著玉山正式環境的 bridge，
+# 等下次收盤後要重建 bridge 時再一起加上 logging: *default-logging。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   shioaji-pro-web:
     container_name: shioaji-pro-web
@@ -13,7 +23,12 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runner
+      args:
+        # 建置版本標籤（畫面上的「dev · <commit>」與映像 org.opencontainers.image.revision）；
+        # scripts/deploy-docker.* 在建置前以 git rev-parse --short HEAD 設定
+        GIT_REVISION: ${GIT_REVISION:-unknown}
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:${PORT:-8080}"
     environment:
@@ -26,12 +41,9 @@ services:
       # NGINX_ENVSUBST_FILTER 由 Dockerfile 的 runner stage 統一定義
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    depends_on:
-      # 只決定啟動順序：nginx 以 resolver 執行期解析 esun-bridge，
-      # 橋接未啟動或不健康時 web 仍可運作（/esun/ 回 502），不會互相拖垮
-      esun-bridge:
-        condition: service_started
-        required: false
+    # 刻意不設 depends_on: esun-bridge：nginx 以 resolver 在執行期解析 esun-bridge，橋接未啟動或不健康時
+    # web 仍可運作（/esun/ 回 502）。有這個相依時，`docker compose up -d shioaji-pro-web shioaji-server`
+    # 會連帶啟動被刻意停掉的 bridge（例如盤中只重建 web、或改用宿主機橋接時）。
 
   shioaji-server:
     container_name: shioaji-pro-sinopac
@@ -40,6 +52,7 @@ services:
       dockerfile: Dockerfile
       target: shioaji
     restart: unless-stopped
+    logging: *default-logging
     init: true
     # 共用 web 的網路命名空間：永豐 sidecar 只綁 127.0.0.1，nginx 以 loopback 存取
     network_mode: "service:shioaji-pro-web"
@@ -61,8 +74,11 @@ services:
     volumes:
       - ./certs:/app/certs:ro
     healthcheck:
-      # 未設定金鑰時只會 sleep，回報 unhealthy 才不會讓人誤以為行情正常
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:21322/api/v1/info > /dev/null"]
+      # 未設定金鑰時只會 sleep，回報 unhealthy 才不會讓人誤以為行情正常。
+      # 同時檢查 web 的 /healthz（免 Basic Auth；Host 127.0.0.1 一定在白名單）：兩者共用網路命名空間，
+      # web 單獨重啟或重建時 sidecar 會卡在舊的命名空間、nginx 連不到它，這時也回報 unhealthy。
+      # 恢復：docker compose up -d --no-deps --force-recreate shioaji-server（只動 sidecar；說明見 docs/fork/esun.md）
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:21322/api/v1/info > /dev/null && curl -sf http://127.0.0.1:${PORT:-8080}/healthz > /dev/null"]
       interval: 15s
       timeout: 5s
       retries: 3

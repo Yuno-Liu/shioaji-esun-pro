@@ -248,6 +248,42 @@ docker compose logs -f esun-bridge        # 或 shioaji-server、shioaji-pro-web
 pnpm run docker:down                      # 或 docker compose down
 ```
 
+### 永豐 sidecar 卡在舊的網路命名空間
+
+`shioaji-server` 以 `network_mode: service:shioaji-pro-web` 共用 web 的網路命名空間。web 單獨重啟（`docker restart`、
+當掉後依 restart 政策自動重啟）或單獨重建時，sidecar 仍留在舊的命名空間，nginx 連不到 `127.0.0.1:21322`，`/api/` 回 502。
+sidecar 的 healthcheck 同時檢查自己的 `/api/v1/info` 與 web 的 `/healthz`（免 Basic Auth），這時會顯示 unhealthy。恢復：
+
+```bash
+docker compose up -d --no-deps --force-recreate shioaji-server
+```
+
+只重建 sidecar，不碰 web 與玉山 bridge。`--force-recreate` 不可省：web 是「重啟」（容器 ID 不變）時，compose 認為 sidecar
+設定沒變、狀態為 Running，不加這個參數會什麼都不做（2026-11-13 以一次性 compose 專案實測；web 是「重建」時，不加也會重建）。
+
+### 日誌輪替
+
+`shioaji-pro-web` 與 `shioaji-server` 使用 json-file 日誌輪替（每檔 10 MB、保留 3 檔，`docker-compose.yml` 的
+`x-logging`），重建容器後生效。`esun-bridge` 目前沒有：修改它的 compose 設定會讓下一次 `docker compose up` 重建連著玉山
+正式環境的 bridge，所以要等下次收盤後重建 bridge 時，再一起在 `esun-bridge` 加上 `logging: *default-logging`。
+
+### web 不依賴 esun-bridge
+
+`shioaji-pro-web` 沒有 `depends_on: esun-bridge`：nginx 以 resolver 在執行期解析 bridge，bridge 停止時 web 照常運作，
+`/esun/` 回 502。因此 `docker compose up -d shioaji-pro-web shioaji-server` 不會把刻意停掉的 bridge 啟動起來；
+要啟動 bridge 時請明確寫出 `esun-bridge`，或不指定服務。
+
+### 建置版本
+
+`scripts/deploy-docker.*` 在建置前設定 `GIT_REVISION`（`git rev-parse --short HEAD`），web 映像據此顯示
+「dev · <commit>」（手機「帳戶 › 診斷」、未加密連線說明頁與桌面伺服器面板的建置版本），並寫入映像標籤 `org.opencontainers.image.revision`。
+直接用 compose 建置時請自行帶入，否則顯示 `dev · unknown`：
+
+```bash
+GIT_REVISION=$(git rev-parse --short HEAD) docker compose build shioaji-pro-web
+docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' shioaji-pro-web
+```
+
 修正玉山密碼或設定檔後，手動解除熔斷並重新登入：
 
 ```bash
