@@ -202,12 +202,22 @@ export const flowBar = style({
     marginTop: '0.125rem',
 });
 
+/**
+ * 軌道：mutedForeground 低透明（::before＋opacity，不用 color-mix）。原 border 色在卡片上只有 1.08:1（深色）／1.30:1（淺色）；
+ * mutedForeground×0.4 對卡片 深色 1.83:1、淺色 1.75:1。填色是後面的絕對定位兄弟，畫在 ::before 之上。
+ */
 export const half = style({
     position: 'relative',
     display: 'block',
     overflow: 'hidden',
     borderRadius: '2px',
-    background: vars.color.border,
+    '::before': {
+        content: '""',
+        position: 'absolute',
+        inset: 0,
+        background: vars.color.mutedForeground,
+        opacity: 0.4,
+    },
 });
 
 const fillBase = style({
@@ -245,8 +255,10 @@ export const spark = style({
     overflow: 'visible',
 });
 
+/** 零軸：mutedForeground×0.6（原 border 色在卡片／面板上 1.08–1.30:1；改後對卡片 深色 2.59、淺色 2.44，對面板 2.64／2.44），仍淡於資料線 */
 export const sparkZero = style({
-    stroke: vars.color.border,
+    stroke: vars.color.mutedForeground,
+    strokeOpacity: 0.6,
     strokeWidth: 1,
     strokeDasharray: '3 3',
 });

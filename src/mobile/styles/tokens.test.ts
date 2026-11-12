@@ -338,3 +338,64 @@ describe('§10 S7／§12 靜態檢查', () => {
         }
     });
 });
+
+describe('深色主題看得見的軌道與營收段（2026-11-13）', () => {
+    // 卡片底＝groupedBg：深色＝muted、淺色＝panel（theme-vars.css.ts）
+    const cardOf = (mode: 'dark' | 'light', p: (k: string) => string) => hex(mode === 'dark' ? p('muted') : p('panel'));
+
+    it.each(MODES)('%s：共用軌道（RatioBar、ProgressBar）的 mutedForeground 內框對卡片 ≥ 4.5（原 muted 底在深色卡片上 1.00:1）', mode => {
+        const p = palette(mode);
+        const card = cardOf(mode, p);
+        const expected = { dark: 4.92, light: 5.38 }[mode];
+        const ring = contrast(hex(p('mutedForeground')), card);
+        expect(Math.abs(ring - expected), `${mode} ring=${ring.toFixed(3)}`).toBeLessThanOrEqual(0.02);
+        expect(ring).toBeGreaterThanOrEqual(4.5);
+        if (mode === 'dark') expect(contrast(hex(p('muted')), card)).toBeCloseTo(1, 5);
+    });
+
+    it('bars.css.ts：track 加 1px mutedForeground inset 內框', () => {
+        const src = readFileSync(join(mobileDir, 'ui', 'bars.css.ts'), 'utf8');
+        const block = src.slice(src.indexOf('export const track = style({'), src.indexOf('});', src.indexOf('export const track = style({')));
+        expect(block).toMatch(/background: vars\.color\.muted,/);
+        expect(block).toMatch(/boxShadow: `inset 0 0 0 1px \$\{vars\.color\.mutedForeground\}`/);
+    });
+
+    it.each(MODES)('%s：產業淨流入軌道 mutedForeground×0.4、零軸 ×0.6 對卡片可分辨（原 border 色 深色 1.08:1）', mode => {
+        const p = palette(mode);
+        const card = cardOf(mode, p);
+        const mf = hex(p('mutedForeground'));
+        const track = contrast(over(mf, 0.4, card), card);
+        const zero = contrast(over(mf, 0.6, card), card);
+        const expected = ({ dark: [1.83, 2.59], light: [1.75, 2.44] } as const)[mode];
+        expect(Math.abs(track - expected[0]), `${mode} track=${track.toFixed(3)}`).toBeLessThanOrEqual(0.02);
+        expect(Math.abs(zero - expected[1]), `${mode} zero=${zero.toFixed(3)}`).toBeLessThanOrEqual(0.02);
+        expect(contrast(hex(p('border')), card)).toBeLessThan(track);
+    });
+
+    it('sector.css.ts：軌道以 ::before＋opacity 0.4（不用 color-mix）、零軸 stroke mutedForeground＋strokeOpacity 0.6', () => {
+        const src = readFileSync(join(stylesDir, 'sector.css.ts'), 'utf8');
+        const half = src.slice(src.indexOf('export const half = style({'), src.indexOf('const fillBase'));
+        expect(half).toMatch(/'::before': \{[^}]*background: vars\.color\.mutedForeground,\s*opacity: 0\.4,/);
+        expect(half).not.toMatch(/background: vars\.color\.border/);
+        const zero = src.slice(src.indexOf('export const sparkZero'), src.indexOf('});', src.indexOf('export const sparkZero')));
+        expect(zero).toMatch(/stroke: vars\.color\.mutedForeground,\s*strokeOpacity: 0\.6,/);
+    });
+
+    it.each(MODES)('%s：營收組成各段對軌道底 ≥ 1.29、相鄰段 ≥ 1.08，且逐段遞減（原第 5 段起 1.26→1.13、相鄰 1.03）', mode => {
+        const src = readFileSync(join(mobileDir, 'components', 'company', 'company-format.ts'), 'utf8');
+        const list = /export const MIX_OPACITY = \[([^\]]+)\]/.exec(src)?.[1];
+        const floor = Number(/export const MIX_OPACITY_FLOOR = ([\d.]+);/.exec(src)?.[1]);
+        expect(list).toBeDefined();
+        const steps = [...list!.split(',').map(Number), floor];
+        expect(steps.slice(0, 3)).toEqual([1, 0.7, 0.5]); // 前 3 段同桌面
+        const p = palette(mode);
+        const bar = hex(p('muted')); // mixBar 底（company.css.ts）
+        const fills = steps.map(a => over(hex(p('accent')), a, bar));
+        const vsBar = fills.map(c => contrast(c, bar));
+        for (let i = 1; i < fills.length; i++) {
+            expect(steps[i]!).toBeLessThan(steps[i - 1]!);
+            expect(contrast(fills[i]!, fills[i - 1]!), `${mode} adj ${i}`).toBeGreaterThanOrEqual(1.08);
+        }
+        expect(Math.min(...vsBar), `${mode} floor`).toBeGreaterThanOrEqual(1.29);
+    });
+});
