@@ -2181,6 +2181,9 @@ class TestWebSocketSupervisor(_BridgeCase):
         resync = [e for e in _drain(events, timeout=1.0) if e["event"] == "resync"]
         self.assertTrue(resync)
         self.assertEqual(resync[0]["data"]["reason"], "ws_reconnected")
+        # no open was ever observed: the bridge cannot tell "not open" from "cannot observe", so it makes
+        # no claim (clients keep the manual path)
+        self.assertNotIn("wsOpen", resync[0]["data"])
         self.assertGreaterEqual(bridge.get_health()["wsReconnects"], 1)
 
     def test_silence_detection_forces_reconnect(self):
@@ -6297,9 +6300,10 @@ class TestWebSocketResyncRules(_BridgeCase):
         sdk.close_websocket()  # an opened connection drops; the next attempt opens
         resyncs = _resyncs(self.events, 1)
         self.assertEqual(len(resyncs), 1, resyncs)  # no degraded refresh for the attempt that had opened
-        self.assertEqual(set(resyncs[0]), {"reason", "generation", "cacheRefreshed", "ts"})
+        self.assertEqual(set(resyncs[0]), {"reason", "generation", "cacheRefreshed", "wsOpen", "ts"})
         self.assertEqual((resyncs[0]["reason"], resyncs[0]["generation"], resyncs[0]["cacheRefreshed"]),
                          ("ws_reconnected", self.bridge.session.generation, True))
+        self.assertIs(resyncs[0]["wsOpen"], True)  # published while the re-opened socket is still open
         after = sdk.trace_copy()[mark:]
         self.assertEqual(after[0], "open")
         self.assertIn("orders", after)  # the snapshot started after the open
@@ -6318,7 +6322,7 @@ class TestWebSocketResyncRules(_BridgeCase):
         self.assertNotIn("orders", sdk.trace_copy()[mark:])
         gate.set()
         resyncs = _resyncs(self.events, 1)
-        self.assertEqual([r["reason"] for r in resyncs], ["ws_reconnected"])
+        self.assertEqual([(r["reason"], r["wsOpen"]) for r in resyncs], [("ws_reconnected", True)])
         after = sdk.trace_copy()[mark:]
         self.assertEqual(after[0], "open")
         self.assertIn("orders", after)
@@ -6340,6 +6344,10 @@ class TestWebSocketResyncRules(_BridgeCase):
             self.assertTrue(_wait_until(lambda: orders_after_open() >= 1))
         self.assertEqual(sdk.ws_connect_calls, 2)
         self.assertEqual([r["reason"] for r in resyncs], ["ws_reconnected", "ws_reconnected"])
+        # the degraded refresh may be published before the open (no claim yet: nothing was observed) or
+        # after it; the socket stays open, so the last one says it is open and none says it is not
+        self.assertIs(resyncs[-1]["wsOpen"], True)
+        self.assertNotIn(False, [r.get("wsOpen") for r in resyncs])
         degraded = [line for line in logs.output if "尚未重新連上" in line]
         reopened = [line for line in logs.output if "已重新連上" in line]
         self.assertEqual((len(degraded), len(reopened)), (1, 1), logs.output)
@@ -6359,7 +6367,8 @@ class TestWebSocketResyncRules(_BridgeCase):
             sdk.close_websocket()
             self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls >= 6, timeout=5))
             resyncs = _resyncs(self.events, 1)
-            self.assertEqual([r["reason"] for r in resyncs], ["ws_reconnected"])  # same contract
+            # same event as a re-open, told apart by wsOpen
+            self.assertEqual([(r["reason"], r["wsOpen"]) for r in resyncs], [("ws_reconnected", False)])
             self.assertTrue(_wait_until(lambda: sdk.trace_copy().count("orders") == orders_before + 1))
             self.assertTrue(self.bridge.positions_cache._dirty)
             attempts = sdk.ws_connect_calls
@@ -6373,6 +6382,80 @@ class TestWebSocketResyncRules(_BridgeCase):
             resyncs = _resyncs(self.events, 1)
             self.assertEqual(len(resyncs), 1, resyncs)
             self.assertTrue(_wait_until(lambda: sdk.trace_copy().count("orders") == orders_before + 2))
+
+    def _hold_next_order_query(self, sdk: ScriptedOpenSDK) -> tuple[threading.Event, threading.Event]:
+        """The next order query blocks until `release` is set; `started` is set when it begins."""
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = sdk.get_order_results
+        held = []
+
+        def get_order_results():
+            if not held:
+                held.append(True)
+                started.set()
+                release.wait(5)
+            return original()
+
+        sdk.get_order_results = get_order_results
+        return started, release
+
+    def test_reopen_that_drops_before_its_snapshot_is_published_says_ws_not_open(self):
+        never = threading.Event()  # the attempt after the second drop stays in the handshake
+        self.addCleanup(never.set)
+        sdk = self._login_and_open(["open", never])
+        started, release = self._hold_next_order_query(sdk)
+        sdk.close_websocket()  # drop; the next attempt opens and starts the post-open snapshot
+        self.assertTrue(started.wait(3))
+        sdk.close_websocket()  # drops again while that snapshot is in flight
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 3))
+        self.assertTrue(self.bridge._ws_runtime.is_connected())  # optimistic while connecting...
+        release.set()
+        resyncs = _resyncs(self.events, 1)
+        # ...but the event must not claim the reports are flowing again
+        self.assertEqual([(r["reason"], r["cacheRefreshed"], r["wsOpen"]) for r in resyncs],
+                         [("ws_reconnected", True, False)])
+
+    def test_reopen_that_drops_and_waits_to_reconnect_says_ws_not_open(self):
+        stable = mock.patch.object(bridge_module, "WS_STABLE_SECONDS", 0)  # every drop restarts the backoff
+        stable.start()
+        self.addCleanup(stable.stop)
+        sdk = self._login_and_open(["open"])
+        started, release = self._hold_next_order_query(sdk)
+        sdk.close_websocket()  # drop; the next attempt opens and starts the post-open snapshot
+        self.assertTrue(started.wait(3))
+        self.bridge.ws_backoff_initial = self.bridge.ws_backoff_max = 30  # the next reconnect waits
+        sdk.close_websocket()  # drops again while that snapshot is in flight
+        runtime = self.bridge._ws_runtime
+        self.assertTrue(_wait_until(lambda: not runtime.is_connected()))
+        release.set()
+        resyncs = _resyncs(self.events, 1)
+        self.assertEqual([(r["reason"], r["wsOpen"]) for r in resyncs], [("ws_reconnected", False)])
+        self.assertEqual(sdk.ws_connect_calls, 2)  # still waiting to reconnect
+
+    def test_degraded_refresh_before_any_open_makes_no_claim_about_the_socket(self):
+        self.factory.mock_cls = type("NeverOpensSDK", (ScriptedOpenSDK,), {"initial_plan": ("fail",)})
+        with self.assertLogs("esun_trade_server", "WARNING"):
+            self.bridge.attempt_initial_login()
+            resyncs = _resyncs(self.events, 1)
+        self.assertEqual([r["reason"] for r in resyncs], ["ws_reconnected"])
+        self.assertNotIn("wsOpen", resyncs[0])
+        self.assertIsNone(self.bridge._ws_runtime.open_state())
+
+    def test_degraded_refresh_published_after_a_later_open_says_ws_open(self):
+        with self.assertLogs("esun_trade_server", "WARNING"):
+            sdk = self._login_and_open(["fail", "open"])
+            started, release = self._hold_next_order_query(sdk)
+            opens = sdk.trace_copy().count("open")
+            sdk.close_websocket()  # drop; the next attempt fails and starts the degraded refresh
+            self.assertTrue(started.wait(3))
+            self.assertTrue(_wait_until(lambda: sdk.trace_copy().count("open") == opens + 1))  # then it opens
+            self.assertEqual(_resyncs(self.events, 0, settle=0.2), [])  # nothing published yet
+            release.set()
+            resyncs = _resyncs(self.events, 2)
+        # the degraded refresh and the post-open resync: both are published while the socket is open, so
+        # neither tells clients that the reports are still down (in whichever order they arrive)
+        self.assertEqual([(r["reason"], r["wsOpen"]) for r in resyncs], [("ws_reconnected", True)] * 2)
 
 
 class TestAccessLogAndClientDisconnect(unittest.TestCase):
