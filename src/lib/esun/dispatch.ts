@@ -462,6 +462,12 @@ export const ESUN_WS_DOWN_MESSAGE = '玉山 bridge 與券商的回報連線中�
  * 待對帳（較舊的 bridge 沒有在重連時清快取）；多等 1 秒餘裕
  */
 export const ESUN_POSITIONS_REREAD_DELAY_MS = 7_000;
+/**
+ * 重讀沒有解除待對帳時的補讀：上游 refreshTradingState 在別的讀取進行中會回傳那一次（可能只讀委託），
+ * 剛讀完 1.5 秒內則直接完成、不讀。等冷卻過後再讀，連第一次最多 ESUN_POSITIONS_REREAD_MAX_READS 次
+ */
+export const ESUN_POSITIONS_REREAD_RETRY_MS = 1_600;
+export const ESUN_POSITIONS_REREAD_MAX_READS = 3;
 /** 讀持倉前的健康檢查最多等這麼久（上游 gap 檢查會退避到 60 秒）：逾時照樣讀 */
 export const ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS = 3_000;
 
@@ -473,14 +479,28 @@ export const ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS = 3_000;
  * 讀取才不會擋掉它），最多等 ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS。stop() 取消計時器、前景監聽與後續一輪
  */
 function createPositionsReread(next: EsunTradingHooks) {
-    // reading：讀取中（含讀前健康檢查）；again：讀取中又收到請求。閒置與已排定的請求都重新計時
-    let reading = false, again = false;
+    // reading：讀取中（含讀前健康檢查）；again：讀取中又收到請求；skip：讀前健康檢查期間被取消。閒置與已排定的請求都重新計時
+    let reading = false, again = false, skip = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onVisible: (() => void) | undefined;
     const disarm = () => {
         clearTimeout(timer);
         if (onVisible) document.removeEventListener('visibilitychange', onVisible);
         onVisible = undefined;
+    };
+    const live = () => hooks === next && !again && !skip;
+    // 讀完確認「已重新連上」的待對帳真的解除了；還在、也不是讀取失敗，就是這次讀取被吸收：冷卻後補讀
+    const readUntilResolved = async () => {
+        const m = await import('../trading-state');
+        for (let attempt = 1; ; attempt += 1) {
+            await m.refreshTradingState('positions');
+            const query = m.getTradingState().queries.positions;
+            const open = Boolean(query.error?.includes(ESUN_WS_RECONNECTED_MESSAGE));
+            const failed = query.reasons.some(r => r === 'query-failed' || r === 'not-subscribed');
+            if (!open || failed || attempt >= ESUN_POSITIONS_REREAD_MAX_READS || !live()) return;
+            await new Promise<void>(resolve => { setTimeout(resolve, ESUN_POSITIONS_REREAD_RETRY_MS); });
+            if (!live()) return;
+        }
     };
     const read = () => {
         reading = true;
@@ -489,11 +509,13 @@ function createPositionsReread(next: EsunTradingHooks) {
             Promise.resolve().then(() => next.checkHealth('gap')).catch(() => undefined),
             new Promise<void>(resolve => { setTimeout(resolve, ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS); }),
         ])
-            // 等健康檢查期間又收到重連：這次不讀（快取可能還是那次重連之前的），交給 finally 重新排一整輪
-            .then(() => hooks === next && !again ? import('../trading-state').then(m => m.refreshTradingState('positions')) : undefined)
+            // 等健康檢查期間又收到重連：這次不讀（快取可能還是那次重連之前的），交給 finally 重新排一整輪。
+            // 期間被取消（券商連線又斷了）也不讀
+            .then(() => live() ? readUntilResolved() : undefined)
             .catch(() => undefined)
             .finally(() => {
                 reading = false;
+                skip = false;
                 if (again) { again = false; arm(); }
             });
     };
@@ -509,6 +531,12 @@ function createPositionsReread(next: EsunTradingHooks) {
         request() {
             if (reading) again = true;
             else arm();
+        },
+        /** 已排定、還在等讀前健康檢查、或在等補讀的重讀作廢；之後的 request 照常重新排定。已經送出的讀取無法取消 */
+        cancel() {
+            again = false;
+            if (reading) skip = true;
+            else disarm();
         },
         stop() {
             // 讀取中停止（含等健康檢查的上限）：讀完不再排下一輪（hooks 已不是 next，讀取本身也跳過）
@@ -715,6 +743,8 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
             void next.checkHealth('gap');
             // 快取重建只解除 orders 的原因：持倉延後（bridge 持倉快取過期後）權威讀取一次
             if (reconnected) positionsReread.request();
+            // 重新連上後又斷了：排定中的重讀作廢。照樣讀的話，會把剛提出的持倉待對帳一併解除，而回報其實還收不到
+            else if (ws && signal.wsOpen === false) positionsReread.cancel();
         }
     });
     return () => {

@@ -9,7 +9,11 @@ vi.mock('./stream', () => ({
     getEsunStreamStatus: () => signals.status,
     onEsunStreamSignal: (listener: (s: unknown) => void) => { signals.listeners.add(listener); return () => signals.listeners.delete(listener); },
 }));
-const tradingState = vi.hoisted(() => ({ refreshTradingState: vi.fn(async (_scope?: string) => undefined) }));
+const tradingState = vi.hoisted(() => ({
+    refreshTradingState: vi.fn(async (_scope?: string) => undefined),
+    // 預設：讀完後持倉沒有待對帳（「已重新連上」的原因已解除）
+    getTradingState: vi.fn(() => ({ queries: { positions: { error: null as string | null, reasons: [] as string[] } } })),
+}));
 vi.mock('../trading-state', () => tradingState);
 
 import { captureServerMode } from '../server-info-store';
@@ -24,6 +28,8 @@ import {
     ESUN_STALE_CACHE_MESSAGE,
     ESUN_POSITIONS_REREAD_DELAY_MS,
     ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS,
+    ESUN_POSITIONS_REREAD_MAX_READS,
+    ESUN_POSITIONS_REREAD_RETRY_MS,
     ESUN_UNREFRESHED_CACHE_MESSAGE,
     ESUN_WS_DOWN_MESSAGE,
     ESUN_WS_RECONNECTED_MESSAGE,
@@ -265,6 +271,7 @@ describe('trading-state hooks (§5 consumer)', () => {
         beforeEach(() => {
             vi.useFakeTimers();
             tradingState.refreshTradingState.mockReset().mockResolvedValue(undefined);
+            tradingState.getTradingState.mockReset().mockReturnValue({ queries: { positions: { error: null, reasons: [] } } });
             doc = undefined;
         });
         afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
@@ -380,6 +387,109 @@ describe('trading-state hooks (§5 consumer)', () => {
             await vi.advanceTimersByTimeAsync(60_000);
             expect(reads()).toBe(0);
             expect(hooks.checkHealth).toHaveBeenCalledTimes(2);
+        });
+
+        it('a resync saying the WebSocket is down again (wsOpen false) cancels the pending read; the next reconnect arms a new one', async () => {
+            const down = () => emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true, wsOpen: false });
+            resync();
+            await vi.advanceTimersByTimeAsync(3_000);
+            down();
+            expect(hooks.raise).toHaveBeenLastCalledWith('positions', 'sequence-gap', ESUN_WS_DOWN_MESSAGE);
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(0);                                                    // 待對帳保留到重新連上或使用者更新
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 1);
+            expect(reads()).toBe(0);
+            await vi.advanceTimersByTimeAsync(1);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+        });
+
+        it('wsOpen false during the pre-read health wait skips that read; a reconnect after it restarts the full delay', async () => {
+            const down = () => emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true, wsOpen: false });
+            const first = deferred(), second = deferred();
+            hooks.checkHealth.mockReturnValueOnce(Promise.resolve()).mockReturnValueOnce(first.promise);
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS + 500);   // 讀前健康檢查等待中
+            resync();                                                                  // 又重新連上…
+            down();                                                                    // …隨即又斷：這一輪不讀，也不再排
+            first.settle();
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(0);
+
+            hooks.checkHealth.mockReturnValueOnce(Promise.resolve()).mockReturnValueOnce(second.promise);
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS + 500);   // 下一輪的讀前健康檢查等待中
+            down();                                                                    // 斷…
+            resync();                                                                  // …又重新連上：這次不讀，重新排一整輪
+            second.settle();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 1000);
+            expect(reads()).toBe(0);
+            await vi.advanceTimersByTimeAsync(1000 + ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+        });
+
+        describe('a read that did not resolve the note (absorbed by another read in flight, or by the 1.5 s cooldown)', () => {
+            const stillOpen = (reasons: string[] = ['sequence-gap']) => ({ queries: { positions: { error: '其他原因；' + ESUN_WS_RECONNECTED_MESSAGE, reasons } } });
+            const down = () => emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true, wsOpen: false });
+            const firstRead = async () => {
+                resync();
+                await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS);
+                await vi.waitFor(() => expect(reads()).toBe(1));
+            };
+
+            it('is retried after the cooldown, three reads at most', async () => {
+                tradingState.getTradingState.mockReturnValue(stillOpen());
+                await firstRead();
+                // vi.waitFor 在假時鐘下每次檢查會推進 50 毫秒，所以留 300 毫秒餘裕
+                await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_RETRY_MS - 300);
+                expect(reads()).toBe(1);
+                await vi.advanceTimersByTimeAsync(300);
+                await vi.waitFor(() => expect(reads()).toBe(2));
+                await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_RETRY_MS);
+                await vi.waitFor(() => expect(reads()).toBe(3));
+                await vi.advanceTimersByTimeAsync(60_000);
+                expect(reads()).toBe(ESUN_POSITIONS_REREAD_MAX_READS);
+                expect(ESUN_POSITIONS_REREAD_RETRY_MS).toBeGreaterThan(1_500);   // 上游冷卻 1.5 秒
+            });
+
+            it('stops as soon as the note is gone', async () => {
+                tradingState.getTradingState.mockReturnValueOnce(stillOpen());
+                await firstRead();
+                await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_RETRY_MS);
+                await vi.waitFor(() => expect(reads()).toBe(2));
+                await vi.advanceTimersByTimeAsync(60_000);
+                expect(reads()).toBe(2);
+            });
+
+            it('is not retried when the read itself failed', async () => {
+                tradingState.getTradingState.mockReturnValue(stillOpen(['sequence-gap', 'not-subscribed']));
+                await firstRead();
+                await vi.advanceTimersByTimeAsync(60_000);
+                expect(reads()).toBe(1);
+            });
+
+            it('wsOpen false during the retry wait ends the retries', async () => {
+                tradingState.getTradingState.mockReturnValue(stillOpen());
+                await firstRead();
+                await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_RETRY_MS - 500);
+                down();
+                await vi.advanceTimersByTimeAsync(60_000);
+                expect(reads()).toBe(1);
+            });
+
+            it('a reconnect during the retry wait replaces the retry with a full new delay', async () => {
+                tradingState.getTradingState.mockReturnValue(stillOpen());
+                await firstRead();
+                await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_RETRY_MS - 500);
+                tradingState.getTradingState.mockReturnValue({ queries: { positions: { error: null, reasons: [] } } });
+                resync();
+                await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 1);
+                expect(reads()).toBe(1);                                                // 補讀沒有發生
+                await vi.advanceTimersByTimeAsync(1);
+                await vi.waitFor(() => expect(reads()).toBe(2));
+                await vi.advanceTimersByTimeAsync(60_000);
+                expect(reads()).toBe(2);
+            });
         });
 
         it('a resync during the pre-read health wait skips that read and restarts the full delay', async () => {

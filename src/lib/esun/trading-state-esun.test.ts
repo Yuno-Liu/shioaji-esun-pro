@@ -571,6 +571,31 @@ describe('resync without a cache refresh (PB2-3 / PB5-2)', () => {
         expect(reasons('positions')).toEqual([]);
     });
 
+    it('the delayed positions read is retried when a read in flight for another tab absorbed it', async () => {
+        mocks.positions.mockClear();
+        await act(async () => { vi.advanceTimersByTime(1600); });
+        await signal({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true, wsOpen: true });
+        await act(async () => { await vi.advanceTimersByTimeAsync(dispatch.ESUN_POSITIONS_REREAD_DELAY_MS - 200); });
+        expect(reasons('positions')).toEqual(['sequence-gap']);
+        // 重讀到期時，一個只讀委託的權威讀取還在進行（委託頁按了更新、bridge 在等查詢間隔）
+        const slow = deferred<Trade[]>();
+        mocks.trades.mockReset().mockImplementation((_type: string, _account: unknown, opts?: { refresh?: boolean }) => opts?.refresh ? slow.promise : Promise.resolve([row()]));
+        let ordersRead!: Promise<void>;
+        await act(async () => {
+            ordersRead = store.refreshTradingState('orders');
+            // 重讀到期，讀前健康檢查的等待上限也過去：上游把那個進行中的讀取回傳給它
+            await vi.advanceTimersByTimeAsync(200 + dispatch.ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS + 100);
+        });
+        expect(mocks.positions).not.toHaveBeenCalled();
+        slow.resolve([row()]);
+        await act(async () => { await ordersRead; await vi.advanceTimersByTimeAsync(100); });
+        expect(mocks.positions).not.toHaveBeenCalled();                    // 那次讀取沒有讀持倉
+        expect(reasons('positions')).toEqual(['sequence-gap']);
+        await act(async () => { await vi.advanceTimersByTimeAsync(dispatch.ESUN_POSITIONS_REREAD_RETRY_MS); });
+        expect(mocks.positions).toHaveBeenCalledTimes(1);                  // 冷卻後補讀
+        expect(reasons('positions')).toEqual([]);
+    });
+
     it('a failed_ack_refresh_failed resync keeps an orders reason no cache rebuild clears, without a positions reason', async () => {
         await signal({ kind: 'resync', reason: 'failed_ack_refresh_failed', cacheRefreshed: false });
         expect(reasons('orders')).toEqual(['snapshot-boundary']);
