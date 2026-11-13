@@ -2887,6 +2887,18 @@ class _WsRuntime:
         with self.lock:
             return self.connected and not self.stop_event.is_set()
 
+    def open_state(self) -> bool | None:
+        """
+        True: the current connect attempt has opened and has not been closed (stricter than
+        is_connected(), which is optimistic while an attempt is still connecting). False: it has not.
+        None: this runtime has not seen any open yet, so "not open" cannot be told from "cannot observe
+        opens" (the open hook only runs with the patched WebSocket handler).
+        """
+        with self.lock:
+            if self.opens == 0:
+                return None
+            return self.connected and self.attempt_opened and not self.stop_event.is_set()
+
     def snapshot(self) -> dict:
         with self.lock:
             return {
@@ -4169,7 +4181,10 @@ class EsunTradeBridge:
         Re-reads orders (events may have been missed while disconnected) and asks clients to resync.
         degraded=False: started by a re-open, so the snapshot is taken after the socket is open.
         degraded=True: an attempt that never opened (keeps the order cache fresh during an outage).
-        Both publish the same "resync" event (reason "ws_reconnected").
+        Both publish the same "resync" event (reason "ws_reconnected"). Its "wsOpen" is the socket state at
+        publish time, whichever kind this is: false means reports are still not arriving, so clients must
+        not treat what they derive from reports (positions) as confirmed. It is left out while the state
+        is unknown (see _WsRuntime.open_state); clients then keep the manual path.
         """
         if not self._ws_should_run(session, runtime):
             return
@@ -4181,10 +4196,12 @@ class EsunTradeBridge:
         if self._is_current(session.generation):
             # fills may have been missed while the socket was down: the next positions read goes upstream
             self.positions_cache.mark_dirty()
+            ws_open = runtime.open_state()
             self.sse_fanout.publish("resync", {
                 "reason": "ws_reconnected",
                 "generation": session.generation,
                 "cacheRefreshed": refreshed,
+                **({} if ws_open is None else {"wsOpen": ws_open}),
                 "ts": taipei_now().isoformat(timespec="milliseconds"),
             })
 
