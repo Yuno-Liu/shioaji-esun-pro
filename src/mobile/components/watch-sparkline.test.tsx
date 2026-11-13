@@ -1,9 +1,18 @@
-// 自選迷你走勢 canvas（components/watch-sparkline.tsx）：DPR 正確、昨收虛線基準與顏色、rAF 合併重繪、沒有資料時不畫。
+// 自選迷你走勢 canvas（components/watch-sparkline.tsx）：DPR 正確、昨收虛線基準與顏色、rAF 合併重繪、沒有資料時不畫、
+// 橫軸固定為交易時段（xs：橫向位置依時段、面積只到最後一點；長度不符或附加即時價時退回等距）；WatchSparkCell 傳入快照的點與位置。
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const sm = vi.hoisted(() => ({ series: null as null | { points: number[]; xs: number[] }, ticks: [] as unknown[] }));
+vi.mock('../lib/watch-sparkline-data', async importOriginal => ({
+    ...await importOriginal<typeof import('../lib/watch-sparkline-data')>(),
+    useSparkline: () => sm.series,
+    useSparkTick: (_c: unknown, tick: unknown) => { sm.ticks.push(tick); },
+}));
+
 import { vars } from '../../theme.css';
-import { drawSparkline, sparkTone, WatchSparkline } from './watch-sparkline';
+import { drawSparkline, sparkTone, WatchSparkCell, WatchSparkline } from './watch-sparkline';
 
 const varName = (ref: string) => ref.slice(4, -1).split(',')[0]!.trim();
 
@@ -23,6 +32,11 @@ function fakeCtx() {
 function fakeCanvas(ctx: unknown, w = 56, h = 32) {
     return { clientWidth: w, clientHeight: h, width: 0, height: 0, getContext: () => ctx };
 }
+
+/** moveTo／lineTo 的 x 座標（依呼叫順序） */
+const xsOf = (ctx: Record<string, unknown>) => (ctx.calls as string[])
+    .filter(c => c.startsWith('moveTo(') || c.startsWith('lineTo('))
+    .map(c => Number(c.slice(c.indexOf('(') + 1).split(',')[0]));
 
 beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
@@ -78,6 +92,23 @@ describe('drawSparkline', () => {
         expect(ctx.fills).toEqual(['MUTED@0.14']);
     });
 
+    it('xs（時間軸）：橫向位置依 xs，面積在最後一點處封閉（右側留白）；昨收虛線仍橫跨全寬', () => {
+        const ctx = fakeCtx();
+        drawSparkline(fakeCanvas(ctx, 100, 40) as never, [10, 11, 12], 10, [0.125, 0.25, 0.5]);
+        // 虛線 0→100；面積 12.5→25→50→(50,底)→(12.5,底)；折線 12.5→25→50
+        expect(xsOf(ctx)).toEqual([0, 100, 12.5, 25, 50, 50, 12.5, 12.5, 25, 50]);
+        expect((ctx.calls as string[])).toContain('lineTo(50,40)');
+        expect((ctx.calls as string[])).toContain('lineTo(12.5,40)');
+    });
+
+    it('xs 長度與點數不符或缺少時：等距排列、填滿寬度', () => {
+        for (const xs of [[0.125, 0.25], null, undefined]) {
+            const ctx = fakeCtx();
+            drawSparkline(fakeCanvas(ctx, 100, 40) as never, [10, 11, 12], 10, xs);
+            expect(xsOf(ctx)).toEqual([0, 100, 0, 50, 100, 100, 0, 0, 50, 100]);
+        }
+    });
+
     it('少於 2 點只清空不畫；沒有 2D context 時不拋錯', () => {
         const ctx = fakeCtx();
         drawSparkline(fakeCanvas(ctx) as never, [10], 10);
@@ -127,6 +158,45 @@ describe('WatchSparkline', () => {
         await act(async () => view!.unmount());
         expect(cv).toMatchObject({ width: 0, height: 0 });
         expect(frames.size).toBe(0);
+    });
+
+    it('xs：沒有附加即時價時依 xs 畫；附加即時價（點數多一）時退回等距', async () => {
+        const frames: (() => void)[] = [];
+        vi.stubGlobal('requestAnimationFrame', (cb: () => void) => { frames.push(cb); return frames.length; });
+        vi.stubGlobal('cancelAnimationFrame', () => undefined);
+        const timed = fakeCtx();
+        let view: ReactTestRenderer | undefined;
+        await act(async () => {
+            view = create(createElement(WatchSparkline, { points: [10, 11], reference: 10, xs: [0.25, 0.5] }), { createNodeMock: () => fakeCanvas(timed) });
+        });
+        frames.splice(0).forEach(f => f());
+        // 56 寬：14、28
+        expect(xsOf(timed).slice(2)).toEqual([14, 28, 28, 14, 14, 28]);
+        await act(async () => view!.unmount());
+
+        const even = fakeCtx();
+        await act(async () => {
+            view = create(createElement(WatchSparkline, { points: [10, 11], last: 12, reference: 10, xs: [0.25, 0.5] }), { createNodeMock: () => fakeCanvas(even) });
+        });
+        frames.splice(0).forEach(f => f());
+        expect(xsOf(even).slice(2)).toEqual([0, 28, 56, 56, 0, 0, 28, 56]);
+        await act(async () => view!.unmount());
+    });
+
+    it('WatchSparkCell：把快照的點與時間軸位置交給 WatchSparkline；沒有快照時兩者皆 null', async () => {
+        vi.stubGlobal('requestAnimationFrame', () => 1);
+        vi.stubGlobal('cancelAnimationFrame', () => undefined);
+        const contract = { code: '2330', security_type: 'STK' as const, exchange: 'TSE' as const, target_code: null };
+        sm.series = { points: [10, 11, 12], xs: [0.1, 0.2, 0.3] };
+        let view: ReactTestRenderer | undefined;
+        await act(async () => { view = create(createElement(WatchSparkCell, { contract, reference: 10, tick: undefined }), { createNodeMock: () => fakeCanvas(fakeCtx()) }); });
+        const props = () => view!.root.findByType(WatchSparkline).props;
+        expect(props()).toMatchObject({ points: [10, 11, 12], xs: [0.1, 0.2, 0.3], reference: 10 });
+        expect(props().last).toBeUndefined();
+        sm.series = null;
+        await act(async () => { view!.update(createElement(WatchSparkCell, { contract, reference: 10, tick: undefined })); });
+        expect(props()).toMatchObject({ points: null, xs: null });
+        await act(async () => view!.unmount());
     });
 
     it('沒有資料：不畫（空白佔位）', async () => {

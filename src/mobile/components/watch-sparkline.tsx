@@ -5,6 +5,9 @@
 // - 即時價只更新尾端點（points＋last）；重繪以 rAF 合併，依 devicePixelRatio 設定畫布像素；主題變更時重畫。
 // - 沒有動畫（減少動態下行為相同）。沒有 canvas／2D context 的環境（測試）不畫。
 // - 預設尺寸是自選列的 56×32（styles.spark）；傳 className 時改用該尺寸，並以 ResizeObserver 在版面尺寸改變時重畫（指數列展開面板）。
+// - 橫軸固定為交易時段（使用者要求；股票、指數 09:00–13:30，期貨／選擇權日盤 08:45–13:45、夜盤 15:00–05:00）：
+//   每點依 xs（時段內位置 0–1）擺放，盤中線只畫到最後一點、隨時間往右延伸，淡色面積只填到最後一點，
+//   昨收虛線仍橫跨全寬。附加即時價（last）或 xs 與點數不符時退回等距、填滿寬度。
 // - 資料與請求上限在 lib/watch-sparkline-data.ts；本元件只負責畫。
 // - 延遲載入（首屏體積）：自選頁經 lib/deferred-modules.ts 的 loadWatchSparkline() 載入 WatchSparkCell，
 //   本檔與 lib/watch-sparkline-data.ts（含時段計算）都不進首屏 chunk。自選頁只為「可見列」掛載 WatchSparkCell，
@@ -37,7 +40,8 @@ export function sparkTone(data: readonly number[], reference: number | undefined
 
 const TONE_COLOR = { up: vars.color.up, down: vars.color.down, flat: vars.color.mutedForeground } as const;
 
-export function drawSparkline(cv: HTMLCanvasElement, data: readonly number[], reference: number | undefined): void {
+/** xs：每個點的橫向位置（0–1，時間軸）；缺少或長度不符時等距排列 */
+export function drawSparkline(cv: HTMLCanvasElement, data: readonly number[], reference: number | undefined, xs?: readonly number[] | null): void {
     const cssW = cv.clientWidth || 56;
     const cssH = cv.clientHeight || 32;
     const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
@@ -65,7 +69,8 @@ export function drawSparkline(cv: HTMLCanvasElement, data: readonly number[], re
     const pad = (max - min) * 0.08;
     min -= pad;
     max += pad;
-    const x = (i: number) => (i / (data.length - 1)) * cssW;
+    const timed = xs && xs.length === data.length ? xs : null;
+    const x = (i: number) => (timed ? timed[i]! : i / (data.length - 1)) * cssW;
     const y = (v: number) => cssH - ((v - min) / (max - min)) * (cssH - 2) - 1;
 
     if (ref !== undefined) {
@@ -88,8 +93,8 @@ export function drawSparkline(cv: HTMLCanvasElement, data: readonly number[], re
     });
     // 淡色面積：沿折線到底部封閉（單色＋低不透明度，不用漸層以免透明端偏黑）
     ctx.save();
-    ctx.lineTo(cssW, cssH);
-    ctx.lineTo(0, cssH);
+    ctx.lineTo(x(data.length - 1), cssH);
+    ctx.lineTo(x(0), cssH);
     ctx.closePath();
     ctx.fillStyle = color;
     ctx.globalAlpha = 0.14;
@@ -108,7 +113,7 @@ export function drawSparkline(cv: HTMLCanvasElement, data: readonly number[], re
     ctx.stroke();
 }
 
-export function WatchSparkline({ points, last, reference, className }: { points: readonly number[] | null; last?: number; reference?: number; className?: string }) {
+export function WatchSparkline({ points, last, reference, className, xs }: { points: readonly number[] | null; last?: number; reference?: number; className?: string; xs?: readonly number[] | null }) {
     const ref = useRef<HTMLCanvasElement | null>(null);
     const theme = themeKey(useThemeSettings());
     // 自訂尺寸（className，例如指數列面板填滿欄寬）：版面寬高改變（旋轉、字級）時重畫；自選列的固定 px 畫布不觀察
@@ -127,10 +132,10 @@ export function WatchSparkline({ points, last, reference, className }: { points:
         const raf = requestAnimationFrame(() => {
             const base = points ?? [];
             const data = base.length > 0 && last !== undefined && Number.isFinite(last) ? [...base, last] : base;
-            drawSparkline(cv, data, reference);
+            drawSparkline(cv, data, reference, data === base ? xs : null);
         });
         return () => cancelAnimationFrame(raf);
-    }, [points, last, reference, theme, resized]);
+    }, [points, last, reference, theme, resized, xs]);
     // 卸載時釋放點陣（DPR 3 的 56×32 畫布約 64 KB；只靠 GC 時 iOS 可能遲遲不回收）
     useEffect(() => {
         const cv = ref.current;
@@ -158,7 +163,7 @@ export interface WatchSparkCellProps {
  * 卸載即釋放（尚未開始的請求移出佇列）。
  */
 export function WatchSparkCell({ contract, reference, tick, className }: WatchSparkCellProps) {
-    const points = useSparkline(contract, true);
+    const series = useSparkline(contract, true);
     useSparkTick(contract, tick);
-    return <WatchSparkline points={points} reference={reference} className={className} />;
+    return <WatchSparkline points={series?.points ?? null} xs={series?.xs ?? null} reference={reference} className={className} />;
 }
