@@ -449,6 +449,14 @@ class ComposeAndDocsTest(unittest.TestCase):
         self.assertNotRegex(web, r"(?m)^    depends_on:")
         self.assertNotRegex(web, r"(?m)^\s+esun-bridge:")
 
+    def test_restart_policies(self) -> None:
+        # web 與 sidecar 共用網路命名空間，必須同為 always：Docker Desktop 正常關閉會先停容器，
+        # unless-stopped 之後不會再啟動（2026-11-13 兩次重啟後整組停著）。只改一邊會留下半套服務
+        for name in ("shioaji-pro-web", "shioaji-server"):
+            self.assertRegex(self.service_block(name), r"(?m)^    restart: always$", name)
+        # bridge 一啟動就登入玉山：Docker 重啟後是否啟動由使用者決定
+        self.assertRegex(self.service_block("esun-bridge"), r"(?m)^    restart: unless-stopped$")
+
     def test_log_rotation_only_on_web_and_sidecar(self) -> None:
         compose = _read(os.path.join(REPO_ROOT, "docker-compose.yml")).replace("\r\n", "\n")
         self.assertRegex(compose, r'(?m)^x-logging: &default-logging\n  driver: json-file\n  options:\n'
