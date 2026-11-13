@@ -99,10 +99,11 @@ const MISMATCH_CODES = new Set(['ESUN_ENV_MISMATCH', 'ESUN_ACCOUNT_MISMATCH']);
 
 function defaultDriver(): IEsunTradeDriver {
     try {
-        const env = (import.meta as any).env;
-        if (env?.VITE_ESUN_DRIVER === 'mock') return new MockEsunDriver();
+        // 必須維持字面 `import.meta.env.VITE_ESUN_DRIVER`：Vite 建置時直接替換成常數，正式版才能把
+        // mock 分支與 mock-driver 模組整個剔除（改成動態讀 env 物件會讓 mock driver 進首屏 bundle）
+        if (import.meta.env.VITE_ESUN_DRIVER === 'mock') return new MockEsunDriver();
     } catch {
-        // non-vite environment
+        // non-vite environment（import.meta.env 不存在）
     }
     return new UnavailableEsunDriver();
 }

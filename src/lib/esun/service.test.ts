@@ -683,3 +683,17 @@ Account = 88401234567`;
         });
     });
 });
+
+describe('EsunTradeService default driver', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    it('uses the mock driver only when VITE_ESUN_DRIVER=mock (build-time constant in Vite builds)', () => {
+        vi.stubEnv('VITE_ESUN_DRIVER', 'mock');
+        expect(new EsunTradeService().getDriver()).toBeInstanceOf(MockEsunDriver);
+    });
+
+    it('starts unavailable (no bridge yet) otherwise', () => {
+        vi.stubEnv('VITE_ESUN_DRIVER', '');
+        expect(new EsunTradeService().getDriver()).toBeInstanceOf(UnavailableEsunDriver);
+    });
+});
