@@ -1127,7 +1127,25 @@ function syncEsunAccountsToStore(accounts: Account[]): void {
     const current = state.accounts.filter(isEsunAccount);
     const key = (list: Account[]) => list.map(a => `${a.account_type}:${a.broker_id}:${a.account_id}`).sort().join('|');
     if (key(current) === key(accounts) && current.every(a => accounts.some(b => sameAccount(a, b) && a.person_id === b.person_id))) return;
+    const before = savedStockKey();
     replaceExternalAccountsForBroker(isEsunBroker, accounts);
+    // 啟動時玉山未連線，記憶體選取已頂替成其他帳戶；玉山帳戶此刻回來，存檔的預設（玉山）被改寫成頂替帳戶。
+    // 不自動改回（實單：選取帳戶只隨使用者操作改變），只提示使用者自行切換；每個頁面工作階段一次
+    // 條件：同步前存檔的是這次同步的玉山帳戶之一，同步後存檔不同（讀不到存檔時視為沒有）
+    if (displacedNoticeShown || !accounts.some(a => `${a.broker_id}-${a.account_id}` === before) || savedStockKey() === before) return;
+    displacedNoticeShown = true;
+    import('./default-displaced-notice').then(m => m.notifyEsunDefaultDisplaced()).catch(() => undefined);
+}
+
+let displacedNoticeShown = false;
+
+/** account-store 存檔的股票帳戶鍵（`${broker_id}-${account_id}`）；讀不到時為 undefined */
+function savedStockKey(): unknown {
+    try {
+        return JSON.parse(localStorage.getItem('sj-pro-accounts-selected') ?? '{}').stock;
+    } catch {
+        return undefined;
+    }
 }
 
 export const esunTradeService = new EsunTradeService();

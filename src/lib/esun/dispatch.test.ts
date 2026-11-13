@@ -1,6 +1,6 @@
 // src/lib/esun/dispatch.test.ts — 確認視窗環境、trading-state 掛鉤（C-02 / D2-04 / §5 消費端）
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const signals = vi.hoisted(() => ({ listeners: new Set<(s: unknown) => void>(), status: 'live' }));
 vi.mock('./stream', () => ({
@@ -9,17 +9,24 @@ vi.mock('./stream', () => ({
     getEsunStreamStatus: () => signals.status,
     onEsunStreamSignal: (listener: (s: unknown) => void) => { signals.listeners.add(listener); return () => signals.listeners.delete(listener); },
 }));
+const tradingState = vi.hoisted(() => ({ refreshTradingState: vi.fn(async (_scope?: string) => undefined) }));
+vi.mock('../trading-state', () => tradingState);
 
 import { captureServerMode } from '../server-info-store';
 import { MOCK_ESUN_ACCOUNT_ID, MockEsunDriver } from './mock-driver';
 import { fromEsunOrderResult } from './order-mapping';
 import { esunTradeService } from './service';
+import { ensureEsunOrderStream } from './stream';
 import type { EsunOrderResult } from './types';
 import {
     ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE,
     ESUN_FAILED_ACK_REFRESHED_MESSAGE,
     ESUN_STALE_CACHE_MESSAGE,
+    ESUN_POSITIONS_REREAD_DELAY_MS,
+    ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS,
     ESUN_UNREFRESHED_CACHE_MESSAGE,
+    ESUN_WS_DOWN_MESSAGE,
+    ESUN_WS_RECONNECTED_MESSAGE,
     esunAccountQuery,
     esunAggregateRepairMessage,
     esunCacheConflictMessage,
@@ -31,6 +38,7 @@ import {
     esunProfitLossRows,
     esunQuantityConflictMessage,
     esunUnitUnknownMessage,
+    fetchAccountsWithEsun,
     startEsunTradingState,
     type EsunTradingHooks,
 } from './dispatch';
@@ -241,6 +249,279 @@ describe('trading-state hooks (§5 consumer)', () => {
         } finally {
             signals.status = 'live';
         }
+    });
+
+    describe('ws_reconnected with a re-read cache: one delayed authoritative positions read', () => {
+        type Doc = EventTarget & { hidden: boolean };
+        let doc: Doc | undefined;
+        const setHidden = (hidden: boolean) => { doc!.hidden = hidden; doc!.dispatchEvent(new Event('visibilitychange')); };
+        const resync = () => emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true, wsOpen: true });
+        const reads = () => tradingState.refreshTradingState.mock.calls.length;
+        const deferred = () => {
+            let settle!: (ok: boolean) => void;
+            const promise = new Promise<void>((resolve, reject) => { settle = ok => ok ? resolve() : reject(new Error('503')); });
+            return { promise, settle: (ok = true) => settle(ok) };
+        };
+        beforeEach(() => {
+            vi.useFakeTimers();
+            tradingState.refreshTradingState.mockReset().mockResolvedValue(undefined);
+            doc = undefined;
+        });
+        afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+        const withDocument = (hidden: boolean) => {
+            doc = Object.assign(new EventTarget(), { hidden });
+            vi.stubGlobal('document', doc);
+            return doc;
+        };
+
+        it('raises both reasons with a message that does not claim a read in progress, and checks health', () => {
+            resync();
+            expect(ESUN_WS_RECONNECTED_MESSAGE).toBe('玉山 bridge 已重新連上券商並重讀委託；持倉稍後自動重新查詢，未解除時請按更新');
+            expect(hooks.raise.mock.calls).toEqual([
+                ['orders', 'sequence-gap', ESUN_WS_RECONNECTED_MESSAGE],
+                ['positions', 'sequence-gap', ESUN_WS_RECONNECTED_MESSAGE],
+            ]);
+            expect(hooks.checkHealth.mock.calls).toEqual([['gap']]);
+            expect(ESUN_POSITIONS_REREAD_DELAY_MS).toBe(7_000);
+        });
+
+        it('reads nothing before 7 s; then a second health check and, after it settles, one positions read', async () => {
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 1);
+            expect(reads()).toBe(0);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(1);
+            const health = deferred();
+            hooks.checkHealth.mockImplementationOnce(() => health.promise);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(2);
+            expect(hooks.checkHealth).toHaveBeenLastCalledWith('gap');
+            await vi.advanceTimersByTimeAsync(50);
+            expect(reads()).toBe(0);
+            health.settle();
+            await vi.waitFor(() => expect(reads()).toBe(1));
+            expect(tradingState.refreshTradingState).toHaveBeenCalledWith('positions');
+            const order = (fn: ReturnType<typeof vi.fn>) => fn.mock.invocationCallOrder.at(-1)!;
+            expect(order(hooks.checkHealth)).toBeLessThan(order(tradingState.refreshTradingState));
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(1);
+        });
+
+        it('a rejected second health check still reads positions', async () => {
+            resync();
+            hooks.checkHealth.mockImplementationOnce(() => Promise.reject(new Error('health 503')));
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(2);
+        });
+
+        it('a second health check that never settles delays the read by at most 3 s', async () => {
+            expect(ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS).toBe(3_000);
+            resync();
+            hooks.checkHealth.mockImplementationOnce(() => new Promise<void>(() => undefined));
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(2);
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS - 1);
+            expect(reads()).toBe(0);
+            await vi.advanceTimersByTimeAsync(1);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(1);
+        });
+
+        it('hidden when the delay elapses: after the page becomes visible, waits the full delay again, then reads', async () => {
+            const d = withDocument(false);
+            resync();
+            d.hidden = true;
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS + 60_000);
+            expect(reads()).toBe(0);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(1);
+            // 仍在背景的 visibilitychange 不觸發
+            setHidden(true);
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS + 10);
+            expect(reads()).toBe(0);
+            setHidden(false);
+            // 回到前景不立即讀：重新計時整整一段
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 1);
+            expect(reads()).toBe(0);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(1);
+            await vi.advanceTimersByTimeAsync(1);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(2);
+            // 一次性監聽：之後的前景切換不再讀
+            setHidden(true); setHidden(false);
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(1);
+        });
+
+        it('hidden again when the restarted delay elapses: keeps waiting for the foreground', async () => {
+            const d = withDocument(true);
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS);
+            setHidden(false);
+            await vi.advanceTimersByTimeAsync(3_000);
+            d.hidden = true;
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS + 60_000);
+            expect(reads()).toBe(0);
+            setHidden(false);
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 1);
+            expect(reads()).toBe(0);
+            await vi.advanceTimersByTimeAsync(1);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+        });
+
+        it('arms nothing while the broker WebSocket is still down (wsOpen false) or for an older bridge without the flag', async () => {
+            emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true, wsOpen: false });
+            expect(hooks.raise).toHaveBeenCalledWith('orders', 'sequence-gap', ESUN_WS_DOWN_MESSAGE);
+            expect(hooks.raise).toHaveBeenCalledWith('positions', 'sequence-gap', ESUN_WS_DOWN_MESSAGE);
+            hooks.raise.mockClear();
+            emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: true });
+            expect(hooks.raise).toHaveBeenCalledWith('positions', 'sequence-gap', expect.stringContaining('玉山回報漏收'));
+            expect(hooks.raise).not.toHaveBeenCalledWith('positions', 'sequence-gap', ESUN_WS_RECONNECTED_MESSAGE);
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(0);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(2);
+        });
+
+        it('a resync during the pre-read health wait skips that read and restarts the full delay', async () => {
+            const pending = deferred();
+            hooks.checkHealth.mockReturnValueOnce(Promise.resolve()).mockReturnValueOnce(pending.promise);
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS + 500);   // 讀前健康檢查等待中
+            expect(reads()).toBe(0);
+            resync();                                                                  // 第二次重連
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS);     // 等待上限到：這次不讀
+            expect(reads()).toBe(0);
+            pending.settle();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS - 1000);
+            expect(reads()).toBe(0);                                                    // 距第二次重連還不到 7 秒
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS + ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+        });
+
+        it('arms nothing when the cache was not re-read (or for other resync reasons)', async () => {
+            emit({ kind: 'resync', reason: 'ws_reconnected', cacheRefreshed: false, wsOpen: true });
+            emit({ kind: 'resync', reason: 'ws_reconnected' });
+            emit({ kind: 'resync', reason: 'bridge_restarted', cacheRefreshed: true });
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(0);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(3);
+            expect(hooks.raise).toHaveBeenCalledWith('orders', 'snapshot-boundary', ESUN_STALE_CACHE_MESSAGE);
+            expect(hooks.raise).not.toHaveBeenCalledWith('orders', 'sequence-gap', ESUN_WS_RECONNECTED_MESSAGE);
+        });
+
+        it('a resync while armed restarts the full delay from the last resync (one read)', async () => {
+            resync();
+            await vi.advanceTimersByTimeAsync(5_000);
+            resync();
+            // 第一次之後 7 秒：不讀
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 5_000);
+            expect(reads()).toBe(0);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(2);
+            // 第二次之後 7 秒：讀一次
+            await vi.advanceTimersByTimeAsync(5_000 - 1);
+            expect(reads()).toBe(0);
+            await vi.advanceTimersByTimeAsync(1);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(1);
+        });
+
+        it('a resync while waiting for the foreground drops the listener and restarts the full delay', async () => {
+            const d = withDocument(true);
+            const remove = vi.spyOn(d, 'removeEventListener');
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS);
+            resync();
+            expect(remove).toHaveBeenCalledWith('visibilitychange', expect.any(Function));
+            // 舊監聽已移除：回到前景不會另外排一輪
+            setHidden(false);
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 1);
+            expect(reads()).toBe(0);
+            await vi.advanceTimersByTimeAsync(1);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(1);
+        });
+
+        it('a resync during the in-flight read runs exactly one more full cycle after it', async () => {
+            const first = deferred();
+            tradingState.refreshTradingState.mockImplementationOnce(() => first.promise.then(() => undefined));
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+            resync();
+            resync();
+            first.settle();
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS - 1);
+            expect(reads()).toBe(1);
+            await vi.advanceTimersByTimeAsync(1);
+            await vi.waitFor(() => expect(reads()).toBe(2));
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(2);
+        });
+
+        it('stop() cancels an armed re-read', async () => {
+            resync();
+            stop();
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(0);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(1);
+        });
+
+        it('stop() during the in-flight read drops the queued follow-up cycle', async () => {
+            const first = deferred();
+            tradingState.refreshTradingState.mockImplementationOnce(() => first.promise.then(() => undefined));
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS);
+            await vi.waitFor(() => expect(reads()).toBe(1));
+            resync();
+            stop();
+            first.settle();
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(1);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(3);
+        });
+
+        it('stop() during the pre-read health wait skips the read', async () => {
+            resync();
+            hooks.checkHealth.mockImplementationOnce(() => new Promise<void>(() => undefined));
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS + 1_000);
+            expect(hooks.checkHealth).toHaveBeenCalledTimes(2);
+            stop();
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(0);
+        });
+
+        it('stop() removes the foreground listener of a re-read waiting for the page', async () => {
+            const d = withDocument(true);
+            const remove = vi.spyOn(d, 'removeEventListener');
+            resync();
+            await vi.advanceTimersByTimeAsync(ESUN_POSITIONS_REREAD_DELAY_MS);
+            stop();
+            expect(remove).toHaveBeenCalledWith('visibilitychange', expect.any(Function));
+            setHidden(false);
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(reads()).toBe(0);
+        });
+    });
+});
+
+describe('account load never fails on the E.SUN probe', () => {
+    afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+    it('resolves with the Sinopac list when starting the order stream throws', async () => {
+        vi.stubEnv('MODE', 'production');
+        vi.spyOn(esunTradeService, 'getBridgeHealth').mockReturnValue(null);
+        const connect = vi.spyOn(esunTradeService, 'connectBridge').mockResolvedValue({ ok: true } as Awaited<ReturnType<typeof esunTradeService.connectBridge>>);
+        vi.spyOn(esunTradeService, 'getAccounts').mockReturnValue([]);
+        vi.mocked(ensureEsunOrderStream).mockImplementationOnce(() => { throw new Error('stream boom'); });
+        const sinopac = [{ account_type: 'S', broker_id: '9A95', account_id: '0000001', person_id: '', signed: true, username: '' }];
+        const fetchSinopac = vi.fn(async () => sinopac);
+        await expect(fetchAccountsWithEsun(fetchSinopac)).resolves.toEqual(sinopac);
+        expect(connect).toHaveBeenCalledTimes(1);
+        expect(ensureEsunOrderStream).toHaveBeenCalled();
+        expect(fetchSinopac).toHaveBeenCalledTimes(1);
     });
 });
 

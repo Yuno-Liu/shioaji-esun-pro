@@ -36,15 +36,66 @@ const notStarted = (message: string) => Object.assign(new Error(message), { muta
 export const ESUN_PROBE_RETRY_MS = 10_000;
 let lastProbeFailure = 0;
 
+/** 背景重新探測的間隔：10、20、40 秒，之後每 60 秒；每段前景最多排 8 次 */
+export const ESUN_PROBE_BACKOFF_MS = [10_000, 20_000, 40_000, 60_000];
+export const ESUN_PROBE_MAX_RETRIES = 8;
+
+/**
+ * bridge 探測失敗後的背景重試（部署、重啟期間 bridge 不在）。一次只有一個計時器；只在前景探測：
+ * 計時器在背景到期時不探測，回到前景（visibilitychange）或網路恢復（online）時歸零次數並立即探測。
+ * 探測回 health（不論 ok 與否，bridge 可達後由它自己的流程接手）即永久停止。
+ * report(health)：探測結果（失敗時開始／繼續排程）。
+ */
+export function createEsunProbeRetry(probe: () => Promise<unknown>) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0, busy = false, done = false, listening = false;
+    const browser = typeof document !== 'undefined' && typeof window !== 'undefined';
+    const run = () => {
+        clearTimeout(timer);
+        timer = undefined;
+        if (done || busy || (browser && document.hidden)) return;
+        busy = true;
+        void probe().catch(() => null).then(health => { busy = false; report(health); }).catch(() => undefined);
+    };
+    const resume = () => { attempts = 0; run(); };
+    const report = (health: unknown) => {
+        if (done) return;
+        if (health) {
+            done = true;
+            clearTimeout(timer);
+            if (listening) { document.removeEventListener('visibilitychange', resume); window.removeEventListener('online', resume); }
+            return;
+        }
+        if (browser && !listening) { listening = true; document.addEventListener('visibilitychange', resume); window.addEventListener('online', resume); }
+        if (timer || busy || attempts >= ESUN_PROBE_MAX_RETRIES) return;
+        timer = setTimeout(run, ESUN_PROBE_BACKOFF_MS[Math.min(attempts++, 3)]);
+    };
+    return report;
+}
+
+/**
+ * 走 service.connectBridge：成功時 service 的監聽同步帳戶，health.ok 時啟動回報串流（同一般載入）。
+ * 串流啟動丟出例外時仍回報探測結果（bridge 可達：不再背景重試），例外交給呼叫端吞掉
+ */
+function probeEsunBridge(): Promise<unknown> {
+    return esunTradeService.connectBridge().catch(() => null).then(health => {
+        try {
+            if (!health) lastProbeFailure = Date.now();
+            else if (health.ok) ensureEsunOrderStream();
+        } finally {
+            reportEsunProbe(health);
+        }
+        return health;
+    });
+}
+const reportEsunProbe = createEsunProbeRetry(probeEsunBridge);
+
 function connectEsunBridge(): Promise<unknown> {
     // Vitest：不探測真實 /esun（測試以 setDriver/registerAccount 自行注入）
     if (import.meta.env?.MODE === 'test') return Promise.resolve(null);
     if (!esunTradeService.getBridgeHealth() && Date.now() - lastProbeFailure < ESUN_PROBE_RETRY_MS) return Promise.resolve(null);
-    return esunTradeService.connectBridge().then(health => {
-        if (!health) lastProbeFailure = Date.now();
-        else if (health.ok) ensureEsunOrderStream();
-        return health;
-    }).catch(() => null);
+    // 玉山探測不能讓帳戶載入失敗（永豐帳戶清單照常回來）
+    return probeEsunBridge().catch(() => null);
 }
 
 /**
@@ -402,6 +453,71 @@ export interface EsunTradingHooks {
 let hooks: EsunTradingHooks | null = null;
 
 export const ESUN_STALE_CACHE_MESSAGE = '玉山 bridge 重新連線後未能重讀委託，快取可能缺少斷線期間的成交／取消；請按更新確認';
+/** ws_reconnected 且 bridge 已重讀委託快取：委託以快取重建，持倉延後做一次權威讀取（開頭「玉山」供 esun-env-switch 辨識） */
+export const ESUN_WS_RECONNECTED_MESSAGE = '玉山 bridge 已重新連上券商並重讀委託；持倉稍後自動重新查詢，未解除時請按更新';
+/** ws_reconnected 但 bridge 與券商的 WebSocket 還沒連上（wsOpen:false，bridge 只是定期補查委託）：持倉待對帳保留到使用者更新 */
+export const ESUN_WS_DOWN_MESSAGE = '玉山 bridge 與券商的回報連線中斷，暫以查詢更新委託；持倉可能不完整，請按更新確認';
+/**
+ * ws_reconnected 後延後重讀持倉的時間：bridge 的持倉快取 TTL 6 秒，立即讀可能拿到斷線前的快照而誤解除
+ * 待對帳（較舊的 bridge 沒有在重連時清快取）；多等 1 秒餘裕
+ */
+export const ESUN_POSITIONS_REREAD_DELAY_MS = 7_000;
+/** 讀持倉前的健康檢查最多等這麼久（上游 gap 檢查會退避到 60 秒）：逾時照樣讀 */
+export const ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS = 3_000;
+
+/**
+ * 持倉延後重讀（每個 startEsunTradingState 一份）。延後從「最後一次」請求起算：排定或等待前景期間
+ * 的請求重新計時整整一段（較舊的 bridge 持倉快取可能還是更晚那次重連之前的快照）；讀取進行中的請求
+ * 在讀完後再跑一整輪。到期時分頁在背景就等回到前景，回到前景後再重新計時一整段（網路剛恢復，
+ * 手機回前景閘門會先做自己的權威讀取）。讀前先再做一次健康檢查（併入排隊中的那輪，快取重建先跑，
+ * 讀取才不會擋掉它），最多等 ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS。stop() 取消計時器、前景監聽與後續一輪
+ */
+function createPositionsReread(next: EsunTradingHooks) {
+    // reading：讀取中（含讀前健康檢查）；again：讀取中又收到請求。閒置與已排定的請求都重新計時
+    let reading = false, again = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onVisible: (() => void) | undefined;
+    const disarm = () => {
+        clearTimeout(timer);
+        if (onVisible) document.removeEventListener('visibilitychange', onVisible);
+        onVisible = undefined;
+    };
+    const read = () => {
+        reading = true;
+        // 健康檢查與等待上限先到者為準（逾時留下的計時器只會再 resolve 一次已定案的 promise）
+        void Promise.race([
+            Promise.resolve().then(() => next.checkHealth('gap')).catch(() => undefined),
+            new Promise<void>(resolve => { setTimeout(resolve, ESUN_POSITIONS_REREAD_HEALTH_WAIT_MS); }),
+        ])
+            // 等健康檢查期間又收到重連：這次不讀（快取可能還是那次重連之前的），交給 finally 重新排一整輪
+            .then(() => hooks === next && !again ? import('../trading-state').then(m => m.refreshTradingState('positions')) : undefined)
+            .catch(() => undefined)
+            .finally(() => {
+                reading = false;
+                if (again) { again = false; arm(); }
+            });
+    };
+    const arm = () => {
+        disarm();
+        timer = setTimeout(() => {
+            if (typeof document === 'undefined' || !document.hidden) return read();
+            onVisible = () => { if (!document.hidden) arm(); };
+            document.addEventListener('visibilitychange', onVisible);
+        }, ESUN_POSITIONS_REREAD_DELAY_MS);
+    };
+    return {
+        request() {
+            if (reading) again = true;
+            else arm();
+        },
+        stop() {
+            // 讀取中停止（含等健康檢查的上限）：讀完不再排下一輪（hooks 已不是 next，讀取本身也跳過）
+            again = false;
+            disarm();
+        },
+    };
+}
+
 export const ESUN_UNREFRESHED_CACHE_MESSAGE = '玉山 bridge 未能重讀委託，快取可能缺少部分成交／取消；請按更新確認';
 /** failed_ack_refreshed：快取重建（CACHE_RESYNC_RESOLVES 的 sequence-gap）即可解除 */
 export const ESUN_FAILED_ACK_REFRESHED_MESSAGE = 'bridge 已依失敗回報重讀委託，快取同步中';
@@ -528,6 +644,7 @@ function esunAccountKeys() {
 /** trading-state.start() 呼叫：玉山 session／串流事件 → 重讀、待對帳原因、快取重建 */
 export function startEsunTradingState(next: EsunTradingHooks): () => void {
     hooks = next;
+    const positionsReread = createPositionsReread(next);
     let keys = esunAccountKeys();
     let generation = esunTradeService.getSessionGeneration();
     const stopService = esunTradeService.subscribe(() => {
@@ -581,7 +698,13 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
             // 不提出 positions 的原因、不做快取重建）。只有權威讀取能清除
             next.raise('orders', 'snapshot-boundary', ESUN_FAILED_ACK_REFRESH_FAILED_MESSAGE);
         } else {
-            const message = '玉山回報漏收超過 bridge 補送範圍；以 bridge 委託快取重建中，必要時請手動對帳';
+            // 只有 bridge 明確回報券商 WebSocket 已重新連上（wsOpen:true）才自動重讀持倉。wsOpen:false 是 bridge 連不上、
+            // 每分鐘補查一次委託：回報仍收不到，持倉待對帳要留到使用者更新。沒帶 wsOpen 的是較舊的 bridge，分不出兩者，維持原行為
+            const ws = signal.reason === 'ws_reconnected';
+            const reconnected = ws && signal.cacheRefreshed === true && signal.wsOpen === true;
+            const message = reconnected ? ESUN_WS_RECONNECTED_MESSAGE
+                : ws && signal.wsOpen === false ? ESUN_WS_DOWN_MESSAGE
+                : '玉山回報漏收超過 bridge 補送範圍；以 bridge 委託快取重建中，必要時請手動對帳';
             next.raise('orders', 'sequence-gap', message);
             next.raise('positions', 'sequence-gap', message);
             // bridge 沒能重讀委託快取（cacheRefreshed:false；ws_reconnected 未帶旗標時也視為沒有重讀）：
@@ -590,10 +713,13 @@ export function startEsunTradingState(next: EsunTradingHooks): () => void {
                 next.raise('orders', 'snapshot-boundary', signal.reason === 'ws_reconnected' ? ESUN_STALE_CACHE_MESSAGE : ESUN_UNREFRESHED_CACHE_MESSAGE);
             }
             void next.checkHealth('gap');
+            // 快取重建只解除 orders 的原因：持倉延後（bridge 持倉快取過期後）權威讀取一次
+            if (reconnected) positionsReread.request();
         }
     });
     return () => {
         if (hooks === next) hooks = null;
+        positionsReread.stop();
         stopService();
         stopStream();
     };

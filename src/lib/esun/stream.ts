@@ -21,8 +21,9 @@ export type EsunStreamSignal =
     | { kind: 'down'; message: string }
     | { kind: 'reconnected' }
     /** bridge 的 resync：cacheRefreshed 表示 bridge 是否已重讀委託快取（ws_reconnected、failed_ack_refreshed、
-     *  failed_ack_refresh_failed 會帶） */
-    | { kind: 'resync'; reason?: string; cacheRefreshed?: boolean }
+     *  failed_ack_refresh_failed 會帶）。wsOpen（ws_reconnected 才帶）：true＝bridge 與券商的 WebSocket 已重新連上；
+     *  false＝還連不上，bridge 只是定期以查詢補齊委託；較舊的 bridge 不帶 */
+    | { kind: 'resync'; reason?: string; cacheRefreshed?: boolean; wsOpen?: boolean }
     /** 收到但無法轉換的回報（欄位不足、環境未知）：不能投影，需要對帳。authoritativeOnly（興櫃回報缺
      *  股數欄位、單位未知；bridge 快取也沒套用）表示快取重建不能解除，只有權威讀取能對帳 */
     | { kind: 'untrackable'; deal: boolean; authoritativeOnly?: { orderId: string } }
@@ -261,12 +262,13 @@ export function ensureEsunOrderStream(): void {
             try { esunTradeService.applySession(JSON.parse(raw) as EsunSessionInfo); } catch { /* malformed */ }
         }),
         onStreamEvent(RESYNC_EVENT, raw => {
-            let payload: { reason?: unknown; cacheRefreshed?: unknown } = {};
+            let payload: { reason?: unknown; cacheRefreshed?: unknown; wsOpen?: unknown } = {};
             try { payload = (JSON.parse(raw) ?? {}) as typeof payload; } catch { /* malformed: still a resync */ }
             signal({
                 kind: 'resync',
                 ...(typeof payload.reason === 'string' ? { reason: payload.reason } : {}),
                 ...(typeof payload.cacheRefreshed === 'boolean' ? { cacheRefreshed: payload.cacheRefreshed } : {}),
+                ...(typeof payload.wsOpen === 'boolean' ? { wsOpen: payload.wsOpen } : {}),
             });
         }),
         onStreamEvent(UNTRACKABLE_EVENT, raw => {
