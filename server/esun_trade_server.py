@@ -129,6 +129,12 @@ _REPORT_LOG_DROP_KEY_RE = re.compile(
 _REPORT_LOG_ORDER_KEYS = frozenset({"ord_no", "ordNo", "pre_ord_no", "preOrdNo"})
 
 
+def mask_order_no(value: any) -> str:
+    """An order number for logs: only the last 2 characters stay visible (A1234 -> ***34)."""
+    text = str(value or "")
+    return ("*" * max(len(text) - 2, 0) + text[-2:]) if text else text
+
+
 def report_log_fields(data: dict) -> str:
     """A WebSocket report's raw fields for an INFO diagnostic, without account / identity fields."""
     out: dict[str, any] = {}
@@ -137,8 +143,7 @@ def report_log_fields(data: dict) -> str:
         if _REPORT_LOG_DROP_KEY_RE.search(name):
             continue
         if name in _REPORT_LOG_ORDER_KEYS:
-            text = str(value or "")
-            out[name] = ("*" * max(len(text) - 2, 0) + text[-2:]) if text else text
+            out[name] = mask_order_no(value)
             continue
         out[name] = value if isinstance(value, (int, float, bool)) or value is None else str(value)
     return redact(json.dumps(out, ensure_ascii=False, sort_keys=True))
@@ -524,14 +529,56 @@ def public_config_profiles(discovery: dict) -> dict:
     }
 
 
+def _entry_host(entry: str) -> str:
+    """Lower-case host name of a [Core] Entry URL (scheme optional); '' when it cannot be parsed."""
+    text = str(entry or "").strip()
+    if not text:
+        return ""
+    try:
+        return (urlsplit(text if "://" in text else "//" + text).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+ESUN_SIMULATION_HOST = _entry_host(ESUN_SIMULATION_ENTRY)
+ESUN_PRODUCTION_HOST = _entry_host(ESUN_PRODUCTION_ENTRY)
+
+
+def describe_esun_environment_conflict(config: configparser.ConfigParser | None) -> str | None:
+    """
+    A known E.Sun Entry host whose [Core] Environment says the other environment (e.g. a template
+    switched to the production Entry but still carrying Environment = SIMULATION): orders would go to
+    one host while the bridge reports the other. Returns the problem text, or None when consistent.
+    """
+    if not config or not config.has_section("Core"):
+        return None
+    host = _entry_host(config.get("Core", "Entry", fallback=""))
+    env_val = config.get("Core", "Environment", fallback="").strip().upper()
+    if host == ESUN_PRODUCTION_HOST and env_val == "SIMULATION":
+        return (
+            f"設定檔 [Core] Entry 與 Environment 不一致：Entry 指向正式環境（{ESUN_PRODUCTION_HOST}），"
+            "但 Environment = SIMULATION；正式環境請刪除 Environment 行，模擬環境請改用模擬 Entry"
+        )
+    if host == ESUN_SIMULATION_HOST and env_val == "PRODUCTION":
+        return (
+            f"設定檔 [Core] Entry 與 Environment 不一致：Entry 指向模擬環境（{ESUN_SIMULATION_HOST}），"
+            "但 Environment = PRODUCTION；模擬環境請設 Environment = SIMULATION，正式環境請改用正式 Entry 並刪除 Environment 行"
+        )
+    return None
+
+
 def detect_esun_environment(config: configparser.ConfigParser | None) -> str:
     """
     Detects whether an E.Sun configuration is SIMULATION or PRODUCTION based on [Core]:
     - Simulation: Entry == ESUN_SIMULATION_ENTRY and Environment == SIMULATION
     - Production: Entry == ESUN_PRODUCTION_ENTRY and (no Environment key or empty)
+    - Conflict: a known production host with Environment = SIMULATION, or a known simulation host
+      with Environment = PRODUCTION -> UNKNOWN (load_config reports it as a problem; login refused).
     - Fallback: Environment == SIMULATION or "simulation" in Entry URL -> SIMULATION, else PRODUCTION.
     """
     if not config or not config.has_section("Core"):
+        return "UNKNOWN"
+    if describe_esun_environment_conflict(config):
         return "UNKNOWN"
     entry = config.get("Core", "Entry", fallback="").strip().rstrip("/")
     has_env = config.has_option("Core", "Environment")
@@ -608,6 +655,9 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
 
     if parser.has_section("Core") and not parser["Core"].get("Entry"):
         problems.append("設定檔缺少 [Core] Entry")
+    env_conflict = describe_esun_environment_conflict(parser)
+    if env_conflict:
+        problems.append(env_conflict)
     if parser.has_section("Api"):
         api_key = str(parser["Api"].get("Key") or "").strip()
         api_secret = str(parser["Api"].get("Secret") or "").strip()
@@ -619,6 +669,7 @@ def load_config(config_path_override: str | None = None) -> tuple[configparser.C
             problems.append("設定檔缺少 [Api] Secret")
         elif api_secret.upper().startswith("YOUR_"):
             problems.append("設定檔 [Api] Secret 仍為範本預設值，請填入玉山核發的密鑰")
+        register_secret(api_key)
         register_secret(api_secret)
     if parser.has_section("User") and not parser["User"].get("Account"):
         problems.append("設定檔缺少 [User] Account")
@@ -1644,7 +1695,7 @@ class OrderBookCache:
             if info is not None:
                 info["covered_by_snapshot"] = False
             if not seq:
-                logger.warning(f"[WebSocket] 成交回報缺少 mkt_seq_num，無法去重，不計入快取成交量（ord_no={ord_no}）")
+                logger.warning(f"[WebSocket] 成交回報缺少 mkt_seq_num，無法去重，不計入快取成交量（ord_no={mask_order_no(ord_no)}）")
                 self._mat_order_info_locked(internal_id, info)
                 return True
             meta["seen_mat"].add(seq)
@@ -1653,7 +1704,7 @@ class OrderBookCache:
             mat_shares = mat_report_shares(mat_data, mat_ap_code)
             if mat_shares is None and mat_ap_code == _EMERGING_AP_CODE:
                 logger.warning(
-                    f"[WebSocket] 興櫃成交回報缺少 mat_qty_share，數量單位未知，不計入快取成交量（ord_no={ord_no}, "
+                    f"[WebSocket] 興櫃成交回報缺少 mat_qty_share，數量單位未知，不計入快取成交量（ord_no={mask_order_no(ord_no)}, "
                     f"mkt_seq_num={seq}）"
                 )
                 self._mat_order_info_locked(internal_id, info)
@@ -4222,7 +4273,7 @@ class EsunTradeBridge:
         )
         if not accepted:
             logger.info(
-                f"[WebSocket] 略過重複的成交回報（ord_no={data.get('ord_no')}, mkt_seq_num={data.get('mkt_seq_num')}）"
+                f"[WebSocket] 略過重複的成交回報（ord_no={mask_order_no(data.get('ord_no'))}, mkt_seq_num={data.get('mkt_seq_num')}）"
             )
             return None
         self.positions_cache.mark_dirty()
@@ -4885,9 +4936,10 @@ class EsunTradeBridge:
         stock_no = stock_no.strip()
         action = to_action(payload.get("buySell", payload.get("buy_sell")))
         ap_code = to_ap_code(payload.get("apCode", payload.get("ap_code")))
-        bs_flag = to_bs_flag(payload.get("bsFlag", payload.get("bs_flag")))
-        price_flag = to_price_flag(payload.get("priceFlag", payload.get("price_flag")))
-        trade = to_trade(payload.get("trade"))
+        # New orders never fall back to ROD / limit / cash: a missing field is refused (400, not sent).
+        bs_flag = to_bs_flag(payload.get("bsFlag", payload.get("bs_flag")), default=None)
+        price_flag = to_price_flag(payload.get("priceFlag", payload.get("price_flag")), default=None)
+        trade = to_trade(payload.get("trade"), default=None)
         quantity = parse_positive_int(payload.get("quantity"), "quantity")
 
         ap, flag, trade_code, side = enum_value(ap_code), enum_value(price_flag), enum_value(trade), enum_value(action)

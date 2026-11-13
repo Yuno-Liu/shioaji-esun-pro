@@ -318,6 +318,20 @@ Account = 88401234567
         cp_legacy_prod.read_string("[Core]\nEntry = https://custom.api.com\n")
         self.assertEqual(detect_esun_environment(cp_legacy_prod), "PRODUCTION")
 
+    def test_load_config_registers_api_key_and_secret_for_redaction(self):
+        path = os.path.join(self.temp_dir.name, "redact_config.ini")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                f"[Core]\nEntry = {ESUN_SIMULATION_ENTRY}\nEnvironment = SIMULATION\n[Cert]\nPath = test.p12\n"
+                "[Api]\nKey = ApiKeyZq81Vt\nSecret = ApiSecretWx52Lp\n[User]\nAccount = 88401234567\n"
+            )
+        _cfg, problems, _env = load_config(path)
+        self.assertEqual(problems, [])
+        text = redact(RuntimeError("SDK 失敗：key=ApiKeyZq81Vt secret=ApiSecretWx52Lp"))
+        self.assertNotIn("ApiKeyZq81Vt", text)
+        self.assertNotIn("ApiSecretWx52Lp", text)
+        self.assertIn("key=***", text)
+
     def test_override_esun_config_environment_roundtrip_in_memory(self):
         # Contract change (§3): switching environments never rewrites the user's ini file;
         # the [Core] section is overridden on the in-memory ConfigParser handed to SDK(config).
@@ -691,7 +705,7 @@ class TestFullHttpIntegration(unittest.TestCase):
     def test_mutation_http_refused_not_sent_inside_switch_swap_window(self):
         env = {"expected_environment": "SIMULATION", "expected_account": "1234567"}
         order = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0,
-                             "apCode": "1", "priceFlag": "0", "bsFlag": "R"}, **env}
+                             "apCode": "1", "priceFlag": "0", "bsFlag": "R", "trade": "0"}, **env}
         placed_before = len(self.mock_sdk.placed_orders)
         with self.bridge._mutations_cond:
             self.bridge._env_switch_in_progress = True
@@ -727,6 +741,7 @@ class TestFullHttpIntegration(unittest.TestCase):
                 "apCode": "1",
                 "priceFlag": "0",
                 "bsFlag": "R",
+                "trade": "0",
             },
             **env,
         }
@@ -1013,6 +1028,99 @@ class TestConfigProfilesDiscovery(unittest.TestCase):
         self.assertEqual(discovery["profiles"]["SIMULATION"]["fileName"], "esun-config.simulation.ini")
         self.assertTrue(discovery["profiles"]["PRODUCTION"]["available"])
         self.assertEqual(discovery["profiles"]["PRODUCTION"]["fileName"], "esun-config.production.ini")
+
+    def _write_full_config(self, name: str, core: str) -> str:
+        path = os.path.join(self.temp_dir.name, name)
+        with open(path, "w") as f:
+            f.write(core + "[Cert]\nPath=cert.p12\n[Api]\nKey=k_test\nSecret=s_test\n[User]\nAccount=88401234567\n")
+        return path
+
+    def test_real_world_entry_without_api_path_detects_both_environments(self):
+        # The two configs actually deployed: bare host Entry (no /api/v1); production has no Environment line.
+        prod = self._write_full_config(
+            "esun-config.production.ini", "[Core]\nEntry = https://esuntradingapi.esunsec.com.tw\n"
+        )
+        sim = self._write_full_config(
+            "esun-config.simulation.ini",
+            "[Core]\nEntry = https://esuntradingapi-simulation.esunsec.com.tw\nEnvironment = SIMULATION\n",
+        )
+        cfg, problems, env = load_config(prod)
+        self.assertEqual((problems, env), ([], "PRODUCTION"))
+        cfg, problems, env = load_config(sim)
+        self.assertEqual((problems, env), ([], "SIMULATION"))
+        discovery = discover_esun_config_profiles(base_dir=self.temp_dir.name)
+        self.assertEqual(discovery["availableEnvironments"], ["SIMULATION", "PRODUCTION"])
+
+        mock_sdk = MockSDK()
+        bridge = EsunTradeBridge(config_path=prod, sdk_factory=lambda cfg: mock_sdk, auto_login=True)
+        self.assertTrue(bridge.logged_in)
+        self.assertEqual(bridge.environment, "PRODUCTION")
+        mock_sdk_sim = MockSDK()
+        bridge_sim = EsunTradeBridge(config_path=sim, sdk_factory=lambda cfg: mock_sdk_sim, auto_login=True)
+        self.assertTrue(bridge_sim.logged_in)
+        self.assertEqual(bridge_sim.environment, "SIMULATION")
+
+    def test_entry_environment_conflict_is_unknown_and_refuses_login(self):
+        cases = [
+            # Template switched to the production Entry but Environment = SIMULATION left behind.
+            ("prod_host_sim_env.ini", "[Core]\nEntry = https://esuntradingapi.esunsec.com.tw\nEnvironment = SIMULATION\n", "SIMULATION"),
+            (
+                "prod_entry_sim_env.ini",
+                f"[Core]\nEntry = {ESUN_PRODUCTION_ENTRY}\nEnvironment = simulation\n",
+                "SIMULATION",
+            ),
+            (
+                "sim_host_prod_env.ini",
+                "[Core]\nEntry = https://ESUNTRADINGAPI-SIMULATION.esunsec.com.tw/\nEnvironment = PRODUCTION\n",
+                "PRODUCTION",
+            ),
+        ]
+        for name, core, env_value in cases:
+            with self.subTest(name=name):
+                path = self._write_full_config(name, core)
+                cp = configparser.ConfigParser()
+                cp.read(path)
+                self.assertEqual(detect_esun_environment(cp), "UNKNOWN")
+                cfg, problems, env = load_config(path)
+                self.assertEqual(env, "UNKNOWN")
+                conflict = [p for p in problems if "Entry 與 Environment 不一致" in p]
+                self.assertEqual(len(conflict), 1)
+                self.assertIn(f"Environment = {env_value}", conflict[0])
+
+                mock_sdk = MockSDK()
+                bridge = EsunTradeBridge(config_path=path, sdk_factory=lambda cfg: mock_sdk, auto_login=True)
+                self.assertFalse(bridge.logged_in)
+                self.assertEqual(mock_sdk.login_calls, 0)
+                self.assertIn("Entry 與 Environment 不一致", bridge.login_error or "")
+                # An explicit switch cannot paper over the conflict by rewriting [Core] in memory.
+                success, _res, _status = bridge.reconnect()
+                self.assertFalse(success)
+                self.assertEqual(mock_sdk.login_calls, 0)
+
+    def test_single_fallback_conflicting_config_is_not_an_available_environment(self):
+        self._write_full_config(
+            "esun-config.ini", "[Core]\nEntry = https://esuntradingapi.esunsec.com.tw\nEnvironment = SIMULATION\n"
+        )
+        discovery = discover_esun_config_profiles(base_dir=self.temp_dir.name)
+        self.assertEqual(discovery["availableEnvironments"], [])
+
+    def test_unknown_entry_and_environment_only_detection_unchanged(self):
+        def detect(core: str) -> str:
+            cp = configparser.ConfigParser()
+            cp.read_string(core)
+            return detect_esun_environment(cp)
+
+        # Unknown hosts keep the legacy fallback, whatever Environment says.
+        self.assertEqual(detect("[Core]\nEntry = https://custom.api.com\nEnvironment = SIMULATION\n"), "SIMULATION")
+        self.assertEqual(detect("[Core]\nEntry = https://custom-simulation.api.com\nEnvironment = PRODUCTION\n"), "SIMULATION")
+        self.assertEqual(detect("[Core]\nEntry = https://custom.api.com\nEnvironment = PRODUCTION\n"), "PRODUCTION")
+        # Environment only (no Entry).
+        self.assertEqual(detect("[Core]\nEnvironment = SIMULATION\n"), "SIMULATION")
+        self.assertEqual(detect("[Core]\nEnvironment = PRODUCTION\n"), "PRODUCTION")
+        # Known hosts with a matching or empty Environment.
+        self.assertEqual(detect(f"[Core]\nEntry = {ESUN_PRODUCTION_ENTRY}\nEnvironment =\n"), "PRODUCTION")
+        self.assertEqual(detect(f"[Core]\nEntry = {ESUN_PRODUCTION_ENTRY}\nEnvironment = PRODUCTION\n"), "PRODUCTION")
+        self.assertEqual(detect(f"[Core]\nEntry = {ESUN_SIMULATION_ENTRY}\n"), "SIMULATION")
 
     def test_discover_aliases(self):
         sim_alias = os.path.join(self.temp_dir.name, "esun-config.sim.ini")
@@ -1487,7 +1595,8 @@ def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.02) -> bool
     return predicate()
 
 
-_QUIET_ORDER = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1", "priceFlag": "0", "bsFlag": "R"}
+_QUIET_ORDER = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1", "priceFlag": "0", "bsFlag": "R",
+                "trade": "0"}
 
 
 class _BridgeCase(unittest.TestCase):
@@ -2548,6 +2657,29 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         self.assertEqual(self._core_calls("order"), [])
         self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
 
+    def test_place_order_requires_trade_bs_flag_and_price_flag(self):
+        # New orders never silently become cash / ROD / limit: each field is required (400, not_sent).
+        full = {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1",
+                "priceFlag": "0", "bsFlag": "R", "trade": "0"}
+        for field in ("trade", "bsFlag", "priceFlag"):
+            for missing in ("absent", None, "", "  "):
+                with self.subTest(field=field, missing=missing):
+                    payload = dict(full)
+                    if missing == "absent":
+                        del payload[field]
+                    else:
+                        payload[field] = missing
+                    res, status = self.bridge.place_order({"payload": payload, **self.env})
+                    self.assertEqual((status, res["outcome"], res["code"]), (400, "not_sent", "ESUN_INVALID_PARAMS"))
+                    self.assertIn(f"缺少必要欄位 {field}", res["error"])
+        # snake_case aliases still satisfy the requirement.
+        snake = {k: v for k, v in full.items() if k not in ("priceFlag", "bsFlag")}
+        snake.update(price_flag="0", bs_flag="R")
+        self.assertEqual(self._core_calls("order"), [])
+        self.assertEqual(self.bridge.order_mutation_daily.get_count(), 0)
+        res, status = self.bridge.place_order({"payload": snake, **self.env})
+        self.assertEqual(status, 200, res)
+
     def test_environment_and_account_checks(self):
         res, status = self.bridge.place_order({"payload": {"stockNo": "2330"}, "expected_environment": "PRODUCTION"})
         self.assertEqual((status, res["code"], res["outcome"]), (409, "ESUN_ENV_MISMATCH", "not_sent"))
@@ -2563,7 +2695,8 @@ class TestMutationContractWithRealSdk(_BridgeCase):
         self.assertEqual(self.core.calls[1:], [])  # only the login call
         # Accepted forms: lower-case environment, 11-digit account with the right branch.
         res, status = self.bridge.place_order({
-            "payload": {"stockNo": "2330", "buySell": "S", "quantity": 1, "price": 951.0, "apCode": "1"},
+            "payload": {"stockNo": "2330", "buySell": "S", "quantity": 1, "price": 951.0, "apCode": "1",
+                        "priceFlag": "0", "bsFlag": "R", "trade": "0"},
             "expectedEnvironment": "simulation", "expectedAccount": "88401234567",
         })
         self.assertEqual(status, 200, res)
@@ -3653,6 +3786,26 @@ class TestReportEvents(_BridgeCase):
         row = self.bridge.order_book_cache.get("A0710")
         self.assertEqual((row.get("mat_qty", 0), row.get("deal_qty", 0), row["esun_fills"]), (0, 0, []))
 
+    def test_mat_warning_and_duplicate_logs_keep_only_last_two_order_number_chars(self):
+        # docs/fork/esun.md: order numbers in logs keep only their last 2 characters.
+        self.bridge.order_book_cache.update_from_ack({"ord_no": "K4321", "stock_no": "2330", "ap_code": "1", "org_qty": 2})
+        self.bridge.order_book_cache.update_from_ack({"ord_no": "E8765", "stock_no": "7777", "ap_code": "4", "org_qty": 2000})
+        mat = {"kind": "MAT", "ord_no": "K4321", "stock_no": "2330", "ap_code": "1", "mat_qty": 1, "mat_price": 950.0}
+        with self.assertLogs("esun_trade_server", level="INFO") as logs:
+            self.bridge._handle_mat(dict(mat))  # no mkt_seq_num
+            self.bridge._handle_mat({**mat, "mkt_seq_num": "000901"})
+            self.bridge._handle_mat({**mat, "mkt_seq_num": "000901"})  # duplicate
+            self.bridge._handle_mat({"kind": "MAT", "ord_no": "E8765", "stock_no": "7777", "ap_code": "4",
+                                     "mat_qty": 1000, "mat_price": 10.0, "mkt_seq_num": "000902"})  # no mat_qty_share
+        text = "\n".join(logs.output)
+        self.assertIn("無法去重", text)
+        self.assertIn("略過重複的成交回報", text)
+        self.assertIn("數量單位未知", text)
+        self.assertIn("ord_no=***21", text)
+        self.assertIn("ord_no=***65", text)
+        self.assertNotIn("K4321", text)
+        self.assertNotIn("E8765", text)
+
     def test_mat_pre_ord_no_is_looked_up_by_ord_no_only(self):
         # PA2-6: a reservation whose pre_ord_no equals the MAT's ord_no is a different order.
         self.bridge.order_book_cache.update_from_ack({"pre_ord_no": "A0720", "stock_no": "2330", "ap_code": "1",
@@ -4692,7 +4845,8 @@ class TestGracefulShutdownMutations(_BridgeCase):
     def setUp(self):
         super().setUp()
         self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
-        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1"},
+        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1",
+                                 "priceFlag": "0", "bsFlag": "R", "trade": "0"},
                      "expected_environment": "SIMULATION", "expected_account": "1234567"}
 
     def _post(self, port, body):
@@ -4881,7 +5035,8 @@ class TestSessionExpiryAndAutoRelogin(_BridgeCase):
     def setUp(self):
         super().setUp()
         self.sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION", account="88401234567")
-        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1"},
+        self.body = {"payload": {"stockNo": "2330", "buySell": "B", "quantity": 1, "price": 950.0, "apCode": "1",
+                                 "priceFlag": "0", "bsFlag": "R", "trade": "0"},
                      "expected_environment": "SIMULATION", "expected_account": "1234567"}
         self.mutation_body = {**self.body, "order_no": "O0001", "price": 951.0,
                               "cancel_quantity": 1, "quantity_unit": "lot"}
