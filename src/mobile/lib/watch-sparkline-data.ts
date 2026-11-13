@@ -21,7 +21,12 @@
 //
 // 即時尾段（不增加請求）：列收到的已節流成交（排除試撮）以 1 分 K label（分鐘結束）為桶寫入：
 // 同一分鐘取代、新分鐘 append，只接受同一時段、晚於最後一根 K 棒的分鐘。走勢＝K 棒＋尾段，超過
-// SPARK_MAX_POINTS 等距抽樣（保留最後一點）。列不可見或 App 在背景時沒有成交，該段會被壓縮，
+// SPARK_MAX_POINTS 等距抽樣（保留最後一點）。列不可見或 App 在背景時沒有成交寫入尾段（見下方時間軸）。
+//
+// 時間軸（使用者要求「x 軸固定是開盤期間 9 點–13 點半」）：每個點另存它在「實際顯示的時段」內的位置 xs
+// （0＝開盤、1＝收盤；label 是分鐘結束，收盤寬限內的 label 夾在 1），與抽樣後的點一一對應，和點同時重算、
+// 放在同一個快照（SparkSeries），列只訂閱一次、點與位置不會錯開。股票、指數 09:00–13:30；期貨／選擇權日盤
+// 08:45–13:45、夜盤 15:00–05:00。盤中線只畫到最後一點（約為現在）；列不可見期間沒寫入尾段的空檔畫成直線，
 // 收盤後的補讀會補齊。
 
 import { useEffect, useSyncExternalStore } from 'react';
@@ -53,6 +58,12 @@ interface Bar {
     c: number;
 }
 
+/** 走勢快照：收盤價與每點在顯示時段內的位置（0＝開盤、1＝收盤），一一對應 */
+export interface SparkSeries {
+    points: readonly number[];
+    xs: readonly number[];
+}
+
 interface Entry {
     key: string;
     contract: ContractBase;
@@ -65,7 +76,8 @@ interface Entry {
     before: Status;
     bars: Bar[];
     tail: Bar[];
-    points: readonly number[] | null;
+    /** 抽樣後的點與時間軸位置（不足 2 點時 null） */
+    series: SparkSeries | null;
     retryAt: number;
     /** 最近一次成功讀取的牆鐘秒（0＝尚未） */
     fetchedAt: number;
@@ -191,20 +203,34 @@ function latestSessionBars(k: KBars, sec: SecurityType, before: number): { win: 
     return null;
 }
 
-/** 超過上限時等距抽樣並保留最後一點 */
-export function samplePoints(closes: readonly number[]): number[] {
-    if (closes.length <= SPARK_MAX_POINTS) return closes.slice();
-    const step = closes.length / (SPARK_MAX_POINTS - 1);
+/** 抽樣的索引：不超過 SPARK_MAX_POINTS 時全取；否則等距抽樣並保留最後一點 */
+function sampleIndices(n: number): number[] {
+    if (n <= SPARK_MAX_POINTS) return Array.from({ length: n }, (_, i) => i);
+    const step = n / (SPARK_MAX_POINTS - 1);
     const out: number[] = [];
-    for (let i = 0; i < SPARK_MAX_POINTS - 1; i++) out.push(closes[Math.floor(i * step)]!);
-    out.push(closes[closes.length - 1]!);
+    for (let i = 0; i < SPARK_MAX_POINTS - 1; i++) out.push(Math.floor(i * step));
+    out.push(n - 1);
     return out;
 }
 
+/** 超過上限時等距抽樣並保留最後一點 */
+export function samplePoints(closes: readonly number[]): number[] {
+    return sampleIndices(closes.length).map(i => closes[i]!);
+}
+
 function recompute(e: Entry): void {
-    const closes = e.bars.map(b => b.c);
-    for (const b of e.tail) closes.push(b.c);
-    e.points = closes.length >= 2 ? samplePoints(closes) : null;
+    const all = e.tail.length > 0 ? [...e.bars, ...e.tail] : e.bars;
+    if (all.length < 2) {
+        e.series = null;
+        return;
+    }
+    const idx = sampleIndices(all.length);
+    // 時間軸位置：K 棒與尾段的 t 是分鐘結束的 label；盤中只到最後一點，收盤寬限內的 label 夾在 1
+    const span = e.win.end - e.win.start;
+    e.series = {
+        points: idx.map(i => all[i]!.c),
+        xs: idx.map(i => Math.min(1, Math.max(0, (all[i]!.t - e.win.start) / span))),
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +367,7 @@ export function retainSparkline(contract: ContractBase): () => void {
     if (!e) {
         pruneCode(contract.code, key);
         e = {
-            key, contract, target: win, win, status: 'idle', before: 'idle', bars: [], tail: [], points: null,
+            key, contract, target: win, win, status: 'idle', before: 'idle', bars: [], tail: [], series: null,
             retryAt: 0, fetchedAt: 0, reads: 0, holders: 0, timer: null,
         };
         entries.set(key, e);
@@ -396,7 +422,12 @@ export function recordSparkTick(code: string, sec: SecurityType, price: number, 
 
 /** 目前時段快取的點（沒有資料時 null） */
 export function getSparklinePoints(code: string, sec: SecurityType = 'STK'): readonly number[] | null {
-    return entries.get(currentSparkKey(code, sec))?.points ?? null;
+    return entries.get(currentSparkKey(code, sec))?.series?.points ?? null;
+}
+
+/** 目前時段每個點在顯示時段內的位置（0–1，與 getSparklinePoints 一一對應；沒有資料時 null） */
+export function getSparklineXs(code: string, sec: SecurityType = 'STK'): readonly number[] | null {
+    return entries.get(currentSparkKey(code, sec))?.series?.xs ?? null;
 }
 
 export function subscribeSparklines(listener: () => void): () => void {
@@ -422,10 +453,10 @@ export function subscribeSparkClock(listener: () => void): () => void {
 const noopSubscribe = () => () => {};
 
 /**
- * 列用：active（列可見、設定開啟、可畫走勢的商品）時 retain，回傳目前時段快取的點。
+ * 列用：active（列可見、設定開啟、可畫走勢的商品）時 retain，回傳目前時段快取的走勢快照（點＋時間軸位置）。
  * 時段鍵改變（換段）或時段收盤時重新 retain。active 為 false 時不排隊、不請求、不計時，只讀快取。
  */
-export function useSparkline(contract: ContractBase, active: boolean): readonly number[] | null {
+export function useSparkline(contract: ContractBase, active: boolean): SparkSeries | null {
     const code = contract.code;
     const sec = contract.security_type;
     const clock = active ? subscribeSparkClock : noopSubscribe;
@@ -437,7 +468,7 @@ export function useSparkline(contract: ContractBase, active: boolean): readonly 
         // 合約物件可能因清單重讀換新；以代碼為準
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [code, active, key, closed]);
-    return useSyncExternalStore(subscribeSparklines, () => entries.get(key)?.points ?? null, () => null);
+    return useSyncExternalStore(subscribeSparklines, () => entries.get(key)?.series ?? null, () => null);
 }
 
 /** 列用：把已節流的即時成交寫入尾段（試撮不算；沒有成交時間時用現在） */

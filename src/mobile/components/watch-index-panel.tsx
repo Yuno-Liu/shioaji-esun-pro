@@ -6,7 +6,7 @@
 //   當日走勢面積圖。
 //   數值與漲跌（即時優先、快照後備）與收合的兩格共用 watch-index-strip 的 useIndexView。
 // - 成交金額：即時 index.amount_sum 優先；沒有或空字串時用快照 total_amount；兩者都沒有顯示「—」。單位元 → 億（四捨五入、千分位）。
-// - 走勢：WatchSparkCell（watch-sparkline.tsx；1 分 K＋即時尾段）。reference＝昨收（即時 reference，或快照 close − change_price），
+// - 走勢：WatchSparkCell（watch-sparkline.tsx；1 分 K＋即時尾段，橫軸固定為時段 09:00–13:30，盤中只畫到現在）。reference＝昨收（即時 reference，或快照 close − change_price），
 //   tick＝即時 index（close／date／time；沒有即時時不寫尾段）。K 線請求由 lib/watch-sparkline-data.ts 的快取與上限處理
 //   （每檔每個時段最多 2 次、同時最多 2 個），本檔不另外輪詢。面板卸載（收合、離開自選頁）即釋放。
 // - 外觀：bar 材質上的文字一律 foreground；方向以有色 ▲▼ 圖形（DirArrow）表示；走勢線顏色由 WatchSparkline 依昨收決定。

@@ -1,5 +1,6 @@
 // 自選迷你走勢資料（lib/watch-sparkline-data.ts）：交易時段判斷（期貨日盤／夜盤、盤前、週末、跨午夜）、
-// 時段內 K 棒篩選與抽樣、每檔每段一次的快取、假日補找、收盤後補讀、即時尾段、佇列上限、取消、重試間隔與計時器。
+// 時段內 K 棒篩選與抽樣、每檔每段一次的快取、假日補找、收盤後補讀、即時尾段、佇列上限、取消、重試間隔與計時器、
+// 走勢的時間軸位置（xs：股票／指數 09:00–13:30、期貨日盤與夜盤）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({ fetchKbars: vi.fn() }));
@@ -12,6 +13,7 @@ import {
     currentSparkKey,
     sessionWindowFor,
     getSparklinePoints,
+    getSparklineXs,
     recordSparkTick,
     resetSparklinesForTest,
     retainSparkline,
@@ -362,5 +364,78 @@ describe('retainSparkline：佇列', () => {
         const again = retainSparkline(stk('3'));
         expect(sparklineQueueForTest().queued).toBe(1);
         again();
+    });
+});
+
+describe('時間軸位置 xs（橫軸固定為交易時段）', () => {
+    const ind = (code = 'IX0001') => ({ code, security_type: 'IND' as const, exchange: 'TSE' as const, target_code: null });
+    const xs = () => getSparklineXs('IX0001', 'IND');
+
+    it('盤中：每點＝(label − 09:00)／(13:30 − 09:00)，只畫到現在；即時尾段 append 時往右延伸；不足 2 點為 null', async () => {
+        at('2026-11-04T09:00:30');
+        m.fetchKbars.mockResolvedValueOnce(kbars([['2026-11-04 09:01:00', 10]]));
+        retainSparkline(ind('IX0043'));
+        await flush();
+        expect(getSparklineXs('IX0043', 'IND')).toBeNull();
+
+        at('2026-11-04T09:20:10');
+        m.fetchKbars.mockResolvedValueOnce(kbars(minutes('2026-11-04T09:01', 20)));
+        retainSparkline(ind());
+        await flush();
+        expect(xs()).toHaveLength(20);
+        expect(xs()![0]).toBeCloseTo(1 / 270, 10);
+        expect(xs()!.at(-1)).toBeCloseTo(20 / 270, 10);
+        recordSparkTick('IX0001', 'IND', 130, w('2026-11-04T09:20:30')); // label 09:21 → append
+        expect(getSparklinePoints('IX0001', 'IND')).toHaveLength(21);
+        expect(xs()).toHaveLength(21);
+        expect(xs()!.at(-1)).toBeCloseTo(21 / 270, 10);
+        recordSparkTick('IX0001', 'IND', 131, w('2026-11-04T09:20:50')); // 同一分鐘：位置不變
+        expect(xs()).toHaveLength(21);
+        expect(xs()!.at(-1)).toBeCloseTo(21 / 270, 10);
+    });
+
+    it('收盤後：抽樣後仍與點一一對應、遞增；收盤寬限內的 label 夾在 1', async () => {
+        at('2026-11-04T14:00:00');
+        m.fetchKbars.mockResolvedValueOnce(kbars([...minutes('2026-11-04T09:01', 270), ['2026-11-04 13:33:00', 500]]));
+        retainSparkline(ind());
+        await flush();
+        const pts = getSparklinePoints('IX0001', 'IND')!;
+        expect(pts).toHaveLength(SPARK_MAX_POINTS);
+        expect(pts.at(-1)).toBe(500);
+        expect(xs()).toHaveLength(SPARK_MAX_POINTS);
+        expect(xs()![0]).toBeCloseTo(1 / 270, 10);
+        expect(xs()!.at(-1)).toBe(1);
+        expect(xs()!.every((x, i, a) => x >= 0 && x <= 1 && (i === 0 || x > a[i - 1]!))).toBe(true);
+    });
+
+    it('期貨：日盤 08:45–13:45、跨午夜的夜盤 15:00–05:00 各自為時間軸', async () => {
+        at('2026-11-04T10:00:00');
+        m.fetchKbars.mockResolvedValueOnce(kbars(minutes('2026-11-04T08:46', 75, 300))); // 08:46–10:00
+        const releaseDay = retainSparkline(fut());
+        await flush();
+        const day = getSparklineXs('TXFR1', 'FUT')!;
+        expect(day[0]).toBeCloseTo(1 / 300, 10);
+        expect(day.at(-1)).toBeCloseTo(75 / 300, 10);
+        releaseDay();
+
+        at('2026-11-05T00:30:00');
+        m.fetchKbars.mockResolvedValueOnce(kbars([['2026-11-04 15:01:00', 30], ['2026-11-04 23:58:00', 31]]));
+        retainSparkline(fut());
+        await flush();
+        recordSparkTick('TXFR1', 'FUT', 32, w('2026-11-05T00:29:30')); // label 00:30
+        const night = getSparklineXs('TXFR1', 'FUT')!;
+        expect(getSparklinePoints('TXFR1', 'FUT')).toEqual([30, 31, 32]);
+        [1, 538, 570].forEach((min, i) => expect(night[i]).toBeCloseTo(min / 840, 10));
+    });
+
+    it('假日補找：以實際顯示的時段（較早的一段）計算位置', async () => {
+        at('2026-11-07T10:00:00'); // 週六；週五休市
+        m.fetchKbars.mockResolvedValueOnce(kbars([]));
+        m.fetchKbars.mockResolvedValueOnce(kbars(minutes('2026-11-05T09:01', 3, 50)));
+        retainSparkline(ind())();
+        await flush();
+        expect(getSparklinePoints('IX0001', 'IND')).toEqual([50, 51, 52]);
+        expect(xs()).toHaveLength(3);
+        xs()!.forEach((x, i) => expect(x).toBeCloseTo((i + 1) / 270, 10));
     });
 });
