@@ -7,9 +7,9 @@
 # - 專案目錄以唯讀掛載給橋接（ESUN_CONFIG_HOST_DIR，預設 .），登入熔斷狀態存於具名 volume。
 # 需要區網存取時，請設定 WEB_BIND、WEB_SERVER_NAMES 並啟用 WEB_BASIC_AUTH，切勿直接開放 8080/8090。
 
-# 容器日誌輪替（json-file，每檔 10 MB、保留 3 檔）：只套用在 web 與永豐 sidecar。
-# esun-bridge 刻意不加：改它的 compose 設定會讓下一次 docker compose up 重建連著玉山正式環境的 bridge，
-# 等下次收盤後要重建 bridge 時再一起加上 logging: *default-logging。
+# 容器日誌輪替（json-file，每檔 10 MB、保留 3 檔）：三個服務都套用。
+# 注意：修改 esun-bridge 的 compose 設定會讓下一次 docker compose up 重建連著玉山正式環境的 bridge，
+# 所以它的設定只在收盤後重建 bridge 時調整（日誌輪替於 2026-11-13 隨 bridge 更新一起加上）。
 x-logging: &default-logging
   driver: json-file
   options:
@@ -102,6 +102,7 @@ services:
     # 刻意維持 unless-stopped：bridge 一啟動就登入玉山，Docker 重啟後要不要啟動由使用者決定
     # （docker compose up -d esun-bridge）。前端在 bridge 恢復後會自動重新探測。
     restart: unless-stopped
+    logging: *default-logging
     init: true
     # SIGTERM 後橋接最多等 8 秒讓進行中的委託完成並回應，再關閉 WebSocket／SSE；預設 10 秒不夠
     stop_grace_period: 15s
