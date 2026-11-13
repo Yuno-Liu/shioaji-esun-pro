@@ -262,6 +262,17 @@ pnpm run docker:down                      # 或 docker compose down
 - `用戶端已中斷連線，回應未送達`：瀏覽器在收到回應前就關閉連線（逾時、切到別的 App、關頁面），不是 bridge 的錯誤。
 - `/esun/livez` 成功的存取記錄不再寫入日誌（容器健康檢查每 15 秒一次）；失敗仍會記錄。
 
+### bridge 或回報連線不穩時，前端怎麼處理
+
+| 狀況 | 前端行為 |
+| --- | --- |
+| 開啟 App 時 bridge 不通（部署、重啟中） | 背景重新探測：10、20、40 秒，之後每 60 秒。只在頁面可見時探測，每段可見期間最多 8 次；回到前景或網路恢復時重新計數並立刻探測。bridge 可達後玉山帳戶自動出現，不必重新整理 |
+| 玉山帳戶晚到，存檔的預設下單帳戶（玉山）已被其他帳戶頂替 | 提示一次「玉山帳戶已恢復連線」。不自動切回：選取的下單帳戶只隨使用者操作改變，要用玉山下單請點帳戶列切換 |
+| 頁面從背景回到前景 | 瀏覽器到 bridge 的回報串流超過 30 秒沒有任何活動，就直接重連，不等看門狗 |
+| bridge 重新連上券商（`resync` 的 `wsOpen: true`，且委託已重讀） | 委託以 bridge 快取重建；持倉在 7 秒後自動重讀一次並解除待對帳（頁面在背景時，等回到前景再計時）。這次讀取如果被別的讀取或 1.5 秒冷卻吸收、待對帳還在，1.6 秒後補讀，連第一次最多 3 次 |
+| bridge 還連不上券商（`wsOpen: false`） | 顯示「回報連線中斷」，已排定的自動重讀取消。這個提示不是常駐的：按「更新」或 App 回到前景的自動讀取會解除當下的提示，bridge 下一次補查（約 1 分鐘內）再提出；重新連上後才不再出現 |
+| `resync` 沒帶 `wsOpen`（較舊的 bridge，或 bridge 這次登入後還沒觀察到連線開啟） | 分不出上面兩種，維持手動：持倉待對帳保留到按「更新」 |
+
 ### 永豐 sidecar 卡在舊的網路命名空間
 
 `shioaji-server` 以 `network_mode: service:shioaji-pro-web` 共用 web 的網路命名空間。web 單獨重啟（`docker restart`、
@@ -277,15 +288,30 @@ docker compose up -d --no-deps --force-recreate shioaji-server
 
 ### 日誌輪替
 
-`shioaji-pro-web` 與 `shioaji-server` 使用 json-file 日誌輪替（每檔 10 MB、保留 3 檔，`docker-compose.yml` 的
-`x-logging`），重建容器後生效。`esun-bridge` 目前沒有：修改它的 compose 設定會讓下一次 `docker compose up` 重建連著玉山
-正式環境的 bridge，所以要等下次收盤後重建 bridge 時，再一起在 `esun-bridge` 加上 `logging: *default-logging`。
+三個服務都使用 json-file 日誌輪替（每檔 10 MB、保留 3 檔，`docker-compose.yml` 的 `x-logging`），重建容器後生效。
+`esun-bridge` 的輪替在 2026-11-13 加入設定。注意：修改 `esun-bridge` 的 compose 設定會讓下一次 `docker compose up`
+重建連著玉山正式環境的 bridge，所以它的設定只在收盤後、準備重建 bridge 時調整。
 
 ### web 不依賴 esun-bridge
 
 `shioaji-pro-web` 沒有 `depends_on: esun-bridge`：nginx 以 resolver 在執行期解析 bridge，bridge 停止時 web 照常運作，
 `/esun/` 回 502。因此 `docker compose up -d shioaji-pro-web shioaji-server` 不會把刻意停掉的 bridge 啟動起來；
 要啟動 bridge 時請明確寫出 `esun-bridge`，或不指定服務。
+
+### 重啟策略
+
+| 服務 | `restart` | 原因 |
+| --- | --- | --- |
+| `shioaji-pro-web`、`shioaji-server` | `always` | Docker Desktop 或主機重啟後自動啟動。兩者共用網路命名空間，必須用同一個策略 |
+| `esun-bridge` | `unless-stopped` | 一啟動就登入玉山，重啟後要不要啟動由使用者決定 |
+
+原本三個都是 `unless-stopped`。Docker Desktop 正常關閉時會先停掉容器，`unless-stopped` 之後就不再啟動：2026-11-13 主機重開機與
+Docker Desktop 重啟各一次，整組服務都停著直到手動啟動。以同版本引擎（29.9.3）的巢狀 daemon 實測，`always` 在 8 次 daemon
+重啟後 web 與共用網路的 sidecar 都自動回復，`unless-stopped` 每次都停著。
+
+- Docker 重啟後 bridge 不會自己起來，需要時執行 `docker compose up -d esun-bridge`。前端會在背景重新探測（見上方
+  「bridge 或回報連線不穩時，前端怎麼處理」），bridge 起來後玉山帳戶自動出現。
+- `always` 的容器即使用 `docker compose stop` 停掉，下次 Docker 重啟也會再啟動；要讓它們保持停止請用 `docker compose down`。
 
 ### 建置版本
 
