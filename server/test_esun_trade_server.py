@@ -2169,13 +2169,13 @@ class TestWebSocketSupervisor(_BridgeCase):
         factory = RecordingFactory()
         bridge = self.make_bridge(sim, factory, auto_login=False)
         bridge.ws_backoff_initial = 0.05
-        bridge.ws_resync_open_wait = 0.1
         bridge.attempt_initial_login()
         sdk = factory.instances[0]
         events = bridge.sse_fanout.register()
         self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 1))
         orders_calls = sdk.orders_calls
         sdk.close_websocket()  # network drop: run_forever returns
+        # MockSDK has no open hook, so the attempt never "opened": the degraded refresh resyncs
         self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 2, timeout=3))
         self.assertTrue(_wait_until(lambda: sdk.orders_calls > orders_calls, timeout=8))
         resync = [e for e in _drain(events, timeout=1.0) if e["event"] == "resync"]
@@ -3930,15 +3930,14 @@ class TestWebSocketPatch(unittest.TestCase):
         activity: list[float] = []
         handler.bridge_open_hook = opened.set
         handler.bridge_activity_hook = lambda: activity.append(time.monotonic())
-        with mock.patch.object(bridge_module, "WS_PING_INTERVAL_SECONDS", 1), \
-                mock.patch.object(bridge_module, "WS_PING_TIMEOUT_SECONDS", 0.5):
+        with mock.patch.object(bridge_module, "WS_PING_INTERVAL_SECONDS", 1):
             worker = threading.Thread(target=handler.connect_websocket, args=(f"ws://127.0.0.1:{server.port}/",), daemon=True)
             worker.start()
             self.assertTrue(opened.wait(5), "on_open hook must fire")
             self.assertTrue(_wait_until(lambda: bool(activity), timeout=5), "pong must count as activity")
             self.assertGreaterEqual(server.pings, 1)
             handler.close_websocket()
-            worker.join(5)
+            worker.join(15)  # Linux: the WebSocket thread may only notice the close at its 10 s select timeout
         self.assertFalse(worker.is_alive(), "close_websocket must make run_forever return")
         self.assertTrue(server.closed_by_client.wait(2))
 
@@ -5874,6 +5873,601 @@ class TestSessionExpiryAndAutoRelogin(_BridgeCase):
 def _credential_material_of(config_path: str) -> bytes:
     cfg, _, _ = load_config(config_path)
     return bridge_module._credential_material(cfg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket keep-alive without ping_timeout, socket timeout, reconnect resync rules
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ScriptedWsServer:
+    """
+    Local multi-connection server; modes[n] drives connection n (the last one repeats):
+    "blackhole": accepts TCP, never reads or answers (stuck upgrade handshake).
+    "half_open": completes the upgrade, then never sends anything (reads and drops every frame).
+    "late_pong": completes the upgrade, ignores pings; pong_delay seconds after the first ping it
+                 sends one unsolicited pong, then records whether another ping follows.
+    "normal":    completes the upgrade, answers pings with pongs and close frames with close frames.
+    "stalled_frame": completes the upgrade, stays quiet for `quiet` seconds, sends the first 2 bytes of
+                 a text frame, waits `stall` seconds, sends the rest, then behaves like "normal".
+    """
+
+    STALLED_PAYLOAD = b"hello"
+
+    def __init__(self, modes, pong_delay: float = 0.0, quiet: float = 0.0, stall: float = 0.0):
+        import socket
+        self.modes = list(modes)
+        self.pong_delay = pong_delay
+        self.quiet = quiet
+        self.stall = stall
+        self.frame_completed = threading.Event()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.url = f"ws://127.0.0.1:{self.port}/"
+        self.lock = threading.Lock()
+        self.accepts = 0
+        self.pings = 0
+        self.conns: list = []
+        self.pong_sent = threading.Event()
+        self.ping_after_pong = threading.Event()
+        self.closed_by_client = threading.Event()
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        with self.lock:
+            conns = list(self.conns)
+        for conn in conns:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _accept_loop(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            with self.lock:
+                mode = self.modes[min(self.accepts, len(self.modes) - 1)]
+                self.accepts += 1
+                self.conns.append(conn)
+            if mode != "blackhole":
+                threading.Thread(target=self._serve, args=(conn, mode), daemon=True).start()
+
+    def _serve(self, conn, mode):
+        import base64
+        import hashlib
+        import re as _re
+        import struct
+        recv_exact = _MiniWsServer._recv_exact
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+            key = _re.search(rb"(?i)Sec-WebSocket-Key:\s*(\S+)", data).group(1)
+            accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+            if mode == "stalled_frame":
+                payload = self.STALLED_PAYLOAD
+                time.sleep(self.quiet)
+                conn.sendall(bytes([0x81, len(payload)]))  # frame header only: the frame stalls midway
+                time.sleep(self.stall)
+                conn.sendall(payload)
+                self.frame_completed.set()
+            while True:
+                head = recv_exact(conn, 2)
+                opcode, length = head[0] & 0x0F, head[1] & 0x7F
+                if length == 126:
+                    length = struct.unpack(">H", recv_exact(conn, 2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", recv_exact(conn, 8))[0]
+                mask = recv_exact(conn, 4) if head[1] & 0x80 else b""
+                payload = recv_exact(conn, length)
+                if mask:
+                    payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+                if opcode == 0x9:
+                    with self.lock:
+                        self.pings += 1
+                    if mode in ("normal", "stalled_frame"):
+                        conn.sendall(bytes([0x8A, len(payload)]) + payload)
+                    elif mode == "late_pong":
+                        if self.pong_sent.is_set():
+                            self.ping_after_pong.set()
+                        else:
+                            time.sleep(self.pong_delay)
+                            conn.sendall(b"\x8A\x00")  # unsolicited pong, long after the ping
+                            self.pong_sent.set()
+                elif opcode == 0x8:
+                    self.closed_by_client.set()
+                    if mode != "half_open":
+                        conn.sendall(b"\x88\x00")
+                        break
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+class RealWsSDK(MockSDK):
+    """MockSDK whose WebSocket is the patched esun_trade WebsocketHandler connecting to ws_url."""
+
+    ws_url = ""
+
+    def __init__(self, *args, **kwargs):
+        import esun_trade.websocket as esun_ws
+        super().__init__(*args, **kwargs)
+        self._SDK__wsHandler = esun_ws.WebsocketHandler()
+
+    def on(self, event_name: str):
+        def decorator(func):
+            self.callbacks[event_name] = func
+            self._SDK__wsHandler.set_callback(event_name, func)
+            return func
+        return decorator
+
+    def connect_websocket(self) -> None:
+        with self._ws_lock:
+            self.ws_connect_calls += 1
+        self._SDK__wsHandler.connect_websocket(self.ws_url)
+
+    def close_websocket(self) -> None:
+        with self._ws_lock:
+            self.ws_close_calls += 1
+        self._SDK__wsHandler.close_websocket()
+
+
+def _real_ws_sdk_cls(url: str) -> type:
+    return type("RealWsSDKFor", (RealWsSDK,), {"ws_url": url})
+
+
+def _quiet_ws_handler():
+    import esun_trade.websocket as esun_ws
+    handler = esun_ws.WebsocketHandler()
+    for name in ("order", "dealt", "error", "close"):
+        handler.set_callback(name, lambda *args: None)  # the SDK default prints on every callback
+    return handler
+
+
+class TestWebSocketKeepaliveAndTimeouts(_BridgeCase):
+    def test_constants_and_import_time_socket_timeout(self):
+        import websocket
+        self.assertFalse(hasattr(bridge_module, "WS_PING_TIMEOUT_SECONDS"))
+        self.assertFalse(hasattr(bridge_module, "WS_RESYNC_OPEN_WAIT_SECONDS"))
+        self.assertGreaterEqual(bridge_module.WS_SILENCE_SECONDS, 2 * bridge_module.WS_PING_INTERVAL_SECONDS + 15)
+        self.assertLess(bridge_module.WS_SOCKET_TIMEOUT_SECONDS, bridge_module.WS_SILENCE_SECONDS)
+        self.assertGreaterEqual(bridge_module.WS_OPEN_SOCKET_TIMEOUT_SECONDS, 2 * bridge_module.WS_PING_INTERVAL_SECONDS)
+        self.assertEqual(websocket.getdefaulttimeout(), bridge_module.WS_SOCKET_TIMEOUT_SECONDS)
+        self.assertEqual(bridge_module.WS_DOWN_REFRESH_SECONDS, 60.0)
+        self.assertLess(bridge_module.CACHE_FILL_WAIT_SECONDS, 15.0)  # frontend query timeout
+
+    def test_run_forever_gets_ping_interval_without_ping_timeout(self):
+        from websocket import WebSocketApp
+        handler = _quiet_ws_handler()
+        with mock.patch.object(WebSocketApp, "run_forever", autospec=True) as run_forever:
+            handler.connect_websocket("ws://127.0.0.1:9/")
+        run_forever.assert_called_once()
+        self.assertEqual(run_forever.call_args.kwargs, {"ping_interval": bridge_module.WS_PING_INTERVAL_SECONDS})
+
+    def test_late_unsolicited_pong_does_not_close_the_connection(self):
+        # E.SUN answers our pings, but each connection also gets an additional pong every 120 s. When it
+        # lands before our next ping is stamped it is more than ping_timeout after the last ping, and with
+        # ping_timeout set websocket-client treated it as "ping/pong timed out" and dropped the link. Here
+        # the server answers no ping at all, so its single pong is exactly such a late, extra pong.
+        server = _ScriptedWsServer(["late_pong"], pong_delay=0.7)
+        self.addCleanup(server.close)
+        handler = _quiet_ws_handler()
+        opened = threading.Event()
+        closed: list = []
+        handler.bridge_open_hook = opened.set
+        handler.set_callback("close", lambda *args: closed.append(args))
+        with mock.patch.object(bridge_module, "WS_PING_INTERVAL_SECONDS", 1):
+            worker = threading.Thread(target=handler.connect_websocket, args=(server.url,), daemon=True)
+            worker.start()
+            self.assertTrue(opened.wait(5))
+            self.assertTrue(server.pong_sent.wait(5))
+            # the next ping proves the client is still running after the late pong
+            self.assertTrue(server.ping_after_pong.wait(5))
+            self.assertTrue(worker.is_alive())
+            self.assertFalse(server.closed_by_client.is_set())
+            self.assertEqual(closed, [])
+            handler.close_websocket()
+            worker.join(15)  # Linux: the WebSocket thread may only notice the close at its 10 s select timeout
+        self.assertFalse(worker.is_alive())
+
+    def test_half_open_link_is_detected_by_silence_and_reconnected(self):
+        server = _ScriptedWsServer(["half_open", "normal"])
+        self.addCleanup(server.close)
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory(mock_cls=_real_ws_sdk_cls(server.url))
+        interval = mock.patch.object(bridge_module, "WS_PING_INTERVAL_SECONDS", 0.2)
+        interval.start()
+        self.addCleanup(interval.stop)
+        bridge = self.make_bridge(sim, factory, auto_login=False)
+        bridge.ws_backoff_initial = 0.05
+        bridge.ws_silence_seconds = 0.6
+        bridge.ws_watchdog_interval = 0.05
+        with self.assertLogs("esun_trade_server", "WARNING") as logs:
+            bridge.attempt_initial_login()
+            sdk = factory.instances[0]
+            # pings go out but nothing comes back; no library timeout closes the link, the watchdog does
+            self.assertTrue(_wait_until(lambda: server.pings >= 2, timeout=5))
+            # 20 s: on Linux the WebSocket thread may only notice the close at its next 10 s select timeout
+            self.assertTrue(_wait_until(lambda: server.accepts >= 2, timeout=20), "supervisor must reconnect")
+        self.assertGreaterEqual(sdk.ws_close_calls, 1)
+        self.assertTrue(any("無任何訊息" in line for line in logs.output), logs.output)
+
+    def test_handshake_timeout_does_not_apply_to_the_open_link(self):
+        # With the short handshake timeout left on the open socket, a frame stalled midway longer than it
+        # was cut with "Connection timed out". The open handler switches to the longer open-link timeout.
+        import websocket
+        previous = websocket.getdefaulttimeout()
+        websocket.setdefaulttimeout(0.5)
+        self.addCleanup(websocket.setdefaulttimeout, previous)
+        open_timeout = mock.patch.object(bridge_module, "WS_OPEN_SOCKET_TIMEOUT_SECONDS", 8.0)
+        open_timeout.start()
+        self.addCleanup(open_timeout.stop)
+        server = _ScriptedWsServer(["stalled_frame"], quiet=1.0, stall=1.5)
+        self.addCleanup(server.close)
+        handler = _quiet_ws_handler()
+        timeouts: list = []
+        opened = threading.Event()
+        messages = threading.Event()
+        problems: list = []
+
+        def _open_hook():
+            timeouts.append(handler.bridge_ws_app.sock.gettimeout())
+            opened.set()
+
+        handler.bridge_open_hook = _open_hook
+        handler.bridge_activity_hook = messages.set  # only messages here: no pings are sent
+        handler.set_callback("error", lambda *args: problems.append(("error", args)))
+        handler.set_callback("close", lambda *args: problems.append(("close", args)))
+        with mock.patch.object(bridge_module, "WS_PING_INTERVAL_SECONDS", 0):  # a fully quiet link
+            worker = threading.Thread(target=handler.connect_websocket, args=(server.url,), daemon=True)
+            worker.start()
+            self.assertTrue(opened.wait(5), "on_open hook must fire")
+            self.assertEqual(timeouts, [8.0])  # switched before the bridge open hook runs
+            # quiet for 1 s, then a frame stalled for 1.5 s: both beyond the 0.5 s handshake timeout
+            self.assertTrue(server.frame_completed.wait(5))
+            self.assertTrue(messages.wait(5), "the stalled frame must still be delivered")
+            self.assertTrue(worker.is_alive())
+            self.assertFalse(server.closed_by_client.is_set())
+            self.assertEqual(problems, [])
+            handler.close_websocket()
+            worker.join(15)  # Linux: the WebSocket thread may only notice the close at its 10 s select timeout
+        self.assertFalse(worker.is_alive())
+
+    def test_frame_stalled_on_a_dead_link_is_cut_by_the_open_timeout_and_reconnected(self):
+        # A frame header arrives and the rest never does (dead link, no FIN). The reader would block in
+        # recv() forever while holding websocket-client's frame lock, and the watchdog's close() waits for
+        # that lock; the open-link socket timeout ends the read so the supervisor can reconnect.
+        server = _ScriptedWsServer(["stalled_frame", "normal"], quiet=0.2, stall=60.0)
+        self.addCleanup(server.close)
+        open_timeout = mock.patch.object(bridge_module, "WS_OPEN_SOCKET_TIMEOUT_SECONDS", 0.5)
+        open_timeout.start()
+        self.addCleanup(open_timeout.stop)
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory(mock_cls=_real_ws_sdk_cls(server.url))
+        bridge = self.make_bridge(sim, factory, auto_login=False)
+        bridge.ws_backoff_initial = 0.05
+        bridge.ws_silence_seconds = 600.0  # the watchdog must not be what ends this link
+        with self.assertLogs("esun_trade_server", "WARNING") as logs:
+            bridge.attempt_initial_login()
+            self.assertTrue(_wait_until(lambda: server.accepts >= 2, timeout=20), "supervisor must reconnect")
+        self.assertTrue(any("timed out" in line for line in logs.output), logs.output)
+        self.assertFalse(any("無任何訊息" in line for line in logs.output), logs.output)
+
+    def test_handshake_blackhole_ends_after_the_socket_timeout_and_is_retried(self):
+        import websocket
+        previous = websocket.getdefaulttimeout()
+        websocket.setdefaulttimeout(0.3)
+        self.addCleanup(websocket.setdefaulttimeout, previous)
+        server = _ScriptedWsServer(["blackhole"])
+        self.addCleanup(server.close)
+
+        handler = _quiet_ws_handler()
+        worker = threading.Thread(target=handler.connect_websocket, args=(server.url,), daemon=True)
+        started = time.monotonic()
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), "a stuck upgrade must end after the socket timeout")
+        self.assertLess(time.monotonic() - started, 3.0)
+
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        factory = RecordingFactory(mock_cls=_real_ws_sdk_cls(server.url))
+        bridge = self.make_bridge(sim, factory, auto_login=False)
+        bridge.ws_backoff_initial = 0.05
+        bridge.ws_backoff_max = 0.1
+        accepted = server.accepts
+        with self.assertLogs("esun_trade_server", "WARNING"):
+            bridge.attempt_initial_login()
+            self.assertTrue(_wait_until(lambda: server.accepts >= accepted + 3, timeout=8), "supervisor must retry")
+
+
+class ScriptedOpenSDK(MockSDK):
+    """
+    MockSDK with a websocket handler; attempt n follows plan[n] (the last entry repeats; the plan starts
+    as initial_plan):
+    "open" fires the open hook on the connecting thread, then blocks until close_websocket();
+    "fail" raises without opening; a threading.Event delays the open until it is set.
+    `trace` records "open" / "orders" in the order they happen.
+    """
+
+    initial_plan: tuple = ("open",)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._SDK__wsHandler = type("Handler", (), {})()
+        self.plan: list = list(self.initial_plan)
+        self.trace: list[str] = []
+        self.trace_lock = threading.Lock()
+
+    def _record(self, item: str) -> None:
+        with self.trace_lock:
+            self.trace.append(item)
+
+    def trace_copy(self) -> list[str]:
+        with self.trace_lock:
+            return list(self.trace)
+
+    def connect_websocket(self) -> None:
+        ev = threading.Event()
+        with self._ws_lock:
+            step = self.plan[min(self.ws_connect_calls, len(self.plan) - 1)]
+            self.ws_connect_calls += 1
+            if step == "fail":
+                raise ConnectionRefusedError("refused")
+            self._ws_events.append(ev)
+            self.ws_connected = True
+        try:
+            if isinstance(step, threading.Event):
+                while not step.wait(0.02):
+                    if ev.is_set():
+                        return  # closed before it opened
+            self._record("open")
+            hook = getattr(self._SDK__wsHandler, "bridge_open_hook", None)
+            if hook is not None:
+                hook()
+            ev.wait()
+        finally:
+            with self._ws_lock:
+                if ev in self._ws_events:
+                    self._ws_events.remove(ev)
+                self.ws_connected = bool(self._ws_events)
+
+    def get_order_results(self) -> list[dict]:
+        self._record("orders")
+        return super().get_order_results()
+
+
+def _resyncs(q, count: int, timeout: float = 3.0, settle: float = 0.3) -> list[dict]:
+    """Collects resync payloads until `count` arrived (or timeout), then for `settle` more seconds."""
+    got: list[dict] = []
+    deadline = time.monotonic() + timeout
+    while len(got) < count and time.monotonic() < deadline:
+        got += [e["data"] for e in _drain(q, timeout=0.05) if e["event"] == "resync"]
+    got += [e["data"] for e in _drain(q, timeout=settle) if e["event"] == "resync"]
+    return got
+
+
+class TestWebSocketResyncRules(_BridgeCase):
+    def setUp(self):
+        super().setUp()
+        interval = mock.patch.object(bridge_module, "ORDERS_REFRESH_MIN_INTERVAL_SECONDS", 0.05)
+        interval.start()
+        self.addCleanup(interval.stop)
+        sim = _write_profile(self.dir, "esun-config.simulation.ini", "SIMULATION")
+        self.factory = RecordingFactory(mock_cls=ScriptedOpenSDK)
+        self.bridge = self.make_bridge(sim, self.factory, auto_login=False)
+        self.bridge.ws_backoff_initial = 0.01
+        self.bridge.ws_backoff_max = 0.02
+        self.events = self.bridge.sse_fanout.register()
+
+    def _login_and_open(self, plan: list) -> ScriptedOpenSDK:
+        self.bridge.attempt_initial_login()
+        sdk = self.factory.instances[0]
+        sdk.plan[1:] = plan
+        self.assertTrue(_wait_until(lambda: "open" in sdk.trace_copy()))
+        self.assertTrue(_wait_until(lambda: "orders" in sdk.trace_copy()))  # login bootstrap
+        return sdk
+
+    def test_first_connection_has_no_resync_and_a_reopen_has_exactly_one_after_the_open(self):
+        sdk = self._login_and_open(["open"])
+        self.assertEqual(_resyncs(self.events, 0), [])  # first connection of the runtime
+        data, status = self.bridge.get_inventories()
+        self.assertEqual(status, 200)
+        inventories = sdk.inventories_calls
+        self.bridge.get_inventories()
+        self.assertEqual(sdk.inventories_calls, inventories)  # cached
+        mark = len(sdk.trace_copy())
+
+        sdk.close_websocket()  # an opened connection drops; the next attempt opens
+        resyncs = _resyncs(self.events, 1)
+        self.assertEqual(len(resyncs), 1, resyncs)  # no degraded refresh for the attempt that had opened
+        self.assertEqual(set(resyncs[0]), {"reason", "generation", "cacheRefreshed", "ts"})
+        self.assertEqual((resyncs[0]["reason"], resyncs[0]["generation"], resyncs[0]["cacheRefreshed"]),
+                         ("ws_reconnected", self.bridge.session.generation, True))
+        after = sdk.trace_copy()[mark:]
+        self.assertEqual(after[0], "open")
+        self.assertIn("orders", after)  # the snapshot started after the open
+        self.bridge.get_inventories()
+        self.assertEqual(sdk.inventories_calls, inventories + 1)  # positions marked dirty by the resync
+
+    def test_slow_open_still_resyncs_after_the_open(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        sdk = self._login_and_open([gate])
+        mark = len(sdk.trace_copy())
+        sdk.close_websocket()
+        self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls == 2))
+        # still connecting: no resync and no query yet (the old 5 s wait would have queried before the open)
+        self.assertEqual(_resyncs(self.events, 0, settle=0.3), [])
+        self.assertNotIn("orders", sdk.trace_copy()[mark:])
+        gate.set()
+        resyncs = _resyncs(self.events, 1)
+        self.assertEqual([r["reason"] for r in resyncs], ["ws_reconnected"])
+        after = sdk.trace_copy()[mark:]
+        self.assertEqual(after[0], "open")
+        self.assertIn("orders", after)
+
+    def test_first_open_after_failed_attempts_resyncs_after_the_open(self):
+        # the runtime's first attempt fails, the second opens: reports may have been missed between the
+        # degraded refresh (end of the failed attempt) and the open, so the open resyncs too
+        self.factory.mock_cls = type("FailThenOpenSDK", (ScriptedOpenSDK,), {"initial_plan": ("fail", "open")})
+        with self.assertLogs("esun_trade_server", "INFO") as logs:
+            self.bridge.attempt_initial_login()
+            sdk = self.factory.instances[0]
+            self.assertTrue(_wait_until(lambda: "open" in sdk.trace_copy()))
+            resyncs = _resyncs(self.events, 2)
+
+            def orders_after_open() -> int:
+                trace = sdk.trace_copy()
+                return trace[trace.index("open"):].count("orders")
+
+            self.assertTrue(_wait_until(lambda: orders_after_open() >= 1))
+        self.assertEqual(sdk.ws_connect_calls, 2)
+        self.assertEqual([r["reason"] for r in resyncs], ["ws_reconnected", "ws_reconnected"])
+        degraded = [line for line in logs.output if "尚未重新連上" in line]
+        reopened = [line for line in logs.output if "已重新連上" in line]
+        self.assertEqual((len(degraded), len(reopened)), (1, 1), logs.output)
+        trace = sdk.trace_copy()
+        self.assertEqual(trace.count("open"), 1, trace)
+        # the post-open resync only shares or starts a query that begins after its own arrival (after the
+        # open); the degraded refresh may share that same query, so 2 or 3 order queries in total
+        self.assertGreaterEqual(orders_after_open(), 1, trace)
+        self.assertIn(trace.count("orders"), (2, 3), trace)
+        self.assertEqual(_resyncs(self.events, 0, settle=0.2), [])  # nothing more while it stays open
+
+    def test_failed_attempts_refresh_at_most_once_per_interval(self):
+        with self.assertLogs("esun_trade_server", "WARNING"):
+            sdk = self._login_and_open(["fail"])
+            self.bridge.positions_cache._dirty = False
+            orders_before = sdk.trace_copy().count("orders")
+            sdk.close_websocket()
+            self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls >= 6, timeout=5))
+            resyncs = _resyncs(self.events, 1)
+            self.assertEqual([r["reason"] for r in resyncs], ["ws_reconnected"])  # same contract
+            self.assertTrue(_wait_until(lambda: sdk.trace_copy().count("orders") == orders_before + 1))
+            self.assertTrue(self.bridge.positions_cache._dirty)
+            attempts = sdk.ws_connect_calls
+            self.assertTrue(_wait_until(lambda: sdk.ws_connect_calls >= attempts + 5, timeout=5))
+            self.assertEqual(_resyncs(self.events, 0, settle=0.2), [])  # within WS_DOWN_REFRESH_SECONDS
+            self.assertEqual(sdk.trace_copy().count("orders"), orders_before + 1)
+
+            runtime = self.bridge._ws_runtime
+            with runtime.lock:  # the interval has elapsed
+                runtime.last_down_refresh -= self.bridge.ws_down_refresh_seconds
+            resyncs = _resyncs(self.events, 1)
+            self.assertEqual(len(resyncs), 1, resyncs)
+            self.assertTrue(_wait_until(lambda: sdk.trace_copy().count("orders") == orders_before + 2))
+
+
+class TestAccessLogAndClientDisconnect(unittest.TestCase):
+    class _FailingWriter:
+        def __init__(self, exc_type):
+            self.exc_type = exc_type
+
+        def write(self, data):
+            raise self.exc_type("client went away")
+
+        def flush(self):
+            pass
+
+    def _handler(self, path: str, wfile, bridge=None) -> EsunHTTPRequestHandler:
+        import email.message
+        handler = EsunHTTPRequestHandler.__new__(EsunHTTPRequestHandler)
+        handler.command = "GET"
+        handler.path = path
+        handler.request_version = "HTTP/1.1"
+        handler.requestline = f"GET {path} HTTP/1.1"
+        handler.client_address = ("127.0.0.1", 50000)
+        handler.close_connection = False
+        handler.wfile = wfile
+        headers = email.message.Message()
+        headers["Host"] = "127.0.0.1"
+        handler.headers = headers
+        handler.access_policy = AccessPolicy()
+        handler.bridge = bridge
+        handler.log_message = mock.Mock()
+        return handler
+
+    @staticmethod
+    def _logged_lines(handler) -> list[str]:
+        return [call.args[0] % call.args[1:] for call in handler.log_message.call_args_list]
+
+    def test_successful_livez_is_not_access_logged(self):
+        for path, code, logged in (
+            ("/esun/livez", 200, False),
+            ("/esun/livez/", 204, False),
+            ("/esun/livez", 503, True),
+            ("/esun/livez", 404, True),
+            ("/esun/health", 200, True),
+            ("/esun/orders?person_id=A123", 200, True),
+        ):
+            handler = self._handler(path, io.BytesIO())
+            handler.log_request(code)
+            self.assertEqual(handler.log_message.called, logged, (path, code))
+        self.assertNotIn("person_id", " ".join(self._logged_lines(handler)))
+
+    def test_livez_over_http_is_quiet_and_other_routes_are_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sim = _write_profile(tmp, "esun-config.simulation.ini", "SIMULATION")
+            with mock.patch.dict(os.environ, {"ESUN_ACCOUNT_PASSWORD": "pw", "ESUN_CERT_PASSWORD": "cpw",
+                                              "ESUN_STATE_DIR": tmp}):
+                bridge = EsunTradeBridge(config_path=sim, sdk_factory=lambda cfg: MockSDK(cfg), auto_login=False)
+            server = create_server(host="127.0.0.1", port=0, bridge=bridge, access_policy=AccessPolicy())
+            port = server.server_address[1]
+            _serve(server)
+            try:
+                with mock.patch.object(EsunHTTPRequestHandler, "log_message") as log_message:
+                    self.assertEqual(_raw_request(port, "GET", "/esun/livez")[0], 200)
+                    self.assertEqual(_raw_request(port, "GET", "/esun/no-such-route")[0], 404)
+                lines = [call.args[0] % call.args[1:] for call in log_message.call_args_list]
+                self.assertFalse([line for line in lines if "/esun/livez" in line], lines)
+                self.assertTrue([line for line in lines if "/esun/no-such-route" in line and "404" in line], lines)
+            finally:
+                server.shutdown()
+                server.server_close()
+                bridge.shutdown()
+
+    def test_client_disconnect_during_response_write_is_not_an_internal_error(self):
+        bridge = mock.Mock()
+        bridge.get_config_profiles.return_value = {"ok": True, "profiles": []}
+        for exc_type in (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            handler = self._handler("/esun/config-profiles?x=secret", self._FailingWriter(exc_type), bridge)
+            with self.assertLogs("esun_trade_server", "INFO") as logs:
+                handler.do_GET()  # must not raise
+            output = "\n".join(logs.output)
+            self.assertNotIn("內部錯誤", output)
+            self.assertEqual([line for line in logs.output if "ERROR" in line], [])
+            self.assertIn("GET /esun/config-profiles 200", output)
+            self.assertNotIn("secret", output)
+            self.assertTrue(handler.close_connection)
+            self.assertFalse([line for line in self._logged_lines(handler) if " 500 " in line])
+
+    def test_genuine_handler_exception_still_answers_internal_error(self):
+        bridge = mock.Mock()
+        bridge.get_config_profiles.side_effect = RuntimeError("boom")
+        wfile = io.BytesIO()
+        handler = self._handler("/esun/config-profiles", wfile, bridge)
+        with self.assertLogs("esun_trade_server", "ERROR") as logs:
+            handler.do_GET()
+        self.assertIn("內部錯誤", "\n".join(logs.output))
+        self.assertIn(b" 500 ", wfile.getvalue().splitlines()[0])  # status line
+        self.assertTrue([line for line in self._logged_lines(handler) if " 500 " in line])
 
 
 if __name__ == "__main__":
