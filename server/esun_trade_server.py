@@ -256,20 +256,40 @@ apply_headless_keyring_patches()
 if ESUN_SDK_VERSION and not ESUN_SDK_VERSION.startswith(SUPPORTED_SDK_VERSION_PREFIXES):
     logger.warning(f"esun_trade {ESUN_SDK_VERSION} 未經驗證（已驗證：{', '.join(SUPPORTED_SDK_VERSION_PREFIXES)}x）")
 
+# Client pings keep NAT / proxy mappings alive, and E.SUN's pongs answering them are the activity the
+# silence watchdog sees on a quiet link. No ping_timeout is passed to run_forever (see
+# _bridge_connect_websocket): half-open links are detected by the bridge's silence watchdog
+# (WS_SILENCE_SECONDS, which must cover two ping intervals; asserted next to it).
 WS_PING_INTERVAL_SECONDS = 30
-WS_PING_TIMEOUT_SECONDS = 10
+# websocket-client socket timeout for the connection handshake only (TCP connect + TLS + HTTP upgrade).
+# With the library default None, a server that accepts TCP but never answers the upgrade blocks
+# run_forever forever and app.close() cannot unblock it. Must stay below WS_SILENCE_SECONDS.
+WS_SOCKET_TIMEOUT_SECONDS = 20
+# Socket timeout once the link is open (applied by the open handler). A quiet link waits in select()
+# and never reaches it; it only bounds a read that has started and then stalls (a frame cut off midway
+# on a dead link). Without a bound that read blocks forever while holding websocket-client's frame
+# lock, and the watchdog's close() then waits for the same lock, so nothing could reconnect. It must be
+# at least two ping intervals: on a healthy link the pong answering our next ping completes any pending
+# read, so a shorter value could cut a slow but live frame (asserted next to WS_SILENCE_SECONDS).
+WS_OPEN_SOCKET_TIMEOUT_SECONDS = 75
 
 
 def apply_websocket_patches() -> bool:
     """
     Replaces esun_trade.websocket.WebsocketHandler.connect_websocket so the bridge can
     (1) keep a handle on the WebSocketApp and close it on session switch, silence or shutdown,
-    (2) run websocket-client ping/pong keep-alive (detects half-open TCP connections), and
-    (3) observe open / message / ping / pong activity for silence detection.
-    Also adds SDK.close_websocket(). Returns True when the patch is active.
+    (2) send keep-alive pings every WS_PING_INTERVAL_SECONDS without websocket-client's ping_timeout
+        check (half-open links are detected by the bridge's silence watchdog instead), and
+    (3) observe open / message / ping / pong activity, which feeds that watchdog.
+    It also sets websocket-client's default socket timeout (WS_SOCKET_TIMEOUT_SECONDS) so a stuck
+    handshake (TCP connect + TLS + HTTP upgrade) ends the attempt; once the link is open the socket
+    gets WS_OPEN_SOCKET_TIMEOUT_SECONDS instead, which only bounds a read that stalls midway (a quiet
+    link waits in select() and is unaffected). Also adds SDK.close_websocket().
+    Returns True when the patch is active.
     """
     try:
         import esun_trade.websocket as esun_ws
+        import websocket as websocket_client
         from websocket import WebSocketApp
     except ImportError:
         return False
@@ -289,6 +309,13 @@ def apply_websocket_patches() -> bool:
 
     def _bridge_connect_websocket(self: any, url_entry: str) -> None:
         def _on_open(ws: any) -> None:
+            # The short default socket timeout only bounds the handshake. The open link gets a longer
+            # read bound (see WS_OPEN_SOCKET_TIMEOUT_SECONDS): long enough for a slow but live frame,
+            # finite so a read stuck on a dead link cannot block the reader and close() forever.
+            try:
+                ws.sock.settimeout(WS_OPEN_SOCKET_TIMEOUT_SECONDS)
+            except Exception:
+                logger.debug("WebSocket socket timeout change failed", exc_info=True)
             _call_hook(self, "bridge_open_hook")
 
         def _on_message(ws: any, message: any) -> None:
@@ -312,7 +339,13 @@ def apply_websocket_patches() -> bool:
         )
         self._WebsocketHandler__ws = app
         self.bridge_ws_app = app
-        app.run_forever(ping_interval=WS_PING_INTERVAL_SECONDS, ping_timeout=WS_PING_TIMEOUT_SECONDS)
+        # Do NOT reintroduce ping_timeout: websocket-client (1.9.x) raises "ping/pong timed out" as soon
+        # as ANY pong arrives more than ping_timeout after the last ping. E.SUN does answer our pings
+        # (with ping_timeout=10 an unanswered ping would have dropped every link ~40 s after the open;
+        # production links lived exactly 120 / 240 / 360 s and the silence watchdog never fired), but each
+        # connection also gets an ADDITIONAL pong every 120 s. When that pong lands before our next ping
+        # is stamped it is more than ping_timeout after the last ping, which killed healthy connections.
+        app.run_forever(ping_interval=WS_PING_INTERVAL_SECONDS)
 
     def _bridge_close_websocket(self: any) -> None:
         app = getattr(self, "bridge_ws_app", None)
@@ -322,6 +355,8 @@ def apply_websocket_patches() -> bool:
     handler_cls.connect_websocket = _bridge_connect_websocket
     handler_cls.close_websocket = _bridge_close_websocket
     handler_cls._esun_bridge_patched = True
+    # Process-wide for websocket-client sockets only (the SDK's HTTP calls do not use this module).
+    websocket_client.setdefaulttimeout(WS_SOCKET_TIMEOUT_SECONDS)
 
     try:
         import esun_trade.sdk as esun_sdk
@@ -341,7 +376,10 @@ def apply_websocket_patches() -> bool:
 
 WS_PATCH_ACTIVE = apply_websocket_patches()
 if ESUN_SDK_VERSION and not WS_PATCH_ACTIVE:
-    logger.warning("WebSocket keep-alive patch 未生效：無法主動關閉舊連線，ping/pong 斷線偵測停用（僅剩靜默偵測）")
+    logger.warning(
+        "WebSocket patch 未生效：無法主動關閉連線（靜默偵測只能記錄、無法強制重連）、不送 keep-alive ping、"
+        "握手無逾時，且偵測不到重新連上（僅未連上的嘗試會補查委託）"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2050,13 +2088,29 @@ ORDER_MUTATION_REFRESH_BUDGET_SECONDS = 8.0  # a mutation waits for a shared que
 MUTATION_QUIET_SECONDS = 10.0
 SWITCH_SWAP_DRAIN_SECONDS = 15.0
 MUTATION_SEND_DEADLINE_SECONDS = 10.0  # no SDK mutation call this long after arrival (client gives up at 15 s)
-CACHE_FILL_WAIT_SECONDS = 20.0
+# A caller queued behind another caller's fill of the same cache gets 503 ESUN_BUSY after this long.
+# Must stay below the frontend query timeout (15 s) so the client is still waiting for that answer.
+CACHE_FILL_WAIT_SECONDS = 12.0
+# No message / ping / pong for this long = dead (half-open) connection: the watchdog closes it and the
+# supervisor reconnects. The watchdog relies on E.SUN's pongs answering our WS_PING_INTERVAL_SECONDS
+# (30 s) pings: on a healthy but quiet link they are the only activity. Do not remove or lengthen the
+# ping interval without revisiting this threshold. Must cover two ping intervals plus margin, and stay
+# above the handshake socket timeout so a stuck handshake ends by that timeout first.
 WS_SILENCE_SECONDS = 90.0
+assert WS_SILENCE_SECONDS >= 2 * WS_PING_INTERVAL_SECONDS + 15, (
+    "WS_SILENCE_SECONDS must be >= 2 * WS_PING_INTERVAL_SECONDS + 15 (silence watchdog replaces ping_timeout)"
+)
+assert WS_SOCKET_TIMEOUT_SECONDS < WS_SILENCE_SECONDS, "WS_SOCKET_TIMEOUT_SECONDS must stay below WS_SILENCE_SECONDS"
+assert WS_OPEN_SOCKET_TIMEOUT_SECONDS >= 2 * WS_PING_INTERVAL_SECONDS, (
+    "WS_OPEN_SOCKET_TIMEOUT_SECONDS must be >= 2 * WS_PING_INTERVAL_SECONDS (a pong completes a pending read)"
+)
 WS_WATCHDOG_INTERVAL_SECONDS = 5.0
 WS_BACKOFF_INITIAL_SECONDS = 1.0
 WS_BACKOFF_MAX_SECONDS = 60.0
 WS_STABLE_SECONDS = 60.0
-WS_RESYNC_OPEN_WAIT_SECONDS = 5.0
+# A reconnect attempt that never opens refreshes the order cache (and asks clients to resync) at most
+# once per this many seconds per WebSocket runtime; the first failed attempt after a disconnect qualifies.
+WS_DOWN_REFRESH_SECONDS = 60.0
 # Session expiry (E.SUN invalidates the login token at the Taipei day change) and automatic re-login:
 # only a day-change expiry is re-logged automatically. First attempt at max(detection + 2 s,
 # today NOT_BEFORE) + 0..JITTER s, then retries (network failures that never reached the server and
@@ -2761,13 +2815,15 @@ class _WsRuntime:
     def __init__(self, generation: int):
         self.generation = generation
         self.stop_event = threading.Event()
-        self.opened_event = threading.Event()
         self.lock = threading.Lock()
         self.connected = False
         self.last_activity = time.monotonic()
         self.last_message_at: str | None = None
         self.reconnects = 0
         self.connect_attempts = 0
+        self.opens = 0  # successful opens (open hook) during this runtime
+        self.attempt_opened = False  # the current / last connect attempt has opened
+        self.last_down_refresh: float | None = None  # monotonic time of the last degraded refresh
         self.thread: threading.Thread | None = None
         self.watchdog: threading.Thread | None = None
 
@@ -2781,23 +2837,47 @@ class _WsRuntime:
             self.last_message_at = taipei_now().isoformat(timespec="seconds")
             self.connected = True
 
-    def note_open(self) -> None:
+    def note_open(self) -> bool:
+        """
+        Records the current attempt's open. True (= resync after the open) unless this is the runtime's
+        first connection attempt: a re-open, or a first open that came after failed attempts (reports
+        may have been missed between the degraded refresh and this open).
+        """
         with self.lock:
             self.connected = True
             self.last_activity = time.monotonic()
-        self.opened_event.set()
+            if self.attempt_opened:
+                return False  # one open per attempt
+            self.attempt_opened = True
+            self.opens += 1
+            # a later attempt that fails is the first one after this disconnect: refresh at once
+            self.last_down_refresh = None
+            return self.opens > 1 or self.connect_attempts > 1
 
     def note_connecting(self) -> None:
         with self.lock:
             self.connected = True  # optimistic until connect_websocket() returns
             self.last_activity = time.monotonic()
             self.connect_attempts += 1
-        self.opened_event.clear()
+            self.attempt_opened = False
 
     def note_closed(self) -> None:
         with self.lock:
             self.connected = False
-        self.opened_event.clear()
+
+    def claim_down_refresh(self, interval: float) -> bool:
+        """
+        Called when an attempt ended: True (and the window is taken) when it never opened and no
+        degraded refresh ran within `interval` seconds.
+        """
+        with self.lock:
+            if self.attempt_opened:
+                return False
+            now = time.monotonic()
+            if self.last_down_refresh is not None and now - self.last_down_refresh < interval:
+                return False
+            self.last_down_refresh = now
+            return True
 
     def silence(self) -> tuple[bool, float]:
         with self.lock:
@@ -2867,7 +2947,7 @@ class EsunTradeBridge:
         self.ws_backoff_max = WS_BACKOFF_MAX_SECONDS
         self.ws_silence_seconds = WS_SILENCE_SECONDS
         self.ws_watchdog_interval = WS_WATCHDOG_INTERVAL_SECONDS
-        self.ws_resync_open_wait = WS_RESYNC_OPEN_WAIT_SECONDS
+        self.ws_down_refresh_seconds = WS_DOWN_REFRESH_SECONDS
 
         self._state_lock = threading.RLock()  # guards the session pointer + cache resets
         self._session_change_lock = threading.Lock()  # serializes logins / switches
@@ -3998,10 +4078,12 @@ class EsunTradeBridge:
         handler = getattr(sdk, "_SDK__wsHandler", None)
         if handler is not None:
             def _open_hook() -> None:
+                # Runs on the WebSocket thread: never block here or call the SDK (except closing).
                 if runtime.stop_event.is_set():
                     self._close_sdk_websocket(sdk)
                     return
-                runtime.note_open()
+                if runtime.note_open():
+                    self._start_ws_resync(session, runtime, degraded=False)
 
             try:
                 handler.bridge_open_hook = _open_hook
@@ -4035,18 +4117,10 @@ class EsunTradeBridge:
     def _ws_supervisor(self, session: EsunSession, runtime: _WsRuntime) -> None:
         """Keeps the session's WebSocket connected: exponential backoff (capped) with jitter."""
         backoff = self.ws_backoff_initial
-        first = True
         while self._ws_should_run(session, runtime):
-            # Clears the previous connection's opened flag BEFORE the resync thread waits on it,
-            # so the resync snapshot is taken after this new connection opens.
+            # Resync after a reconnect: a re-open starts it from the open hook (snapshot after the open);
+            # an attempt that never opened refreshes in degraded mode below (rate limited).
             runtime.note_connecting()
-            if not first:
-                threading.Thread(
-                    target=self._ws_resync_after_reconnect,
-                    args=(session, runtime),
-                    daemon=True,
-                    name=f"EsunWSResync-g{session.generation}",
-                ).start()
             started = time.monotonic()
             try:
                 session.sdk.connect_websocket()
@@ -4054,9 +4128,10 @@ class EsunTradeBridge:
                 logger.warning(f"[WebSocket] 連線失敗或中斷（g{session.generation}）：{redact(e)}")
                 self._note_ws_failure(session, e)
             runtime.note_closed()
-            first = False
             if not self._ws_should_run(session, runtime):
                 break
+            if runtime.claim_down_refresh(self.ws_down_refresh_seconds):
+                self._start_ws_resync(session, runtime, degraded=True)
             if time.monotonic() - started >= WS_STABLE_SECONDS:
                 backoff = self.ws_backoff_initial
             delay = min(backoff, self.ws_backoff_max)
@@ -4081,13 +4156,31 @@ class EsunTradeBridge:
                 runtime.note_closed()
                 self._close_sdk_websocket(session.sdk)
 
-    def _ws_resync_after_reconnect(self, session: EsunSession, runtime: _WsRuntime) -> None:
-        """After a reconnect, re-read orders (events may have been missed) and ask clients to resync."""
-        runtime.opened_event.wait(timeout=self.ws_resync_open_wait)
+    def _start_ws_resync(self, session: EsunSession, runtime: _WsRuntime, degraded: bool) -> None:
+        threading.Thread(
+            target=self._ws_resync,
+            args=(session, runtime, degraded),
+            daemon=True,
+            name=f"EsunWSResync-g{session.generation}",
+        ).start()
+
+    def _ws_resync(self, session: EsunSession, runtime: _WsRuntime, degraded: bool) -> None:
+        """
+        Re-reads orders (events may have been missed while disconnected) and asks clients to resync.
+        degraded=False: started by a re-open, so the snapshot is taken after the socket is open.
+        degraded=True: an attempt that never opened (keeps the order cache fresh during an outage).
+        Both publish the same "resync" event (reason "ws_reconnected").
+        """
         if not self._ws_should_run(session, runtime):
             return
+        if degraded:
+            logger.info(f"[WebSocket] 尚未重新連上，改以查詢補齊委託（g{session.generation}）")
+        else:
+            logger.info(f"[WebSocket] 已重新連上，查詢補齊委託（g{session.generation}）")
         refreshed = self._bootstrap_orders(session)
         if self._is_current(session.generation):
+            # fills may have been missed while the socket was down: the next positions read goes upstream
+            self.positions_cache.mark_dirty()
             self.sse_fanout.publish("resync", {
                 "reason": "ws_reconnected",
                 "generation": session.generation,
@@ -5699,6 +5792,13 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
         """Logs method and path only: query strings may carry identifiers (e.g. person_id)."""
         code_val = getattr(code, "value", code)
         path = urlsplit(self.path or "").path or "-"
+        if path.rstrip("/") == "/esun/livez":
+            # container health checks poll this every few seconds: log only failures
+            try:
+                if int(code_val) < 400:
+                    return
+            except (TypeError, ValueError):
+                pass
         self.log_message('"%s %s" %s %s', self.command, path, str(code_val), str(size))
 
     def _policy(self) -> AccessPolicy:
@@ -5726,8 +5826,18 @@ class EsunHTTPRequestHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         for key, value in (headers or {}).items():
             self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.end_headers()  # writes the buffered status line and headers
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The client went away (closed tab, timeout): not a server error, nothing left to answer.
+            self.close_connection = True
+            logger.info(
+                "用戶端已中斷連線，回應未送達：%s %s %s",
+                self.command,
+                urlsplit(self.path or "").path or "-",
+                status_code,
+            )
 
     @staticmethod
     def _retry_headers(data: any) -> dict[str, str] | None:

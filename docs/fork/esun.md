@@ -209,6 +209,7 @@ Linux 主機請確認設定檔與 `certs/esun_cert.p12` 對其他使用者可讀
 | 登入頻率（`AGR0000`） | 每分鐘 10 次 | 滑動視窗限流；觸發後冷卻 60 秒 |
 | 每日登入（`AGR0004`） | 每日 300 次 | 每日累計計數 |
 | 登入 token 換日失效 | 台北換日後舊登入失效（WebSocket 1011 `Token Validation Error`、SDK `A0000x: response parse Error`） | 判定依「登入開始時間」（`client.login()` 前記錄）：早於「今日 00:00 ＋ `ESUN_AUTO_RELOGIN_NOT_BEFORE`（預設 00:05）」的 session 視為換日前 session（含 23:59:59 開始、午夜後才完成，以及 00:00–00:05 間完成的登入）。換日前 session 收到 WebSocket token 錯誤或 SDK 回應解析失敗時判定失效；之後才登入的 session 收到 token 錯誤屬「日間失效」（可能在其他地方重新登入），**不自動重新登入**，health 要求手動重連，以免踢掉其他工具的登入。失效後 health 改回 `loggedIn: false`、`sessionExpired: true`；委託在呼叫 SDK 前即以 503 `ESUN_SESSION_EXPIRED`（`not_sent`）拒絕，查詢回 503；舊 WebSocket 停止重連；已在 SDK 呼叫中的委託維持 `accepted`／`unknown`。換日型失效自動重新登入（`ESUN_AUTO_RELOGIN=0` 可停用）：第一次在 max(偵測＋2 秒, 今日 00:05) ＋ 0–60 秒隨機延遲（`ESUN_AUTO_RELOGIN_JITTER_SECONDS`）；只有明確未送出的網路失敗（DNS、connection refused、unreachable）與 AGR0000（至少等完冷卻）依 2／5／10 分鐘重試（`ESUN_AUTO_RELOGIN_RETRY_MINUTES`）；可能已送達伺服器的失敗（timeout、EOF、502／503／504）同一次失效最多 2 次嘗試。只有明確的憑證錯誤（AGA0000、密碼、憑證）才啟動持久熔斷；無法辨識的回應（含 `A0000x: response parse Error`、SDK 核心 panic）改為 `autoRelogin.state: paused`，不寫熔斷與指紋，按「重新連線」即可手動登入。手動登入路徑的分類維持 fail-safe（無法辨識一律視為憑證錯誤）。每次嘗試記錄時間與結果 |
+| WebSocket 保活與重連 | SDK 原生不送 ping。實測玉山會回應 ping，另外每條連線約每 120 秒多送一個 pong | 每 30 秒送一次 ping，但不使用 websocket-client 的 `ping_timeout`：它把「距上次 ping 超過逾時才到的 pong」當成逾時，玉山多送的那個 pong 會讓健康的連線被切斷（2026-11-13 正式環境 55 分鐘誤斷 21 次，全部落在連線後 120 秒的整數倍）。半開連線改由靜默看門狗偵測：90 秒沒有任何訊息、ping 或 pong 就關線重連（`WS_SILENCE_SECONDS`，依賴玉山回應每 30 秒的 ping，不可拿掉或拉長 ping 間隔）。握手（TCP＋TLS＋HTTP upgrade）逾時 20 秒；連線建立後的讀取逾時 75 秒，只限制「讀到一半就停住」的 frame，安靜的連線不受影響。重新連上後查一次委託並發 `resync`（`ws_reconnected`），發布前把庫存快取標成需重讀；連不上的嘗試每 60 秒最多補查一次（斷線後第一次失敗立即補查）。 |
 | 委託頻率（`AGR0002`） | 每秒 20 筆 | 限制 18 筆／秒 |
 | 每日委託（`AGR0001`） | 每日 2,000 筆 | 新單、改價、改量、刪單合計計數 |
 | 委託數量 | 整股 499 張／零股 999 股 | 前端與橋接都先檢查 |
@@ -247,6 +248,19 @@ docker compose up -d                      # 修改 .env 後重新載入
 docker compose logs -f esun-bridge        # 或 shioaji-server、shioaji-pro-web
 pnpm run docker:down                      # 或 docker compose down
 ```
+
+### 玉山 WebSocket 斷線排查
+
+`docker compose logs esun-bridge` 裡與回報連線有關的訊息：
+
+- `ping/pong timed out`：2026-11-13 之後不應再出現（原因見上表「WebSocket 保活與重連」）。
+- `已 N 秒無任何訊息，視為斷線並重連`：靜默看門狗判定半開連線。偶爾出現是正常的網路中斷；
+  如果在安靜但正常的連線上大約每 90 秒出現一次，代表玉山不再回應 ping，要把 `WS_SILENCE_SECONDS` 提高到涵蓋它自己的
+  120 秒 pong（例如 150）。
+- `已重新連上，查詢補齊委託`：每次重新連上各一次。`尚未重新連上，改以查詢補齊委託`：連不上期間每分鐘最多一次。
+- `Connection timed out`：握手 20 秒內沒完成，或連線建立後某個 frame 讀到一半停了 75 秒；之後會依退避重連。
+- `用戶端已中斷連線，回應未送達`：瀏覽器在收到回應前就關閉連線（逾時、切到別的 App、關頁面），不是 bridge 的錯誤。
+- `/esun/livez` 成功的存取記錄不再寫入日誌（容器健康檢查每 15 秒一次）；失敗仍會記錄。
 
 ### 永豐 sidecar 卡在舊的網路命名空間
 
