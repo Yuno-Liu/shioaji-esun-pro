@@ -4,7 +4,8 @@
 //   BroadcastChannel 分送其他視窗（一個來源只佔一條長連線）。
 // - 斷線交給 EventSource 原生重連，才會帶 Last-Event-ID 讓 bridge 補送；連線被關閉
 //   （HTTP 錯誤）時才自行以退避重建（以 ?last_event_id= 帶上最後收到的 id）。超過 80 秒沒有
-//   任何事件或心跳視為停滯並重連。
+//   任何事件或心跳視為停滯並重連；頁面回到前景時門檻縮為 30 秒（手機從背景恢復時，死掉的連線
+//   不必等看門狗）。
 // - `order`／`deal` 轉成上游回報管線格式後送進 stream.ts 的回報處理；`session` 更新
 //   esunTradeService 的環境快照；`resync`（漏收超過補送範圍）交給 trading-state 以快取重建。
 
@@ -20,8 +21,9 @@ export type EsunStreamSignal =
     | { kind: 'down'; message: string }
     | { kind: 'reconnected' }
     /** bridge 的 resync：cacheRefreshed 表示 bridge 是否已重讀委託快取（ws_reconnected、failed_ack_refreshed、
-     *  failed_ack_refresh_failed 會帶） */
-    | { kind: 'resync'; reason?: string; cacheRefreshed?: boolean }
+     *  failed_ack_refresh_failed 會帶）。wsOpen（ws_reconnected 才帶）：true＝bridge 與券商的 WebSocket 已重新連上；
+     *  false＝還連不上，bridge 只是定期以查詢補齊委託；較舊的 bridge 不帶 */
+    | { kind: 'resync'; reason?: string; cacheRefreshed?: boolean; wsOpen?: boolean }
     /** 收到但無法轉換的回報（欄位不足、環境未知）：不能投影，需要對帳。authoritativeOnly（興櫃回報缺
      *  股數欄位、單位未知；bridge 快取也沒套用）表示快取重建不能解除，只有權威讀取能對帳 */
     | { kind: 'untrackable'; deal: boolean; authoritativeOnly?: { orderId: string } }
@@ -38,6 +40,8 @@ const UNRESOLVED_FAILURE_EVENT = 'esun_unresolved_failure';
 const COVERED_DEAL_EVENT = 'esun_covered_deal';
 /** bridge 每 25 秒送心跳；超過兩個週期加寬限沒有任何訊息就視為停滯 */
 export const ESUN_STREAM_STALE_MS = 80_000;
+/** 頁面回到前景時的停滯門檻：超過一個心跳週期加寬限沒有任何訊息就立即重連 */
+export const ESUN_STREAM_RESUME_STALE_MS = 30_000;
 const RETRY_MAX_MS = 30_000;
 
 let started = false;
@@ -223,12 +227,23 @@ function disconnect() {
     es = null;
 }
 
-function checkWatchdog() {
+/** 擁有者的 live 連線超過 staleMs 沒有任何事件或心跳：關閉並以退避重建（帶 last_event_id） */
+function reconnectIfStale(staleMs: number) {
     if (!es || status !== 'live' || !isStreamOwner()) return;
-    if (Date.now() - lastActivity <= ESUN_STREAM_STALE_MS) return;
+    if (Date.now() - lastActivity <= staleMs) return;
     disconnect();
     publishStatus('down');
     scheduleRetry();
+}
+
+function checkWatchdog() {
+    reconnectIfStale(ESUN_STREAM_STALE_MS);
+}
+
+/** 回到前景：背景期間連線可能已死但仍顯示 live，不等 80 秒的看門狗 */
+function onVisibilityChange() {
+    if (document.visibilityState !== 'visible') return;
+    reconnectIfStale(ESUN_STREAM_RESUME_STALE_MS);
 }
 
 /** 啟動玉山回報串流（冪等）。只有行情串流的擁有者視窗會真的連線。 */
@@ -247,12 +262,13 @@ export function ensureEsunOrderStream(): void {
             try { esunTradeService.applySession(JSON.parse(raw) as EsunSessionInfo); } catch { /* malformed */ }
         }),
         onStreamEvent(RESYNC_EVENT, raw => {
-            let payload: { reason?: unknown; cacheRefreshed?: unknown } = {};
+            let payload: { reason?: unknown; cacheRefreshed?: unknown; wsOpen?: unknown } = {};
             try { payload = (JSON.parse(raw) ?? {}) as typeof payload; } catch { /* malformed: still a resync */ }
             signal({
                 kind: 'resync',
                 ...(typeof payload.reason === 'string' ? { reason: payload.reason } : {}),
                 ...(typeof payload.cacheRefreshed === 'boolean' ? { cacheRefreshed: payload.cacheRefreshed } : {}),
+                ...(typeof payload.wsOpen === 'boolean' ? { wsOpen: payload.wsOpen } : {}),
             });
         }),
         onStreamEvent(UNTRACKABLE_EVENT, raw => {
@@ -282,6 +298,10 @@ export function ensureEsunOrderStream(): void {
             else disconnect();
         }),
     );
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        stops.push(() => document.removeEventListener('visibilitychange', onVisibilityChange));
+    }
     watchdog = setInterval(checkWatchdog, 5_000);
     connect();
 }

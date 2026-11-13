@@ -449,14 +449,21 @@ class ComposeAndDocsTest(unittest.TestCase):
         self.assertNotRegex(web, r"(?m)^    depends_on:")
         self.assertNotRegex(web, r"(?m)^\s+esun-bridge:")
 
-    def test_log_rotation_only_on_web_and_sidecar(self) -> None:
+    def test_restart_policies(self) -> None:
+        # web 與 sidecar 共用網路命名空間，必須同為 always：Docker Desktop 正常關閉會先停容器，
+        # unless-stopped 之後不會再啟動（2026-11-13 兩次重啟後整組停著）。只改一邊會留下半套服務
+        for name in ("shioaji-pro-web", "shioaji-server"):
+            self.assertRegex(self.service_block(name), r"(?m)^    restart: always$", name)
+        # bridge 一啟動就登入玉山：Docker 重啟後是否啟動由使用者決定
+        self.assertRegex(self.service_block("esun-bridge"), r"(?m)^    restart: unless-stopped$")
+
+    def test_log_rotation_on_all_services(self) -> None:
         compose = _read(os.path.join(REPO_ROOT, "docker-compose.yml")).replace("\r\n", "\n")
         self.assertRegex(compose, r'(?m)^x-logging: &default-logging\n  driver: json-file\n  options:\n'
                                   r'    max-size: "10m"\n    max-file: "3"$')
-        for name in ("shioaji-pro-web", "shioaji-server"):
+        # bridge 的輪替於 2026-11-13 隨 bridge 更新（收盤後重建）一起加上
+        for name in ("shioaji-pro-web", "shioaji-server", "esun-bridge"):
             self.assertRegex(self.service_block(name), r"(?m)^    logging: \*default-logging$", name)
-        # bridge 等收盤後重建時再加（改它的設定會讓下一次 compose up 重建 bridge）
-        self.assertNotIn("logging:", self.service_block("esun-bridge"))
 
     def test_sidecar_healthcheck_also_checks_web(self) -> None:
         block = self.service_block("shioaji-server")
