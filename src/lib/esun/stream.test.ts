@@ -42,7 +42,7 @@ class FakeEventSource {
 
 import { MockEsunDriver } from './mock-driver';
 import { esunTradeService } from './service';
-import { ensureEsunOrderStream, getEsunStreamStatus, onEsunStreamSignal, stopEsunOrderStream, type EsunStreamSignal } from './stream';
+import { ensureEsunOrderStream, ESUN_STREAM_RESUME_STALE_MS, getEsunStreamStatus, onEsunStreamSignal, stopEsunOrderStream, type EsunStreamSignal } from './stream';
 
 const latest = () => FakeEventSource.instances[FakeEventSource.instances.length - 1]!;
 const published = (name: string) => bus.published.filter(p => p.name === name);
@@ -262,5 +262,98 @@ describe('E.SUN order stream', () => {
         expect(getEsunStreamStatus()).toBe('down');
         vi.advanceTimersByTime(1_000);
         expect(FakeEventSource.instances).toHaveLength(2);
+    });
+
+    describe('foreground resume (visibilitychange)', () => {
+        // 測試環境是 node：以假的 document 模擬頁面可見性
+        let doc: {
+            visibilityState: 'visible' | 'hidden';
+            listeners: Set<() => void>;
+            addEventListener: (name: string, l: () => void) => void;
+            removeEventListener: (name: string, l: () => void) => void;
+        };
+        const become = (state: 'visible' | 'hidden') => {
+            doc.visibilityState = state;
+            doc.listeners.forEach(l => l());
+        };
+
+        beforeEach(() => {
+            doc = {
+                visibilityState: 'visible',
+                listeners: new Set(),
+                addEventListener: (name, l) => { if (name === 'visibilitychange') doc.listeners.add(l); },
+                removeEventListener: (name, l) => { if (name === 'visibilitychange') doc.listeners.delete(l); },
+            };
+            vi.stubGlobal('document', doc);
+            vi.useFakeTimers();
+        });
+
+        it('reconnects once from the last event id when the page returns after more than 30 s of silence', () => {
+            ensureEsunOrderStream();
+            latest().open();
+            latest().fire('resync', { reason: 'ws_reconnected' }, 'boot1-7');
+            become('hidden');
+            vi.advanceTimersByTime(ESUN_STREAM_RESUME_STALE_MS + 1_000); // 看門狗（80 秒）還不會動
+            expect(FakeEventSource.instances[0]!.closed).toBe(false);
+            become('visible');
+            expect(FakeEventSource.instances[0]!.closed).toBe(true);
+            expect(getEsunStreamStatus()).toBe('down');
+            become('visible'); // 已不是 live：不重複重連
+            vi.advanceTimersByTime(1_000);
+            expect(FakeEventSource.instances).toHaveLength(2);
+            expect(latest().url).toBe('/esun/stream/orders?last_event_id=boot1-7');
+            latest().open();
+            expect(seen.map(s => s.kind)).toEqual(['resync', 'down', 'reconnected']);
+            become('visible'); // 新連線剛有活動：不再重連（沒有迴圈）
+            vi.advanceTimersByTime(10_000);
+            expect(FakeEventSource.instances).toHaveLength(2);
+            expect(getEsunStreamStatus()).toBe('live');
+        });
+
+        it('keeps a connection that was active within 30 s', () => {
+            ensureEsunOrderStream();
+            latest().open();
+            become('hidden');
+            vi.advanceTimersByTime(ESUN_STREAM_RESUME_STALE_MS - 1_000);
+            become('visible');
+            expect(latest().closed).toBe(false);
+            expect(getEsunStreamStatus()).toBe('live');
+            vi.advanceTimersByTime(1_000);
+            expect(FakeEventSource.instances).toHaveLength(1);
+        });
+
+        it('ignores a visibilitychange to hidden', () => {
+            ensureEsunOrderStream();
+            latest().open();
+            vi.advanceTimersByTime(ESUN_STREAM_RESUME_STALE_MS + 5_000);
+            become('hidden');
+            expect(latest().closed).toBe(false);
+            expect(getEsunStreamStatus()).toBe('live');
+        });
+
+        it('does nothing in a window that does not own the stream', () => {
+            bus.owner = false;
+            ensureEsunOrderStream();
+            // 擁有者廣播的 live 狀態：本視窗沒有連線，回到前景也不能自己連線
+            bus.named.get('esun_status')?.forEach(l => l(JSON.stringify({ status: 'live' })));
+            expect(getEsunStreamStatus()).toBe('live');
+            vi.advanceTimersByTime(ESUN_STREAM_RESUME_STALE_MS + 5_000);
+            become('visible');
+            vi.advanceTimersByTime(60_000);
+            expect(FakeEventSource.instances).toHaveLength(0);
+            expect(published('esun_status').map(p => p.raw)).toEqual([]);
+        });
+
+        it('registers one listener while started and removes it on stop', () => {
+            ensureEsunOrderStream();
+            ensureEsunOrderStream();
+            expect(doc.listeners.size).toBe(1);
+            stopEsunOrderStream();
+            expect(doc.listeners.size).toBe(0);
+            ensureEsunOrderStream();
+            expect(doc.listeners.size).toBe(1);
+            stopEsunOrderStream();
+            expect(doc.listeners.size).toBe(0);
+        });
     });
 });

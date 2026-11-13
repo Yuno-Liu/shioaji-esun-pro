@@ -4,7 +4,8 @@
 //   BroadcastChannel 分送其他視窗（一個來源只佔一條長連線）。
 // - 斷線交給 EventSource 原生重連，才會帶 Last-Event-ID 讓 bridge 補送；連線被關閉
 //   （HTTP 錯誤）時才自行以退避重建（以 ?last_event_id= 帶上最後收到的 id）。超過 80 秒沒有
-//   任何事件或心跳視為停滯並重連。
+//   任何事件或心跳視為停滯並重連；頁面回到前景時門檻縮為 30 秒（手機從背景恢復時，死掉的連線
+//   不必等看門狗）。
 // - `order`／`deal` 轉成上游回報管線格式後送進 stream.ts 的回報處理；`session` 更新
 //   esunTradeService 的環境快照；`resync`（漏收超過補送範圍）交給 trading-state 以快取重建。
 
@@ -38,6 +39,8 @@ const UNRESOLVED_FAILURE_EVENT = 'esun_unresolved_failure';
 const COVERED_DEAL_EVENT = 'esun_covered_deal';
 /** bridge 每 25 秒送心跳；超過兩個週期加寬限沒有任何訊息就視為停滯 */
 export const ESUN_STREAM_STALE_MS = 80_000;
+/** 頁面回到前景時的停滯門檻：超過一個心跳週期加寬限沒有任何訊息就立即重連 */
+export const ESUN_STREAM_RESUME_STALE_MS = 30_000;
 const RETRY_MAX_MS = 30_000;
 
 let started = false;
@@ -223,12 +226,23 @@ function disconnect() {
     es = null;
 }
 
-function checkWatchdog() {
+/** 擁有者的 live 連線超過 staleMs 沒有任何事件或心跳：關閉並以退避重建（帶 last_event_id） */
+function reconnectIfStale(staleMs: number) {
     if (!es || status !== 'live' || !isStreamOwner()) return;
-    if (Date.now() - lastActivity <= ESUN_STREAM_STALE_MS) return;
+    if (Date.now() - lastActivity <= staleMs) return;
     disconnect();
     publishStatus('down');
     scheduleRetry();
+}
+
+function checkWatchdog() {
+    reconnectIfStale(ESUN_STREAM_STALE_MS);
+}
+
+/** 回到前景：背景期間連線可能已死但仍顯示 live，不等 80 秒的看門狗 */
+function onVisibilityChange() {
+    if (document.visibilityState !== 'visible') return;
+    reconnectIfStale(ESUN_STREAM_RESUME_STALE_MS);
 }
 
 /** 啟動玉山回報串流（冪等）。只有行情串流的擁有者視窗會真的連線。 */
@@ -282,6 +296,10 @@ export function ensureEsunOrderStream(): void {
             else disconnect();
         }),
     );
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        stops.push(() => document.removeEventListener('visibilitychange', onVisibilityChange));
+    }
     watchdog = setInterval(checkWatchdog, 5_000);
     connect();
 }
